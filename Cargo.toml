@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/domain",
+    "crates/probe",
+    "crates/pipeline",
+    "crates/cli",
+    "xtask",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+fastconv-domain = { path = "crates/domain" }
+fastconv-probe = { path = "crates/probe" }
+fastconv-pipeline = { path = "crates/pipeline" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"

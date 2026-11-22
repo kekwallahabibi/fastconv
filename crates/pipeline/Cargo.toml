@@ -1,0 +1,10 @@
+[package]
+name = "fastconv-pipeline"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fastconv-domain.workspace = true
+
+[lints]
+workspace = true

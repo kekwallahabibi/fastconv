@@ -1,0 +1,16 @@
+[package]
+name = "fastconv-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "fastconv"
+path = "src/main.rs"
+
+[dependencies]
+fastconv-domain.workspace = true
+fastconv-probe.workspace = true
+fastconv-pipeline.workspace = true
+
+[lints]
+workspace = true

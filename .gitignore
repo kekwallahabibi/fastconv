@@ -1,0 +1,25 @@
+# Rust build artifacts
+/target
+
+# Temporary benchmark and conversion outputs
+/bench-output
+*.bench.tmp
+*.out.mp4
+*.out.mkv
+*.out.webm
+*.out.wav
+*.out.flac
+*.out.png
+*.out.webp
+*.out.avif
+*.profraw
+*.profdata
+*.log
+
+# OS and editor metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
