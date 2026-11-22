@@ -1,3 +1,7 @@
+pub mod hardware;
+
+pub use hardware::detect_host_hardware;
+
 use std::error::Error;
 use std::fmt;
 use std::fs;

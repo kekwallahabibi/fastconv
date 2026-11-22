@@ -1,9 +1,21 @@
+pub mod hardware;
+pub mod metrics;
+
+pub use hardware::{
+    CpuInfo, DetectedGpuBackend, GpuCapability, GpuDeviceType, GpuVendor, GraphicsApi,
+    HostHardware, SimdLevel, WgpuAdapterInfo,
+};
+pub use metrics::{BenchmarkMetrics, BenchmarkSample, PeakMemory, Throughput, WorkloadUnit};
+
 use std::error::Error;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 /// High-level media category supported by `fastconv`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum MediaKind {
     Video,
     Audio,
@@ -11,23 +23,25 @@ pub enum MediaKind {
 }
 
 /// Subset of media kinds eligible for zero-copy GPU execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum GpuMediaKind {
     Video,
     Image,
 }
 
 /// Concrete hardware acceleration backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum GpuBackend {
     Nvenc,
     Vaapi,
+    Qsv,
+    Amf,
     VideoToolbox,
     Vulkan,
 }
 
 /// Execution backend explicitly selected for a conversion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum HardwareBackend {
     Cpu,
     Gpu(GpuBackend),
@@ -44,11 +58,25 @@ pub enum PathRole {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainError {
     EmptyPath(PathRole),
+    EmptyField(&'static str),
     IdenticalSourceAndTarget(PathBuf),
+    InvalidCpuTopology {
+        physical_cores: NonZeroUsize,
+        logical_threads: NonZeroUsize,
+    },
+    ZeroDuration,
     UnsupportedBackend {
         media_kind: MediaKind,
         backend: HardwareBackend,
     },
+}
+
+pub(crate) fn require_non_empty(value: &str, field: &'static str) -> Result<String, DomainError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(DomainError::EmptyField(field));
+    }
+    Ok(trimmed.to_owned())
 }
 
 impl fmt::Display for MediaKind {
@@ -67,6 +95,8 @@ impl fmt::Display for GpuBackend {
         let label = match self {
             Self::Nvenc => "nvenc",
             Self::Vaapi => "vaapi",
+            Self::Qsv => "qsv",
+            Self::Amf => "amf",
             Self::VideoToolbox => "videotoolbox",
             Self::Vulkan => "vulkan",
         };
@@ -97,6 +127,7 @@ impl fmt::Display for DomainError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyPath(role) => write!(f, "{role} path must not be empty"),
+            Self::EmptyField(field) => write!(f, "field '{field}' must not be blank"),
             Self::IdenticalSourceAndTarget(path) => {
                 write!(
                     f,
@@ -104,6 +135,14 @@ impl fmt::Display for DomainError {
                     path.display()
                 )
             }
+            Self::InvalidCpuTopology {
+                physical_cores,
+                logical_threads,
+            } => write!(
+                f,
+                "invalid CPU topology: logical threads ({logical_threads}) cannot be fewer than physical cores ({physical_cores})"
+            ),
+            Self::ZeroDuration => f.write_str("benchmark duration must be greater than zero"),
             Self::UnsupportedBackend {
                 media_kind,
                 backend,
