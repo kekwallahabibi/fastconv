@@ -1,6 +1,10 @@
 # Rust build artifacts
 /target
 
+# Generated local benchmark fixtures (never commit generated media)
+/fixtures/*
+!/fixtures/.gitkeep
+
 # Temporary benchmark and conversion outputs
 /bench-output
 *.bench.tmp
