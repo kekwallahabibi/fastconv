@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 fastconv-domain.workspace = true
+pollster.workspace = true
+wgpu.workspace = true
 
 [lints]
 workspace = true
