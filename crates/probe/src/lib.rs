@@ -1,6 +1,8 @@
 pub mod hardware;
+pub mod image;
 
 pub use hardware::detect_host_hardware;
+pub use image::{prepare_image_batch, probe_png_dimensions};
 
 use std::error::Error;
 use std::fmt;
@@ -15,8 +17,22 @@ use fastconv_domain::{ConversionRequest, DomainError, HardwareBackend, MediaKind
 /// Errors produced at the system boundary while inspecting files or host capabilities.
 #[derive(Debug)]
 pub enum ProbeError {
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
     NotAFile(PathBuf),
+    NotAFileOrDirectory(PathBuf),
+    TargetNotADirectory(PathBuf),
+    EmptySourceDirectory(PathBuf),
+    InvalidImage {
+        path: PathBuf,
+        reason: String,
+    },
+    UnsupportedTargetFormat {
+        path: PathBuf,
+        expected: &'static str,
+    },
     ParallelismUnavailable(io::Error),
     InvalidDomain(DomainError),
 }
@@ -29,6 +45,37 @@ impl fmt::Display for ProbeError {
             }
             Self::NotAFile(path) => {
                 write!(f, "source path is not a regular file: {}", path.display())
+            }
+            Self::NotAFileOrDirectory(path) => {
+                write!(
+                    f,
+                    "source path is neither a regular file nor a directory: {}",
+                    path.display()
+                )
+            }
+            Self::TargetNotADirectory(path) => {
+                write!(
+                    f,
+                    "target must be a directory when source is a directory: {}",
+                    path.display()
+                )
+            }
+            Self::EmptySourceDirectory(path) => {
+                write!(
+                    f,
+                    "no PNG files found in source directory: {}",
+                    path.display()
+                )
+            }
+            Self::InvalidImage { path, reason } => {
+                write!(f, "invalid PNG image '{}': {reason}", path.display())
+            }
+            Self::UnsupportedTargetFormat { path, expected } => {
+                write!(
+                    f,
+                    "unsupported target extension for '{}' (expected .{expected})",
+                    path.display()
+                )
             }
             Self::ParallelismUnavailable(source) => {
                 write!(f, "failed to determine host CPU parallelism: {source}")
@@ -43,7 +90,12 @@ impl Error for ProbeError {
         match self {
             Self::Io { source, .. } | Self::ParallelismUnavailable(source) => Some(source),
             Self::InvalidDomain(err) => Some(err),
-            Self::NotAFile(_) => None,
+            Self::NotAFile(_)
+            | Self::NotAFileOrDirectory(_)
+            | Self::TargetNotADirectory(_)
+            | Self::EmptySourceDirectory(_)
+            | Self::InvalidImage { .. }
+            | Self::UnsupportedTargetFormat { .. } => None,
         }
     }
 }
