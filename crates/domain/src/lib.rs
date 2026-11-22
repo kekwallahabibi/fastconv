@@ -1,9 +1,14 @@
 pub mod hardware;
+pub mod image;
 pub mod metrics;
 
 pub use hardware::{
     CpuInfo, DetectedGpuBackend, GpuCapability, GpuDeviceType, GpuVendor, GraphicsApi,
     HostHardware, SimdLevel, WgpuAdapterInfo,
+};
+pub use image::{
+    ImageBatchPlan, ImageConversionReport, ImageDimensions, PngToWebpItem, WebpEncoding,
+    WebpQuality,
 };
 pub use metrics::{BenchmarkMetrics, BenchmarkSample, PeakMemory, Throughput, WorkloadUnit};
 
@@ -65,6 +70,17 @@ pub enum DomainError {
         logical_threads: NonZeroUsize,
     },
     ZeroDuration,
+    InvalidDimensions {
+        width: u32,
+        height: u32,
+    },
+    InvalidQuality {
+        value: u8,
+        max: u8,
+    },
+    EmptyBatch,
+    DuplicateTargetPath(PathBuf),
+    TargetOverwritesSource(PathBuf),
     UnsupportedBackend {
         media_kind: MediaKind,
         backend: HardwareBackend,
@@ -143,6 +159,29 @@ impl fmt::Display for DomainError {
                 "invalid CPU topology: logical threads ({logical_threads}) cannot be fewer than physical cores ({physical_cores})"
             ),
             Self::ZeroDuration => f.write_str("benchmark duration must be greater than zero"),
+            Self::InvalidDimensions { width, height } => {
+                write!(f, "image dimensions must be non-zero, got {width}x{height}")
+            }
+            Self::InvalidQuality { value, max } => {
+                write!(f, "webp quality must be in 0..={max}, got {value}")
+            }
+            Self::EmptyBatch => {
+                f.write_str("image conversion batch must contain at least one file")
+            }
+            Self::DuplicateTargetPath(path) => {
+                write!(
+                    f,
+                    "multiple batch items target the same output path: {}",
+                    path.display()
+                )
+            }
+            Self::TargetOverwritesSource(path) => {
+                write!(
+                    f,
+                    "batch output path would overwrite a source file: {}",
+                    path.display()
+                )
+            }
             Self::UnsupportedBackend {
                 media_kind,
                 backend,
