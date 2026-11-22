@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 fastconv-domain.workspace = true
+png.workspace = true
+zenwebp.workspace = true
 
 [lints]
 workspace = true
