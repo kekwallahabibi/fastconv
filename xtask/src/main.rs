@@ -278,6 +278,7 @@ fn cmd_bench_status(root: &Path) {
         if has_mp4 { "ready" } else { "missing" }
     );
     println!("run `cargo xtask gen-fixtures` to generate missing fixtures.");
+    println!("run `cargo xtask bench` to run the head-to-head benchmark (fastconv vs FFmpeg).");
     println!("run `cargo xtask bench --baseline` to execute and save the FFmpeg baseline.");
 }
 
@@ -291,8 +292,13 @@ fn print_usage() {
     );
     println!("  cargo xtask gen-fixtures --force");
     println!("                                Regenerate all fixtures from scratch");
-    println!("  cargo xtask bench             Report local fixture status");
-    println!("  cargo xtask bench --baseline  Run FFmpeg baseline benchmarks and save JSON report");
+    println!(
+        "  cargo xtask bench             Run head-to-head benchmark (fastconv --release vs ffmpeg) + output validation"
+    );
+    println!(
+        "  cargo xtask bench --baseline  Run FFmpeg baseline across all workloads and save JSON"
+    );
+    println!("  cargo xtask bench --status    Report local fixture availability");
 }
 
 fn main() -> ExitCode {
@@ -309,8 +315,9 @@ fn main() -> ExitCode {
         ["gen-fixtures", "--force"] => {
             workspace_root().and_then(|root| fixtures::generate_all(&root, true))
         }
-        ["bench"] => workspace_root().map(|root| cmd_bench_status(&root)),
+        ["bench"] => workspace_root().and_then(|root| bench::run_head_to_head(&root)),
         ["bench", "--baseline"] => workspace_root().and_then(|root| bench::run_baseline(&root)),
+        ["bench", "--status"] => workspace_root().map(|root| cmd_bench_status(&root)),
         [] | ["-h" | "--help"] => {
             print_usage();
             Ok(())
