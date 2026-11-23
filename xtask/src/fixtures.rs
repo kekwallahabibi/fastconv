@@ -9,7 +9,7 @@ use std::thread;
 use jpeg_encoder::{
     ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor,
 };
-use zenwebp::{EncodeRequest, LossyConfig, PixelLayout};
+use zenwebp::{Encoder as WebpEncoder, EncoderConfig as WebpEncoderConfig};
 
 pub const IMAGE_BATCH_COUNT: usize = 20;
 pub const IMAGE_WIDTH: u32 = 3840;
@@ -299,8 +299,9 @@ fn write_single_4k_webp(root: &Path, index: usize) -> Result<(), String> {
     let tmp = webp_images_dir(root).join(format!(".img_{index:02}.webp.tmp"));
     let rgb = generate_4k_rgb_frame(index)?;
 
-    let cfg = LossyConfig::new().with_quality(80.0).with_method(4);
-    let encoded = EncodeRequest::lossy(&cfg, &rgb, PixelLayout::Rgb8, IMAGE_WIDTH, IMAGE_HEIGHT)
+    let cfg = WebpEncoderConfig::new().quality(80.0).method(4);
+    let encoded = WebpEncoder::new_rgb(&rgb, IMAGE_WIDTH, IMAGE_HEIGHT)
+        .config(cfg)
         .encode()
         .map_err(|err| format!("failed to encode WebP '{}': {err}", tmp.display()))?;
     fs::write(&tmp, &encoded)

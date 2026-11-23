@@ -539,6 +539,7 @@ fn license_term_allowed(term: &str) -> bool {
             | "cc0-1.0"
             | "mpl-2.0"
             | "ijg"
+            | "ncsa"
             | "unicode-3.0"
             | "agpl-3.0"
             | "agpl-3.0-only"
@@ -722,6 +723,7 @@ fn helper<'a>(s: &'a str) -> char { let _ = s; '\"' }
             "CC0-1.0",
             "GPL-2.0-only WITH Classpath-exception-2.0",
             "GPL-3.0-only AND (GPL-2.0-only WITH Classpath-exception-2.0)",
+            "(MIT OR Apache-2.0) AND NCSA",
         ] {
             assert!(!forbidden_license(allowed), "should be allowed: {allowed}");
         }

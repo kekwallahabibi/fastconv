@@ -17,7 +17,7 @@ fn print_usage() {
     println!("Usage:");
     println!("  fastconv probe");
     println!(
-        "  fastconv convert <source> <target> [--quality <0..=100> | --lossless] [--to <webp|heic|jpeg|png|bmp|qoi>] [--threads <N>] [--backend <cpu|nvenc|vaapi|qsv|amf|videotoolbox|vulkan>]"
+        "  fastconv convert <source> <target> [--quality <0..=100> | --lossless] [--to <webp|heic|jpeg|png|bmp|qoi|tiff|jxl|avif>] [--threads <N>] [--backend <cpu|nvenc|vaapi|qsv|amf|videotoolbox|vulkan>]"
     );
     println!(
         "  fastconv audio <source> <target> [--to <flac|wav|opus>] [--threads <N>] [--backend <cpu|...>]"
@@ -66,8 +66,11 @@ fn parse_target_format(value: &str) -> Result<ImageOutputFormat, String> {
         "png" => Ok(ImageOutputFormat::Png),
         "bmp" => Ok(ImageOutputFormat::Bmp),
         "qoi" => Ok(ImageOutputFormat::Qoi),
+        "tiff" | "tif" => Ok(ImageOutputFormat::Tiff),
+        "jxl" => Ok(ImageOutputFormat::Jxl),
+        "avif" => Ok(ImageOutputFormat::Avif),
         other => Err(format!(
-            "unknown format '{other}' (expected webp, heic, jpeg, png, bmp, or qoi)"
+            "unknown format '{other}' (expected webp, heic, jpeg, png, bmp, qoi, tiff, jxl, or avif)"
         )),
     }
 }
@@ -416,6 +419,10 @@ mod tests {
             ("png", ImageOutputFormat::Png),
             ("bmp", ImageOutputFormat::Bmp),
             ("qoi", ImageOutputFormat::Qoi),
+            ("tiff", ImageOutputFormat::Tiff),
+            ("tif", ImageOutputFormat::Tiff),
+            ("jxl", ImageOutputFormat::Jxl),
+            ("avif", ImageOutputFormat::Avif),
         ] {
             let ConvertCommand::Run(parsed) =
                 parse_convert_args(&["src_dir", "out_dir", "--to", flag])?
@@ -447,7 +454,7 @@ mod tests {
         );
         assert!(parse_convert_args(&["a.png", "b.webp", "--lossless", "--lossless"]).is_err());
         assert!(parse_convert_args(&["a.png", "b.webp", "--to", "webp", "--to", "heic"]).is_err());
-        assert!(parse_convert_args(&["a.png", "b.webp", "--to", "avif"]).is_err());
+        assert!(parse_convert_args(&["a.png", "b.webp", "--to", "gif"]).is_err());
         assert!(parse_convert_args(&["a.png", "b.webp", "--format", "webp"]).is_err());
         assert!(
             parse_convert_args(&["a.png", "b.webp", "--threads", "2", "--threads", "4"]).is_err()

@@ -536,7 +536,10 @@ mod enabled {
                 std::mem::swap(pixel_buf, &mut rgba_bytes);
                 finish_rgba_expansion(item_index, item, decoded, pixel_buf, rgba_bytes)
             }
-            ImageInputFormat::Png | ImageInputFormat::Webp => {
+            ImageInputFormat::Png
+            | ImageInputFormat::Webp
+            | ImageInputFormat::Tiff
+            | ImageInputFormat::Jxl => {
                 let decoded =
                     decode_image_into(item, DecodeTargetHint::Native, file_bytes, pixel_buf)?;
                 finish_rgba_expansion(item_index, item, decoded, pixel_buf, rgba_bytes)
@@ -551,6 +554,12 @@ mod enabled {
         pixel_buf: &[u8],
         mut rgba_bytes: Vec<u8>,
     ) -> Result<DecodedRgbaFrame, PipelineError> {
+        if decoded.has_non_opaque_native_alpha {
+            return Err(PipelineError::UnsupportedPixelFormat {
+                path: item.source().to_path_buf(),
+                format: "TIFF alpha sample is not fully opaque at native bit depth".to_owned(),
+            });
+        }
         let pixels =
             pixel_buf
                 .get(..decoded.byte_len)

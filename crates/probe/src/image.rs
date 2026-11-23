@@ -7,6 +7,7 @@ use fastconv_domain::{
     DomainError, HardwareBackend, HostHardware, ImageBatchItem, ImageBatchPlan, ImageCompression,
     ImageDimensions, ImageExecutionMode, ImageInputFormat, ImageOutputFormat, PathRole,
 };
+use jxl::api::JxlBitstreamInput;
 use zune_jpeg::JpegDecoder;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 
@@ -22,9 +23,15 @@ const QOI_MAX_RUN: u64 = 62;
 // Shared pixel budget matching `fastconv-pipeline` QOI encode/decode (128 Mi pixels = 512 MiB RGBA8).
 const MAX_QOI_PIXELS: u64 = 128 * 1024 * 1024;
 const BMP_MAGIC: [u8; 2] = *b"BM";
-const KNOWN_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "qoi"];
+const TIFF_LE_MAGIC: [u8; 4] = *b"II*\0";
+const TIFF_BE_MAGIC: [u8; 4] = *b"MM\0*";
+// 512 Mi samples = 512 MiB RGBA8; keeps a hostile JXL header from forcing huge allocations.
+const MAX_JXL_SAMPLES: usize = 512 * 1024 * 1024;
+const KNOWN_IMAGE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "webp", "bmp", "qoi", "tif", "tiff", "jxl",
+];
 const UNRECOGNIZED_MAGIC_REASON: &str =
-    "unrecognized image magic bytes (expected PNG, JPEG, WebP, BMP, or QOI)";
+    "unrecognized image magic bytes (expected PNG, JPEG, WebP, BMP, QOI, TIFF, or JPEG XL)";
 
 /// Detected input container format and validated pixel dimensions from image headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +62,13 @@ fn sniff_magic_format(header: &[u8], strict_bmp_dib: bool) -> Option<ImageInputF
         let dib_bytes = header.get(14..18)?;
         let dib_size = u32::from_le_bytes([dib_bytes[0], dib_bytes[1], dib_bytes[2], dib_bytes[3]]);
         is_known_bmp_dib_size(dib_size).then_some(ImageInputFormat::Bmp)
+    } else if header.starts_with(&TIFF_LE_MAGIC) || header.starts_with(&TIFF_BE_MAGIC) {
+        Some(ImageInputFormat::Tiff)
+    } else if matches!(
+        jxl::api::check_signature(header),
+        jxl::api::JxlSignature::Codestream | jxl::api::JxlSignature::Container
+    ) {
+        Some(ImageInputFormat::Jxl)
     } else {
         None
     }
@@ -736,9 +750,102 @@ fn probe_opened_image(
         ImageInputFormat::Webp => probe_webp(&mut file, path)?,
         ImageInputFormat::Bmp => probe_bmp(&mut file, path)?,
         ImageInputFormat::Qoi => probe_qoi(&mut file, path)?,
+        ImageInputFormat::Tiff => probe_tiff(file, path)?,
+        ImageInputFormat::Jxl => probe_jxl(file, path)?,
     };
 
     Ok(ProbedImage { format, dimensions })
+}
+
+fn probe_tiff(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+    let mut decoder = tiff::decoder::Decoder::new(BufReader::new(file))
+        .map_err(|err| invalid_image(path, format!("invalid TIFF header: {err}")))?;
+    let (width, height) = decoder
+        .dimensions()
+        .map_err(|err| invalid_image(path, format!("invalid TIFF dimensions: {err}")))?;
+    let color = decoder
+        .colortype()
+        .map_err(|err| invalid_image(path, format!("invalid TIFF color type: {err}")))?;
+    let bits = match color {
+        tiff::ColorType::Gray(bits)
+        | tiff::ColorType::GrayA(bits)
+        | tiff::ColorType::RGB(bits)
+        | tiff::ColorType::RGBA(bits) => bits,
+        other => {
+            return Err(invalid_image(
+                path,
+                format!(
+                    "unsupported TIFF color type {other:?}; supported are grayscale, gray+alpha, RGB, and RGBA"
+                ),
+            ));
+        }
+    };
+    if !matches!(bits, 1..=16) {
+        return Err(invalid_image(
+            path,
+            format!("unsupported TIFF sample depth {bits} (expected 1..=16 bits)"),
+        ));
+    }
+    if width == 0 || height == 0 {
+        return Err(invalid_image(
+            path,
+            format!("invalid TIFF dimensions {width}x{height}"),
+        ));
+    }
+    Ok(ImageDimensions::new(width, height)?)
+}
+
+fn probe_jxl(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+    let mut reader = BufReader::new(file);
+    let mut options = jxl::api::JxlDecoderOptions::default();
+    options.sample_limit = Some(MAX_JXL_SAMPLES);
+    let mut decoder = jxl::api::JxlDecoder::new(options);
+
+    loop {
+        match decoder.process(&mut reader, None, None) {
+            Ok(jxl::api::Event::BasicInfo) => {
+                let info = decoder.basic_info().ok_or_else(|| {
+                    invalid_image(path, "missing JPEG XL basic image information")
+                })?;
+                if info.animation.is_some() {
+                    return Err(invalid_image(
+                        path,
+                        "animated JPEG XL is not supported by the still-image pipeline",
+                    ));
+                }
+                let (width, height) = info.size;
+                let width = u32::try_from(width).map_err(|_| {
+                    invalid_image(path, format!("JPEG XL width {width} is too large"))
+                })?;
+                let height = u32::try_from(height).map_err(|_| {
+                    invalid_image(path, format!("JPEG XL height {height} is too large"))
+                })?;
+                return Ok(ImageDimensions::new(width, height)?);
+            }
+            Ok(jxl::api::Event::NeedMoreInput { .. }) => {
+                let remaining = reader.available_bytes().map_err(|source| ProbeError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+                if remaining == 0 {
+                    return Err(invalid_image(path, "truncated JPEG XL stream"));
+                }
+            }
+            Ok(jxl::api::Event::Complete) => {
+                return Err(invalid_image(
+                    path,
+                    "JPEG XL codestream contains no visible frame",
+                ));
+            }
+            Ok(jxl::api::Event::FrameHeader | jxl::api::Event::FrameComplete { .. }) => {}
+            Err(err) => {
+                return Err(invalid_image(
+                    path,
+                    format!("invalid JPEG XL stream: {err}"),
+                ));
+            }
+        }
+    }
 }
 
 /// Probes image format via magic bytes and reads header dimensions without decoding pixels.
@@ -1001,12 +1108,15 @@ fn resolve_single_target(
                 ImageOutputFormat::Png => ".png",
                 ImageOutputFormat::Bmp => ".bmp",
                 ImageOutputFormat::Qoi => ".qoi",
+                ImageOutputFormat::Tiff => ".tif or .tiff",
+                ImageOutputFormat::Jxl => ".jxl",
+                ImageOutputFormat::Avif => ".avif",
             },
         }),
         (None, Some(actual)) => Ok((target.to_path_buf(), actual)),
         (None, None) => Err(ProbeError::UnsupportedTargetFormat {
             path: target.to_path_buf(),
-            expected: ".webp, .heic, .jpg, .jpeg, .png, .bmp, or .qoi",
+            expected: ".webp, .heic, .jpg, .jpeg, .png, .bmp, .qoi, .tif, .tiff, .jxl, or .avif",
         }),
     }
 }
@@ -1024,6 +1134,12 @@ fn infer_format_from_extension(path: &Path) -> Option<ImageOutputFormat> {
         Some(ImageOutputFormat::Bmp)
     } else if has_extension(path, "qoi") {
         Some(ImageOutputFormat::Qoi)
+    } else if has_any_extension(path, &["tif", "tiff"]) {
+        Some(ImageOutputFormat::Tiff)
+    } else if has_extension(path, "jxl") {
+        Some(ImageOutputFormat::Jxl)
+    } else if has_extension(path, "avif") {
+        Some(ImageOutputFormat::Avif)
     } else {
         None
     }
@@ -1157,17 +1273,19 @@ mod tests {
         let bpp = if with_alpha { 4_usize } else { 3_usize };
         let len = usize::try_from(width * height).unwrap_or(0) * bpp;
         let pixels = vec![180_u8; len];
-        let layout = if with_alpha {
-            zenwebp::PixelLayout::Rgba8
+        let cfg = if lossless {
+            zenwebp::EncoderConfig::new_lossless()
         } else {
-            zenwebp::PixelLayout::Rgb8
+            zenwebp::EncoderConfig::new().quality(80.0)
         };
-        let encoded = if lossless {
-            let cfg = zenwebp::LosslessConfig::new();
-            zenwebp::EncodeRequest::lossless(&cfg, &pixels, layout, width, height).encode()
+        let encoded = if with_alpha {
+            zenwebp::Encoder::new_rgba(&pixels, width, height)
+                .config(cfg)
+                .encode()
         } else {
-            let cfg = zenwebp::LossyConfig::new().with_quality(80.0);
-            zenwebp::EncodeRequest::lossy(&cfg, &pixels, layout, width, height).encode()
+            zenwebp::Encoder::new_rgb(&pixels, width, height)
+                .config(cfg)
+                .encode()
         }
         .map_err(|err| ProbeError::InvalidImage {
             path: path.to_path_buf(),
@@ -1773,7 +1891,7 @@ mod tests {
 
         let ext_err = prepare_image_batch(
             &valid,
-            &root.join("out.avif"),
+            &root.join("out.gif"),
             Some(ImageCompression::Lossless),
             None,
             None,

@@ -22,16 +22,26 @@ fastconv-pipeline = { path = "crates/pipeline" }
 flacenc = { version = "0.5.1", default-features = false }
 hound = "3.5.1"
 jpeg-encoder = { version = "0.7.1", features = ["std", "simd"] }
+# JPEG XL decode is the pure-Rust `jxl` (jxl-rs) port; encode is the pure-Rust
+jxl = "0.8.0"
+# `jixel` is the pure-Rust JPEG XL encoder used for JXL output.
+# It is dual-licensed BSD-3-Clause OR Apache-2.0.
+jixel = { version = "0.5.13", default-features = false, features = ["avx", "sse"] }
 nvidia-video-codec-sdk = "0.4"
 opus-pure = "0.2.3"
 png = "0.18"
 pollster = "1"
 rubato = "0.16.2"
+# `ravif` is the pure-Rust rav1e-based AVIF encoder. The `asm` feature enables
+# rav1e's NASM-accelerated paths; CI installs NASM explicitly.
+ravif = { version = "0.13.0", default-features = false, features = ["asm", "threading"] }
+rgb = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 symphonia = { version = "0.6.1", default-features = false, features = ["opt-simd", "pcm", "wav", "flac", "vorbis", "mp3", "ogg"] }
+tiff = { version = "0.11.3", default-features = false, features = ["deflate", "lzw"] }
 wgpu = { version = "30", default-features = false, features = ["std", "vulkan", "metal", "dx12"] }
-zenwebp = { version = "0.4", default-features = false, features = ["std", "fast-yuv"] }
+zenwebp = { version = "=0.2.0", default-features = false, features = ["std", "fast-yuv", "simd"] }
 # Pin 0.5.16-rc3 until stable 0.5.16 ships: fixes silent wrong-color decoding in 0.5.15 (zune-image#496).
 zune-jpeg = "0.5.16-rc3"
 
@@ -50,13 +60,23 @@ opt-level = 3
 [profile.dev.package.zenwebp]
 opt-level = 3
 
-[profile.dev.package.zenyuv]
-opt-level = 3
-
 [profile.dev.package.zune-jpeg]
 opt-level = 3
 
 [profile.dev.package.jpeg-encoder]
+opt-level = 3
+
+[profile.dev.package.jxl]
+opt-level = 3
+
+
+[profile.dev.package.ravif]
+opt-level = 3
+
+[profile.dev.package.rav1e]
+opt-level = 3
+
+[profile.dev.package.tiff]
 opt-level = 3
 
 [workspace.lints.rust]

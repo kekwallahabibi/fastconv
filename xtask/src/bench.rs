@@ -141,6 +141,12 @@ struct HeadToHeadReport {
     png_to_qoi_ffmpeg: HeadToHeadEntry,
     webp_to_bmp_fastconv: HeadToHeadEntry,
     webp_to_bmp_ffmpeg: HeadToHeadEntry,
+    png_to_tiff_fastconv: HeadToHeadEntry,
+    png_to_tiff_ffmpeg: HeadToHeadEntry,
+    png_to_jxl_fastconv: HeadToHeadEntry,
+    png_to_jxl_ffmpeg: HeadToHeadEntry,
+    png_to_avif_fastconv: HeadToHeadEntry,
+    png_to_avif_ffmpeg: HeadToHeadEntry,
     png_to_heic_nvenc: Option<HeadToHeadEntry>,
     jpeg_to_heic_nvenc: Option<HeadToHeadEntry>,
     webp_to_heic_nvenc: Option<HeadToHeadEntry>,
@@ -200,7 +206,7 @@ pub fn run_head_to_head(root: &Path) -> Result<(), String> {
         })?;
     }
 
-    let mut rows: Vec<&HeadToHeadEntry> = Vec::with_capacity(15);
+    let mut rows: Vec<&HeadToHeadEntry> = Vec::with_capacity(21);
     rows.push(&report.png_to_webp_fastconv);
     rows.push(&report.png_to_webp_ffmpeg);
     rows.push(&report.png_to_jpeg_fastconv);
@@ -213,6 +219,12 @@ pub fn run_head_to_head(root: &Path) -> Result<(), String> {
     rows.push(&report.png_to_qoi_ffmpeg);
     rows.push(&report.webp_to_bmp_fastconv);
     rows.push(&report.webp_to_bmp_ffmpeg);
+    rows.push(&report.png_to_tiff_fastconv);
+    rows.push(&report.png_to_tiff_ffmpeg);
+    rows.push(&report.png_to_jxl_fastconv);
+    rows.push(&report.png_to_jxl_ffmpeg);
+    rows.push(&report.png_to_avif_fastconv);
+    rows.push(&report.png_to_avif_ffmpeg);
     if let Some(ref heic) = report.png_to_heic_nvenc {
         rows.push(heic);
     }
@@ -258,6 +270,9 @@ const fn bench_target_cli_arg(format: ImageOutputFormat) -> &'static str {
         ImageOutputFormat::Png => "png",
         ImageOutputFormat::Bmp => "bmp",
         ImageOutputFormat::Qoi => "qoi",
+        ImageOutputFormat::Tiff => "tiff",
+        ImageOutputFormat::Jxl => "jxl",
+        ImageOutputFormat::Avif => "avif",
     }
 }
 
@@ -268,6 +283,10 @@ struct LossyRuns {
     png_to_jpeg_ffmpeg: HeadToHeadEntry,
     jpeg_to_webp_fastconv: HeadToHeadEntry,
     jpeg_to_webp_ffmpeg: HeadToHeadEntry,
+    png_to_jxl_fastconv: HeadToHeadEntry,
+    png_to_jxl_ffmpeg: HeadToHeadEntry,
+    png_to_avif_fastconv: HeadToHeadEntry,
+    png_to_avif_ffmpeg: HeadToHeadEntry,
 }
 
 struct LosslessRuns {
@@ -277,6 +296,8 @@ struct LosslessRuns {
     png_to_qoi_ffmpeg: HeadToHeadEntry,
     webp_to_bmp_fastconv: HeadToHeadEntry,
     webp_to_bmp_ffmpeg: HeadToHeadEntry,
+    png_to_tiff_fastconv: HeadToHeadEntry,
+    png_to_tiff_ffmpeg: HeadToHeadEntry,
 }
 
 struct NvencHeicRuns {
@@ -396,6 +417,11 @@ fn run_lossy_contenders(
         COMPRESSED_TO_LOSSY_POLICY,
     )?;
 
+    let (png_to_jxl_fastconv, png_to_jxl_ffmpeg) =
+        run_png_to_jxl_contenders(fastconv_bin, fixtures, h2h_tmp)?;
+    let (png_to_avif_fastconv, png_to_avif_ffmpeg) =
+        run_png_to_avif_contenders(fastconv_bin, fixtures, h2h_tmp)?;
+
     Ok(LossyRuns {
         png_to_webp_fastconv,
         png_to_webp_ffmpeg,
@@ -403,6 +429,10 @@ fn run_lossy_contenders(
         png_to_jpeg_ffmpeg,
         jpeg_to_webp_fastconv,
         jpeg_to_webp_ffmpeg,
+        png_to_jxl_fastconv,
+        png_to_jxl_ffmpeg,
+        png_to_avif_fastconv,
+        png_to_avif_ffmpeg,
     })
 }
 
@@ -434,6 +464,7 @@ fn run_lossless_contenders(
         fixtures.webp_batch_bytes,
         &create_h2h_dir(h2h_tmp, "ffmpeg_webp_to_png")?,
         ImageOutputFormat::Png,
+        LOSSLESS_EXACT_POLICY,
         &["-c:v", "png"],
     )?;
 
@@ -460,6 +491,7 @@ fn run_lossless_contenders(
         fixtures.image_batch_bytes,
         &create_h2h_dir(h2h_tmp, "ffmpeg_png_to_qoi")?,
         ImageOutputFormat::Qoi,
+        LOSSLESS_EXACT_POLICY,
         &["-c:v", "qoi"],
     )?;
 
@@ -486,8 +518,12 @@ fn run_lossless_contenders(
         fixtures.webp_batch_bytes,
         &create_h2h_dir(h2h_tmp, "ffmpeg_webp_to_bmp")?,
         ImageOutputFormat::Bmp,
+        LOSSLESS_EXACT_POLICY,
         &["-c:v", "bmp"],
     )?;
+
+    let (png_to_tiff_fastconv, png_to_tiff_ffmpeg) =
+        run_png_to_tiff_contenders(fastconv_bin, fixtures, h2h_tmp)?;
 
     Ok(LosslessRuns {
         webp_to_png_fastconv,
@@ -496,6 +532,8 @@ fn run_lossless_contenders(
         png_to_qoi_ffmpeg,
         webp_to_bmp_fastconv,
         webp_to_bmp_ffmpeg,
+        png_to_tiff_fastconv,
+        png_to_tiff_ffmpeg,
     })
 }
 
@@ -568,6 +606,144 @@ fn run_nvenc_heic_contenders(
     })
 }
 
+fn run_png_to_jxl_contenders(
+    fastconv_bin: &Path,
+    fixtures: &VerifiedHeadToHeadFixtures,
+    h2h_tmp: &Path,
+) -> Result<(HeadToHeadEntry, HeadToHeadEntry), String> {
+    let fastconv = run_fastconv_image_batch(
+        fastconv_bin,
+        &FastconvBenchJob {
+            workload_name: "image_batch_4k_png_to_jxl",
+            tool_label: "fastconv (cpu q=80)",
+            source_dir: &fixtures.images_dir,
+            source_format: SourceBatchFormat::Png,
+            input_bytes: fixtures.image_batch_bytes,
+            out_dir: &create_h2h_dir(h2h_tmp, "fastconv_png_to_jxl")?,
+            target_format: ImageOutputFormat::Jxl,
+            quality: Some("80"),
+            backend: "cpu",
+            policy: PNG_TO_LOSSY_POLICY,
+        },
+    )?;
+    let ffmpeg = run_ffmpeg_lossless_batch(
+        "image_batch_4k_png_to_jxl",
+        "ffmpeg (libjxl d=1.9)",
+        &fixtures.images_dir,
+        SourceBatchFormat::Png,
+        fixtures.image_batch_bytes,
+        &create_h2h_dir(h2h_tmp, "ffmpeg_png_to_jxl")?,
+        ImageOutputFormat::Jxl,
+        PNG_TO_LOSSY_POLICY,
+        // jixel maps --quality 80 to Butteraugli distance 1.9.
+        &["-c:v", "libjxl", "-distance", "1.9"],
+    )?;
+    Ok((fastconv, ffmpeg))
+}
+
+fn run_png_to_avif_contenders(
+    fastconv_bin: &Path,
+    fixtures: &VerifiedHeadToHeadFixtures,
+    h2h_tmp: &Path,
+) -> Result<(HeadToHeadEntry, HeadToHeadEntry), String> {
+    let fastconv = run_fastconv_image_batch(
+        fastconv_bin,
+        &FastconvBenchJob {
+            workload_name: "image_batch_4k_png_to_avif",
+            tool_label: "fastconv (cpu q=80)",
+            source_dir: &fixtures.images_dir,
+            source_format: SourceBatchFormat::Png,
+            input_bytes: fixtures.image_batch_bytes,
+            out_dir: &create_h2h_dir(h2h_tmp, "fastconv_png_to_avif")?,
+            target_format: ImageOutputFormat::Avif,
+            quality: Some("80"),
+            backend: "cpu",
+            policy: PNG_TO_LOSSY_POLICY,
+        },
+    )?;
+    let (tool_label, codec_args): (&str, &[&str]) = if ffmpeg_has_encoder("libsvtav1")? {
+        (
+            "ffmpeg (libsvtav1 preset 8)",
+            &[
+                "-c:v",
+                "libsvtav1",
+                "-preset",
+                "8",
+                "-crf",
+                "30",
+                "-g",
+                "1",
+                "-svtav1-params",
+                "tune=0",
+            ],
+        )
+    } else {
+        (
+            "ffmpeg (libaom cpu-used 4)",
+            &[
+                "-c:v",
+                "libaom-av1",
+                "-cpu-used",
+                "4",
+                "-crf",
+                "30",
+                "-b:v",
+                "0",
+                "-g",
+                "1",
+                "-still-picture",
+                "1",
+            ],
+        )
+    };
+    let ffmpeg = run_ffmpeg_lossless_batch(
+        "image_batch_4k_png_to_avif",
+        tool_label,
+        &fixtures.images_dir,
+        SourceBatchFormat::Png,
+        fixtures.image_batch_bytes,
+        &create_h2h_dir(h2h_tmp, "ffmpeg_png_to_avif")?,
+        ImageOutputFormat::Avif,
+        PNG_TO_LOSSY_POLICY,
+        codec_args,
+    )?;
+    Ok((fastconv, ffmpeg))
+}
+
+fn run_png_to_tiff_contenders(
+    fastconv_bin: &Path,
+    fixtures: &VerifiedHeadToHeadFixtures,
+    h2h_tmp: &Path,
+) -> Result<(HeadToHeadEntry, HeadToHeadEntry), String> {
+    let fastconv = run_fastconv_image_batch(
+        fastconv_bin,
+        &FastconvBenchJob {
+            workload_name: "image_batch_4k_png_to_tiff",
+            tool_label: "fastconv (cpu tiff)",
+            source_dir: &fixtures.images_dir,
+            source_format: SourceBatchFormat::Png,
+            input_bytes: fixtures.image_batch_bytes,
+            out_dir: &create_h2h_dir(h2h_tmp, "fastconv_png_to_tiff")?,
+            target_format: ImageOutputFormat::Tiff,
+            quality: None,
+            backend: "cpu",
+            policy: LOSSLESS_EXACT_POLICY,
+        },
+    )?;
+    let ffmpeg = run_ffmpeg_lossless_batch(
+        "image_batch_4k_png_to_tiff",
+        "ffmpeg (tiff)",
+        &fixtures.images_dir,
+        SourceBatchFormat::Png,
+        fixtures.image_batch_bytes,
+        &create_h2h_dir(h2h_tmp, "ffmpeg_png_to_tiff")?,
+        ImageOutputFormat::Tiff,
+        LOSSLESS_EXACT_POLICY,
+        &["-c:v", "tiff", "-compression_algo", "deflate"],
+    )?;
+    Ok((fastconv, ffmpeg))
+}
+
 fn build_head_to_head_report(
     ffmpeg_version: String,
     hardware: HostHardware,
@@ -624,6 +800,12 @@ fn build_head_to_head_report(
         png_to_qoi_ffmpeg: lossless.png_to_qoi_ffmpeg,
         webp_to_bmp_fastconv: lossless.webp_to_bmp_fastconv,
         webp_to_bmp_ffmpeg: lossless.webp_to_bmp_ffmpeg,
+        png_to_tiff_fastconv: lossless.png_to_tiff_fastconv,
+        png_to_tiff_ffmpeg: lossless.png_to_tiff_ffmpeg,
+        png_to_jxl_fastconv: lossy.png_to_jxl_fastconv,
+        png_to_jxl_ffmpeg: lossy.png_to_jxl_ffmpeg,
+        png_to_avif_fastconv: lossy.png_to_avif_fastconv,
+        png_to_avif_ffmpeg: lossy.png_to_avif_ffmpeg,
         png_to_heic_nvenc: nvenc.png,
         jpeg_to_heic_nvenc: nvenc.jpeg,
         webp_to_heic_nvenc: nvenc.webp,
@@ -942,6 +1124,15 @@ fn validate_target_batch(
         ImageOutputFormat::Qoi => {
             validate_qoi_batch(source_dir, source_format, out_dir, count, policy)
         }
+        ImageOutputFormat::Tiff => {
+            validate_tiff_batch(source_dir, source_format, out_dir, count, policy)
+        }
+        ImageOutputFormat::Jxl => {
+            validate_jxl_batch(source_dir, source_format, out_dir, count, policy)
+        }
+        ImageOutputFormat::Avif => {
+            validate_avif_batch(source_dir, source_format, out_dir, count, policy)
+        }
     }
 }
 
@@ -954,6 +1145,7 @@ fn run_ffmpeg_lossless_batch(
     input_bytes: NonZeroU64,
     out_dir: &Path,
     target_format: ImageOutputFormat,
+    policy: ValidationPolicy,
     codec_args: &[&str],
 ) -> Result<HeadToHeadEntry, String> {
     let input_pattern = source_dir.join(format!("img_%02d.{}", source_format.extension()));
@@ -973,7 +1165,7 @@ fn run_ffmpeg_lossless_batch(
         source_format,
         out_dir,
         IMAGE_BATCH_COUNT,
-        LOSSLESS_EXACT_POLICY,
+        policy,
     )?;
 
     let metrics = BenchmarkMetrics::new(
@@ -1308,6 +1500,220 @@ fn validate_bmp_batch(
     )
 }
 
+fn validate_tiff_batch(
+    source_dir: &Path,
+    source_format: SourceBatchFormat,
+    tiff_dir: &Path,
+    count: usize,
+    policy: ValidationPolicy,
+) -> Result<BatchValidationSummary, String> {
+    validate_image_batch(
+        source_dir,
+        source_format,
+        tiff_dir,
+        "tiff",
+        "TIFF",
+        count,
+        |src, src_fmt, out| validate_single_tiff_pair(src, src_fmt, out, policy),
+    )
+}
+
+fn validate_jxl_batch(
+    source_dir: &Path,
+    source_format: SourceBatchFormat,
+    jxl_dir: &Path,
+    count: usize,
+    policy: ValidationPolicy,
+) -> Result<BatchValidationSummary, String> {
+    validate_image_batch(
+        source_dir,
+        source_format,
+        jxl_dir,
+        "jxl",
+        "JPEG XL",
+        count,
+        |src, src_fmt, out| validate_single_jxl_pair(src, src_fmt, out, policy),
+    )
+}
+
+fn validate_avif_batch(
+    source_dir: &Path,
+    source_format: SourceBatchFormat,
+    avif_dir: &Path,
+    count: usize,
+    policy: ValidationPolicy,
+) -> Result<BatchValidationSummary, String> {
+    validate_image_batch(
+        source_dir,
+        source_format,
+        avif_dir,
+        "avif",
+        "AVIF",
+        count,
+        |src, src_fmt, out| validate_single_avif_pair(src, src_fmt, out, policy),
+    )
+}
+
+fn validate_single_tiff_pair(
+    src_path: &Path,
+    src_format: SourceBatchFormat,
+    tiff_path: &Path,
+    policy: ValidationPolicy,
+) -> Result<ValidatedImageResult, String> {
+    let out_bytes = check_output_size(src_path, src_format.label(), tiff_path, "TIFF", policy)?;
+    let probed = fastconv_probe::probe_image(tiff_path)
+        .map_err(|err| format!("invalid TIFF output '{}': {err}", tiff_path.display()))?;
+    if probed.format != ImageInputFormat::Tiff {
+        return Err(format!(
+            "expected TIFF magic bytes in '{}', detected {}",
+            tiff_path.display(),
+            probed.format
+        ));
+    }
+    let (src_rgb, src_w, src_h) = src_format.decode_to_rgb8(src_path)?;
+    let (tiff_rgb, tiff_w, tiff_h) = decode_image_to_rgb8_via_ffmpeg(tiff_path, "TIFF")?;
+    if (tiff_w, tiff_h)
+        != (
+            probed.dimensions.width().get(),
+            probed.dimensions.height().get(),
+        )
+    {
+        return Err(format!(
+            "TIFF header/decoder dimension mismatch for '{}': header {}, decoded {tiff_w}x{tiff_h}",
+            tiff_path.display(),
+            probed.dimensions
+        ));
+    }
+
+    let (exact_pixel_match, psnr_db) = check_dimensions_and_quality(
+        &DecodedImageRef {
+            rgb: &src_rgb,
+            width: src_w,
+            height: src_h,
+            label: src_format.label(),
+        },
+        &DecodedImageRef {
+            rgb: &tiff_rgb,
+            width: tiff_w,
+            height: tiff_h,
+            label: "TIFF",
+        },
+        tiff_path,
+        policy,
+    )?;
+
+    Ok(ValidatedImageResult {
+        bytes: out_bytes,
+        width: tiff_w,
+        height: tiff_h,
+        exact_pixel_match,
+        psnr_db,
+    })
+}
+
+fn validate_single_jxl_pair(
+    src_path: &Path,
+    src_format: SourceBatchFormat,
+    jxl_path: &Path,
+    policy: ValidationPolicy,
+) -> Result<ValidatedImageResult, String> {
+    let out_bytes = check_output_size(src_path, src_format.label(), jxl_path, "JPEG XL", policy)?;
+    let probed = fastconv_probe::probe_image(jxl_path)
+        .map_err(|err| format!("invalid JPEG XL output '{}': {err}", jxl_path.display()))?;
+    if probed.format != ImageInputFormat::Jxl {
+        return Err(format!(
+            "expected JPEG XL magic bytes in '{}', detected {}",
+            jxl_path.display(),
+            probed.format
+        ));
+    }
+    let (src_rgb, src_w, src_h) = src_format.decode_to_rgb8(src_path)?;
+    let (jxl_rgb, jxl_w, jxl_h) = decode_image_to_rgb8_via_ffmpeg(jxl_path, "JPEG XL")?;
+    if (jxl_w, jxl_h)
+        != (
+            probed.dimensions.width().get(),
+            probed.dimensions.height().get(),
+        )
+    {
+        return Err(format!(
+            "JPEG XL header/decoder dimension mismatch for '{}': header {}, decoded {jxl_w}x{jxl_h}",
+            jxl_path.display(),
+            probed.dimensions
+        ));
+    }
+
+    let (exact_pixel_match, psnr_db) = check_dimensions_and_quality(
+        &DecodedImageRef {
+            rgb: &src_rgb,
+            width: src_w,
+            height: src_h,
+            label: src_format.label(),
+        },
+        &DecodedImageRef {
+            rgb: &jxl_rgb,
+            width: jxl_w,
+            height: jxl_h,
+            label: "JPEG XL",
+        },
+        jxl_path,
+        policy,
+    )?;
+
+    Ok(ValidatedImageResult {
+        bytes: out_bytes,
+        width: jxl_w,
+        height: jxl_h,
+        exact_pixel_match,
+        psnr_db,
+    })
+}
+
+fn validate_single_avif_pair(
+    src_path: &Path,
+    src_format: SourceBatchFormat,
+    avif_path: &Path,
+    policy: ValidationPolicy,
+) -> Result<ValidatedImageResult, String> {
+    let out_bytes = check_output_size(src_path, src_format.label(), avif_path, "AVIF", policy)?;
+    let avif_bytes = fs::read(avif_path)
+        .map_err(|err| format!("failed to read AVIF '{}': {err}", avif_path.display()))?;
+    if avif_bytes.get(4..12) != Some(b"ftypavif".as_slice())
+        && avif_bytes.get(4..12) != Some(b"ftypavis".as_slice())
+    {
+        return Err(format!(
+            "invalid AVIF container header in '{}'",
+            avif_path.display()
+        ));
+    }
+    let (src_rgb, src_w, src_h) = src_format.decode_to_rgb8(src_path)?;
+    let (avif_rgb, avif_w, avif_h) = decode_image_to_rgb8_via_ffmpeg(avif_path, "AVIF")?;
+
+    let (exact_pixel_match, psnr_db) = check_dimensions_and_quality(
+        &DecodedImageRef {
+            rgb: &src_rgb,
+            width: src_w,
+            height: src_h,
+            label: src_format.label(),
+        },
+        &DecodedImageRef {
+            rgb: &avif_rgb,
+            width: avif_w,
+            height: avif_h,
+            label: "AVIF",
+        },
+        avif_path,
+        policy,
+    )?;
+
+    Ok(ValidatedImageResult {
+        bytes: out_bytes,
+        width: avif_w,
+        height: avif_h,
+        exact_pixel_match,
+        psnr_db,
+    })
+}
+
 fn check_output_size(
     src_path: &Path,
     src_label: &str,
@@ -1399,7 +1805,7 @@ fn validate_single_webp_pair(
     let (src_rgb, src_w, src_h) = src_format.decode_to_rgb8(src_path)?;
     let webp_data = fs::read(webp_path)
         .map_err(|err| format!("failed to read WebP '{}': {err}", webp_path.display()))?;
-    let (webp_rgb, webp_w, webp_h) = zenwebp::oneshot::decode_rgb(&webp_data)
+    let (webp_rgb, webp_w, webp_h) = zenwebp::decode_rgb(&webp_data)
         .map_err(|err| format!("invalid WebP output '{}': {err}", webp_path.display()))?;
 
     let (exact_pixel_match, psnr_db) = check_dimensions_and_quality(
@@ -1864,7 +2270,7 @@ fn decode_image_to_rgb8_via_ffmpeg(
 fn decode_webp_to_rgb8(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
     let bytes =
         fs::read(path).map_err(|err| format!("failed to read WebP '{}': {err}", path.display()))?;
-    let mut decoder = zenwebp::WebPDecoder::build(&bytes)
+    let mut decoder = zenwebp::WebPDecoder::new(&bytes)
         .map_err(|err| format!("invalid WebP '{}': {err}", path.display()))?;
     let (w, h) = decoder.dimensions();
     let buf_len = decoder
@@ -2074,6 +2480,8 @@ fn verify_image_batch_with_dims(
         ImageInputFormat::Webp => "WebP",
         ImageInputFormat::Bmp => "BMP",
         ImageInputFormat::Qoi => "QOI",
+        ImageInputFormat::Tiff => "TIFF",
+        ImageInputFormat::Jxl => "JPEG XL",
     };
 
     for index in 1..=IMAGE_BATCH_COUNT {
@@ -2081,7 +2489,10 @@ fn verify_image_batch_with_dims(
             ImageInputFormat::Png => fixtures::image_path(root, index),
             ImageInputFormat::Jpeg => fixtures::jpeg_image_path(root, index),
             ImageInputFormat::Webp => fixtures::webp_image_path(root, index),
-            ImageInputFormat::Bmp | ImageInputFormat::Qoi => {
+            ImageInputFormat::Bmp
+            | ImageInputFormat::Qoi
+            | ImageInputFormat::Tiff
+            | ImageInputFormat::Jxl => {
                 return Err(format!("no 4K fixture batch configured for {label}"));
             }
         };
@@ -2233,6 +2644,29 @@ fn verify_ffmpeg_qoi_support() -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn ffmpeg_has_encoder(encoder: &str) -> Result<bool, String> {
+    let output = Command::new("ffmpeg")
+        .stdin(Stdio::null())
+        .args(["-hide_banner", "-loglevel", "error", "-encoders"])
+        .output()
+        .map_err(|err| format!("failed to query ffmpeg encoders: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffmpeg -encoders failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .any(|line| ffmpeg_encoder_line_matches(line, encoder)))
+}
+
+fn ffmpeg_encoder_line_matches(line: &str, encoder: &str) -> bool {
+    let mut parts = line.split_whitespace();
+    parts.next().is_some_and(|flags| flags.starts_with('V')) && parts.next() == Some(encoder)
 }
 
 fn verify_ffprobe_available() -> Result<(), String> {
@@ -2649,10 +3083,11 @@ mod tests {
     use super::{
         BatchValidationSummary, HeadToHeadComparison, HeadToHeadEntry, HeadToHeadReport,
         QualityValidationMode, SourceBatchFormat, ValidationPolicy, compute_rgb_psnr_db,
-        format_baseline_table, format_head_to_head_summary, format_head_to_head_table,
-        format_validation_quality, parse_ffmpeg_codec_support, parse_proc_status_vm_hwm_bytes,
-        validate_jpeg_batch, validate_single_jpeg_pair, validate_single_png_pair,
-        validate_single_webp_pair, validate_webp_batch, verify_4k_image_batch,
+        ffmpeg_encoder_line_matches, format_baseline_table, format_head_to_head_summary,
+        format_head_to_head_table, format_validation_quality, parse_ffmpeg_codec_support,
+        parse_proc_status_vm_hwm_bytes, validate_jpeg_batch, validate_single_jpeg_pair,
+        validate_single_png_pair, validate_single_webp_pair, validate_webp_batch,
+        verify_4k_image_batch,
     };
     use fastconv_domain::{
         BenchmarkMetrics, BenchmarkSample, CpuInfo, HostHardware, ImageInputFormat, MediaKind,
@@ -2666,7 +3101,7 @@ mod tests {
     use std::path::Path;
     use std::process;
     use std::time::Duration;
-    use zenwebp::{EncodeRequest, LossyConfig, PixelLayout};
+    use zenwebp::{Encoder as WebpEncoder, EncoderConfig as WebpEncoderConfig};
 
     fn write_rgb_png(path: &Path, width: u32, height: u32, pixels: &[u8]) -> Result<(), String> {
         let file = File::create(path).map_err(|err| err.to_string())?;
@@ -2749,8 +3184,9 @@ VmRSS:\t   42000 kB
         write_rgb_png(&png_path, 32, 24, &rgb)?;
 
         let valid_webp = root.join("valid.webp");
-        let cfg = LossyConfig::new().with_quality(80.0).with_method(4);
-        let encoded = EncodeRequest::lossy(&cfg, &rgb, PixelLayout::Rgb8, 32, 24)
+        let cfg = WebpEncoderConfig::new().quality(80.0).method(4);
+        let encoded = WebpEncoder::new_rgb(&rgb, 32, 24)
+            .config(cfg.clone())
             .encode()
             .map_err(|err| err.to_string())?;
         fs::write(&valid_webp, &encoded).map_err(|err| err.to_string())?;
@@ -2774,10 +3210,10 @@ VmRSS:\t   42000 kB
         );
 
         let wrong_dim_webp = root.join("wrong_dim.webp");
-        let wrong_encoded =
-            EncodeRequest::lossy(&cfg, &rgb[..16 * 12 * 3], PixelLayout::Rgb8, 16, 12)
-                .encode()
-                .map_err(|err| err.to_string())?;
+        let wrong_encoded = WebpEncoder::new_rgb(&rgb[..16 * 12 * 3], 16, 12)
+            .config(cfg.clone())
+            .encode()
+            .map_err(|err| err.to_string())?;
         fs::write(&wrong_dim_webp, &wrong_encoded).map_err(|err| err.to_string())?;
         assert!(
             validate_single_webp_pair(&png_path, SourceBatchFormat::Png, &wrong_dim_webp, policy)
@@ -2800,7 +3236,8 @@ VmRSS:\t   42000 kB
 
         let black_rgb = vec![0_u8; 32 * 24 * 3];
         let low_psnr_webp = root.join("black.webp");
-        let black_encoded = EncodeRequest::lossy(&cfg, &black_rgb, PixelLayout::Rgb8, 32, 24)
+        let black_encoded = WebpEncoder::new_rgb(&black_rgb, 32, 24)
+            .config(cfg.clone())
             .encode()
             .map_err(|err| err.to_string())?;
         fs::write(&low_psnr_webp, &black_encoded).map_err(|err| err.to_string())?;
@@ -2873,8 +3310,9 @@ VmRSS:\t   42000 kB
         fs::create_dir_all(&out_dir).map_err(|err| err.to_string())?;
 
         let rgb = make_pattern_rgb(32, 24);
-        let cfg = LossyConfig::new().with_quality(80.0).with_method(4);
-        let encoded = EncodeRequest::lossy(&cfg, &rgb, PixelLayout::Rgb8, 32, 24)
+        let cfg = WebpEncoderConfig::new().quality(80.0).method(4);
+        let encoded = WebpEncoder::new_rgb(&rgb, 32, 24)
+            .config(cfg.clone())
             .encode()
             .map_err(|err| err.to_string())?;
 
@@ -2945,9 +3383,10 @@ VmRSS:\t   42000 kB
 
         let jpg_src = root.join("src_jpg.jpg");
         write_rgb_jpeg(&jpg_src, 32, 24, &rgb)?;
-        let cfg = LossyConfig::new().with_quality(80.0).with_method(4);
+        let cfg = WebpEncoderConfig::new().quality(80.0).method(4);
         let webp_from_jpg = root.join("from_jpg.webp");
-        let webp_bytes = EncodeRequest::lossy(&cfg, &rgb, PixelLayout::Rgb8, 32, 24)
+        let webp_bytes = WebpEncoder::new_rgb(&rgb, 32, 24)
+            .config(cfg)
             .encode()
             .map_err(|err| err.to_string())?;
         fs::write(&webp_from_jpg, &webp_bytes).map_err(|err| err.to_string())?;
@@ -2960,6 +3399,7 @@ VmRSS:\t   42000 kB
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Test fixture exercises the complete head-to-head report schema.
     fn formats_baseline_and_head_to_head_tables() -> Result<(), String> {
         let input = NonZeroU64::new(300_000_000).ok_or_else(|| "bad const".to_owned())?;
         let output = NonZeroU64::new(5_000_000).ok_or_else(|| "bad const".to_owned())?;
@@ -3103,7 +3543,17 @@ VmRSS:\t   42000 kB
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Test covers codec-support parsing and summary edge cases.
     fn parses_ffmpeg_qoi_codec_support_and_formats_summary_edge_cases() -> Result<(), String> {
+        assert!(ffmpeg_encoder_line_matches(
+            " V....D libsvtav1           SVT-AV1",
+            "libsvtav1"
+        ));
+        assert!(!ffmpeg_encoder_line_matches(
+            " V....D libaom-av1          libaom AV1",
+            "libsvtav1"
+        ));
+
         let codecs_ok = "Codecs:\n -------\n DEVI.S qoi                  QOI (Quite OK Image)\n";
         assert_eq!(parse_ffmpeg_codec_support(codecs_ok, "qoi"), (true, true));
         let codecs_dec_only = "Codecs:\n -------\n D.VI.S qoi                  QOI\n";
@@ -3180,6 +3630,12 @@ VmRSS:\t   42000 kB
             png_to_qoi_ffmpeg: mk_entry("w", 2000, true, None)?,
             webp_to_bmp_fastconv: mk_entry("w", 1000, true, None)?,
             webp_to_bmp_ffmpeg: mk_entry("w", 2000, true, None)?,
+            png_to_tiff_fastconv: mk_entry("w", 1000, true, None)?,
+            png_to_tiff_ffmpeg: mk_entry("w", 2000, true, None)?,
+            png_to_jxl_fastconv: mk_entry("w", 1000, false, Some(34.0))?,
+            png_to_jxl_ffmpeg: mk_entry("w", 2000, false, Some(33.5))?,
+            png_to_avif_fastconv: mk_entry("w", 1000, false, Some(34.0))?,
+            png_to_avif_ffmpeg: mk_entry("w", 2000, false, Some(33.5))?,
             png_to_heic_nvenc: Some(exact_heic),
             jpeg_to_heic_nvenc: Some(mk_entry("j", 1000, false, None)?),
             webp_to_heic_nvenc: Some(mk_entry("wb", 1000, true, None)?),

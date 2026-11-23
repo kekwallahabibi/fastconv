@@ -12,8 +12,14 @@ use fastconv_domain::{
     ExecutionPlan, HardwareBackend, ImageBatchItem, ImageBatchPlan, ImageCompression,
     ImageConversionReport, ImageQuality,
 };
+use jixel::{
+    EncodeConfig, EncodeError as JixelEncodeError, Speed, distance_from_quality, encode_image,
+    encode_image_gray, encode_image_gray_alpha, encode_image_with_alpha,
+};
 use jpeg_encoder::{ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder as JpegEncoder};
-use zenwebp::{EncodeRequest, LosslessConfig, LossyConfig, PixelLayout};
+use tiff::encoder::{Compression as TiffCompression, DeflateLevel, TiffEncoder, colortype};
+use tiff::tags::ExtraSamples;
+use zenwebp::{Encoder as WebpEncoder, EncoderConfig as WebpEncoderConfig};
 
 use crate::PipelineError;
 use crate::bmp::encode_bmp_to_writer;
@@ -39,10 +45,18 @@ pub const fn execute(_plan: &ExecutionPlan) -> Result<(), PipelineError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CpuImageEncoder {
     Webp(ImageCompression),
-    Jpeg { quality: ImageQuality },
+    Jpeg {
+        quality: ImageQuality,
+    },
     Png,
     Bmp,
     Qoi,
+    Tiff,
+    Jxl(ImageCompression),
+    Avif {
+        quality: ImageQuality,
+        threads: usize,
+    },
 }
 
 static STAGING_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -235,7 +249,16 @@ pub(crate) fn execute_cpu_image_batch(
     };
     precreate_target_directories(items)?;
 
-    let worker_threads = plan.effective_workers();
+    // Heavy 4K encoders can otherwise allocate several gigabytes of working
+    // state across all worker threads. Keep lightweight formats on the full
+    // worker set, but cap JXL/AVIF concurrency to four images.
+    let requested_workers = plan.effective_workers().get();
+    let worker_count = match encoder {
+        CpuImageEncoder::Jxl(_) => requested_workers.clamp(1, 4),
+        CpuImageEncoder::Avif { .. } => requested_workers.clamp(1, 3),
+        _ => requested_workers,
+    };
+    let worker_threads = NonZeroUsize::new(worker_count).unwrap_or(NonZeroUsize::MIN);
     let files_converted = NonZeroUsize::new(items.len())
         .ok_or_else(|| PipelineError::EmptyOutput(first_item.target().to_path_buf()))?;
 
@@ -381,6 +404,34 @@ fn convert_single_item(
         CpuImageEncoder::Bmp => {
             encode_bmp_streaming(item.target(), pixels, decoded, &mut scratch.aux_buf)?
         }
+        CpuImageEncoder::Tiff => {
+            scratch.encoded_buf.clear();
+            encode_tiff_into(item.target(), pixels, decoded, &mut scratch.encoded_buf)?;
+            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
+        }
+        CpuImageEncoder::Jxl(compression) => {
+            scratch.encoded_buf.clear();
+            encode_jxl_into(
+                item.target(),
+                compression,
+                pixels,
+                decoded,
+                &mut scratch.encoded_buf,
+            )?;
+            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
+        }
+        CpuImageEncoder::Avif { quality, threads } => {
+            scratch.encoded_buf.clear();
+            encode_avif_into(
+                item.target(),
+                quality,
+                threads,
+                pixels,
+                decoded,
+                &mut scratch.encoded_buf,
+            )?;
+            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
+        }
     };
 
     Ok((decoded.input_file_bytes, output_bytes))
@@ -514,28 +565,29 @@ fn encode_webp_into(
     decoded: DecodedFrameMeta,
     encoded_buf: &mut Vec<u8>,
 ) -> Result<(), PipelineError> {
-    let layout = match decoded.format {
-        DecodedPixelFormat::L8 => PixelLayout::L8,
-        DecodedPixelFormat::La8 => PixelLayout::La8,
-        DecodedPixelFormat::Rgb8 => PixelLayout::Rgb8,
-        DecodedPixelFormat::Rgba8 => PixelLayout::Rgba8,
+    let config = match compression {
+        ImageCompression::Lossy { quality } => {
+            WebpEncoderConfig::new().quality(quality.as_f32()).method(4)
+        }
+        ImageCompression::Lossless => WebpEncoderConfig::new_lossless(),
     };
 
-    match compression {
-        ImageCompression::Lossy { quality } => {
-            let config = LossyConfig::new()
-                .with_quality(quality.as_f32())
-                .with_method(4);
-            EncodeRequest::lossy(&config, pixels, layout, decoded.width, decoded.height)
-                .encode_into(encoded_buf)
-        }
-        ImageCompression::Lossless => {
-            let config = LosslessConfig::new();
-            EncodeRequest::lossless(&config, pixels, layout, decoded.width, decoded.height)
-                .encode_into(encoded_buf)
-        }
-    }
-    .map_err(|err| PipelineError::EncodeFailed {
+    let encode_res = match decoded.format {
+        DecodedPixelFormat::L8 => WebpEncoder::new_l8(pixels, decoded.width, decoded.height)
+            .config(config)
+            .encode_into(encoded_buf),
+        DecodedPixelFormat::La8 => WebpEncoder::new_la8(pixels, decoded.width, decoded.height)
+            .config(config)
+            .encode_into(encoded_buf),
+        DecodedPixelFormat::Rgb8 => WebpEncoder::new_rgb(pixels, decoded.width, decoded.height)
+            .config(config)
+            .encode_into(encoded_buf),
+        DecodedPixelFormat::Rgba8 => WebpEncoder::new_rgba(pixels, decoded.width, decoded.height)
+            .config(config)
+            .encode_into(encoded_buf),
+    };
+
+    encode_res.map_err(|err| PipelineError::EncodeFailed {
         path: target.to_path_buf(),
         reason: err.to_string(),
     })
@@ -619,6 +671,266 @@ fn encode_jpeg_into(
         })
 }
 
+fn encode_tiff_into(
+    target: &Path,
+    pixels: &[u8],
+    decoded: DecodedFrameMeta,
+    encoded_buf: &mut Vec<u8>,
+) -> Result<(), PipelineError> {
+    let width = decoded.width;
+    let height = decoded.height;
+
+    let mut writer = io::Cursor::new(encoded_buf);
+    let mut encoder = TiffEncoder::new(&mut writer).map_err(|err| PipelineError::EncodeFailed {
+        path: target.to_path_buf(),
+        reason: format!("failed to create TIFF encoder: {err}"),
+    })?;
+    encoder = encoder.with_compression(TiffCompression::Deflate(DeflateLevel::Fast));
+
+    match decoded.format {
+        DecodedPixelFormat::L8 => encoder
+            .write_image::<colortype::Gray8>(width, height, pixels)
+            .map_err(|err| PipelineError::EncodeFailed {
+                path: target.to_path_buf(),
+                reason: format!("failed to encode TIFF grayscale image: {err}"),
+            })?,
+        DecodedPixelFormat::La8 => {
+            let (pairs, remainder) = pixels.as_chunks::<2>();
+            if !remainder.is_empty() {
+                return Err(PipelineError::DecodeFailed {
+                    path: target.to_path_buf(),
+                    reason: "unaligned LA8 pixel buffer".to_owned(),
+                });
+            }
+            let mut rgba = Vec::with_capacity(pairs.len() * 4);
+            for pair in pairs {
+                let value = pair[0];
+                rgba.extend_from_slice(&[value, value, value, pair[1]]);
+            }
+            let mut image = encoder
+                .new_image::<colortype::RGB8>(width, height)
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: target.to_path_buf(),
+                    reason: format!("failed to create TIFF gray+alpha image: {err}"),
+                })?;
+            image
+                .extra_samples(&[ExtraSamples::UnassociatedAlpha])
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: target.to_path_buf(),
+                    reason: format!("failed to declare TIFF alpha sample: {err}"),
+                })?;
+            image
+                .write_data(&rgba)
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: target.to_path_buf(),
+                    reason: format!("failed to encode TIFF gray+alpha image: {err}"),
+                })?;
+        }
+        DecodedPixelFormat::Rgb8 => encoder
+            .write_image::<colortype::RGB8>(width, height, pixels)
+            .map_err(|err| PipelineError::EncodeFailed {
+                path: target.to_path_buf(),
+                reason: format!("failed to encode TIFF RGB image: {err}"),
+            })?,
+        DecodedPixelFormat::Rgba8 => {
+            let mut image = encoder
+                .new_image::<colortype::RGB8>(width, height)
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: target.to_path_buf(),
+                    reason: format!("failed to create TIFF RGBA image: {err}"),
+                })?;
+            image
+                .extra_samples(&[ExtraSamples::UnassociatedAlpha])
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: target.to_path_buf(),
+                    reason: format!("failed to declare TIFF alpha sample: {err}"),
+                })?;
+            image
+                .write_data(pixels)
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: target.to_path_buf(),
+                    reason: format!("failed to encode TIFF RGBA image: {err}"),
+                })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn encode_jxl_into(
+    target: &Path,
+    compression: ImageCompression,
+    pixels: &[u8],
+    decoded: DecodedFrameMeta,
+    encoded_buf: &mut Vec<u8>,
+) -> Result<(), PipelineError> {
+    let width = decoded.width;
+    let height = decoded.height;
+
+    let mut config = EncodeConfig::default();
+    config.speed = Speed::Fastest;
+    config.num_threads = 1;
+
+    match compression {
+        ImageCompression::Lossless => {
+            config.lossless = true;
+        }
+        ImageCompression::Lossy { quality } => {
+            if quality.get() >= 100 {
+                config.lossless = true;
+            } else {
+                config.distance = distance_from_quality(quality.as_f32());
+            }
+        }
+    }
+
+    let encoded = match decoded.format {
+        DecodedPixelFormat::L8 => {
+            encode_image_gray(pixels, width as usize, height as usize, &config)
+        }
+        DecodedPixelFormat::La8 => {
+            encode_image_gray_alpha(pixels, width as usize, height as usize, &config)
+        }
+        DecodedPixelFormat::Rgb8 => encode_image(pixels, width as usize, height as usize, &config),
+        DecodedPixelFormat::Rgba8 => {
+            encode_image_with_alpha(pixels, width as usize, height as usize, &config)
+        }
+    }
+    .map_err(|err: JixelEncodeError| PipelineError::EncodeFailed {
+        path: target.to_path_buf(),
+        reason: format!("failed to encode JPEG XL: {err}"),
+    })?;
+
+    encoded_buf.extend_from_slice(&encoded);
+    Ok(())
+}
+
+fn decoded_pixels_to_rgba(
+    target: &Path,
+    pixels: &[u8],
+    format: DecodedPixelFormat,
+    pixel_count: usize,
+) -> Result<Vec<ravif::RGBA8>, PipelineError> {
+    match format {
+        DecodedPixelFormat::L8 => {
+            if pixels.len() != pixel_count {
+                return Err(PipelineError::DecodeFailed {
+                    path: target.to_path_buf(),
+                    reason: "decoded L8 buffer has unexpected length".to_owned(),
+                });
+            }
+            Ok(pixels
+                .iter()
+                .map(|&value| ravif::RGBA8 {
+                    r: value,
+                    g: value,
+                    b: value,
+                    a: 255,
+                })
+                .collect())
+        }
+        DecodedPixelFormat::La8 => {
+            if pixels.len() != pixel_count * 2 {
+                return Err(PipelineError::DecodeFailed {
+                    path: target.to_path_buf(),
+                    reason: "decoded LA8 buffer has unexpected length".to_owned(),
+                });
+            }
+            let (pairs, _) = pixels.as_chunks::<2>();
+            Ok(pairs
+                .iter()
+                .map(|pair| ravif::RGBA8 {
+                    r: pair[0],
+                    g: pair[0],
+                    b: pair[0],
+                    a: pair[1],
+                })
+                .collect())
+        }
+        DecodedPixelFormat::Rgb8 => {
+            if pixels.len() != pixel_count * 3 {
+                return Err(PipelineError::DecodeFailed {
+                    path: target.to_path_buf(),
+                    reason: "decoded RGB8 buffer has unexpected length".to_owned(),
+                });
+            }
+            let (triples, _) = pixels.as_chunks::<3>();
+            Ok(triples
+                .iter()
+                .map(|triple| ravif::RGBA8 {
+                    r: triple[0],
+                    g: triple[1],
+                    b: triple[2],
+                    a: 255,
+                })
+                .collect())
+        }
+        DecodedPixelFormat::Rgba8 => {
+            if pixels.len() != pixel_count * 4 {
+                return Err(PipelineError::DecodeFailed {
+                    path: target.to_path_buf(),
+                    reason: "decoded RGBA8 buffer has unexpected length".to_owned(),
+                });
+            }
+            let (quads, _) = pixels.as_chunks::<4>();
+            Ok(quads
+                .iter()
+                .map(|quad| ravif::RGBA8 {
+                    r: quad[0],
+                    g: quad[1],
+                    b: quad[2],
+                    a: quad[3],
+                })
+                .collect())
+        }
+    }
+}
+
+fn encode_avif_into(
+    target: &Path,
+    quality: ImageQuality,
+    threads: usize,
+    pixels: &[u8],
+    decoded: DecodedFrameMeta,
+    encoded_buf: &mut Vec<u8>,
+) -> Result<(), PipelineError> {
+    let width = usize::try_from(decoded.width).map_err(|_| PipelineError::EncodeFailed {
+        path: target.to_path_buf(),
+        reason: format!("AVIF width {} is too large", decoded.width),
+    })?;
+    let height = usize::try_from(decoded.height).map_err(|_| PipelineError::EncodeFailed {
+        path: target.to_path_buf(),
+        reason: format!("AVIF height {} is too large", decoded.height),
+    })?;
+
+    let pixel_count = width
+        .checked_mul(height)
+        .ok_or_else(|| PipelineError::EncodeFailed {
+            path: target.to_path_buf(),
+            reason: "AVIF dimensions overflow pixel count".to_owned(),
+        })?;
+
+    let rgba_pixels = decoded_pixels_to_rgba(target, pixels, decoded.format, pixel_count)?;
+
+    let quality = f32::from(quality.get().max(1));
+    let encoded = ravif::Encoder::new()
+        .with_quality(quality)
+        .with_alpha_quality(quality)
+        .with_speed(7)
+        .with_num_threads(Some(threads.max(1)))
+        .encode_rgba(ravif::Img::new(&rgba_pixels, width, height))
+        .map_err(|err| PipelineError::EncodeFailed {
+            path: target.to_path_buf(),
+            reason: format!("failed to encode AVIF: {err}"),
+        })?;
+
+    if encoded.avif_file.is_empty() {
+        return Err(PipelineError::EmptyOutput(target.to_path_buf()));
+    }
+    encoded_buf.extend_from_slice(&encoded.avif_file);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{encode_bmp_streaming, encode_png_streaming, encode_png_to_writer};
@@ -700,6 +1012,7 @@ mod tests {
             format: DecodedPixelFormat::Rgb8,
             byte_len: pixels.len(),
             input_file_bytes: 1,
+            has_non_opaque_native_alpha: false,
         };
         let mut sink = FailOnceAfterIdatHeader::new();
         let res = encode_png_to_writer(Path::new("fault.png"), &pixels, meta, &mut sink);
@@ -736,6 +1049,7 @@ mod tests {
             format: DecodedPixelFormat::Rgb8,
             byte_len: pixels.len(),
             input_file_bytes: 1,
+            has_non_opaque_native_alpha: false,
         };
 
         let png_target = dir.join("private.png");
@@ -783,6 +1097,7 @@ mod tests {
             format: DecodedPixelFormat::Rgb8,
             byte_len: bad_pixels.len(),
             input_file_bytes: 1,
+            has_non_opaque_native_alpha: false,
         };
         assert!(encode_png_streaming(&png_target, &bad_pixels, meta).is_err());
         let mut scratch = Vec::new();

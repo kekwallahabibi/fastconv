@@ -5,17 +5,20 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-fastconv-domain.workspace = true
 containr.workspace = true
 opus-pure.workspace = true
 png.workspace = true
 pollster.workspace = true
 symphonia.workspace = true
+fastconv-domain.workspace = true
+jxl.workspace = true
+tiff.workspace = true
 wgpu.workspace = true
 zune-jpeg.workspace = true
 
 [dev-dependencies]
 jpeg-encoder.workspace = true
+jixel.workspace = true
 zenwebp.workspace = true
 
 [lints]
