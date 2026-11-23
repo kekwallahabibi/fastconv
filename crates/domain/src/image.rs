@@ -50,11 +50,35 @@ impl fmt::Display for ImageDimensions {
     }
 }
 
+/// Supported still-image input container formats validated at the boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum ImageInputFormat {
+    Png,
+    Jpeg,
+}
+
+impl ImageInputFormat {
+    #[must_use]
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpeg",
+        }
+    }
+}
+
+impl fmt::Display for ImageInputFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.extension())
+    }
+}
+
 /// Supported still-image output container formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum ImageOutputFormat {
     Webp,
     Heic,
+    Jpeg,
 }
 
 impl ImageOutputFormat {
@@ -63,6 +87,7 @@ impl ImageOutputFormat {
         match self {
             Self::Webp => "webp",
             Self::Heic => "heic",
+            Self::Jpeg => "jpg",
         }
     }
 }
@@ -110,12 +135,12 @@ impl ImageQuality {
 /// Compression mode requested for an image conversion, making lossless + quality
 /// contradictions unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-pub enum WebpEncoding {
+pub enum ImageCompression {
     Lossy { quality: ImageQuality },
     Lossless,
 }
 
-impl fmt::Display for WebpEncoding {
+impl fmt::Display for ImageCompression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Lossy { quality } => write!(f, "lossy q={}", quality.get()),
@@ -126,11 +151,12 @@ impl fmt::Display for WebpEncoding {
 
 /// Compile-time-legal combination of output image format, codec mode, and hardware backend.
 ///
-/// Illegal pairings (e.g. NVENC + WebP, Vulkan + WebP/HEIC, CPU + HEIC, or
-/// hardware-absent video encoder backends) cannot be constructed.
+/// Illegal pairings (e.g. NVENC + WebP/JPEG, Vulkan + WebP/HEIC/JPEG, CPU + HEIC,
+/// lossless + JPEG/HEIC, or hardware-absent video encoder backends) cannot be constructed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum ImageExecutionMode {
-    CpuWebp(WebpEncoding),
+    CpuWebp(ImageCompression),
+    CpuJpeg { quality: ImageQuality },
     NvencHeic { quality: ImageQuality },
 }
 
@@ -139,13 +165,24 @@ impl ImageExecutionMode {
     ///
     /// # Errors
     ///
-    /// Returns [`DomainError::UnsupportedImagePipeline`] if `format` has no native CPU encoder.
+    /// Returns [`DomainError::UnsupportedImagePipeline`] if `format` has no native CPU encoder
+    /// or the requested compression mode is unsupported for `format`.
     pub fn resolve_cpu(
         format: ImageOutputFormat,
-        encoding: WebpEncoding,
+        compression: ImageCompression,
     ) -> Result<Self, DomainError> {
         match format {
-            ImageOutputFormat::Webp => Ok(Self::CpuWebp(encoding)),
+            ImageOutputFormat::Webp => Ok(Self::CpuWebp(compression)),
+            ImageOutputFormat::Jpeg => match compression {
+                ImageCompression::Lossy { quality } => Ok(Self::CpuJpeg { quality }),
+                ImageCompression::Lossless => Err(DomainError::UnsupportedImagePipeline {
+                    format,
+                    backend: HardwareBackend::Cpu,
+                    reason:
+                        "JPEG is a lossy format and does not support --lossless; use --quality 0..=100"
+                            .to_owned(),
+                }),
+            },
             ImageOutputFormat::Heic => Err(DomainError::UnsupportedImagePipeline {
                 format,
                 backend: HardwareBackend::Cpu,
@@ -162,27 +199,21 @@ impl ImageExecutionMode {
     /// # Errors
     ///
     /// Returns [`DomainError::UnsupportedImagePipeline`] if the requested combination of
-    /// format, encoding mode, and backend is not supported on `hardware`.
+    /// format, compression mode, and backend is not supported on `hardware`.
     pub fn resolve(
         format: ImageOutputFormat,
-        encoding: WebpEncoding,
+        compression: ImageCompression,
         backend: HardwareBackend,
         hardware: &HostHardware,
     ) -> Result<Self, DomainError> {
         match (format, backend) {
-            (format, HardwareBackend::Cpu) => Self::resolve_cpu(format, encoding),
-            (ImageOutputFormat::Webp, HardwareBackend::Gpu(GpuBackend::Nvenc)) => {
-                let hw_note = if hardware.supports_video_encode(GpuBackend::Nvenc) {
-                    "NVENC only provides hardware H.264/HEVC/AV1 encoders, not VP8/WebP; use --backend cpu for .webp, or target .heic (--format heic) for NVENC HEVC-Intra"
-                } else {
-                    "NVENC is not available on this host and does not provide a VP8/WebP encoder"
-                };
-                Err(DomainError::UnsupportedImagePipeline {
-                    format,
-                    backend,
-                    reason: hw_note.to_owned(),
-                })
-            }
+            (format, HardwareBackend::Cpu) => Self::resolve_cpu(format, compression),
+            (ImageOutputFormat::Webp, HardwareBackend::Gpu(GpuBackend::Nvenc)) => Err(
+                nvenc_unsupported_image_error(format, "VP8/WebP", ".webp", hardware),
+            ),
+            (ImageOutputFormat::Jpeg, HardwareBackend::Gpu(GpuBackend::Nvenc)) => Err(
+                nvenc_unsupported_image_error(format, "JPEG", ".jpg", hardware),
+            ),
             (ImageOutputFormat::Heic, HardwareBackend::Gpu(GpuBackend::Nvenc)) => {
                 if !hardware.supports_video_encode(GpuBackend::Nvenc) {
                     return Err(DomainError::UnsupportedImagePipeline {
@@ -191,9 +222,9 @@ impl ImageExecutionMode {
                         reason: "no NVENC hardware video encoder detected on this host".to_owned(),
                     });
                 }
-                match encoding {
-                    WebpEncoding::Lossy { quality } => Ok(Self::NvencHeic { quality }),
-                    WebpEncoding::Lossless => Err(DomainError::UnsupportedImagePipeline {
+                match compression {
+                    ImageCompression::Lossy { quality } => Ok(Self::NvencHeic { quality }),
+                    ImageCompression::Lossless => Err(DomainError::UnsupportedImagePipeline {
                         format,
                         backend,
                         reason: "NVENC HEIC currently supports lossy HEVC-Intra (--quality 0..=100), not --lossless".to_owned(),
@@ -215,6 +246,7 @@ impl ImageExecutionMode {
     pub const fn output_format(self) -> ImageOutputFormat {
         match self {
             Self::CpuWebp(_) => ImageOutputFormat::Webp,
+            Self::CpuJpeg { .. } => ImageOutputFormat::Jpeg,
             Self::NvencHeic { .. } => ImageOutputFormat::Heic,
         }
     }
@@ -222,7 +254,7 @@ impl ImageExecutionMode {
     #[must_use]
     pub const fn backend(self) -> HardwareBackend {
         match self {
-            Self::CpuWebp(_) => HardwareBackend::Cpu,
+            Self::CpuWebp(_) | Self::CpuJpeg { .. } => HardwareBackend::Cpu,
             Self::NvencHeic { .. } => HardwareBackend::Gpu(GpuBackend::Nvenc),
         }
     }
@@ -231,11 +263,32 @@ impl ImageExecutionMode {
 impl fmt::Display for ImageExecutionMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CpuWebp(encoding) => write!(f, "webp {encoding}"),
+            Self::CpuWebp(compression) => write!(f, "webp {compression}"),
+            Self::CpuJpeg { quality } => write!(f, "jpeg q={}", quality.get()),
             Self::NvencHeic { quality } => {
                 write!(f, "heic hevc-intra q={}", quality.get())
             }
         }
+    }
+}
+
+fn nvenc_unsupported_image_error(
+    format: ImageOutputFormat,
+    codec_label: &str,
+    cpu_ext: &str,
+    hardware: &HostHardware,
+) -> DomainError {
+    let reason = if hardware.supports_video_encode(GpuBackend::Nvenc) {
+        format!(
+            "NVENC only provides hardware H.264/HEVC/AV1 encoders, not {codec_label}; use --backend cpu for {cpu_ext}, or target .heic (--to heic) for NVENC HEVC-Intra"
+        )
+    } else {
+        format!("NVENC is not available on this host and does not provide a {codec_label} encoder")
+    };
+    DomainError::UnsupportedImagePipeline {
+        format,
+        backend: HardwareBackend::Gpu(GpuBackend::Nvenc),
+        reason,
     }
 }
 
@@ -264,11 +317,12 @@ fn explain_unimplemented_or_absent_gpu(
     }
 }
 
-/// Single validated PNG-to-image conversion item.
+/// Single validated still-image conversion item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageBatchItem {
     source: PathBuf,
     target: PathBuf,
+    input_format: ImageInputFormat,
     dimensions: ImageDimensions,
 }
 
@@ -282,6 +336,7 @@ impl ImageBatchItem {
     pub fn new(
         source: PathBuf,
         target: PathBuf,
+        input_format: ImageInputFormat,
         dimensions: ImageDimensions,
     ) -> Result<Self, DomainError> {
         if source.as_os_str().is_empty() {
@@ -297,6 +352,7 @@ impl ImageBatchItem {
         Ok(Self {
             source,
             target,
+            input_format,
             dimensions,
         })
     }
@@ -309,6 +365,11 @@ impl ImageBatchItem {
     #[must_use]
     pub fn target(&self) -> &Path {
         &self.target
+    }
+
+    #[must_use]
+    pub const fn input_format(&self) -> ImageInputFormat {
+        self.input_format
     }
 
     #[must_use]
@@ -463,8 +524,8 @@ impl ImageConversionReport {
 #[cfg(test)]
 mod tests {
     use super::{
-        ImageBatchItem, ImageBatchPlan, ImageDimensions, ImageExecutionMode, ImageOutputFormat,
-        ImageQuality, WebpEncoding,
+        ImageBatchItem, ImageBatchPlan, ImageCompression, ImageDimensions, ImageExecutionMode,
+        ImageInputFormat, ImageOutputFormat, ImageQuality,
     };
     use crate::{
         CpuInfo, DetectedGpuBackend, DomainError, GpuBackend, GpuCapability, GpuDeviceType,
@@ -525,10 +586,10 @@ mod tests {
     }
 
     #[test]
-    fn resolves_valid_cpu_webp_and_nvenc_heic_modes() -> Result<(), DomainError> {
+    fn resolves_valid_cpu_webp_cpu_jpeg_and_nvenc_heic_modes() -> Result<(), DomainError> {
         let rtx = rtx_2060_hardware()?;
         let cpu_only = cpu_only_hardware()?;
-        let lossy = WebpEncoding::Lossy {
+        let lossy = ImageCompression::Lossy {
             quality: ImageQuality::DEFAULT,
         };
 
@@ -540,6 +601,17 @@ mod tests {
                 &cpu_only
             )?,
             ImageExecutionMode::CpuWebp(lossy)
+        );
+        assert_eq!(
+            ImageExecutionMode::resolve(
+                ImageOutputFormat::Jpeg,
+                lossy,
+                HardwareBackend::Cpu,
+                &cpu_only
+            )?,
+            ImageExecutionMode::CpuJpeg {
+                quality: ImageQuality::DEFAULT
+            }
         );
         assert_eq!(
             ImageExecutionMode::resolve(
@@ -559,7 +631,7 @@ mod tests {
     fn rejects_absent_decode_only_and_codec_mismatched_backends() -> Result<(), DomainError> {
         let rtx = rtx_2060_hardware()?;
         let cpu_only = cpu_only_hardware()?;
-        let lossy = WebpEncoding::Lossy {
+        let lossy = ImageCompression::Lossy {
             quality: ImageQuality::DEFAULT,
         };
 
@@ -656,24 +728,91 @@ mod tests {
     }
 
     #[test]
-    fn constructs_valid_batch_and_caps_effective_workers() -> Result<(), DomainError> {
+    fn rejects_unsupported_jpeg_modes_and_backends() -> Result<(), DomainError> {
+        let rtx = rtx_2060_hardware()?;
+        let cpu_only = cpu_only_hardware()?;
+        let lossy = ImageCompression::Lossy {
+            quality: ImageQuality::DEFAULT,
+        };
+
+        let jpeg_lossless = ImageExecutionMode::resolve(
+            ImageOutputFormat::Jpeg,
+            ImageCompression::Lossless,
+            HardwareBackend::Cpu,
+            &cpu_only,
+        );
+        assert!(matches!(
+            jpeg_lossless,
+            Err(DomainError::UnsupportedImagePipeline {
+                format: ImageOutputFormat::Jpeg,
+                backend: HardwareBackend::Cpu,
+                ref reason,
+            }) if reason.contains("lossless")
+        ));
+
+        let vulkan_jpeg_rtx = ImageExecutionMode::resolve(
+            ImageOutputFormat::Jpeg,
+            lossy,
+            HardwareBackend::Gpu(GpuBackend::Vulkan),
+            &rtx,
+        );
+        assert!(matches!(
+            vulkan_jpeg_rtx,
+            Err(DomainError::UnsupportedImagePipeline {
+                format: ImageOutputFormat::Jpeg,
+                backend: HardwareBackend::Gpu(GpuBackend::Vulkan),
+                ref reason,
+            }) if reason.contains("only exposes compute")
+        ));
+
+        let nvenc_jpeg = ImageExecutionMode::resolve(
+            ImageOutputFormat::Jpeg,
+            lossy,
+            HardwareBackend::Gpu(GpuBackend::Nvenc),
+            &rtx,
+        );
+        assert!(matches!(
+            nvenc_jpeg,
+            Err(DomainError::UnsupportedImagePipeline {
+                format: ImageOutputFormat::Jpeg,
+                backend: HardwareBackend::Gpu(GpuBackend::Nvenc),
+                ref reason,
+            }) if reason.contains("JPEG") && reason.contains("--to heic")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn constructs_valid_mixed_batch_and_caps_effective_workers() -> Result<(), DomainError> {
         let dims = ImageDimensions::new(3840, 2160)?;
         assert_eq!(dims.to_string(), "3840x2160");
 
         let items = vec![
-            ImageBatchItem::new(PathBuf::from("a.png"), PathBuf::from("a.webp"), dims)?,
-            ImageBatchItem::new(PathBuf::from("b.png"), PathBuf::from("b.webp"), dims)?,
+            ImageBatchItem::new(
+                PathBuf::from("a.png"),
+                PathBuf::from("a.webp"),
+                ImageInputFormat::Png,
+                dims,
+            )?,
+            ImageBatchItem::new(
+                PathBuf::from("b.jpg"),
+                PathBuf::from("b.webp"),
+                ImageInputFormat::Jpeg,
+                dims,
+            )?,
         ];
         let requested_workers = NonZeroUsize::new(8).ok_or(DomainError::EmptyBatch)?;
         let plan = ImageBatchPlan::new(
             items,
-            ImageExecutionMode::CpuWebp(WebpEncoding::Lossy {
+            ImageExecutionMode::CpuWebp(ImageCompression::Lossy {
                 quality: ImageQuality::DEFAULT,
             }),
             requested_workers,
         )?;
 
         assert_eq!(plan.items().len(), 2);
+        assert_eq!(plan.items()[0].input_format(), ImageInputFormat::Png);
+        assert_eq!(plan.items()[1].input_format(), ImageInputFormat::Jpeg);
         assert_eq!(plan.worker_threads().get(), 8);
         assert_eq!(plan.effective_workers().get(), 2);
         assert_eq!(plan.output_format(), ImageOutputFormat::Webp);
@@ -710,7 +849,7 @@ mod tests {
     #[test]
     fn rejects_empty_batch_duplicate_targets_and_source_overwrite() -> Result<(), DomainError> {
         let workers = NonZeroUsize::MIN;
-        let lossless = ImageExecutionMode::CpuWebp(WebpEncoding::Lossless);
+        let lossless = ImageExecutionMode::CpuWebp(ImageCompression::Lossless);
         assert_eq!(
             ImageBatchPlan::new(Vec::new(), lossless, workers),
             Err(DomainError::EmptyBatch)
@@ -718,25 +857,52 @@ mod tests {
 
         let dims = ImageDimensions::new(64, 64)?;
         let dup_items = vec![
-            ImageBatchItem::new(PathBuf::from("a.png"), PathBuf::from("same.webp"), dims)?,
-            ImageBatchItem::new(PathBuf::from("b.png"), PathBuf::from("same.webp"), dims)?,
+            ImageBatchItem::new(
+                PathBuf::from("photo.png"),
+                PathBuf::from("photo.webp"),
+                ImageInputFormat::Png,
+                dims,
+            )?,
+            ImageBatchItem::new(
+                PathBuf::from("photo.jpg"),
+                PathBuf::from("photo.webp"),
+                ImageInputFormat::Jpeg,
+                dims,
+            )?,
         ];
         assert_eq!(
             ImageBatchPlan::new(dup_items, lossless, workers),
-            Err(DomainError::DuplicateTargetPath(PathBuf::from("same.webp")))
+            Err(DomainError::DuplicateTargetPath(PathBuf::from(
+                "photo.webp"
+            )))
         );
 
         let overwrite_items = vec![
-            ImageBatchItem::new(PathBuf::from("a.png"), PathBuf::from("b.png"), dims)?,
-            ImageBatchItem::new(PathBuf::from("b.png"), PathBuf::from("c.webp"), dims)?,
+            ImageBatchItem::new(
+                PathBuf::from("a.png"),
+                PathBuf::from("b.jpg"),
+                ImageInputFormat::Png,
+                dims,
+            )?,
+            ImageBatchItem::new(
+                PathBuf::from("b.jpg"),
+                PathBuf::from("c.webp"),
+                ImageInputFormat::Jpeg,
+                dims,
+            )?,
         ];
         assert_eq!(
             ImageBatchPlan::new(overwrite_items, lossless, workers),
-            Err(DomainError::TargetOverwritesSource(PathBuf::from("b.png")))
+            Err(DomainError::TargetOverwritesSource(PathBuf::from("b.jpg")))
         );
 
         assert_eq!(
-            ImageBatchItem::new(PathBuf::new(), PathBuf::from("out.webp"), dims),
+            ImageBatchItem::new(
+                PathBuf::new(),
+                PathBuf::from("out.webp"),
+                ImageInputFormat::Png,
+                dims,
+            ),
             Err(DomainError::EmptyPath(PathRole::Source))
         );
         Ok(())

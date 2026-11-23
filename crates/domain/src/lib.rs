@@ -7,8 +7,8 @@ pub use hardware::{
     HostHardware, SimdLevel, WgpuAdapterInfo,
 };
 pub use image::{
-    ImageBatchItem, ImageBatchPlan, ImageConversionReport, ImageDimensions, ImageExecutionMode,
-    ImageOutputFormat, ImageQuality, WebpEncoding,
+    ImageBatchItem, ImageBatchPlan, ImageCompression, ImageConversionReport, ImageDimensions,
+    ImageExecutionMode, ImageInputFormat, ImageOutputFormat, ImageQuality,
 };
 pub use metrics::{BenchmarkMetrics, BenchmarkSample, PeakMemory, Throughput, WorkloadUnit};
 
