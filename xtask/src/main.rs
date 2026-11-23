@@ -7,7 +7,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use crate::fixtures::{IMAGE_BATCH_COUNT, audio_wav_path, image_path, video_mp4_path};
+use crate::fixtures::{
+    IMAGE_BATCH_COUNT, audio_wav_path, image_path, jpeg_image_path, video_mp4_path,
+};
 
 fn workspace_root() -> Result<PathBuf, String> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -322,12 +324,16 @@ fn cmd_bench_status(root: &Path) {
     let png_count = (1..=IMAGE_BATCH_COUNT)
         .filter(|&idx| image_path(root, idx).is_file())
         .count();
+    let jpeg_count = (1..=IMAGE_BATCH_COUNT)
+        .filter(|&idx| jpeg_image_path(root, idx).is_file())
+        .count();
     let has_wav = audio_wav_path(root).is_file();
     let has_mp4 = video_mp4_path(root).is_file();
 
     println!("==> fastconv benchmark harness");
     println!("fixtures dir : {}", root.join("fixtures").display());
     println!("4K PNG batch : {png_count}/{IMAGE_BATCH_COUNT}");
+    println!("4K JPEG batch: {jpeg_count}/{IMAGE_BATCH_COUNT}");
     println!(
         "60s WAV      : {}",
         if has_wav { "ready" } else { "missing" }
@@ -347,12 +353,12 @@ fn print_usage() {
         "  cargo xtask verify            Check no-ffmpeg invariant, fmt, clippy -D warnings, and tests"
     );
     println!(
-        "  cargo xtask gen-fixtures      Generate reproducible 4K PNG, WAV, and 1080p60 MP4 fixtures"
+        "  cargo xtask gen-fixtures      Generate reproducible 4K PNG/JPEG, WAV, and 1080p60 MP4 fixtures"
     );
     println!("  cargo xtask gen-fixtures --force");
     println!("                                Regenerate all fixtures from scratch");
     println!(
-        "  cargo xtask bench             Run 4K WebP (fastconv cpu vs ffmpeg) + NVENC HEIC benchmark + output validation"
+        "  cargo xtask bench             Run 4K PNG/JPEG head-to-head benchmarks (fastconv vs ffmpeg) + validation"
     );
     println!(
         "  cargo xtask bench --baseline  Run FFmpeg baseline across all workloads and save JSON"
