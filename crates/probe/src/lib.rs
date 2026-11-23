@@ -73,7 +73,7 @@ impl fmt::Display for ProbeError {
             Self::UnsupportedTargetFormat { path, expected } => {
                 write!(
                     f,
-                    "unsupported target extension for '{}' (expected .{expected})",
+                    "unsupported target extension for '{}' (expected {expected})",
                     path.display()
                 )
             }

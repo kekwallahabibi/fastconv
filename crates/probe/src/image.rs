@@ -4,11 +4,11 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use fastconv_domain::{
-    DomainError, HardwareBackend, ImageBatchPlan, ImageDimensions, MediaKind, PathRole,
-    PngToWebpItem, WebpEncoding,
+    DomainError, HardwareBackend, HostHardware, ImageBatchItem, ImageBatchPlan, ImageDimensions,
+    ImageExecutionMode, ImageOutputFormat, PathRole, WebpEncoding,
 };
 
-use crate::{ProbeError, available_cpu_threads};
+use crate::{ProbeError, available_cpu_threads, detect_host_hardware};
 
 /// Probes the PNG header at `path` without decoding pixel data.
 ///
@@ -34,27 +34,44 @@ pub fn probe_png_dimensions(path: &Path) -> Result<ImageDimensions, ProbeError> 
     Ok(ImageDimensions::new(info.width, info.height)?)
 }
 
-/// Validates a single PNG file or folder of PNGs at the boundary and returns an [`ImageBatchPlan`].
+/// Validates a single PNG file or folder of PNGs at the boundary against live host hardware
+/// and returns a compile-time-legal [`ImageBatchPlan`].
 ///
-/// Never performs silent CPU fallbacks: requesting any GPU backend fails explicitly.
+/// Avoids initializing GPU probing (`wgpu`/Vulkan) when [`HardwareBackend::Cpu`] is explicitly
+/// requested so CPU invocations incur zero loader overhead. Never performs silent CPU fallbacks.
 ///
 /// # Errors
 ///
-/// Returns [`ProbeError`] on missing/corrupt inputs, incompatible target paths, empty source
-/// directories, or unsupported backends.
+/// Returns [`ProbeError`] on missing/corrupt inputs, incompatible target paths or extensions,
+/// empty source directories, or backends unavailable/unsupported for the chosen output format.
 pub fn prepare_image_batch(
     source: &Path,
     target: &Path,
     encoding: WebpEncoding,
+    output_format: Option<ImageOutputFormat>,
     worker_threads: Option<NonZeroUsize>,
     backend: HardwareBackend,
 ) -> Result<ImageBatchPlan, ProbeError> {
-    if matches!(backend, HardwareBackend::Gpu(_)) {
-        return Err(ProbeError::InvalidDomain(DomainError::UnsupportedBackend {
-            media_kind: MediaKind::Image,
-            backend,
-        }));
-    }
+    prepare_image_batch_inner(
+        source,
+        target,
+        encoding,
+        output_format,
+        worker_threads,
+        backend,
+        None,
+    )
+}
+
+fn prepare_image_batch_inner(
+    source: &Path,
+    target: &Path,
+    encoding: WebpEncoding,
+    output_format: Option<ImageOutputFormat>,
+    worker_threads: Option<NonZeroUsize>,
+    backend: HardwareBackend,
+    hardware: Option<&HostHardware>,
+) -> Result<ImageBatchPlan, ProbeError> {
     if source.as_os_str().is_empty() {
         return Err(ProbeError::InvalidDomain(DomainError::EmptyPath(
             PathRole::Source,
@@ -77,24 +94,48 @@ pub fn prepare_image_batch(
     })?;
 
     if source_meta.is_file() {
+        let (resolved_target, resolved_format) =
+            resolve_single_target(source, target, output_format)?;
+        let mode = resolve_execution_mode(resolved_format, encoding, backend, hardware)?;
         let dims = probe_png_dimensions(source)?;
-        let resolved_target = resolve_single_target(source, target)?;
         reject_canonical_same_path(source, &resolved_target)?;
-        let item = PngToWebpItem::new(source.to_path_buf(), resolved_target, dims)?;
-        return Ok(ImageBatchPlan::new(vec![item], encoding, threads)?);
+        let item = ImageBatchItem::new(source.to_path_buf(), resolved_target, dims)?;
+        return Ok(ImageBatchPlan::new(vec![item], mode, threads)?);
     }
 
     if source_meta.is_dir() {
-        return prepare_directory_batch(source, target, encoding, threads);
+        let resolved_format = output_format.unwrap_or(ImageOutputFormat::Webp);
+        let mode = resolve_execution_mode(resolved_format, encoding, backend, hardware)?;
+        return prepare_directory_batch(source, target, mode, threads);
     }
 
     Err(ProbeError::NotAFileOrDirectory(source.to_path_buf()))
 }
 
+fn resolve_execution_mode(
+    format: ImageOutputFormat,
+    encoding: WebpEncoding,
+    backend: HardwareBackend,
+    hardware: Option<&HostHardware>,
+) -> Result<ImageExecutionMode, ProbeError> {
+    match (backend, hardware) {
+        (HardwareBackend::Cpu, _) => Ok(ImageExecutionMode::resolve_cpu(format, encoding)?),
+        (HardwareBackend::Gpu(_), Some(hw)) => {
+            Ok(ImageExecutionMode::resolve(format, encoding, backend, hw)?)
+        }
+        (HardwareBackend::Gpu(_), None) => {
+            let detected = detect_host_hardware()?;
+            Ok(ImageExecutionMode::resolve(
+                format, encoding, backend, &detected,
+            )?)
+        }
+    }
+}
+
 fn prepare_directory_batch(
     source_dir: &Path,
     target_dir: &Path,
-    encoding: WebpEncoding,
+    mode: ImageExecutionMode,
     threads: NonZeroUsize,
 ) -> Result<ImageBatchPlan, ProbeError> {
     match fs::metadata(target_dir) {
@@ -133,15 +174,16 @@ fn prepare_directory_batch(
         return Err(ProbeError::EmptySourceDirectory(source_dir.to_path_buf()));
     }
 
+    let format = mode.output_format();
     let mut items = Vec::with_capacity(png_paths.len());
     for src_path in png_paths {
         let dims = probe_png_dimensions(&src_path)?;
-        let out_path = derive_webp_in_dir(&src_path, target_dir)?;
+        let out_path = derive_target_in_dir(&src_path, target_dir, format)?;
         reject_canonical_same_path(&src_path, &out_path)?;
-        items.push(PngToWebpItem::new(src_path, out_path, dims)?);
+        items.push(ImageBatchItem::new(src_path, out_path, dims)?);
     }
 
-    Ok(ImageBatchPlan::new(items, encoding, threads)?)
+    Ok(ImageBatchPlan::new(items, mode, threads)?)
 }
 
 fn is_visible_png_file(path: &Path) -> Result<bool, ProbeError> {
@@ -160,9 +202,17 @@ fn is_visible_png_file(path: &Path) -> Result<bool, ProbeError> {
     Ok(meta.is_file())
 }
 
-fn resolve_single_target(source: &Path, target: &Path) -> Result<PathBuf, ProbeError> {
+fn resolve_single_target(
+    source: &Path,
+    target: &Path,
+    explicit_format: Option<ImageOutputFormat>,
+) -> Result<(PathBuf, ImageOutputFormat), ProbeError> {
     match fs::metadata(target) {
-        Ok(meta) if meta.is_dir() => return derive_webp_in_dir(source, target),
+        Ok(meta) if meta.is_dir() => {
+            let format = explicit_format.unwrap_or(ImageOutputFormat::Webp);
+            let derived = derive_target_in_dir(source, target, format)?;
+            return Ok((derived, format));
+        }
         Ok(meta) if !meta.is_file() => {
             return Err(ProbeError::NotAFileOrDirectory(target.to_path_buf()));
         }
@@ -176,22 +226,48 @@ fn resolve_single_target(source: &Path, target: &Path) -> Result<PathBuf, ProbeE
         }
     }
 
-    if !has_extension(target, "webp") {
-        return Err(ProbeError::UnsupportedTargetFormat {
+    let inferred = infer_format_from_extension(target);
+    match (explicit_format, inferred) {
+        (Some(expected), Some(actual)) if expected == actual => {
+            Ok((target.to_path_buf(), expected))
+        }
+        (Some(expected), _) => Err(ProbeError::UnsupportedTargetFormat {
             path: target.to_path_buf(),
-            expected: "webp",
-        });
+            expected: match expected {
+                ImageOutputFormat::Webp => ".webp",
+                ImageOutputFormat::Heic => ".heic",
+            },
+        }),
+        (None, Some(actual)) => Ok((target.to_path_buf(), actual)),
+        (None, None) => Err(ProbeError::UnsupportedTargetFormat {
+            path: target.to_path_buf(),
+            expected: ".webp or .heic",
+        }),
     }
-    Ok(target.to_path_buf())
 }
 
-fn derive_webp_in_dir(source: &Path, target_dir: &Path) -> Result<PathBuf, ProbeError> {
+fn infer_format_from_extension(path: &Path) -> Option<ImageOutputFormat> {
+    if has_extension(path, "webp") {
+        Some(ImageOutputFormat::Webp)
+    } else if has_extension(path, "heic") {
+        Some(ImageOutputFormat::Heic)
+    } else {
+        None
+    }
+}
+
+fn derive_target_in_dir(
+    source: &Path,
+    target_dir: &Path,
+    format: ImageOutputFormat,
+) -> Result<PathBuf, ProbeError> {
     let stem = source.file_stem().ok_or_else(|| ProbeError::InvalidImage {
         path: source.to_path_buf(),
         reason: "source path has no file stem".to_owned(),
     })?;
     let mut name = stem.to_os_string();
-    name.push(".webp");
+    name.push(".");
+    name.push(format.extension());
     Ok(target_dir.join(name))
 }
 
@@ -226,15 +302,17 @@ fn reject_canonical_same_path(source: &Path, target: &Path) -> Result<(), ProbeE
 
 #[cfg(test)]
 mod tests {
-    use super::{prepare_image_batch, probe_png_dimensions};
+    use super::{prepare_image_batch, prepare_image_batch_inner, probe_png_dimensions};
     use crate::ProbeError;
     use fastconv_domain::{
-        DomainError, GpuBackend, HardwareBackend, ImageDimensions, PathRole, WebpEncoding,
-        WebpQuality,
+        CpuInfo, DetectedGpuBackend, DomainError, GpuBackend, GpuCapability, GpuDeviceType,
+        GpuVendor, GraphicsApi, HardwareBackend, HostHardware, ImageDimensions, ImageExecutionMode,
+        ImageOutputFormat, ImageQuality, PathRole, SimdLevel, WebpEncoding, WgpuAdapterInfo,
     };
     use std::env;
     use std::fs::{self, File};
     use std::io::BufWriter;
+    use std::num::{NonZeroU64, NonZeroUsize};
     use std::path::{Path, PathBuf};
     use std::process;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -275,8 +353,53 @@ mod tests {
         Ok(())
     }
 
+    fn synthetic_rtx_hardware() -> Result<HostHardware, ProbeError> {
+        let cores =
+            NonZeroUsize::new(4).ok_or(ProbeError::InvalidDomain(DomainError::EmptyBatch))?;
+        let threads =
+            NonZeroUsize::new(8).ok_or(ProbeError::InvalidDomain(DomainError::EmptyBatch))?;
+        let cpu = CpuInfo::new(
+            "Test CPU",
+            "x86_64",
+            cores,
+            threads,
+            SimdLevel::X86Avx2Fma,
+            NonZeroU64::new(16 * 1024 * 1024 * 1024),
+        )?;
+        let adapter = WgpuAdapterInfo::new(
+            "NVIDIA GeForce RTX 2060",
+            GpuVendor::Nvidia,
+            0x1e89,
+            GpuDeviceType::Discrete,
+            GraphicsApi::Vulkan,
+            "NVIDIA",
+            "620.73.04",
+        )?;
+        let backends = vec![
+            DetectedGpuBackend::new(
+                GpuBackend::Nvenc,
+                GpuCapability::VideoEncodeAndDecode,
+                "NVIDIA GeForce RTX 2060",
+                "/usr/lib/libnvidia-encode.so.1",
+            )?,
+            DetectedGpuBackend::new(
+                GpuBackend::Vulkan,
+                GpuCapability::ComputeOnly,
+                "NVIDIA GeForce RTX 2060",
+                "wgpu vulkan",
+            )?,
+            DetectedGpuBackend::new(
+                GpuBackend::Vaapi,
+                GpuCapability::VideoDecodeOnly,
+                "NVIDIA GeForce RTX 2060",
+                "/usr/lib/libva.so.2 + /usr/lib/dri/nvidia_drv_video.so",
+            )?,
+        ];
+        Ok(HostHardware::new(cpu, vec![adapter], backends))
+    }
+
     #[test]
-    fn prepares_single_image_and_directory_batch() -> Result<(), ProbeError> {
+    fn prepares_single_image_and_directory_batches_for_webp_and_heic() -> Result<(), ProbeError> {
         let root = create_temp_dir("batch")?;
         let src_dir = root.join("src");
         let out_dir = root.join("out");
@@ -299,37 +422,156 @@ mod tests {
 
         assert_eq!(probe_png_dimensions(&img_a)?, ImageDimensions::new(16, 12)?);
 
+        let rtx = synthetic_rtx_hardware()?;
         let encoding = WebpEncoding::Lossy {
-            quality: WebpQuality::DEFAULT,
+            quality: ImageQuality::DEFAULT,
         };
         let single = prepare_image_batch(
             &img_a,
             &root.join("single.webp"),
             encoding,
             None,
+            None,
             HardwareBackend::Cpu,
         )?;
         assert_eq!(single.items().len(), 1);
         assert_eq!(single.items()[0].target(), root.join("single.webp"));
+        assert_eq!(single.mode(), ImageExecutionMode::CpuWebp(encoding));
+
+        let heic_single = prepare_image_batch_inner(
+            &img_a,
+            &root.join("nvenc.heic"),
+            encoding,
+            None,
+            None,
+            HardwareBackend::Gpu(GpuBackend::Nvenc),
+            Some(&rtx),
+        )?;
+        assert_eq!(
+            heic_single.mode(),
+            ImageExecutionMode::NvencHeic {
+                quality: ImageQuality::DEFAULT
+            }
+        );
 
         fs::create_dir_all(&out_dir).map_err(|source| ProbeError::Io {
             path: out_dir.clone(),
             source,
         })?;
-        let into_dir = prepare_image_batch(&img_a, &out_dir, encoding, None, HardwareBackend::Cpu)?;
+        let into_dir =
+            prepare_image_batch(&img_a, &out_dir, encoding, None, None, HardwareBackend::Cpu)?;
         assert_eq!(into_dir.items()[0].target(), out_dir.join("alpha.webp"));
 
-        let batch = prepare_image_batch(&src_dir, &out_dir, encoding, None, HardwareBackend::Cpu)?;
-        assert_eq!(batch.items().len(), 2);
-        assert_eq!(batch.items()[0].target(), out_dir.join("alpha.webp"));
-        assert_eq!(batch.items()[1].target(), out_dir.join("beta.webp"));
+        let heic_batch = prepare_image_batch_inner(
+            &src_dir,
+            &out_dir,
+            encoding,
+            Some(ImageOutputFormat::Heic),
+            None,
+            HardwareBackend::Gpu(GpuBackend::Nvenc),
+            Some(&rtx),
+        )?;
+        assert_eq!(heic_batch.items().len(), 2);
+        assert_eq!(heic_batch.items()[0].target(), out_dir.join("alpha.heic"));
+        assert_eq!(heic_batch.items()[1].target(), out_dir.join("beta.heic"));
 
         fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
         Ok(())
     }
 
     #[test]
-    fn rejects_corrupt_png_bad_targets_and_gpu_backend() -> Result<(), ProbeError> {
+    fn rejects_incompatible_gpu_backends_and_format_mismatches() -> Result<(), ProbeError> {
+        let root = create_temp_dir("gpu-errors")?;
+        let valid = root.join("good.png");
+        write_tiny_png(&valid, 8, 8)?;
+
+        let rtx = synthetic_rtx_hardware()?;
+        let lossy = WebpEncoding::Lossy {
+            quality: ImageQuality::DEFAULT,
+        };
+
+        let nvenc_webp = prepare_image_batch_inner(
+            &valid,
+            &root.join("out.webp"),
+            lossy,
+            None,
+            None,
+            HardwareBackend::Gpu(GpuBackend::Nvenc),
+            Some(&rtx),
+        );
+        assert!(matches!(
+            nvenc_webp,
+            Err(ProbeError::InvalidDomain(
+                DomainError::UnsupportedImagePipeline {
+                    format: ImageOutputFormat::Webp,
+                    backend: HardwareBackend::Gpu(GpuBackend::Nvenc),
+                    ..
+                }
+            ))
+        ));
+
+        let vulkan_webp = prepare_image_batch_inner(
+            &valid,
+            &root.join("out.webp"),
+            lossy,
+            None,
+            None,
+            HardwareBackend::Gpu(GpuBackend::Vulkan),
+            Some(&rtx),
+        );
+        assert!(matches!(
+            vulkan_webp,
+            Err(ProbeError::InvalidDomain(
+                DomainError::UnsupportedImagePipeline {
+                    format: ImageOutputFormat::Webp,
+                    backend: HardwareBackend::Gpu(GpuBackend::Vulkan),
+                    ..
+                }
+            ))
+        ));
+
+        let vaapi_err = prepare_image_batch_inner(
+            &valid,
+            &root.join("out.webp"),
+            lossy,
+            None,
+            None,
+            HardwareBackend::Gpu(GpuBackend::Vaapi),
+            Some(&rtx),
+        );
+        assert!(matches!(
+            vaapi_err,
+            Err(ProbeError::InvalidDomain(
+                DomainError::UnsupportedImagePipeline {
+                    backend: HardwareBackend::Gpu(GpuBackend::Vaapi),
+                    ..
+                }
+            ))
+        ));
+
+        let format_mismatch = prepare_image_batch_inner(
+            &valid,
+            &root.join("out.webp"),
+            lossy,
+            Some(ImageOutputFormat::Heic),
+            None,
+            HardwareBackend::Gpu(GpuBackend::Nvenc),
+            Some(&rtx),
+        );
+        assert!(matches!(
+            format_mismatch,
+            Err(ProbeError::UnsupportedTargetFormat {
+                expected: ".heic",
+                ..
+            })
+        ));
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_corrupt_png_bad_extension_and_empty_dir() -> Result<(), ProbeError> {
         let root = create_temp_dir("errors")?;
         let valid = root.join("good.png");
         let corrupt = root.join("corrupt.png");
@@ -344,26 +586,11 @@ mod tests {
             source,
         })?;
 
-        let encoding = WebpEncoding::Lossless;
-
-        let gpu_err = prepare_image_batch(
-            &valid,
-            &root.join("out.webp"),
-            encoding,
-            None,
-            HardwareBackend::Gpu(GpuBackend::Nvenc),
-        );
-        assert!(matches!(
-            gpu_err,
-            Err(ProbeError::InvalidDomain(
-                DomainError::UnsupportedBackend { .. }
-            ))
-        ));
-
         let corrupt_err = prepare_image_batch(
             &corrupt,
             &root.join("out.webp"),
-            encoding,
+            WebpEncoding::Lossless,
+            None,
             None,
             HardwareBackend::Cpu,
         );
@@ -372,7 +599,8 @@ mod tests {
         let ext_err = prepare_image_batch(
             &valid,
             &root.join("out.jpg"),
-            encoding,
+            WebpEncoding::Lossless,
+            None,
             None,
             HardwareBackend::Cpu,
         );
@@ -384,7 +612,8 @@ mod tests {
         let empty_err = prepare_image_batch(
             &empty_dir,
             &root.join("out"),
-            encoding,
+            WebpEncoding::Lossless,
+            None,
             None,
             HardwareBackend::Cpu,
         );
@@ -393,7 +622,14 @@ mod tests {
             Err(ProbeError::EmptySourceDirectory(_))
         ));
 
-        let dir_to_file = prepare_image_batch(&root, &valid, encoding, None, HardwareBackend::Cpu);
+        let dir_to_file = prepare_image_batch(
+            &root,
+            &valid,
+            WebpEncoding::Lossless,
+            None,
+            None,
+            HardwareBackend::Cpu,
+        );
         assert!(matches!(
             dir_to_file,
             Err(ProbeError::TargetNotADirectory(_))
@@ -414,6 +650,7 @@ mod tests {
                 &root.join("out.webp"),
                 encoding,
                 None,
+                None,
                 HardwareBackend::Cpu,
             ),
             Err(ProbeError::InvalidDomain(DomainError::EmptyPath(
@@ -425,6 +662,7 @@ mod tests {
                 &root.join("in.png"),
                 Path::new(""),
                 encoding,
+                None,
                 None,
                 HardwareBackend::Cpu,
             ),
@@ -445,6 +683,7 @@ mod tests {
             &root.join("out"),
             encoding,
             None,
+            None,
             HardwareBackend::Cpu,
         );
         assert!(matches!(
@@ -460,6 +699,7 @@ mod tests {
             &same_webp,
             &root.join("./same.webp"),
             encoding,
+            None,
             None,
             HardwareBackend::Cpu,
         );

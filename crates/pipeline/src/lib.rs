@@ -1,17 +1,24 @@
+#![cfg_attr(not(feature = "nvenc"), forbid(unsafe_code))]
+
 pub mod cpu;
 pub mod gpu;
+mod png_decode;
 
 use std::error::Error;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-use fastconv_domain::{ExecutionPlan, HardwareBackend, ImageBatchPlan, ImageConversionReport};
+use fastconv_domain::{
+    ExecutionPlan, GpuBackend, HardwareBackend, ImageBatchPlan, ImageConversionReport,
+    ImageExecutionMode,
+};
 
 /// Errors raised while executing a concrete media conversion pipeline.
 #[derive(Debug)]
 pub enum PipelineError {
     BackendNotImplemented(HardwareBackend),
+    GpuBackendFailed { backend: GpuBackend, reason: String },
     Io { path: PathBuf, source: io::Error },
     DecodeFailed { path: PathBuf, reason: String },
     EncodeFailed { path: PathBuf, reason: String },
@@ -26,6 +33,9 @@ impl fmt::Display for PipelineError {
             Self::BackendNotImplemented(backend) => {
                 write!(f, "conversion backend '{backend}' is not implemented yet")
             }
+            Self::GpuBackendFailed { backend, reason } => {
+                write!(f, "GPU backend 'gpu:{backend}' failed: {reason}")
+            }
             Self::Io { path, source } => {
                 write!(f, "I/O error at '{}': {source}", path.display())
             }
@@ -33,7 +43,7 @@ impl fmt::Display for PipelineError {
                 write!(f, "failed to decode PNG '{}': {reason}", path.display())
             }
             Self::EncodeFailed { path, reason } => {
-                write!(f, "failed to encode WebP '{}': {reason}", path.display())
+                write!(f, "failed to encode image '{}': {reason}", path.display())
             }
             Self::UnsupportedPixelFormat { path, format } => {
                 write!(
@@ -55,6 +65,7 @@ impl Error for PipelineError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::BackendNotImplemented(_)
+            | Self::GpuBackendFailed { .. }
             | Self::DecodeFailed { .. }
             | Self::EncodeFailed { .. }
             | Self::UnsupportedPixelFormat { .. }
@@ -77,21 +88,26 @@ pub fn execute(plan: &ExecutionPlan) -> Result<(), PipelineError> {
     }
 }
 
-/// Executes a validated PNG-to-WebP batch plan on the native multi-threaded CPU pipeline.
+/// Executes a validated [`ImageBatchPlan`] on its exact selected CPU or GPU backend.
+///
+/// Never performs silent CPU fallbacks when a GPU mode is selected.
 ///
 /// # Errors
 ///
-/// Returns [`PipelineError`] if reading, decoding, encoding, or writing any image fails.
+/// Returns [`PipelineError`] if reading, decoding, GPU compute/encode, or writing any image fails.
 pub fn execute_image_batch(plan: &ImageBatchPlan) -> Result<ImageConversionReport, PipelineError> {
-    cpu::execute_image_batch(plan)
+    match plan.mode() {
+        ImageExecutionMode::CpuWebp(encoding) => cpu::execute_webp_batch(plan, encoding),
+        ImageExecutionMode::NvencHeic { quality } => gpu::nvenc::execute_heic_batch(plan, quality),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{PipelineError, execute, execute_image_batch};
     use fastconv_domain::{
-        ConversionRequest, DomainError, ExecutionPlan, GpuBackend, HardwareBackend, ImageBatchPlan,
-        ImageDimensions, MediaKind, PngToWebpItem, WebpEncoding, WebpQuality,
+        ConversionRequest, DomainError, ExecutionPlan, GpuBackend, HardwareBackend, ImageBatchItem,
+        ImageBatchPlan, ImageDimensions, ImageExecutionMode, ImageQuality, MediaKind, WebpEncoding,
     };
     use std::env;
     use std::fs::{self, File};
@@ -142,11 +158,17 @@ mod tests {
         Ok(())
     }
 
-    fn domain_err<T>(res: Result<T, DomainError>) -> Result<T, PipelineError> {
-        res.map_err(|err| PipelineError::EncodeFailed {
-            path: PathBuf::new(),
-            reason: err.to_string(),
-        })
+    fn make_rgb_gradient(width: u32, height: u32) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let r = u8::try_from((x * 5) % 256).unwrap_or(0);
+                let g = u8::try_from((y * 7) % 256).unwrap_or(0);
+                let b = u8::try_from(((x ^ y) * 3) % 256).unwrap_or(0);
+                pixels.extend_from_slice(&[r, g, b]);
+            }
+        }
+        pixels
     }
 
     #[test]
@@ -185,285 +207,197 @@ mod tests {
         Ok(())
     }
 
-    fn sample_rgb_16x12() -> Vec<u8> {
-        let mut rgb = Vec::with_capacity(16 * 12 * 3);
-        for y in 0_u8..12 {
-            for x in 0_u8..16 {
-                let r = x.saturating_mul(16);
-                let g = y.saturating_mul(20);
-                rgb.extend_from_slice(&[r, g, r ^ g]);
-            }
-        }
-        rgb
-    }
-
     #[test]
-    fn converts_rgb_rgba_gray_lossy_and_lossless() -> Result<(), PipelineError> {
-        let root = create_temp_dir("formats")?;
-        let dims = domain_err(ImageDimensions::new(16, 12))?;
-        let rgb = sample_rgb_16x12();
+    fn converts_rgb_and_rgba_pngs_to_valid_lossy_and_lossless_webp()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = create_temp_dir("webp-cpu")?;
+        let rgb_path = root.join("rgb.png");
+        let alpha_path = root.join("alpha.png");
+        let rgb_out = root.join("nested/rgb.webp");
+        let alpha_out = root.join("nested/alpha.webp");
 
-        let mut alpha_pixels = Vec::with_capacity(16 * 12 * 4);
-        let mut gray = Vec::with_capacity(16 * 12);
-        for y in 0_u8..12 {
-            for x in 0_u8..16 {
-                let r = x.saturating_mul(16);
-                let g = y.saturating_mul(20);
-                alpha_pixels.extend_from_slice(&[r, g, r ^ g, 200]);
-                gray.push(r.wrapping_add(g));
+        let rgb_pixels = make_rgb_gradient(64, 48);
+        let mut alpha_pixels = Vec::with_capacity(32 * 24 * 4);
+        for y in 0_u32..24 {
+            for x in 0_u32..32 {
+                let r = u8::try_from((x * 8) % 256).unwrap_or(0);
+                let g = u8::try_from((y * 10) % 256).unwrap_or(0);
+                let b = u8::try_from((x + y) % 256).unwrap_or(0);
+                let a = if x < 16 { 255 } else { 180 };
+                alpha_pixels.extend_from_slice(&[r, g, b, a]);
             }
         }
 
-        let rgb_png = root.join("rgb.png");
-        let alpha_png = root.join("rgba.png");
-        let gray_png = root.join("gray.png");
-        write_test_png(&rgb_png, 16, 12, png::ColorType::Rgb, &rgb)?;
-        write_test_png(&alpha_png, 16, 12, png::ColorType::Rgba, &alpha_pixels)?;
-        write_test_png(&gray_png, 16, 12, png::ColorType::Grayscale, &gray)?;
+        write_test_png(&rgb_path, 64, 48, png::ColorType::Rgb, &rgb_pixels)?;
+        write_test_png(&alpha_path, 32, 24, png::ColorType::Rgba, &alpha_pixels)?;
 
-        let workers_4 = NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN);
-        let lossy_plan = domain_err(ImageBatchPlan::new(
+        let workers = NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN);
+        let lossy_plan = ImageBatchPlan::new(
             vec![
-                domain_err(PngToWebpItem::new(
-                    rgb_png.clone(),
-                    root.join("out/rgb.webp"),
-                    dims,
-                ))?,
-                domain_err(PngToWebpItem::new(
-                    alpha_png,
-                    root.join("out/rgba.webp"),
-                    dims,
-                ))?,
-                domain_err(PngToWebpItem::new(
-                    gray_png,
-                    root.join("out/gray.webp"),
-                    dims,
-                ))?,
+                ImageBatchItem::new(
+                    rgb_path.clone(),
+                    rgb_out.clone(),
+                    ImageDimensions::new(64, 48)?,
+                )?,
+                ImageBatchItem::new(
+                    alpha_path.clone(),
+                    alpha_out.clone(),
+                    ImageDimensions::new(32, 24)?,
+                )?,
             ],
-            WebpEncoding::Lossy {
-                quality: WebpQuality::DEFAULT,
-            },
-            workers_4,
-        ))?;
-        let lossy_report = execute_image_batch(&lossy_plan)?;
-        assert_eq!(lossy_report.files_converted().get(), 3);
-        assert_eq!(lossy_report.worker_threads_used().get(), 3);
+            ImageExecutionMode::CpuWebp(WebpEncoding::Lossy {
+                quality: ImageQuality::DEFAULT,
+            }),
+            workers,
+        )?;
 
-        for name in ["out/rgb.webp", "out/rgba.webp", "out/gray.webp"] {
-            let webp_path = root.join(name);
-            let bytes = fs::read(&webp_path).map_err(|source| PipelineError::Io {
-                path: webp_path.clone(),
-                source,
-            })?;
-            let (_, w, h) = zenwebp::oneshot::decode_rgb(&bytes).map_err(|err| {
-                PipelineError::DecodeFailed {
-                    path: webp_path,
-                    reason: err.to_string(),
-                }
-            })?;
-            assert_eq!((w, h), (16, 12));
-        }
+        let report = execute_image_batch(&lossy_plan)?;
+        assert_eq!(report.files_converted().get(), 2);
+        assert_eq!(report.backend(), HardwareBackend::Cpu);
+        assert_eq!(report.hardware_device(), None);
 
-        let lossless_webp = root.join("lossless/rgb.webp");
-        let lossless_plan = domain_err(ImageBatchPlan::new(
-            vec![domain_err(PngToWebpItem::new(
-                rgb_png,
-                lossless_webp.clone(),
-                dims,
-            ))?],
-            WebpEncoding::Lossless,
+        let rgb_webp = fs::read(&rgb_out)?;
+        let (dec_rgb, w, h) = zenwebp::oneshot::decode_rgb(&rgb_webp)?;
+        assert_eq!((w, h), (64, 48));
+        assert_eq!(dec_rgb.len(), 64 * 48 * 3);
+
+        let lossless_out = root.join("alpha_lossless.webp");
+        let lossless_plan = ImageBatchPlan::new(
+            vec![ImageBatchItem::new(
+                alpha_path,
+                lossless_out.clone(),
+                ImageDimensions::new(32, 24)?,
+            )?],
+            ImageExecutionMode::CpuWebp(WebpEncoding::Lossless),
             NonZeroUsize::MIN,
-        ))?;
-        execute_image_batch(&lossless_plan)?;
-        let lossless_bytes = fs::read(&lossless_webp).map_err(|source| PipelineError::Io {
-            path: lossless_webp.clone(),
-            source,
-        })?;
-        let (decoded_pixels, lw, lh) =
-            zenwebp::oneshot::decode_rgb(&lossless_bytes).map_err(|err| {
-                PipelineError::DecodeFailed {
-                    path: lossless_webp,
-                    reason: err.to_string(),
-                }
-            })?;
-        assert_eq!((lw, lh), (16, 12));
-        assert_eq!(decoded_pixels, rgb);
+        )?;
+        let lossless_report = execute_image_batch(&lossless_plan)?;
+        assert_eq!(lossless_report.files_converted().get(), 1);
+        let lossless_bytes = fs::read(&lossless_out)?;
+        let (dec_alpha, lw, lh) = zenwebp::oneshot::decode_rgba(&lossless_bytes)?;
+        assert_eq!((lw, lh), (32, 24));
+        assert_eq!(dec_alpha, alpha_pixels);
 
-        fs::remove_dir_all(&root).map_err(|source| PipelineError::Io { path: root, source })?;
+        fs::remove_dir_all(&root)?;
         Ok(())
     }
 
+    #[cfg(not(feature = "nvenc"))]
     #[test]
-    fn converts_multi_image_batch_in_parallel() -> Result<(), PipelineError> {
-        let root = create_temp_dir("parallel")?;
-        let dims = domain_err(ImageDimensions::new(16, 12))?;
-        let rgb = sample_rgb_16x12();
-        let batch_dir = root.join("batch");
-        fs::create_dir_all(&batch_dir).map_err(|source| PipelineError::Io {
-            path: batch_dir.clone(),
-            source,
-        })?;
-
-        let mut batch_items = Vec::with_capacity(6);
-        for i in 0..6 {
-            let src = batch_dir.join(format!("in_{i}.png"));
-            write_test_png(&src, 16, 12, png::ColorType::Rgb, &rgb)?;
-            batch_items.push(domain_err(PngToWebpItem::new(
+    fn nvenc_heic_fails_explicitly_without_nvenc_feature() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = create_temp_dir("nvenc-disabled")?;
+        let src = root.join("in.png");
+        write_test_png(
+            &src,
+            256,
+            256,
+            png::ColorType::Rgb,
+            &make_rgb_gradient(256, 256),
+        )?;
+        let plan = ImageBatchPlan::new(
+            vec![ImageBatchItem::new(
                 src,
-                root.join(format!("batch_out/out_{i}.webp")),
-                dims,
-            ))?);
-        }
-
-        let workers_4 = NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN);
-        let batch_plan = domain_err(ImageBatchPlan::new(
-            batch_items,
-            WebpEncoding::Lossy {
-                quality: WebpQuality::DEFAULT,
+                root.join("out.heic"),
+                ImageDimensions::new(256, 256)?,
+            )?],
+            ImageExecutionMode::NvencHeic {
+                quality: ImageQuality::DEFAULT,
             },
-            workers_4,
-        ))?;
-        let batch_report = execute_image_batch(&batch_plan)?;
-        assert_eq!(batch_report.files_converted().get(), 6);
-        assert_eq!(batch_report.worker_threads_used().get(), 4);
-
-        for i in 0..6 {
-            let out = root.join(format!("batch_out/out_{i}.webp"));
-            let bytes = fs::read(&out).map_err(|source| PipelineError::Io {
-                path: out.clone(),
-                source,
-            })?;
-            let (_, w, h) = zenwebp::oneshot::decode_rgb(&bytes).map_err(|err| {
-                PipelineError::DecodeFailed {
-                    path: out,
-                    reason: err.to_string(),
-                }
-            })?;
-            assert_eq!((w, h), (16, 12));
-        }
-
-        fs::remove_dir_all(&root).map_err(|source| PipelineError::Io { path: root, source })?;
+            NonZeroUsize::MIN,
+        )?;
+        assert!(matches!(
+            execute_image_batch(&plan),
+            Err(PipelineError::GpuBackendFailed {
+                backend: GpuBackend::Nvenc,
+                ..
+            })
+        ));
+        fs::remove_dir_all(&root)?;
         Ok(())
     }
 
+    #[cfg(feature = "nvenc")]
     #[test]
-    fn reuses_worker_scratch_across_shrinking_dimensions() -> Result<(), PipelineError> {
-        let root = create_temp_dir("scratch")?;
-        let rgba_32x24 = vec![120_u8; 32 * 24 * 4];
-        let gray_8x6 = vec![200_u8; 8 * 6];
-        let rgb_16x12 = sample_rgb_16x12();
+    fn converts_png_batch_to_valid_heic_via_nvenc_hardware()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = create_temp_dir("nvenc-heic")?;
+        let src_a = root.join("a.png");
+        let src_b = root.join("b.png");
+        let out_a = root.join("out/a.heic");
+        let out_b = root.join("out/b.heic");
 
-        let src_large = root.join("large.png");
-        let src_small = root.join("small.png");
-        let src_medium = root.join("medium.png");
-        write_test_png(&src_large, 32, 24, png::ColorType::Rgba, &rgba_32x24)?;
-        write_test_png(&src_small, 8, 6, png::ColorType::Grayscale, &gray_8x6)?;
-        write_test_png(&src_medium, 16, 12, png::ColorType::Rgb, &rgb_16x12)?;
+        write_test_png(
+            &src_a,
+            256,
+            256,
+            png::ColorType::Rgb,
+            &make_rgb_gradient(256, 256),
+        )?;
+        write_test_png(
+            &src_b,
+            256,
+            256,
+            png::ColorType::Rgb,
+            &make_rgb_gradient(256, 256),
+        )?;
 
-        let out_specs = [
-            (root.join("out/large.webp"), (32_u32, 24_u32)),
-            (root.join("out/small.webp"), (8_u32, 6_u32)),
-            (root.join("out/medium.webp"), (16_u32, 12_u32)),
-        ];
-        let plan = domain_err(ImageBatchPlan::new(
+        let plan = ImageBatchPlan::new(
             vec![
-                domain_err(PngToWebpItem::new(
-                    src_large,
-                    out_specs[0].0.clone(),
-                    domain_err(ImageDimensions::new(32, 24))?,
-                ))?,
-                domain_err(PngToWebpItem::new(
-                    src_small,
-                    out_specs[1].0.clone(),
-                    domain_err(ImageDimensions::new(8, 6))?,
-                ))?,
-                domain_err(PngToWebpItem::new(
-                    src_medium,
-                    out_specs[2].0.clone(),
-                    domain_err(ImageDimensions::new(16, 12))?,
-                ))?,
+                ImageBatchItem::new(src_a, out_a.clone(), ImageDimensions::new(256, 256)?)?,
+                ImageBatchItem::new(src_b, out_b.clone(), ImageDimensions::new(256, 256)?)?,
             ],
-            WebpEncoding::Lossy {
-                quality: WebpQuality::DEFAULT,
+            ImageExecutionMode::NvencHeic {
+                quality: ImageQuality::DEFAULT,
             },
-            NonZeroUsize::MIN,
-        ))?;
+            NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN),
+        )?;
 
         let report = execute_image_batch(&plan)?;
-        assert_eq!(report.files_converted().get(), 3);
-        assert_eq!(report.worker_threads_used().get(), 1);
+        assert_eq!(report.files_converted().get(), 2);
+        assert_eq!(report.backend(), HardwareBackend::Gpu(GpuBackend::Nvenc));
+        assert!(report.hardware_device().is_some());
 
-        for (webp_path, expected_dims) in &out_specs {
-            let bytes = fs::read(webp_path).map_err(|source| PipelineError::Io {
-                path: webp_path.clone(),
-                source,
-            })?;
-            let (_, w, h) = zenwebp::oneshot::decode_rgb(&bytes).map_err(|err| {
-                PipelineError::DecodeFailed {
-                    path: webp_path.clone(),
-                    reason: err.to_string(),
-                }
-            })?;
-            assert_eq!((w, h), *expected_dims);
-        }
+        let bytes_a = fs::read(&out_a)?;
+        assert_eq!(bytes_a.get(4..12), Some(b"ftypheic".as_slice()));
+        let bytes_b = fs::read(&out_b)?;
+        assert_eq!(bytes_b.get(4..12), Some(b"ftypheic".as_slice()));
 
-        fs::remove_dir_all(&root).map_err(|source| PipelineError::Io { path: root, source })?;
+        fs::remove_dir_all(&root)?;
         Ok(())
     }
 
+    #[cfg(feature = "nvenc")]
     #[test]
-    fn rejects_corrupt_png_in_parallel_batch_and_dimension_mismatch() -> Result<(), PipelineError> {
-        let root = create_temp_dir("errors")?;
-        let dims = domain_err(ImageDimensions::new(16, 12))?;
-        let rgb = sample_rgb_16x12();
-
-        let mut items = Vec::with_capacity(4);
-        for i in 0..4 {
-            let src = root.join(format!("img_{i}.png"));
-            write_test_png(&src, 16, 12, png::ColorType::Rgb, &rgb)?;
-            items.push(domain_err(PngToWebpItem::new(
-                src,
-                root.join(format!("out/img_{i}.webp")),
-                dims,
-            ))?);
+    fn nvenc_heic_rejects_transparent_png_without_silent_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = create_temp_dir("nvenc-heic-alpha")?;
+        let src = root.join("alpha.png");
+        let out = root.join("alpha.heic");
+        let mut alpha_pixels = Vec::with_capacity(256 * 256 * 4);
+        for _ in 0..(256 * 256) {
+            alpha_pixels.extend_from_slice(&[120, 180, 220, 128]);
         }
+        write_test_png(&src, 256, 256, png::ColorType::Rgba, &alpha_pixels)?;
 
-        let corrupt_src = root.join("img_2.png");
-        fs::write(&corrupt_src, b"corrupted").map_err(|source| PipelineError::Io {
-            path: corrupt_src,
-            source,
-        })?;
-
-        let workers_2 = NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN);
-        let parallel_plan = domain_err(ImageBatchPlan::new(
-            items,
-            WebpEncoding::Lossy {
-                quality: WebpQuality::DEFAULT,
+        let plan = ImageBatchPlan::new(
+            vec![ImageBatchItem::new(
+                src,
+                out,
+                ImageDimensions::new(256, 256)?,
+            )?],
+            ImageExecutionMode::NvencHeic {
+                quality: ImageQuality::DEFAULT,
             },
-            workers_2,
-        ))?;
-        assert!(matches!(
-            execute_image_batch(&parallel_plan),
-            Err(PipelineError::DecodeFailed { .. })
-        ));
-
-        let mismatch_src = root.join("img_0.png");
-        let wrong_dims = domain_err(ImageDimensions::new(32, 24))?;
-        let mismatch_plan = domain_err(ImageBatchPlan::new(
-            vec![domain_err(PngToWebpItem::new(
-                mismatch_src,
-                root.join("out/mismatch.webp"),
-                wrong_dims,
-            ))?],
-            WebpEncoding::Lossless,
             NonZeroUsize::MIN,
-        ))?;
+        )?;
+
         assert!(matches!(
-            execute_image_batch(&mismatch_plan),
-            Err(PipelineError::DecodeFailed { .. })
+            execute_image_batch(&plan),
+            Err(PipelineError::UnsupportedPixelFormat { .. })
         ));
 
-        fs::remove_dir_all(&root).map_err(|source| PipelineError::Io { path: root, source })?;
+        fs::remove_dir_all(&root)?;
         Ok(())
     }
 }

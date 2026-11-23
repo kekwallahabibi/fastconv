@@ -7,8 +7,8 @@ pub use hardware::{
     HostHardware, SimdLevel, WgpuAdapterInfo,
 };
 pub use image::{
-    ImageBatchPlan, ImageConversionReport, ImageDimensions, PngToWebpItem, WebpEncoding,
-    WebpQuality,
+    ImageBatchItem, ImageBatchPlan, ImageConversionReport, ImageDimensions, ImageExecutionMode,
+    ImageOutputFormat, ImageQuality, WebpEncoding,
 };
 pub use metrics::{BenchmarkMetrics, BenchmarkSample, PeakMemory, Throughput, WorkloadUnit};
 
@@ -84,6 +84,11 @@ pub enum DomainError {
     UnsupportedBackend {
         media_kind: MediaKind,
         backend: HardwareBackend,
+    },
+    UnsupportedImagePipeline {
+        format: ImageOutputFormat,
+        backend: HardwareBackend,
+        reason: String,
     },
 }
 
@@ -163,7 +168,7 @@ impl fmt::Display for DomainError {
                 write!(f, "image dimensions must be non-zero, got {width}x{height}")
             }
             Self::InvalidQuality { value, max } => {
-                write!(f, "webp quality must be in 0..={max}, got {value}")
+                write!(f, "image quality must be in 0..={max}, got {value}")
             }
             Self::EmptyBatch => {
                 f.write_str("image conversion batch must contain at least one file")
@@ -188,6 +193,14 @@ impl fmt::Display for DomainError {
             } => write!(
                 f,
                 "backend '{backend}' is not supported for {media_kind} conversions"
+            ),
+            Self::UnsupportedImagePipeline {
+                format,
+                backend,
+                reason,
+            } => write!(
+                f,
+                "backend '{backend}' cannot encode .{format} images: {reason}"
             ),
         }
     }

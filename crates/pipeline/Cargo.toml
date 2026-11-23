@@ -3,10 +3,27 @@ name = "fastconv-pipeline"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+nvenc = ["dep:cudarc", "dep:nvidia-video-codec-sdk"]
+
 [dependencies]
+cudarc = { workspace = true, optional = true }
 fastconv-domain.workspace = true
+nvidia-video-codec-sdk = { workspace = true, optional = true }
 png.workspace = true
 zenwebp.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+# Default builds enforce `#![forbid(unsafe_code)]` via `src/lib.rs`.
+# Only the optional `nvenc` FFI boundary uses narrowly scoped `unsafe` blocks.
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"

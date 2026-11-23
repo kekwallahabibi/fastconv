@@ -1,18 +1,17 @@
-use std::collections::BTreeSet;
-use std::fs::{self, File};
-use std::io::{self, Read};
+use std::fs;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 
 use fastconv_domain::{
-    ExecutionPlan, HardwareBackend, ImageBatchPlan, ImageConversionReport, PngToWebpItem,
+    ExecutionPlan, HardwareBackend, ImageBatchItem, ImageBatchPlan, ImageConversionReport,
     WebpEncoding,
 };
 use zenwebp::{EncodeRequest, LosslessConfig, LossyConfig, PixelLayout};
 
 use crate::PipelineError;
+use crate::png_decode::{DecodedPixelFormat, decode_png_into, precreate_target_directories};
 
 /// Concrete CPU execution backend entry point.
 ///
@@ -46,7 +45,10 @@ impl WorkerScratch {
 ///
 /// Returns [`PipelineError`] if creating output directories, decoding PNGs, encoding WebP,
 /// or writing outputs fails.
-pub fn execute_image_batch(plan: &ImageBatchPlan) -> Result<ImageConversionReport, PipelineError> {
+pub fn execute_webp_batch(
+    plan: &ImageBatchPlan,
+    encoding: WebpEncoding,
+) -> Result<ImageConversionReport, PipelineError> {
     let items = plan.items();
     let Some(first_item) = items.first() else {
         return Err(PipelineError::EmptyOutput(PathBuf::new()));
@@ -58,9 +60,9 @@ pub fn execute_image_batch(plan: &ImageBatchPlan) -> Result<ImageConversionRepor
         .ok_or_else(|| PipelineError::EmptyOutput(first_item.target().to_path_buf()))?;
 
     let (total_input, total_output) = if worker_threads.get() == 1 || items.len() == 1 {
-        execute_sequential(items, plan.encoding())?
+        execute_sequential(items, encoding)?
     } else {
-        execute_parallel(items, plan.encoding(), worker_threads.get())?
+        execute_parallel(items, encoding, worker_threads.get())?
     };
 
     let input_nz = NonZeroU64::new(total_input)
@@ -73,29 +75,13 @@ pub fn execute_image_batch(plan: &ImageBatchPlan) -> Result<ImageConversionRepor
         input_nz,
         output_nz,
         worker_threads,
+        HardwareBackend::Cpu,
+        None,
     ))
 }
 
-fn precreate_target_directories(items: &[PngToWebpItem]) -> Result<(), PipelineError> {
-    let mut parents = BTreeSet::new();
-    for item in items {
-        if let Some(parent) = item.target().parent()
-            && !parent.as_os_str().is_empty()
-        {
-            parents.insert(parent);
-        }
-    }
-    for dir in parents {
-        fs::create_dir_all(dir).map_err(|source| PipelineError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
-    }
-    Ok(())
-}
-
 fn execute_sequential(
-    items: &[PngToWebpItem],
+    items: &[ImageBatchItem],
     encoding: WebpEncoding,
 ) -> Result<(u64, u64), PipelineError> {
     let mut scratch = WorkerScratch::new();
@@ -112,7 +98,7 @@ fn execute_sequential(
 }
 
 fn execute_parallel(
-    items: &[PngToWebpItem],
+    items: &[ImageBatchItem],
     encoding: WebpEncoding,
     worker_count: usize,
 ) -> Result<(u64, u64), PipelineError> {
@@ -163,82 +149,25 @@ fn execute_parallel(
 }
 
 fn convert_single_item(
-    item: &PngToWebpItem,
+    item: &ImageBatchItem,
     encoding: WebpEncoding,
     scratch: &mut WorkerScratch,
 ) -> Result<(u64, u64), PipelineError> {
-    scratch.file_bytes.clear();
-    let mut file = File::open(item.source()).map_err(|source| PipelineError::Io {
-        path: item.source().to_path_buf(),
-        source,
-    })?;
-    file.read_to_end(&mut scratch.file_bytes)
-        .map_err(|source| PipelineError::Io {
-            path: item.source().to_path_buf(),
-            source,
-        })?;
-    let input_bytes = u64::try_from(scratch.file_bytes.len()).unwrap_or(u64::MAX);
-
-    let mut decoder = png::Decoder::new(io::Cursor::new(scratch.file_bytes.as_slice()));
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    decoder.set_ignore_text_chunk(true);
-
-    let mut reader = decoder
-        .read_info()
-        .map_err(|err| PipelineError::DecodeFailed {
-            path: item.source().to_path_buf(),
-            reason: err.to_string(),
-        })?;
-
-    let required_len = reader
-        .output_buffer_size()
-        .ok_or_else(|| PipelineError::DecodeFailed {
-            path: item.source().to_path_buf(),
-            reason: "decoded PNG buffer size exceeds addressable memory".to_owned(),
-        })?;
-    if scratch.pixel_buf.len() < required_len {
-        scratch.pixel_buf.resize(required_len, 0);
-    }
-
-    let frame =
-        reader
-            .next_frame(&mut scratch.pixel_buf)
-            .map_err(|err| PipelineError::DecodeFailed {
+    let decoded = decode_png_into(item, &mut scratch.file_bytes, &mut scratch.pixel_buf)?;
+    let pixels =
+        scratch
+            .pixel_buf
+            .get(..decoded.byte_len)
+            .ok_or_else(|| PipelineError::DecodeFailed {
                 path: item.source().to_path_buf(),
-                reason: err.to_string(),
+                reason: "decoded PNG frame exceeded allocated pixel buffer".to_owned(),
             })?;
-
-    let expected_dims = item.dimensions();
-    if frame.width != expected_dims.width().get() || frame.height != expected_dims.height().get() {
-        return Err(PipelineError::DecodeFailed {
-            path: item.source().to_path_buf(),
-            reason: format!(
-                "decoded PNG dimensions {}x{} do not match probed {}",
-                frame.width, frame.height, expected_dims
-            ),
-        });
-    }
-
-    let layout = match (frame.color_type, frame.bit_depth) {
-        (png::ColorType::Grayscale, png::BitDepth::Eight) => PixelLayout::L8,
-        (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => PixelLayout::La8,
-        (png::ColorType::Rgb, png::BitDepth::Eight) => PixelLayout::Rgb8,
-        (png::ColorType::Rgba, png::BitDepth::Eight) => PixelLayout::Rgba8,
-        (color, depth) => {
-            return Err(PipelineError::UnsupportedPixelFormat {
-                path: item.source().to_path_buf(),
-                format: format!("{color:?} {depth:?}"),
-            });
-        }
+    let layout = match decoded.format {
+        DecodedPixelFormat::L8 => PixelLayout::L8,
+        DecodedPixelFormat::La8 => PixelLayout::La8,
+        DecodedPixelFormat::Rgb8 => PixelLayout::Rgb8,
+        DecodedPixelFormat::Rgba8 => PixelLayout::Rgba8,
     };
-
-    let pixels = scratch
-        .pixel_buf
-        .get(..frame.buffer_size())
-        .ok_or_else(|| PipelineError::DecodeFailed {
-            path: item.source().to_path_buf(),
-            reason: "decoded PNG frame exceeded allocated pixel buffer".to_owned(),
-        })?;
 
     scratch.webp_buf.clear();
     match encoding {
@@ -246,12 +175,12 @@ fn convert_single_item(
             let config = LossyConfig::new()
                 .with_quality(quality.as_f32())
                 .with_method(4);
-            EncodeRequest::lossy(&config, pixels, layout, frame.width, frame.height)
+            EncodeRequest::lossy(&config, pixels, layout, decoded.width, decoded.height)
                 .encode_into(&mut scratch.webp_buf)
         }
         WebpEncoding::Lossless => {
             let config = LosslessConfig::new();
-            EncodeRequest::lossless(&config, pixels, layout, frame.width, frame.height)
+            EncodeRequest::lossless(&config, pixels, layout, decoded.width, decoded.height)
                 .encode_into(&mut scratch.webp_buf)
         }
     }
@@ -270,5 +199,5 @@ fn convert_single_item(
     })?;
 
     let output_bytes = u64::try_from(scratch.webp_buf.len()).unwrap_or(u64::MAX);
-    Ok((input_bytes, output_bytes))
+    Ok((decoded.input_file_bytes, output_bytes))
 }

@@ -13,9 +13,11 @@ edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
+cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12090"] }
 fastconv-domain = { path = "crates/domain" }
 fastconv-probe = { path = "crates/probe" }
 fastconv-pipeline = { path = "crates/pipeline" }
+nvidia-video-codec-sdk = "0.4"
 png = "0.18"
 pollster = "1"
 serde = { version = "1", features = ["derive"] }
