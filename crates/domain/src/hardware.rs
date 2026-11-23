@@ -406,6 +406,24 @@ impl HostHardware {
             .iter()
             .any(|entry| entry.backend() == backend && entry.capability().supports_video_encode())
     }
+
+    /// Returns the best matching detected entry for `backend`, preferring encode-capable
+    /// devices on hybrid multi-GPU hosts.
+    #[must_use]
+    pub fn find_gpu_backend(&self, backend: GpuBackend) -> Option<&DetectedGpuBackend> {
+        let mut fallback = None;
+        for entry in &self.gpu_backends {
+            if entry.backend() == backend {
+                if entry.capability().supports_video_encode() {
+                    return Some(entry);
+                }
+                if fallback.is_none() {
+                    fallback = Some(entry);
+                }
+            }
+        }
+        fallback
+    }
 }
 
 #[cfg(test)]

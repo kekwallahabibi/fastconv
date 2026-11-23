@@ -3,6 +3,10 @@ name = "fastconv-cli"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+nvenc = ["fastconv-pipeline/nvenc"]
+
 [[bin]]
 name = "fastconv"
 path = "src/main.rs"

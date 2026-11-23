@@ -9,6 +9,7 @@ fastconv-probe.workspace = true
 png.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+zenwebp.workspace = true
 
 [lints]
 workspace = true
