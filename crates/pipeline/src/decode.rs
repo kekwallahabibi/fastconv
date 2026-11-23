@@ -386,6 +386,46 @@ fn decode_jpeg_slice_into(
     })
 }
 
+fn unpremultiply_native_u16(samples: &mut [u16], color_samples: usize, max_sample: u32) {
+    let stride = color_samples + 1;
+    for pixel in samples.chunks_exact_mut(stride) {
+        let alpha = u32::from(pixel[color_samples]);
+        if alpha == 0 {
+            for sample in &mut pixel[..color_samples] {
+                *sample = 0;
+            }
+        } else {
+            for sample in &mut pixel[..color_samples] {
+                *sample = u32::from(*sample)
+                    .checked_mul(max_sample)
+                    .and_then(|value| value.checked_div(alpha))
+                    .map_or(0, |value| {
+                        u16::try_from(value.min(max_sample)).unwrap_or(u16::MAX)
+                    });
+            }
+        }
+    }
+}
+
+fn unpremultiply_native_u8(samples: &mut [u8], color_samples: usize) {
+    let stride = color_samples + 1;
+    for pixel in samples.chunks_exact_mut(stride) {
+        let alpha = u32::from(pixel[color_samples]);
+        if alpha == 0 {
+            for sample in &mut pixel[..color_samples] {
+                *sample = 0;
+            }
+        } else {
+            for sample in &mut pixel[..color_samples] {
+                *sample = u32::from(*sample)
+                    .checked_mul(255)
+                    .and_then(|value| value.checked_div(alpha))
+                    .map_or(0, |value| u8::try_from(value.min(255)).unwrap_or(u8::MAX));
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)] // TIFF decoding validates headers and converts all supported sample widths in one cohesive path.
 fn decode_tiff_slice_into(
     item: &ImageBatchItem,
@@ -504,7 +544,7 @@ fn decode_tiff_slice_into(
             == Some(1);
 
     match result {
-        tiff::decoder::DecodingResult::U8(samples) => {
+        tiff::decoder::DecodingResult::U8(mut samples) => {
             if bits < 8 && format == DecodedPixelFormat::L8 {
                 let row_bytes = width_usize
                     .checked_mul(usize::from(bits))
@@ -558,6 +598,16 @@ fn decode_tiff_slice_into(
                     });
                 }
                 if bits == 8 {
+                    if alpha_associated
+                        && matches!(format, DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8)
+                    {
+                        let color_samples = if format == DecodedPixelFormat::La8 {
+                            1
+                        } else {
+                            3
+                        };
+                        unpremultiply_native_u8(&mut samples[..expected_len], color_samples);
+                    }
                     pixel_buf[..expected_len].copy_from_slice(&samples[..expected_len]);
                     if matches!(format, DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8) {
                         let alpha_stride = if format == DecodedPixelFormat::La8 {
@@ -581,7 +631,7 @@ fn decode_tiff_slice_into(
                 }
             }
         }
-        tiff::decoder::DecodingResult::U16(samples) => {
+        tiff::decoder::DecodingResult::U16(mut samples) => {
             if samples.len() < expected_len {
                 return Err(PipelineError::DecodeFailed {
                     path: item.source().to_path_buf(),
@@ -603,6 +653,16 @@ fn decode_tiff_slice_into(
                     .step_by(alpha_stride)
                     .any(|&alpha| u32::from(alpha) < max_sample);
             }
+            if alpha_associated
+                && matches!(format, DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8)
+            {
+                let color_samples = if format == DecodedPixelFormat::La8 {
+                    1
+                } else {
+                    3
+                };
+                unpremultiply_native_u16(&mut samples[..expected_len], color_samples, max_sample);
+            }
             for (dst, src) in pixel_buf[..expected_len]
                 .iter_mut()
                 .zip(samples[..expected_len].iter().copied())
@@ -615,24 +675,6 @@ fn decode_tiff_slice_into(
                 path: item.source().to_path_buf(),
                 format: format!("TIFF decoded sample type {other:?}"),
             });
-        }
-    }
-
-    if alpha_associated {
-        let color_samples = if format == DecodedPixelFormat::La8 {
-            1
-        } else {
-            3
-        };
-        let stride = color_samples + 1;
-        for pixel in pixel_buf[..expected_len].chunks_exact_mut(stride) {
-            let alpha = u16::from(pixel[color_samples]);
-            for sample in &mut pixel[..color_samples] {
-                *sample = u16::from(*sample)
-                    .checked_mul(255)
-                    .and_then(|value| value.checked_div(alpha))
-                    .map_or(0, |value| u8::try_from(value.min(255)).unwrap_or(u8::MAX));
-            }
         }
     }
 
