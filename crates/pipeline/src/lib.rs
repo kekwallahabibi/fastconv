@@ -1,8 +1,10 @@
 #![cfg_attr(not(feature = "nvenc"), forbid(unsafe_code))]
 
+mod bmp;
 pub mod cpu;
 mod decode;
 pub mod gpu;
+mod qoi;
 
 use std::error::Error;
 use std::fmt;
@@ -104,6 +106,9 @@ pub fn execute_image_batch(plan: &ImageBatchPlan) -> Result<ImageConversionRepor
         ImageExecutionMode::CpuJpeg { quality } => {
             cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Jpeg { quality })
         }
+        ImageExecutionMode::CpuPng => cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Png),
+        ImageExecutionMode::CpuBmp => cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Bmp),
+        ImageExecutionMode::CpuQoi => cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Qoi),
         ImageExecutionMode::NvencHeic { quality } => gpu::nvenc::execute_heic_batch(plan, quality),
     }
 }
@@ -668,37 +673,335 @@ mod tests {
         Ok(())
     }
 
+    struct DecodedTestPng {
+        pixels: Vec<u8>,
+        width: u32,
+        height: u32,
+        color_type: png::ColorType,
+    }
+
+    fn decode_test_png(path: &Path) -> Result<DecodedTestPng, Box<dyn std::error::Error>> {
+        let dec = png::Decoder::new(std::io::BufReader::new(File::open(path)?));
+        let mut reader = dec.read_info()?;
+        let mut buf = vec![0_u8; reader.output_buffer_size().ok_or("png buf")?];
+        let frame = reader.next_frame(&mut buf)?;
+        buf.truncate(frame.buffer_size());
+        Ok(DecodedTestPng {
+            pixels: buf,
+            width: frame.width,
+            height: frame.height,
+            color_type: frame.color_type,
+        })
+    }
+
+    #[test]
+    fn roundtrips_png_qoi_webp_png_losslessly() -> Result<(), Box<dyn std::error::Error>> {
+        let root = create_temp_dir("nm-lossless-chain")?;
+        let grad_rgb = make_rgb_gradient(53, 37);
+        let alpha_rgba: Vec<u8> = grad_rgb
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &[r, g, b])| [r, g, b, if i % 4 == 0 { 160 } else { 255 }])
+            .collect();
+
+        let src_png = root.join("src.png");
+        let src_alpha_png = root.join("src_alpha.png");
+        write_test_png(&src_png, 53, 37, png::ColorType::Rgb, &grad_rgb)?;
+        write_test_png(&src_alpha_png, 53, 37, png::ColorType::Rgba, &alpha_rgba)?;
+        let workers = NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN);
+
+        let qoi_rgb = root.join("stage1/rgb.qoi");
+        let qoi_rgba = root.join("stage1/rgba.qoi");
+        execute_image_batch(&ImageBatchPlan::new(
+            vec![
+                jpeg_item(src_png, qoi_rgb.clone(), ImageInputFormat::Png, 53, 37)?,
+                jpeg_item(
+                    src_alpha_png,
+                    qoi_rgba.clone(),
+                    ImageInputFormat::Png,
+                    53,
+                    37,
+                )?,
+            ],
+            ImageExecutionMode::CpuQoi,
+            workers,
+        )?)?;
+
+        let webp_rgb = root.join("stage2/rgb.webp");
+        let webp_rgba = root.join("stage2/rgba.webp");
+        execute_image_batch(&ImageBatchPlan::new(
+            vec![
+                jpeg_item(qoi_rgb, webp_rgb.clone(), ImageInputFormat::Qoi, 53, 37)?,
+                jpeg_item(qoi_rgba, webp_rgba.clone(), ImageInputFormat::Qoi, 53, 37)?,
+            ],
+            ImageExecutionMode::CpuWebp(ImageCompression::Lossless),
+            workers,
+        )?)?;
+
+        let png_rgb = root.join("stage3/rgb.png");
+        let png_rgba = root.join("stage3/rgba.png");
+        execute_image_batch(&ImageBatchPlan::new(
+            vec![
+                jpeg_item(webp_rgb, png_rgb.clone(), ImageInputFormat::Webp, 53, 37)?,
+                jpeg_item(webp_rgba, png_rgba.clone(), ImageInputFormat::Webp, 53, 37)?,
+            ],
+            ImageExecutionMode::CpuPng,
+            workers,
+        )?)?;
+
+        let dec_rgb = decode_test_png(&png_rgb)?;
+        assert_eq!(
+            (dec_rgb.width, dec_rgb.height, dec_rgb.color_type),
+            (53, 37, png::ColorType::Rgb)
+        );
+        assert_eq!(dec_rgb.pixels, grad_rgb);
+
+        let dec_alpha = decode_test_png(&png_rgba)?;
+        assert_eq!(
+            (dec_alpha.width, dec_alpha.height, dec_alpha.color_type),
+            (53, 37, png::ColorType::Rgba)
+        );
+        assert_eq!(dec_alpha.pixels, alpha_rgba);
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn converts_bmp_to_jpeg_and_rejects_transparent_bmp_for_jpeg()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = create_temp_dir("nm-bmp-jpeg")?;
+        let grad_rgb = make_rgb_gradient(53, 37);
+        let alpha_rgba: Vec<u8> = grad_rgb
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &[r, g, b])| [r, g, b, if i % 4 == 0 { 160 } else { 255 }])
+            .collect();
+
+        let src_png = root.join("src.png");
+        let src_alpha_png = root.join("src_alpha.png");
+        write_test_png(&src_png, 53, 37, png::ColorType::Rgb, &grad_rgb)?;
+        write_test_png(&src_alpha_png, 53, 37, png::ColorType::Rgba, &alpha_rgba)?;
+        let workers = NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN);
+
+        let bmp_rgb = root.join("rgb.bmp");
+        let bmp_rgba = root.join("rgba.bmp");
+        execute_image_batch(&ImageBatchPlan::new(
+            vec![
+                jpeg_item(src_png, bmp_rgb.clone(), ImageInputFormat::Png, 53, 37)?,
+                jpeg_item(
+                    src_alpha_png,
+                    bmp_rgba.clone(),
+                    ImageInputFormat::Png,
+                    53,
+                    37,
+                )?,
+            ],
+            ImageExecutionMode::CpuBmp,
+            workers,
+        )?)?;
+
+        let jpg_from_bmp = root.join("rgb.jpg");
+        execute_image_batch(&ImageBatchPlan::new(
+            vec![jpeg_item(
+                bmp_rgb,
+                jpg_from_bmp.clone(),
+                ImageInputFormat::Bmp,
+                53,
+                37,
+            )?],
+            ImageExecutionMode::CpuJpeg {
+                quality: ImageQuality::DEFAULT,
+            },
+            NonZeroUsize::MIN,
+        )?)?;
+        let jpg_bytes = fs::read(&jpg_from_bmp)?;
+        let jpg_pixels = JpegDecoder::new(ZCursor::new(jpg_bytes.as_slice())).decode()?;
+        assert!(mean_abs_channel_diff(&jpg_pixels, &grad_rgb)? < 12.0);
+
+        let alpha_bmp_to_jpg = ImageBatchPlan::new(
+            vec![jpeg_item(
+                bmp_rgba,
+                root.join("alpha.jpg"),
+                ImageInputFormat::Bmp,
+                53,
+                37,
+            )?],
+            ImageExecutionMode::CpuJpeg {
+                quality: ImageQuality::DEFAULT,
+            },
+            NonZeroUsize::MIN,
+        )?;
+        assert!(matches!(
+            execute_image_batch(&alpha_bmp_to_jpg),
+            Err(PipelineError::UnsupportedPixelFormat { .. })
+        ));
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn converts_mixed_five_format_batch_to_webp() -> Result<(), Box<dyn std::error::Error>> {
+        let root = create_temp_dir("nm-mixed-five")?;
+        let grad_rgb = make_rgb_gradient(53, 37);
+        let src_png = root.join("src.png");
+        let src_jpg = root.join("src.jpg");
+        let src_webp = root.join("src.webp");
+        let src_bmp = root.join("src.bmp");
+        let src_qoi = root.join("src.qoi");
+        write_test_png(&src_png, 53, 37, png::ColorType::Rgb, &grad_rgb)?;
+        write_test_jpeg(&src_jpg, 53, 37, JpegColorType::Rgb, &grad_rgb)?;
+        execute_image_batch(&ImageBatchPlan::new(
+            vec![jpeg_item(
+                src_png.clone(),
+                src_webp.clone(),
+                ImageInputFormat::Png,
+                53,
+                37,
+            )?],
+            ImageExecutionMode::CpuWebp(ImageCompression::Lossless),
+            NonZeroUsize::MIN,
+        )?)?;
+        execute_image_batch(&ImageBatchPlan::new(
+            vec![jpeg_item(
+                src_png.clone(),
+                src_bmp.clone(),
+                ImageInputFormat::Png,
+                53,
+                37,
+            )?],
+            ImageExecutionMode::CpuBmp,
+            NonZeroUsize::MIN,
+        )?)?;
+        execute_image_batch(&ImageBatchPlan::new(
+            vec![jpeg_item(
+                src_png.clone(),
+                src_qoi.clone(),
+                ImageInputFormat::Png,
+                53,
+                37,
+            )?],
+            ImageExecutionMode::CpuQoi,
+            NonZeroUsize::MIN,
+        )?)?;
+
+        let workers = NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN);
+        let mixed_plan = ImageBatchPlan::new(
+            vec![
+                jpeg_item(
+                    src_png,
+                    root.join("mixed/01.webp"),
+                    ImageInputFormat::Png,
+                    53,
+                    37,
+                )?,
+                jpeg_item(
+                    src_jpg,
+                    root.join("mixed/02.webp"),
+                    ImageInputFormat::Jpeg,
+                    53,
+                    37,
+                )?,
+                jpeg_item(
+                    src_webp,
+                    root.join("mixed/03.webp"),
+                    ImageInputFormat::Webp,
+                    53,
+                    37,
+                )?,
+                jpeg_item(
+                    src_bmp,
+                    root.join("mixed/04.webp"),
+                    ImageInputFormat::Bmp,
+                    53,
+                    37,
+                )?,
+                jpeg_item(
+                    src_qoi,
+                    root.join("mixed/05.webp"),
+                    ImageInputFormat::Qoi,
+                    53,
+                    37,
+                )?,
+            ],
+            ImageExecutionMode::CpuWebp(ImageCompression::Lossy {
+                quality: ImageQuality::DEFAULT,
+            }),
+            workers,
+        )?;
+        assert_eq!(execute_image_batch(&mixed_plan)?.files_converted().get(), 5);
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
     #[cfg(feature = "nvenc")]
     #[test]
-    fn converts_mixed_png_and_jpeg_batch_to_valid_heic_via_nvenc_hardware()
+    fn converts_mixed_all_five_input_formats_to_valid_heic_via_nvenc_hardware()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = create_temp_dir("nvenc-heic")?;
         let src_png = root.join("a.png");
         let src_jpg = root.join("b.jpg");
-        let src_luma_jpg = root.join("c.jpg");
-        let out_png = root.join("out/a.heic");
-        let out_jpg = root.join("out/b.heic");
-        let out_luma_jpg = root.join("out/c.heic");
+        let src_webp = root.join("c.webp");
+        let src_bmp = root.join("d.bmp");
+        let src_qoi = root.join("e.qoi");
+        let out_a = root.join("out/a.heic");
+        let out_b = root.join("out/b.heic");
+        let out_c = root.join("out/c.heic");
+        let out_d = root.join("out/d.heic");
+        let out_e = root.join("out/e.heic");
 
         let grad = make_rgb_gradient(256, 256);
-        let grad_luma: Vec<u8> = (0_u32..256 * 256)
-            .map(|i| u8::try_from((i * 5) % 256).unwrap_or(0))
-            .collect();
         write_test_png(&src_png, 256, 256, png::ColorType::Rgb, &grad)?;
         write_test_jpeg(&src_jpg, 256, 256, JpegColorType::Rgb, &grad)?;
-        write_test_jpeg(&src_luma_jpg, 256, 256, JpegColorType::Luma, &grad_luma)?;
+        execute_image_batch(&ImageBatchPlan::new(
+            vec![jpeg_item(
+                src_png.clone(),
+                src_webp.clone(),
+                ImageInputFormat::Png,
+                256,
+                256,
+            )?],
+            ImageExecutionMode::CpuWebp(ImageCompression::Lossy {
+                quality: ImageQuality::DEFAULT,
+            }),
+            NonZeroUsize::MIN,
+        )?)?;
+        execute_image_batch(&ImageBatchPlan::new(
+            vec![jpeg_item(
+                src_png.clone(),
+                src_bmp.clone(),
+                ImageInputFormat::Png,
+                256,
+                256,
+            )?],
+            ImageExecutionMode::CpuBmp,
+            NonZeroUsize::MIN,
+        )?)?;
+        execute_image_batch(&ImageBatchPlan::new(
+            vec![jpeg_item(
+                src_png.clone(),
+                src_qoi.clone(),
+                ImageInputFormat::Png,
+                256,
+                256,
+            )?],
+            ImageExecutionMode::CpuQoi,
+            NonZeroUsize::MIN,
+        )?)?;
 
         let plan = ImageBatchPlan::new(
             vec![
-                jpeg_item(src_png, out_png.clone(), ImageInputFormat::Png, 256, 256)?,
-                jpeg_item(src_jpg, out_jpg.clone(), ImageInputFormat::Jpeg, 256, 256)?,
-                jpeg_item(
-                    src_luma_jpg,
-                    out_luma_jpg.clone(),
-                    ImageInputFormat::Jpeg,
-                    256,
-                    256,
-                )?,
+                jpeg_item(src_png, out_a.clone(), ImageInputFormat::Png, 256, 256)?,
+                jpeg_item(src_jpg, out_b.clone(), ImageInputFormat::Jpeg, 256, 256)?,
+                jpeg_item(src_webp, out_c.clone(), ImageInputFormat::Webp, 256, 256)?,
+                jpeg_item(src_bmp, out_d.clone(), ImageInputFormat::Bmp, 256, 256)?,
+                jpeg_item(src_qoi, out_e.clone(), ImageInputFormat::Qoi, 256, 256)?,
             ],
             ImageExecutionMode::NvencHeic {
                 quality: ImageQuality::DEFAULT,
@@ -707,11 +1010,11 @@ mod tests {
         )?;
 
         let report = execute_image_batch(&plan)?;
-        assert_eq!(report.files_converted().get(), 3);
+        assert_eq!(report.files_converted().get(), 5);
         assert_eq!(report.backend(), HardwareBackend::Gpu(GpuBackend::Nvenc));
         assert!(report.hardware_device().is_some());
 
-        for path in [&out_png, &out_jpg, &out_luma_jpg] {
+        for path in [&out_a, &out_b, &out_c, &out_d, &out_e] {
             let bytes = fs::read(path)?;
             assert_eq!(bytes.get(4..12), Some(b"ftypheic".as_slice()));
         }

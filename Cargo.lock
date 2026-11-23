@@ -242,6 +242,7 @@ dependencies = [
  "png",
  "pollster",
  "wgpu",
+ "zenwebp",
  "zune-jpeg",
 ]
 

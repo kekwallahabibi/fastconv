@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use crate::fixtures::{
-    IMAGE_BATCH_COUNT, audio_wav_path, image_path, jpeg_image_path, video_mp4_path,
+    IMAGE_BATCH_COUNT, audio_wav_path, image_path, jpeg_image_path, video_mp4_path, webp_image_path,
 };
 
 fn workspace_root() -> Result<PathBuf, String> {
@@ -327,6 +327,9 @@ fn cmd_bench_status(root: &Path) {
     let jpeg_count = (1..=IMAGE_BATCH_COUNT)
         .filter(|&idx| fixtures::is_non_empty_file(&jpeg_image_path(root, idx)))
         .count();
+    let webp_count = (1..=IMAGE_BATCH_COUNT)
+        .filter(|&idx| fixtures::is_non_empty_file(&webp_image_path(root, idx)))
+        .count();
     let has_wav = fixtures::is_non_empty_file(&audio_wav_path(root));
     let has_mp4 = fixtures::is_non_empty_file(&video_mp4_path(root));
 
@@ -334,6 +337,7 @@ fn cmd_bench_status(root: &Path) {
     println!("fixtures dir : {}", root.join("fixtures").display());
     println!("4K PNG batch : {png_count}/{IMAGE_BATCH_COUNT}");
     println!("4K JPEG batch: {jpeg_count}/{IMAGE_BATCH_COUNT}");
+    println!("4K WebP batch: {webp_count}/{IMAGE_BATCH_COUNT}");
     println!(
         "60s WAV      : {}",
         if has_wav { "ready" } else { "missing" }
@@ -353,12 +357,12 @@ fn print_usage() {
         "  cargo xtask verify            Check no-ffmpeg invariant, fmt, clippy -D warnings, and tests"
     );
     println!(
-        "  cargo xtask gen-fixtures      Generate reproducible 4K PNG/JPEG, WAV, and 1080p60 MP4 fixtures"
+        "  cargo xtask gen-fixtures      Generate reproducible 4K PNG/JPEG/WebP, WAV, and 1080p60 MP4 fixtures"
     );
     println!("  cargo xtask gen-fixtures --force");
     println!("                                Regenerate all fixtures from scratch");
     println!(
-        "  cargo xtask bench             Run 4K PNG/JPEG head-to-head benchmarks (fastconv vs ffmpeg) + validation"
+        "  cargo xtask bench             Run 4K image head-to-head benchmarks (fastconv vs ffmpeg >= 5.1 with QOI codec + ffprobe) + validation"
     );
     println!(
         "  cargo xtask bench --baseline  Run FFmpeg baseline across all workloads and save JSON"

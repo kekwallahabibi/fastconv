@@ -55,6 +55,9 @@ impl fmt::Display for ImageDimensions {
 pub enum ImageInputFormat {
     Png,
     Jpeg,
+    Webp,
+    Bmp,
+    Qoi,
 }
 
 impl ImageInputFormat {
@@ -63,6 +66,9 @@ impl ImageInputFormat {
         match self {
             Self::Png => "png",
             Self::Jpeg => "jpeg",
+            Self::Webp => "webp",
+            Self::Bmp => "bmp",
+            Self::Qoi => "qoi",
         }
     }
 }
@@ -79,6 +85,9 @@ pub enum ImageOutputFormat {
     Webp,
     Heic,
     Jpeg,
+    Png,
+    Bmp,
+    Qoi,
 }
 
 impl ImageOutputFormat {
@@ -88,6 +97,9 @@ impl ImageOutputFormat {
             Self::Webp => "webp",
             Self::Heic => "heic",
             Self::Jpeg => "jpg",
+            Self::Png => "png",
+            Self::Bmp => "bmp",
+            Self::Qoi => "qoi",
         }
     }
 }
@@ -151,31 +163,45 @@ impl fmt::Display for ImageCompression {
 
 /// Compile-time-legal combination of output image format, codec mode, and hardware backend.
 ///
-/// Illegal pairings (e.g. NVENC + WebP/JPEG, Vulkan + WebP/HEIC/JPEG, CPU + HEIC,
-/// lossless + JPEG/HEIC, or hardware-absent video encoder backends) cannot be constructed.
+/// Illegal pairings (e.g. NVENC + WebP/JPEG/PNG/BMP/QOI, Vulkan + images, CPU + HEIC,
+/// lossless + JPEG/HEIC, lossy quality + PNG/BMP/QOI, or hardware-absent video encoder
+/// backends) cannot be constructed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum ImageExecutionMode {
     CpuWebp(ImageCompression),
     CpuJpeg { quality: ImageQuality },
+    CpuPng,
+    CpuBmp,
+    CpuQoi,
     NvencHeic { quality: ImageQuality },
 }
 
 impl ImageExecutionMode {
     /// Resolves a CPU-only [`ImageExecutionMode`] for `format` without probing GPU hardware.
     ///
+    /// When `compression` is `None`, selects the natural default for `format` (lossy quality 80
+    /// for WebP/JPEG, lossless for PNG/BMP/QOI).
+    ///
     /// # Errors
     ///
     /// Returns [`DomainError::UnsupportedImagePipeline`] if `format` has no native CPU encoder
-    /// or the requested compression mode is unsupported for `format`.
+    /// or the explicitly requested compression mode is incompatible with `format`.
     pub fn resolve_cpu(
         format: ImageOutputFormat,
-        compression: ImageCompression,
+        compression: Option<ImageCompression>,
     ) -> Result<Self, DomainError> {
         match format {
-            ImageOutputFormat::Webp => Ok(Self::CpuWebp(compression)),
+            ImageOutputFormat::Webp => Ok(Self::CpuWebp(compression.unwrap_or(
+                ImageCompression::Lossy {
+                    quality: ImageQuality::DEFAULT,
+                },
+            ))),
             ImageOutputFormat::Jpeg => match compression {
-                ImageCompression::Lossy { quality } => Ok(Self::CpuJpeg { quality }),
-                ImageCompression::Lossless => Err(DomainError::UnsupportedImagePipeline {
+                None => Ok(Self::CpuJpeg {
+                    quality: ImageQuality::DEFAULT,
+                }),
+                Some(ImageCompression::Lossy { quality }) => Ok(Self::CpuJpeg { quality }),
+                Some(ImageCompression::Lossless) => Err(DomainError::UnsupportedImagePipeline {
                     format,
                     backend: HardwareBackend::Cpu,
                     reason:
@@ -183,6 +209,9 @@ impl ImageExecutionMode {
                             .to_owned(),
                 }),
             },
+            ImageOutputFormat::Png => resolve_lossless_only_cpu(format, "PNG", compression, Self::CpuPng),
+            ImageOutputFormat::Bmp => resolve_lossless_only_cpu(format, "BMP", compression, Self::CpuBmp),
+            ImageOutputFormat::Qoi => resolve_lossless_only_cpu(format, "QOI", compression, Self::CpuQoi),
             ImageOutputFormat::Heic => Err(DomainError::UnsupportedImagePipeline {
                 format,
                 backend: HardwareBackend::Cpu,
@@ -202,7 +231,7 @@ impl ImageExecutionMode {
     /// format, compression mode, and backend is not supported on `hardware`.
     pub fn resolve(
         format: ImageOutputFormat,
-        compression: ImageCompression,
+        compression: Option<ImageCompression>,
         backend: HardwareBackend,
         hardware: &HostHardware,
     ) -> Result<Self, DomainError> {
@@ -214,6 +243,15 @@ impl ImageExecutionMode {
             (ImageOutputFormat::Jpeg, HardwareBackend::Gpu(GpuBackend::Nvenc)) => Err(
                 nvenc_unsupported_image_error(format, "JPEG", ".jpg", hardware),
             ),
+            (ImageOutputFormat::Png, HardwareBackend::Gpu(GpuBackend::Nvenc)) => Err(
+                nvenc_unsupported_image_error(format, "PNG", ".png", hardware),
+            ),
+            (ImageOutputFormat::Bmp, HardwareBackend::Gpu(GpuBackend::Nvenc)) => Err(
+                nvenc_unsupported_image_error(format, "BMP", ".bmp", hardware),
+            ),
+            (ImageOutputFormat::Qoi, HardwareBackend::Gpu(GpuBackend::Nvenc)) => Err(
+                nvenc_unsupported_image_error(format, "QOI", ".qoi", hardware),
+            ),
             (ImageOutputFormat::Heic, HardwareBackend::Gpu(GpuBackend::Nvenc)) => {
                 if !hardware.supports_video_encode(GpuBackend::Nvenc) {
                     return Err(DomainError::UnsupportedImagePipeline {
@@ -223,8 +261,11 @@ impl ImageExecutionMode {
                     });
                 }
                 match compression {
-                    ImageCompression::Lossy { quality } => Ok(Self::NvencHeic { quality }),
-                    ImageCompression::Lossless => Err(DomainError::UnsupportedImagePipeline {
+                    None => Ok(Self::NvencHeic {
+                        quality: ImageQuality::DEFAULT,
+                    }),
+                    Some(ImageCompression::Lossy { quality }) => Ok(Self::NvencHeic { quality }),
+                    Some(ImageCompression::Lossless) => Err(DomainError::UnsupportedImagePipeline {
                         format,
                         backend,
                         reason: "NVENC HEIC currently supports lossy HEVC-Intra (--quality 0..=100), not --lossless".to_owned(),
@@ -247,6 +288,9 @@ impl ImageExecutionMode {
         match self {
             Self::CpuWebp(_) => ImageOutputFormat::Webp,
             Self::CpuJpeg { .. } => ImageOutputFormat::Jpeg,
+            Self::CpuPng => ImageOutputFormat::Png,
+            Self::CpuBmp => ImageOutputFormat::Bmp,
+            Self::CpuQoi => ImageOutputFormat::Qoi,
             Self::NvencHeic { .. } => ImageOutputFormat::Heic,
         }
     }
@@ -254,7 +298,11 @@ impl ImageExecutionMode {
     #[must_use]
     pub const fn backend(self) -> HardwareBackend {
         match self {
-            Self::CpuWebp(_) | Self::CpuJpeg { .. } => HardwareBackend::Cpu,
+            Self::CpuWebp(_)
+            | Self::CpuJpeg { .. }
+            | Self::CpuPng
+            | Self::CpuBmp
+            | Self::CpuQoi => HardwareBackend::Cpu,
             Self::NvencHeic { .. } => HardwareBackend::Gpu(GpuBackend::Nvenc),
         }
     }
@@ -265,10 +313,31 @@ impl fmt::Display for ImageExecutionMode {
         match self {
             Self::CpuWebp(compression) => write!(f, "webp {compression}"),
             Self::CpuJpeg { quality } => write!(f, "jpeg q={}", quality.get()),
+            Self::CpuPng => f.write_str("png lossless"),
+            Self::CpuBmp => f.write_str("bmp lossless"),
+            Self::CpuQoi => f.write_str("qoi lossless"),
             Self::NvencHeic { quality } => {
                 write!(f, "heic hevc-intra q={}", quality.get())
             }
         }
+    }
+}
+
+fn resolve_lossless_only_cpu(
+    format: ImageOutputFormat,
+    label: &str,
+    compression: Option<ImageCompression>,
+    mode: ImageExecutionMode,
+) -> Result<ImageExecutionMode, DomainError> {
+    match compression {
+        None | Some(ImageCompression::Lossless) => Ok(mode),
+        Some(ImageCompression::Lossy { .. }) => Err(DomainError::UnsupportedImagePipeline {
+            format,
+            backend: HardwareBackend::Cpu,
+            reason: format!(
+                "{label} is a lossless format and does not accept --quality; omit --quality or pass --lossless"
+            ),
+        }),
     }
 }
 
@@ -586,12 +655,12 @@ mod tests {
     }
 
     #[test]
-    fn resolves_valid_cpu_webp_cpu_jpeg_and_nvenc_heic_modes() -> Result<(), DomainError> {
+    fn resolves_valid_cpu_and_nvenc_modes_including_defaults() -> Result<(), DomainError> {
         let rtx = rtx_2060_hardware()?;
         let cpu_only = cpu_only_hardware()?;
-        let lossy = ImageCompression::Lossy {
+        let lossy = Some(ImageCompression::Lossy {
             quality: ImageQuality::DEFAULT,
-        };
+        });
 
         assert_eq!(
             ImageExecutionMode::resolve(
@@ -600,12 +669,25 @@ mod tests {
                 HardwareBackend::Cpu,
                 &cpu_only
             )?,
-            ImageExecutionMode::CpuWebp(lossy)
+            ImageExecutionMode::CpuWebp(ImageCompression::Lossy {
+                quality: ImageQuality::DEFAULT
+            })
+        );
+        assert_eq!(
+            ImageExecutionMode::resolve(
+                ImageOutputFormat::Webp,
+                None,
+                HardwareBackend::Cpu,
+                &cpu_only
+            )?,
+            ImageExecutionMode::CpuWebp(ImageCompression::Lossy {
+                quality: ImageQuality::DEFAULT
+            })
         );
         assert_eq!(
             ImageExecutionMode::resolve(
                 ImageOutputFormat::Jpeg,
-                lossy,
+                None,
                 HardwareBackend::Cpu,
                 &cpu_only
             )?,
@@ -615,8 +697,55 @@ mod tests {
         );
         assert_eq!(
             ImageExecutionMode::resolve(
+                ImageOutputFormat::Png,
+                None,
+                HardwareBackend::Cpu,
+                &cpu_only
+            )?,
+            ImageExecutionMode::CpuPng
+        );
+        assert_eq!(
+            ImageExecutionMode::resolve(
+                ImageOutputFormat::Png,
+                Some(ImageCompression::Lossless),
+                HardwareBackend::Cpu,
+                &cpu_only
+            )?,
+            ImageExecutionMode::CpuPng
+        );
+        assert_eq!(
+            ImageExecutionMode::resolve(
+                ImageOutputFormat::Bmp,
+                None,
+                HardwareBackend::Cpu,
+                &cpu_only
+            )?,
+            ImageExecutionMode::CpuBmp
+        );
+        assert_eq!(
+            ImageExecutionMode::resolve(
+                ImageOutputFormat::Qoi,
+                None,
+                HardwareBackend::Cpu,
+                &cpu_only
+            )?,
+            ImageExecutionMode::CpuQoi
+        );
+        assert_eq!(
+            ImageExecutionMode::resolve(
                 ImageOutputFormat::Heic,
                 lossy,
+                HardwareBackend::Gpu(GpuBackend::Nvenc),
+                &rtx
+            )?,
+            ImageExecutionMode::NvencHeic {
+                quality: ImageQuality::DEFAULT
+            }
+        );
+        assert_eq!(
+            ImageExecutionMode::resolve(
+                ImageOutputFormat::Heic,
+                None,
                 HardwareBackend::Gpu(GpuBackend::Nvenc),
                 &rtx
             )?,
@@ -631,9 +760,9 @@ mod tests {
     fn rejects_absent_decode_only_and_codec_mismatched_backends() -> Result<(), DomainError> {
         let rtx = rtx_2060_hardware()?;
         let cpu_only = cpu_only_hardware()?;
-        let lossy = ImageCompression::Lossy {
+        let lossy = Some(ImageCompression::Lossy {
             quality: ImageQuality::DEFAULT,
-        };
+        });
 
         let vulkan_webp_rtx = ImageExecutionMode::resolve(
             ImageOutputFormat::Webp,
@@ -728,16 +857,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_jpeg_modes_and_backends() -> Result<(), DomainError> {
+    fn rejects_unsupported_jpeg_and_lossless_format_modes_and_backends() -> Result<(), DomainError>
+    {
         let rtx = rtx_2060_hardware()?;
         let cpu_only = cpu_only_hardware()?;
-        let lossy = ImageCompression::Lossy {
+        let lossy = Some(ImageCompression::Lossy {
             quality: ImageQuality::DEFAULT,
-        };
+        });
 
         let jpeg_lossless = ImageExecutionMode::resolve(
             ImageOutputFormat::Jpeg,
-            ImageCompression::Lossless,
+            Some(ImageCompression::Lossless),
             HardwareBackend::Cpu,
             &cpu_only,
         );
@@ -779,6 +909,53 @@ mod tests {
                 ref reason,
             }) if reason.contains("JPEG") && reason.contains("--to heic")
         ));
+
+        for fmt in [
+            ImageOutputFormat::Png,
+            ImageOutputFormat::Bmp,
+            ImageOutputFormat::Qoi,
+        ] {
+            let quality_rejected =
+                ImageExecutionMode::resolve(fmt, lossy, HardwareBackend::Cpu, &cpu_only);
+            assert!(matches!(
+                quality_rejected,
+                Err(DomainError::UnsupportedImagePipeline {
+                    format,
+                    backend: HardwareBackend::Cpu,
+                    ref reason,
+                }) if format == fmt && reason.contains("--quality")
+            ));
+
+            let vulkan_rejected = ImageExecutionMode::resolve(
+                fmt,
+                None,
+                HardwareBackend::Gpu(GpuBackend::Vulkan),
+                &rtx,
+            );
+            assert!(matches!(
+                vulkan_rejected,
+                Err(DomainError::UnsupportedImagePipeline {
+                    format,
+                    backend: HardwareBackend::Gpu(GpuBackend::Vulkan),
+                    ref reason,
+                }) if format == fmt && reason.contains("only exposes compute")
+            ));
+
+            let nvenc_rejected = ImageExecutionMode::resolve(
+                fmt,
+                None,
+                HardwareBackend::Gpu(GpuBackend::Nvenc),
+                &rtx,
+            );
+            assert!(matches!(
+                nvenc_rejected,
+                Err(DomainError::UnsupportedImagePipeline {
+                    format,
+                    backend: HardwareBackend::Gpu(GpuBackend::Nvenc),
+                    ref reason,
+                }) if format == fmt && reason.contains("--to heic")
+            ));
+        }
         Ok(())
     }
 
@@ -787,34 +964,65 @@ mod tests {
         let dims = ImageDimensions::new(3840, 2160)?;
         assert_eq!(dims.to_string(), "3840x2160");
 
-        let items = vec![
+        assert!(matches!(
+            ImageBatchItem::new(
+                PathBuf::from("c.webp"),
+                PathBuf::from("c.webp"),
+                ImageInputFormat::Webp,
+                dims,
+            ),
+            Err(DomainError::IdenticalSourceAndTarget(_))
+        ));
+
+        let valid_items = vec![
             ImageBatchItem::new(
                 PathBuf::from("a.png"),
-                PathBuf::from("a.webp"),
+                PathBuf::from("out/a.webp"),
                 ImageInputFormat::Png,
                 dims,
             )?,
             ImageBatchItem::new(
                 PathBuf::from("b.jpg"),
-                PathBuf::from("b.webp"),
+                PathBuf::from("out/b.webp"),
                 ImageInputFormat::Jpeg,
+                dims,
+            )?,
+            ImageBatchItem::new(
+                PathBuf::from("c.webp"),
+                PathBuf::from("out/c.webp"),
+                ImageInputFormat::Webp,
+                dims,
+            )?,
+            ImageBatchItem::new(
+                PathBuf::from("d.bmp"),
+                PathBuf::from("out/d.webp"),
+                ImageInputFormat::Bmp,
+                dims,
+            )?,
+            ImageBatchItem::new(
+                PathBuf::from("e.qoi"),
+                PathBuf::from("out/e.webp"),
+                ImageInputFormat::Qoi,
                 dims,
             )?,
         ];
         let requested_workers = NonZeroUsize::new(8).ok_or(DomainError::EmptyBatch)?;
         let plan = ImageBatchPlan::new(
-            items,
+            valid_items,
             ImageExecutionMode::CpuWebp(ImageCompression::Lossy {
                 quality: ImageQuality::DEFAULT,
             }),
             requested_workers,
         )?;
 
-        assert_eq!(plan.items().len(), 2);
+        assert_eq!(plan.items().len(), 5);
         assert_eq!(plan.items()[0].input_format(), ImageInputFormat::Png);
         assert_eq!(plan.items()[1].input_format(), ImageInputFormat::Jpeg);
+        assert_eq!(plan.items()[2].input_format(), ImageInputFormat::Webp);
+        assert_eq!(plan.items()[3].input_format(), ImageInputFormat::Bmp);
+        assert_eq!(plan.items()[4].input_format(), ImageInputFormat::Qoi);
         assert_eq!(plan.worker_threads().get(), 8);
-        assert_eq!(plan.effective_workers().get(), 2);
+        assert_eq!(plan.effective_workers().get(), 5);
         assert_eq!(plan.output_format(), ImageOutputFormat::Webp);
         assert_eq!(plan.backend(), HardwareBackend::Cpu);
         Ok(())

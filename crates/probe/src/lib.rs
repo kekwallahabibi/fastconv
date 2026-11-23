@@ -63,7 +63,7 @@ impl fmt::Display for ProbeError {
             Self::EmptySourceDirectory(path) => {
                 write!(
                     f,
-                    "no PNG or JPEG images found in source directory: {}",
+                    "no supported images (PNG, JPEG, WebP, BMP, or QOI) found in source directory: {}",
                     path.display()
                 )
             }

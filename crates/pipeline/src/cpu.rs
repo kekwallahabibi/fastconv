@@ -1,6 +1,10 @@
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 
@@ -12,10 +16,15 @@ use jpeg_encoder::{ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder 
 use zenwebp::{EncodeRequest, LosslessConfig, LossyConfig, PixelLayout};
 
 use crate::PipelineError;
+use crate::bmp::encode_bmp_to_writer;
 use crate::decode::{
     DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat, decode_image_into,
     precreate_target_directories,
 };
+use crate::qoi::encode_qoi_into;
+
+const STREAM_IO_BUF_BYTES: usize = 512 * 1024;
+const PNG_IDAT_CHUNK_BYTES: usize = 256 * 1024;
 
 /// Concrete CPU execution backend entry point.
 ///
@@ -31,6 +40,164 @@ pub const fn execute(_plan: &ExecutionPlan) -> Result<(), PipelineError> {
 pub(crate) enum CpuImageEncoder {
     Webp(ImageCompression),
     Jpeg { quality: ImageQuality },
+    Png,
+    Bmp,
+    Qoi,
+}
+
+static STAGING_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct CountingWriter<W> {
+    inner: W,
+    bytes_written: u64,
+    first_error: Option<io::Error>,
+}
+
+impl<W> CountingWriter<W> {
+    const fn new(inner: W) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+            first_error: None,
+        }
+    }
+
+    fn record_error(&mut self, err: &io::Error) {
+        if self.first_error.is_none() {
+            self.first_error = Some(io::Error::new(err.kind(), err.to_string()));
+        }
+    }
+
+    fn take_error(&mut self) -> Option<io::Error> {
+        self.first_error.take()
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(ref err) = self.first_error {
+            return Err(io::Error::new(err.kind(), err.to_string()));
+        }
+        match self.inner.write(buf) {
+            Ok(0) if !buf.is_empty() => {
+                let err = io::Error::new(io::ErrorKind::WriteZero, "failed to write whole buffer");
+                self.record_error(&err);
+                Err(err)
+            }
+            Ok(written) => {
+                self.bytes_written = self
+                    .bytes_written
+                    .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+                Ok(written)
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => Err(err),
+            Err(err) => {
+                self.record_error(&err);
+                Err(err)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(ref err) = self.first_error {
+            return Err(io::Error::new(err.kind(), err.to_string()));
+        }
+        match self.inner.flush() {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => Err(err),
+            Err(err) => {
+                self.record_error(&err);
+                Err(err)
+            }
+        }
+    }
+}
+
+struct StagingFile {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl StagingFile {
+    fn create_for(target: &Path) -> Result<(Self, File), PipelineError> {
+        let parent = target
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let pid = process::id();
+        for _ in 0..64 {
+            let seq = STAGING_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let tmp_path = parent.join(format!(".fastconv-{pid}-{seq}.tmp"));
+            let mut open_opts = OpenOptions::new();
+            open_opts.write(true).create_new(true);
+            // Create staging files owner-only regardless of process umask so image data is never
+            // exposed during staging or after replacing a restrictive destination file.
+            #[cfg(unix)]
+            open_opts.mode(0o600);
+            match open_opts.open(&tmp_path) {
+                Ok(file) => {
+                    return Ok((
+                        Self {
+                            path: tmp_path,
+                            committed: false,
+                        },
+                        file,
+                    ));
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(source) => {
+                    return Err(PipelineError::Io {
+                        path: tmp_path,
+                        source,
+                    });
+                }
+            }
+        }
+        Err(PipelineError::Io {
+            path: target.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "failed to create unique temporary staging file",
+            ),
+        })
+    }
+
+    fn commit(mut self, target: &Path, file: File) -> Result<(), PipelineError> {
+        preserve_existing_permissions(&file, target)?;
+        drop(file);
+        fs::rename(&self.path, target).map_err(|source| PipelineError::Io {
+            path: target.to_path_buf(),
+            source,
+        })?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+fn preserve_existing_permissions(file: &File, target: &Path) -> Result<(), PipelineError> {
+    match fs::symlink_metadata(target) {
+        Ok(meta) if meta.file_type().is_file() => {
+            file.set_permissions(meta.permissions())
+                .map_err(|source| PipelineError::Io {
+                    path: target.to_path_buf(),
+                    source,
+                })
+        }
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(PipelineError::Io {
+            path: target.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+impl Drop for StagingFile {
+    fn drop(&mut self) {
+        if !self.committed && fs::remove_file(&self.path).is_err() {
+            // Best-effort cleanup of the staging file when encoding or rename failed.
+        }
+    }
 }
 
 struct WorkerScratch {
@@ -181,36 +348,163 @@ fn convert_single_item(
                 reason: "decoded image frame exceeded allocated pixel buffer".to_owned(),
             })?;
 
-    scratch.encoded_buf.clear();
-    match encoder {
-        CpuImageEncoder::Webp(compression) => encode_webp_into(
-            item.target(),
-            compression,
-            pixels,
-            decoded,
-            &mut scratch.encoded_buf,
-        )?,
-        CpuImageEncoder::Jpeg { quality } => encode_jpeg_into(
-            item,
-            quality,
-            pixels,
-            decoded,
-            &mut scratch.aux_buf,
-            &mut scratch.encoded_buf,
-        )?,
-    }
+    let output_bytes = match encoder {
+        CpuImageEncoder::Webp(compression) => {
+            scratch.encoded_buf.clear();
+            encode_webp_into(
+                item.target(),
+                compression,
+                pixels,
+                decoded,
+                &mut scratch.encoded_buf,
+            )?;
+            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
+        }
+        CpuImageEncoder::Jpeg { quality } => {
+            scratch.encoded_buf.clear();
+            encode_jpeg_into(
+                item,
+                quality,
+                pixels,
+                decoded,
+                &mut scratch.aux_buf,
+                &mut scratch.encoded_buf,
+            )?;
+            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
+        }
+        CpuImageEncoder::Qoi => {
+            scratch.encoded_buf.clear();
+            encode_qoi_into(item.target(), pixels, decoded, &mut scratch.encoded_buf)?;
+            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
+        }
+        CpuImageEncoder::Png => encode_png_streaming(item.target(), pixels, decoded)?,
+        CpuImageEncoder::Bmp => {
+            encode_bmp_streaming(item.target(), pixels, decoded, &mut scratch.aux_buf)?
+        }
+    };
 
-    if scratch.encoded_buf.is_empty() {
-        return Err(PipelineError::EmptyOutput(item.target().to_path_buf()));
-    }
+    Ok((decoded.input_file_bytes, output_bytes))
+}
 
-    fs::write(item.target(), &scratch.encoded_buf).map_err(|source| PipelineError::Io {
-        path: item.target().to_path_buf(),
+fn write_encoded_buffer(target: &Path, encoded_buf: &[u8]) -> Result<u64, PipelineError> {
+    if encoded_buf.is_empty() {
+        return Err(PipelineError::EmptyOutput(target.to_path_buf()));
+    }
+    fs::write(target, encoded_buf).map_err(|source| PipelineError::Io {
+        path: target.to_path_buf(),
         source,
     })?;
+    Ok(u64::try_from(encoded_buf.len()).unwrap_or(u64::MAX))
+}
 
-    let output_bytes = u64::try_from(scratch.encoded_buf.len()).unwrap_or(u64::MAX);
-    Ok((decoded.input_file_bytes, output_bytes))
+fn encode_png_to_writer<W: Write>(
+    target: &Path,
+    pixels: &[u8],
+    decoded: DecodedFrameMeta,
+    sink: W,
+) -> Result<u64, PipelineError> {
+    let mut writer = CountingWriter::new(sink);
+
+    let write_res = (|| -> Result<(), PipelineError> {
+        let mut encoder = png::Encoder::new(&mut writer, decoded.width, decoded.height);
+        encoder.set_color(match decoded.format {
+            DecodedPixelFormat::L8 => png::ColorType::Grayscale,
+            DecodedPixelFormat::La8 => png::ColorType::GrayscaleAlpha,
+            DecodedPixelFormat::Rgb8 => png::ColorType::Rgb,
+            DecodedPixelFormat::Rgba8 => png::ColorType::Rgba,
+        });
+        encoder.set_depth(png::BitDepth::Eight);
+        // `Compression::Fastest` selects `fdeflate` + `Filter::Up` for high CPU throughput
+        // while keeping PNG file sizes well compressed and avoiding full-frame zlib buffering.
+        encoder.set_compression(png::Compression::Fastest);
+
+        let mut png_writer = encoder
+            .write_header()
+            .map_err(|err| PipelineError::EncodeFailed {
+                path: target.to_path_buf(),
+                reason: err.to_string(),
+            })?;
+        {
+            let mut stream = png_writer
+                .stream_writer_with_size(PNG_IDAT_CHUNK_BYTES)
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: target.to_path_buf(),
+                    reason: err.to_string(),
+                })?;
+            stream
+                .write_all(pixels)
+                .map_err(|source| PipelineError::Io {
+                    path: target.to_path_buf(),
+                    source,
+                })?;
+            // In `png` 0.18 `Fastest`, `StreamWriter::finish()` drops the final `ChunkWriter`
+            // whose `Drop` ignores flush errors; `CountingWriter` latches any sink error so it
+            // cannot be lost across finalization.
+            stream.finish().map_err(|err| PipelineError::EncodeFailed {
+                path: target.to_path_buf(),
+                reason: err.to_string(),
+            })?;
+        }
+        png_writer
+            .finish()
+            .map_err(|err| PipelineError::EncodeFailed {
+                path: target.to_path_buf(),
+                reason: err.to_string(),
+            })?;
+        writer.flush().map_err(|source| PipelineError::Io {
+            path: target.to_path_buf(),
+            source,
+        })
+    })();
+
+    if let Some(source) = writer.take_error() {
+        return Err(PipelineError::Io {
+            path: target.to_path_buf(),
+            source,
+        });
+    }
+    write_res?;
+
+    if writer.bytes_written == 0 {
+        return Err(PipelineError::EmptyOutput(target.to_path_buf()));
+    }
+    Ok(writer.bytes_written)
+}
+
+fn encode_png_streaming(
+    target: &Path,
+    pixels: &[u8],
+    decoded: DecodedFrameMeta,
+) -> Result<u64, PipelineError> {
+    let (staging, file) = StagingFile::create_for(target)?;
+    let mut buf_writer = BufWriter::with_capacity(STREAM_IO_BUF_BYTES, file);
+    let bytes = encode_png_to_writer(target, pixels, decoded, &mut buf_writer)?;
+    let file = buf_writer.into_inner().map_err(|err| PipelineError::Io {
+        path: target.to_path_buf(),
+        source: err.into_error(),
+    })?;
+    staging.commit(target, file)?;
+    Ok(bytes)
+}
+
+fn encode_bmp_streaming(
+    target: &Path,
+    pixels: &[u8],
+    decoded: DecodedFrameMeta,
+    batch_scratch: &mut Vec<u8>,
+) -> Result<u64, PipelineError> {
+    let (staging, mut file) = StagingFile::create_for(target)?;
+    let bytes = encode_bmp_to_writer(target, pixels, decoded, batch_scratch, &mut file)?;
+    if bytes == 0 {
+        drop(file);
+        return Err(PipelineError::EmptyOutput(target.to_path_buf()));
+    }
+    file.flush().map_err(|source| PipelineError::Io {
+        path: target.to_path_buf(),
+        source,
+    })?;
+    staging.commit(target, file)?;
+    Ok(bytes)
 }
 
 fn encode_webp_into(
@@ -323,4 +617,190 @@ fn encode_jpeg_into(
             path: target.to_path_buf(),
             reason: err.to_string(),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{encode_bmp_streaming, encode_png_streaming, encode_png_to_writer};
+    use crate::PipelineError;
+    use crate::decode::{DecodedFrameMeta, DecodedPixelFormat};
+    use std::env;
+    use std::fs;
+    use std::io::{self, Write};
+    use std::path::Path;
+    use std::process;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CPU_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct FailOnceAfterIdatHeader {
+        saw_idat_header: bool,
+        failed_once: bool,
+        written: Vec<u8>,
+    }
+
+    impl FailOnceAfterIdatHeader {
+        const fn new() -> Self {
+            Self {
+                saw_idat_header: false,
+                failed_once: false,
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for FailOnceAfterIdatHeader {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.saw_idat_header && !self.failed_once {
+                self.failed_once = true;
+                return Err(io::Error::other(
+                    "injected transient final IDAT write error",
+                ));
+            }
+            if buf == b"IDAT" {
+                self.saw_idat_header = true;
+            }
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ZeroWriteOnceAfterIdat {
+        saw_idat: bool,
+        returned_zero: bool,
+    }
+
+    impl Write for ZeroWriteOnceAfterIdat {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.saw_idat && !self.returned_zero && !buf.is_empty() {
+                self.returned_zero = true;
+                return Ok(0);
+            }
+            if buf == b"IDAT" {
+                self.saw_idat = true;
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn png_encode_propagates_transient_final_idat_write_error() {
+        let pixels = vec![42_u8; 16 * 16 * 3];
+        let meta = DecodedFrameMeta {
+            width: 16,
+            height: 16,
+            format: DecodedPixelFormat::Rgb8,
+            byte_len: pixels.len(),
+            input_file_bytes: 1,
+        };
+        let mut sink = FailOnceAfterIdatHeader::new();
+        let res = encode_png_to_writer(Path::new("fault.png"), &pixels, meta, &mut sink);
+        assert!(sink.failed_once, "fault injector should have failed IDAT");
+        assert!(matches!(res, Err(PipelineError::Io { .. })));
+
+        // Also verify Ok(0) on a non-empty buffer during final IDAT is latched as WriteZero.
+        let mut zero_sink = ZeroWriteOnceAfterIdat {
+            saw_idat: false,
+            returned_zero: false,
+        };
+        let zero_res = encode_png_to_writer(Path::new("zero.png"), &pixels, meta, &mut zero_sink);
+        assert!(zero_sink.returned_zero);
+        assert!(matches!(
+            zero_res,
+            Err(PipelineError::Io { ref source, .. }) if source.kind() == io::ErrorKind::WriteZero
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_png_and_bmp_outputs_do_not_widen_private_permissions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let id = CPU_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = env::temp_dir().join(format!("fastconv-cpu-perms-{}-{id}", process::id()));
+        fs::create_dir_all(&dir)?;
+
+        let pixels = vec![99_u8; 8 * 8 * 3];
+        let meta = DecodedFrameMeta {
+            width: 8,
+            height: 8,
+            format: DecodedPixelFormat::Rgb8,
+            byte_len: pixels.len(),
+            input_file_bytes: 1,
+        };
+
+        let png_target = dir.join("private.png");
+        let bmp_target = dir.join("private.bmp");
+        fs::write(&png_target, b"old")?;
+        fs::write(&bmp_target, b"old")?;
+        fs::set_permissions(&png_target, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(&bmp_target, fs::Permissions::from_mode(0o600))?;
+
+        encode_png_streaming(&png_target, &pixels, meta)?;
+        let mut scratch = Vec::new();
+        encode_bmp_streaming(&bmp_target, &pixels, meta, &mut scratch)?;
+
+        assert_eq!(
+            fs::metadata(&png_target)?.permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&bmp_target)?.permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_png_and_bmp_streaming_preserves_existing_destination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let id = CPU_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = env::temp_dir().join(format!("fastconv-cpu-atomic-{}-{id}", process::id()));
+        fs::create_dir_all(&dir)?;
+
+        let sentinel = b"existing-destination-must-survive";
+        let png_target = dir.join("out.png");
+        let bmp_target = dir.join("out.bmp");
+        fs::write(&png_target, sentinel)?;
+        fs::write(&bmp_target, sentinel)?;
+
+        // Truncated pixel slice triggers encode error during streaming.
+        let bad_pixels = vec![0_u8; 3];
+        let meta = DecodedFrameMeta {
+            width: 16,
+            height: 16,
+            format: DecodedPixelFormat::Rgb8,
+            byte_len: bad_pixels.len(),
+            input_file_bytes: 1,
+        };
+        assert!(encode_png_streaming(&png_target, &bad_pixels, meta).is_err());
+        let mut scratch = Vec::new();
+        assert!(encode_bmp_streaming(&bmp_target, &bad_pixels, meta, &mut scratch).is_err());
+
+        assert_eq!(fs::read(&png_target)?, sentinel);
+        assert_eq!(fs::read(&bmp_target)?, sentinel);
+
+        let leftover_tmps: Vec<_> = fs::read_dir(&dir)?
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftover_tmps.is_empty(),
+            "expected no leftover staging files: {leftover_tmps:?}"
+        );
+
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
 }

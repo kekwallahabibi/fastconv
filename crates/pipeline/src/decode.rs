@@ -9,6 +9,8 @@ use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
 
 use crate::PipelineError;
+use crate::bmp::decode_bmp_slice_into;
+use crate::qoi::decode_qoi_slice_into;
 
 /// Decoded 8-bit pixel format supported across CPU and GPU image pipelines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +58,7 @@ pub(crate) fn precreate_target_directories(items: &[ImageBatchItem]) -> Result<(
     Ok(())
 }
 
-/// Reads and decodes a validated PNG or JPEG item into `pixel_buf`, reusing `file_bytes`.
+/// Reads and decodes a validated still-image item into `pixel_buf`, reusing `file_bytes`.
 pub(crate) fn decode_image_into(
     item: &ImageBatchItem,
     hint: DecodeTargetHint,
@@ -86,7 +88,93 @@ pub(crate) fn decode_image_into(
             input_file_bytes,
             pixel_buf,
         ),
+        ImageInputFormat::Webp => {
+            decode_webp_slice_into(item, file_bytes.as_slice(), input_file_bytes, pixel_buf)
+        }
+        ImageInputFormat::Bmp => {
+            let (width, height, format, byte_len) =
+                decode_bmp_slice_into(item.source(), file_bytes.as_slice(), hint, pixel_buf)?;
+            verify_decoded_dimensions(item, width, height)?;
+            Ok(DecodedFrameMeta {
+                width,
+                height,
+                format,
+                byte_len,
+                input_file_bytes,
+            })
+        }
+        ImageInputFormat::Qoi => {
+            let (width, height, format, byte_len) =
+                decode_qoi_slice_into(item.source(), file_bytes.as_slice(), hint, pixel_buf)?;
+            verify_decoded_dimensions(item, width, height)?;
+            Ok(DecodedFrameMeta {
+                width,
+                height,
+                format,
+                byte_len,
+                input_file_bytes,
+            })
+        }
     }
+}
+
+fn decode_webp_slice_into(
+    item: &ImageBatchItem,
+    file_bytes: &[u8],
+    input_file_bytes: u64,
+    pixel_buf: &mut Vec<u8>,
+) -> Result<DecodedFrameMeta, PipelineError> {
+    let mut decoder =
+        zenwebp::WebPDecoder::build(file_bytes).map_err(|err| PipelineError::DecodeFailed {
+            path: item.source().to_path_buf(),
+            reason: err.to_string(),
+        })?;
+    if decoder.is_animated() {
+        return Err(PipelineError::DecodeFailed {
+            path: item.source().to_path_buf(),
+            reason: "animated WebP is not supported by the still-image pipeline".to_owned(),
+        });
+    }
+
+    let (width, height) = decoder.dimensions();
+    verify_decoded_dimensions(item, width, height)?;
+
+    let required_len = decoder
+        .output_buffer_size()
+        .ok_or_else(|| PipelineError::DecodeFailed {
+            path: item.source().to_path_buf(),
+            reason: "decoded WebP buffer size exceeds addressable memory".to_owned(),
+        })?;
+    if pixel_buf.len() < required_len {
+        pixel_buf.resize(required_len, 0);
+    }
+
+    let dst = pixel_buf
+        .get_mut(..required_len)
+        .ok_or_else(|| PipelineError::DecodeFailed {
+            path: item.source().to_path_buf(),
+            reason: "decoded WebP buffer slice out of bounds".to_owned(),
+        })?;
+    decoder
+        .read_image(dst)
+        .map_err(|err| PipelineError::DecodeFailed {
+            path: item.source().to_path_buf(),
+            reason: err.to_string(),
+        })?;
+
+    let format = if decoder.has_alpha() {
+        DecodedPixelFormat::Rgba8
+    } else {
+        DecodedPixelFormat::Rgb8
+    };
+
+    Ok(DecodedFrameMeta {
+        width,
+        height,
+        format,
+        byte_len: required_len,
+        input_file_bytes,
+    })
 }
 
 fn verify_decoded_dimensions(

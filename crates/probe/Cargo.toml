@@ -12,6 +12,7 @@ zune-jpeg.workspace = true
 
 [dev-dependencies]
 jpeg-encoder.workspace = true
+zenwebp.workspace = true
 
 [lints]
 workspace = true
