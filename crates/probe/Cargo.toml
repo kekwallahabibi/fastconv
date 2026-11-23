@@ -8,6 +8,10 @@ fastconv-domain.workspace = true
 png.workspace = true
 pollster.workspace = true
 wgpu.workspace = true
+zune-jpeg.workspace = true
+
+[dev-dependencies]
+jpeg-encoder.workspace = true
 
 [lints]
 workspace = true

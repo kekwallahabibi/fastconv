@@ -6,10 +6,12 @@ edition.workspace = true
 [dependencies]
 fastconv-domain.workspace = true
 fastconv-probe.workspace = true
+jpeg-encoder.workspace = true
 png.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 zenwebp.workspace = true
+zune-jpeg.workspace = true
 
 [lints]
 workspace = true

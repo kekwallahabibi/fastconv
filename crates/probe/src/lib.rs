@@ -2,7 +2,7 @@ pub mod hardware;
 pub mod image;
 
 pub use hardware::detect_host_hardware;
-pub use image::{prepare_image_batch, probe_png_dimensions};
+pub use image::{ProbedImage, prepare_image_batch, probe_image};
 
 use std::error::Error;
 use std::fmt;
@@ -63,12 +63,12 @@ impl fmt::Display for ProbeError {
             Self::EmptySourceDirectory(path) => {
                 write!(
                     f,
-                    "no PNG files found in source directory: {}",
+                    "no PNG or JPEG images found in source directory: {}",
                     path.display()
                 )
             }
             Self::InvalidImage { path, reason } => {
-                write!(f, "invalid PNG image '{}': {reason}", path.display())
+                write!(f, "invalid image '{}': {reason}", path.display())
             }
             Self::UnsupportedTargetFormat { path, expected } => {
                 write!(

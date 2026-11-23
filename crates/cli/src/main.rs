@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use fastconv_domain::{GpuBackend, HardwareBackend, ImageOutputFormat, ImageQuality, WebpEncoding};
+use fastconv_domain::{
+    GpuBackend, HardwareBackend, ImageCompression, ImageOutputFormat, ImageQuality,
+};
 
 fn print_usage() {
     println!("fastconv {}", env!("CARGO_PKG_VERSION"));
@@ -12,7 +14,7 @@ fn print_usage() {
     println!("Usage:");
     println!("  fastconv probe");
     println!(
-        "  fastconv convert <source> <target> [--quality <0..=100> | --lossless] [--format <webp|heic>] [--threads <N>] [--backend <cpu|nvenc|vaapi|qsv|amf|videotoolbox|vulkan>]"
+        "  fastconv convert <source> <target> [--quality <0..=100> | --lossless] [--to <webp|heic|jpeg>] [--threads <N>] [--backend <cpu|nvenc|vaapi|qsv|amf|videotoolbox|vulkan>]"
     );
     println!("  fastconv --version");
     println!("  fastconv --help");
@@ -22,8 +24,8 @@ fn print_usage() {
 struct ConvertArgs {
     source: PathBuf,
     target: PathBuf,
-    encoding: WebpEncoding,
-    format: Option<ImageOutputFormat>,
+    compression: ImageCompression,
+    to: Option<ImageOutputFormat>,
     threads: Option<NonZeroUsize>,
     backend: HardwareBackend,
 }
@@ -49,11 +51,14 @@ fn parse_backend(value: &str) -> Result<HardwareBackend, String> {
     }
 }
 
-fn parse_format(value: &str) -> Result<ImageOutputFormat, String> {
+fn parse_target_format(value: &str) -> Result<ImageOutputFormat, String> {
     match value {
         "webp" => Ok(ImageOutputFormat::Webp),
         "heic" => Ok(ImageOutputFormat::Heic),
-        other => Err(format!("unknown format '{other}' (expected webp or heic)")),
+        "jpeg" | "jpg" => Ok(ImageOutputFormat::Jpeg),
+        other => Err(format!(
+            "unknown format '{other}' (expected webp, heic, or jpeg)"
+        )),
     }
 }
 
@@ -61,7 +66,7 @@ fn parse_convert_args(args: &[&str]) -> Result<ConvertCommand, String> {
     let mut positional: Vec<&str> = Vec::new();
     let mut quality_arg: Option<ImageQuality> = None;
     let mut lossless = false;
-    let mut format: Option<ImageOutputFormat> = None;
+    let mut to: Option<ImageOutputFormat> = None;
     let mut threads: Option<NonZeroUsize> = None;
     let mut backend: Option<HardwareBackend> = None;
 
@@ -96,15 +101,15 @@ fn parse_convert_args(args: &[&str]) -> Result<ConvertCommand, String> {
                 quality_arg = Some(ImageQuality::new(parsed).map_err(|err| err.to_string())?);
                 i += 2;
             }
-            "--format" => {
-                if format.is_some() {
-                    return Err("duplicate flag '--format'".to_owned());
+            "--to" => {
+                if to.is_some() {
+                    return Err("duplicate flag '--to'".to_owned());
                 }
                 let raw = args
                     .get(i + 1)
                     .copied()
-                    .ok_or_else(|| "missing value for --format".to_owned())?;
-                format = Some(parse_format(raw)?);
+                    .ok_or_else(|| "missing value for --to".to_owned())?;
+                to = Some(parse_target_format(raw)?);
                 i += 2;
             }
             "--threads" => {
@@ -146,10 +151,10 @@ fn parse_convert_args(args: &[&str]) -> Result<ConvertCommand, String> {
         return Err("expected `fastconv convert <source> <target> [options]`".to_owned());
     };
 
-    let encoding = if lossless {
-        WebpEncoding::Lossless
+    let compression = if lossless {
+        ImageCompression::Lossless
     } else {
-        WebpEncoding::Lossy {
+        ImageCompression::Lossy {
             quality: quality_arg.unwrap_or(ImageQuality::DEFAULT),
         }
     };
@@ -157,8 +162,8 @@ fn parse_convert_args(args: &[&str]) -> Result<ConvertCommand, String> {
     Ok(ConvertCommand::Run(ConvertArgs {
         source: PathBuf::from(source),
         target: PathBuf::from(target),
-        encoding,
-        format,
+        compression,
+        to,
         threads,
         backend: backend.unwrap_or(HardwareBackend::Cpu),
     }))
@@ -221,8 +226,8 @@ fn run_convert(args: &ConvertArgs) -> Result<(), String> {
     let plan = fastconv_probe::prepare_image_batch(
         &args.source,
         &args.target,
-        args.encoding,
-        args.format,
+        args.compression,
+        args.to,
         args.threads,
         args.backend,
     )
@@ -315,7 +320,7 @@ fn main() -> ExitCode {
 mod tests {
     use super::{ConvertArgs, ConvertCommand, parse_convert_args};
     use fastconv_domain::{
-        GpuBackend, HardwareBackend, ImageOutputFormat, ImageQuality, WebpEncoding,
+        GpuBackend, HardwareBackend, ImageCompression, ImageOutputFormat, ImageQuality,
     };
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
@@ -331,10 +336,10 @@ mod tests {
             ConvertCommand::Run(ConvertArgs {
                 source: PathBuf::from("in.png"),
                 target: PathBuf::from("out.webp"),
-                encoding: WebpEncoding::Lossy {
+                compression: ImageCompression::Lossy {
                     quality: ImageQuality::DEFAULT
                 },
-                format: None,
+                to: None,
                 threads: None,
                 backend: HardwareBackend::Cpu,
             })
@@ -345,7 +350,7 @@ mod tests {
             "out_dir",
             "--quality",
             "85",
-            "--format",
+            "--to",
             "heic",
             "--threads",
             "4",
@@ -356,14 +361,28 @@ mod tests {
             return Err("expected ConvertCommand::Run".to_owned());
         };
         assert_eq!(
-            flagged.encoding,
-            WebpEncoding::Lossy {
+            flagged.compression,
+            ImageCompression::Lossy {
                 quality: ImageQuality::new(85).map_err(|err| err.to_string())?
             }
         );
-        assert_eq!(flagged.format, Some(ImageOutputFormat::Heic));
+        assert_eq!(flagged.to, Some(ImageOutputFormat::Heic));
         assert_eq!(flagged.threads, NonZeroUsize::new(4));
         assert_eq!(flagged.backend, HardwareBackend::Gpu(GpuBackend::Nvenc));
+
+        let ConvertCommand::Run(to_jpeg) =
+            parse_convert_args(&["src_dir", "out_dir", "--to", "jpeg"])?
+        else {
+            return Err("expected ConvertCommand::Run".to_owned());
+        };
+        assert_eq!(to_jpeg.to, Some(ImageOutputFormat::Jpeg));
+
+        let ConvertCommand::Run(jpeg_alias) =
+            parse_convert_args(&["src_dir", "out_dir", "--to", "jpg"])?
+        else {
+            return Err("expected ConvertCommand::Run".to_owned());
+        };
+        assert_eq!(jpeg_alias.to, Some(ImageOutputFormat::Jpeg));
 
         let ConvertCommand::Run(vulkan_webp) =
             parse_convert_args(&["a.png", "b.webp", "--backend", "vulkan"])?
@@ -385,11 +404,9 @@ mod tests {
             parse_convert_args(&["a.png", "b.webp", "--quality", "80", "--quality", "90"]).is_err()
         );
         assert!(parse_convert_args(&["a.png", "b.webp", "--lossless", "--lossless"]).is_err());
-        assert!(
-            parse_convert_args(&["a.png", "b.webp", "--format", "webp", "--format", "heic"])
-                .is_err()
-        );
-        assert!(parse_convert_args(&["a.png", "b.webp", "--format", "avif"]).is_err());
+        assert!(parse_convert_args(&["a.png", "b.webp", "--to", "webp", "--to", "heic"]).is_err());
+        assert!(parse_convert_args(&["a.png", "b.webp", "--to", "avif"]).is_err());
+        assert!(parse_convert_args(&["a.png", "b.webp", "--format", "webp"]).is_err());
         assert!(
             parse_convert_args(&["a.png", "b.webp", "--threads", "2", "--threads", "4"]).is_err()
         );

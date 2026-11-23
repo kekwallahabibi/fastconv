@@ -11,7 +11,7 @@ mod enabled {
     use cudarc::driver::CudaContext;
     use fastconv_domain::{
         GpuBackend, HardwareBackend, ImageBatchItem, ImageBatchPlan, ImageConversionReport,
-        ImageQuality,
+        ImageInputFormat, ImageQuality,
     };
     use nvidia_video_codec_sdk::{
         Bitstream, Buffer, EncodePictureParams, Encoder, EncoderInitParams, EncoderInput, Session,
@@ -23,8 +23,11 @@ mod enabled {
     };
 
     use crate::PipelineError;
+    use crate::decode::{
+        DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat, decode_image_into,
+        precreate_target_directories,
+    };
     use crate::gpu::heic::{HeicColorInfo, mux_annex_b_hevc_to_heic};
-    use crate::png_decode::{DecodedPixelFormat, decode_png_into, precreate_target_directories};
 
     const DECODE_QUEUE_CAPACITY: usize = 2;
 
@@ -512,13 +515,48 @@ mod enabled {
         pixel_buf: &mut Vec<u8>,
         mut rgba_bytes: Vec<u8>,
     ) -> Result<DecodedRgbaFrame, PipelineError> {
-        let decoded = decode_png_into(item, file_bytes, pixel_buf)?;
+        match item.input_format() {
+            ImageInputFormat::Jpeg => {
+                let decoded = decode_image_into(
+                    item,
+                    DecodeTargetHint::OpaqueRgba8,
+                    file_bytes,
+                    &mut rgba_bytes,
+                )?;
+                if decoded.format == DecodedPixelFormat::Rgba8 {
+                    rgba_bytes.truncate(decoded.byte_len);
+                    return Ok(DecodedRgbaFrame {
+                        item_index,
+                        width: decoded.width,
+                        height: decoded.height,
+                        rgba_bytes,
+                        input_file_bytes: decoded.input_file_bytes,
+                    });
+                }
+                std::mem::swap(pixel_buf, &mut rgba_bytes);
+                finish_rgba_expansion(item_index, item, decoded, pixel_buf, rgba_bytes)
+            }
+            ImageInputFormat::Png => {
+                let decoded =
+                    decode_image_into(item, DecodeTargetHint::Native, file_bytes, pixel_buf)?;
+                finish_rgba_expansion(item_index, item, decoded, pixel_buf, rgba_bytes)
+            }
+        }
+    }
+
+    fn finish_rgba_expansion(
+        item_index: usize,
+        item: &ImageBatchItem,
+        decoded: DecodedFrameMeta,
+        pixel_buf: &[u8],
+        mut rgba_bytes: Vec<u8>,
+    ) -> Result<DecodedRgbaFrame, PipelineError> {
         let pixels =
             pixel_buf
                 .get(..decoded.byte_len)
                 .ok_or_else(|| PipelineError::DecodeFailed {
                     path: item.source().to_path_buf(),
-                    reason: "decoded PNG frame exceeded allocated pixel buffer".to_owned(),
+                    reason: "decoded frame exceeded allocated pixel buffer".to_owned(),
                 })?;
 
         let pixel_count = usize::try_from(decoded.width)
@@ -573,7 +611,7 @@ mod enabled {
             return Err(PipelineError::DecodeFailed {
                 path: source.to_path_buf(),
                 reason: format!(
-                    "decoded PNG pixel byte count {} does not match expected {expected_src_len}",
+                    "decoded image pixel byte count {} does not match expected {expected_src_len}",
                     pixels.len()
                 ),
             });

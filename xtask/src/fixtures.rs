@@ -6,6 +6,10 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
+use jpeg_encoder::{
+    ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor,
+};
+
 pub const IMAGE_BATCH_COUNT: usize = 20;
 pub const IMAGE_WIDTH: u32 = 3840;
 pub const IMAGE_HEIGHT: u32 = 2160;
@@ -29,6 +33,16 @@ pub fn image_path(root: &Path, index: usize) -> PathBuf {
 }
 
 #[must_use]
+pub fn jpeg_images_dir(root: &Path) -> PathBuf {
+    root.join("fixtures/images_4k_jpeg")
+}
+
+#[must_use]
+pub fn jpeg_image_path(root: &Path, index: usize) -> PathBuf {
+    jpeg_images_dir(root).join(format!("img_{index:02}.jpg"))
+}
+
+#[must_use]
 pub fn audio_wav_path(root: &Path) -> PathBuf {
     root.join("fixtures/audio_60s_stereo.wav")
 }
@@ -40,12 +54,14 @@ pub fn video_mp4_path(root: &Path) -> PathBuf {
 
 pub fn generate_all(root: &Path, force: bool) -> Result<(), String> {
     generate_image_batch(root, force)?;
+    generate_jpeg_batch(root, force)?;
     generate_audio_wav(root, force)?;
     generate_video_mp4(root, force)?;
     Ok(())
 }
 
-fn is_non_empty_file(path: &Path) -> bool {
+#[must_use]
+pub fn is_non_empty_file(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
 }
 
@@ -63,12 +79,37 @@ fn generate_image_batch(root: &Path, force: bool) -> Result<(), String> {
         return Ok(());
     }
 
+    run_parallel_4k_generation("PNG", |index| write_single_4k_png(root, index))
+}
+
+fn generate_jpeg_batch(root: &Path, force: bool) -> Result<(), String> {
+    let dir = jpeg_images_dir(root);
+    fs::create_dir_all(&dir)
+        .map_err(|err| format!("failed to create '{}': {err}", dir.display()))?;
+
+    let all_present =
+        (1..=IMAGE_BATCH_COUNT).all(|idx| is_non_empty_file(&jpeg_image_path(root, idx)));
+    if all_present && !force {
+        println!(
+            "==> skip 4K JPEG batch ({IMAGE_BATCH_COUNT} files already exist in {})",
+            dir.display()
+        );
+        return Ok(());
+    }
+
+    run_parallel_4k_generation("JPEG", |index| write_single_4k_jpeg(root, index))
+}
+
+fn run_parallel_4k_generation<F>(label: &str, generate_one: F) -> Result<(), String>
+where
+    F: Fn(usize) -> Result<(), String> + Sync,
+{
     let workers = thread::available_parallelism()
         .map_or(4, NonZeroUsize::get)
         .min(IMAGE_BATCH_COUNT);
 
     println!(
-        "==> generating {IMAGE_BATCH_COUNT}x {IMAGE_WIDTH}x{IMAGE_HEIGHT} PNG fixtures using {workers} threads..."
+        "==> generating {IMAGE_BATCH_COUNT}x {IMAGE_WIDTH}x{IMAGE_HEIGHT} {label} fixtures using {workers} threads..."
     );
 
     let next_index = AtomicUsize::new(1);
@@ -81,7 +122,7 @@ fn generate_image_batch(root: &Path, force: bool) -> Result<(), String> {
                     if index > IMAGE_BATCH_COUNT {
                         break;
                     }
-                    write_single_4k_png(root, index)?;
+                    generate_one(index)?;
                 }
                 Ok(())
             }));
@@ -92,7 +133,7 @@ fn generate_image_batch(root: &Path, force: bool) -> Result<(), String> {
             .map(|handle| {
                 handle
                     .join()
-                    .unwrap_or_else(|_| Err("PNG generator worker thread panicked".to_owned()))
+                    .unwrap_or_else(|_| Err(format!("{label} generator worker thread panicked")))
             })
             .collect()
     });
@@ -101,14 +142,11 @@ fn generate_image_batch(root: &Path, force: bool) -> Result<(), String> {
         result?;
     }
 
-    println!("==> generated {IMAGE_BATCH_COUNT} 4K PNG fixtures");
+    println!("==> generated {IMAGE_BATCH_COUNT} 4K {label} fixtures");
     Ok(())
 }
 
-fn write_single_4k_png(root: &Path, index: usize) -> Result<(), String> {
-    let target = image_path(root, index);
-    let tmp = images_dir(root).join(format!(".img_{index:02}.png.tmp"));
-
+fn generate_4k_rgb_frame(index: usize) -> Result<Vec<u8>, String> {
     let width = usize::try_from(IMAGE_WIDTH).map_err(|err| err.to_string())?;
     let height = usize::try_from(IMAGE_HEIGHT).map_err(|err| err.to_string())?;
     let row_bytes = width * 3;
@@ -139,6 +177,14 @@ fn write_single_4k_png(root: &Path, index: usize) -> Result<(), String> {
         }
     }
 
+    Ok(rgb)
+}
+
+fn write_single_4k_png(root: &Path, index: usize) -> Result<(), String> {
+    let target = image_path(root, index);
+    let tmp = images_dir(root).join(format!(".img_{index:02}.png.tmp"));
+    let rgb = generate_4k_rgb_frame(index)?;
+
     {
         let file = File::create(&tmp)
             .map_err(|err| format!("failed to create '{}': {err}", tmp.display()))?;
@@ -159,6 +205,39 @@ fn write_single_4k_png(root: &Path, index: usize) -> Result<(), String> {
     fs::rename(&tmp, &target).map_err(|err| {
         format!(
             "failed to finalize PNG '{}' -> '{}': {err}",
+            tmp.display(),
+            target.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn write_single_4k_jpeg(root: &Path, index: usize) -> Result<(), String> {
+    let target = jpeg_image_path(root, index);
+    let tmp = jpeg_images_dir(root).join(format!(".img_{index:02}.jpg.tmp"));
+    let rgb = generate_4k_rgb_frame(index)?;
+    let width = u16::try_from(IMAGE_WIDTH).map_err(|err| err.to_string())?;
+    let height = u16::try_from(IMAGE_HEIGHT).map_err(|err| err.to_string())?;
+
+    {
+        let file = File::create(&tmp)
+            .map_err(|err| format!("failed to create '{}': {err}", tmp.display()))?;
+        let mut writer = BufWriter::with_capacity(256 * 1024, file);
+        let mut encoder = JpegEncoder::new(&mut writer, 90);
+        encoder.set_sampling_factor(SamplingFactor::F_2_2);
+        encoder.set_chroma_subsampling_method(ChromaSubsamplingMethod::Average);
+        encoder
+            .encode(&rgb, width, height, JpegColorType::Rgb)
+            .map_err(|err| format!("failed to encode JPEG '{}': {err}", tmp.display()))?;
+        writer
+            .flush()
+            .map_err(|err| format!("failed to flush JPEG '{}': {err}", tmp.display()))?;
+    }
+
+    fs::rename(&tmp, &target).map_err(|err| {
+        format!(
+            "failed to finalize JPEG '{}' -> '{}': {err}",
             tmp.display(),
             target.display()
         )
