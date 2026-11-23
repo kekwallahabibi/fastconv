@@ -2659,10 +2659,14 @@ fn ffmpeg_has_encoder(encoder: &str) -> Result<bool, String> {
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.lines().any(|line| {
-        let mut parts = line.split_whitespace();
-        parts.next().is_some_and(|flags| flags.contains('E')) && parts.next() == Some(encoder)
-    }))
+    Ok(stdout
+        .lines()
+        .any(|line| ffmpeg_encoder_line_matches(line, encoder)))
+}
+
+fn ffmpeg_encoder_line_matches(line: &str, encoder: &str) -> bool {
+    let mut parts = line.split_whitespace();
+    parts.next().is_some_and(|flags| flags.starts_with('V')) && parts.next() == Some(encoder)
 }
 
 fn verify_ffprobe_available() -> Result<(), String> {
@@ -3079,10 +3083,11 @@ mod tests {
     use super::{
         BatchValidationSummary, HeadToHeadComparison, HeadToHeadEntry, HeadToHeadReport,
         QualityValidationMode, SourceBatchFormat, ValidationPolicy, compute_rgb_psnr_db,
-        format_baseline_table, format_head_to_head_summary, format_head_to_head_table,
-        format_validation_quality, parse_ffmpeg_codec_support, parse_proc_status_vm_hwm_bytes,
-        validate_jpeg_batch, validate_single_jpeg_pair, validate_single_png_pair,
-        validate_single_webp_pair, validate_webp_batch, verify_4k_image_batch,
+        ffmpeg_encoder_line_matches, format_baseline_table, format_head_to_head_summary,
+        format_head_to_head_table, format_validation_quality, parse_ffmpeg_codec_support,
+        parse_proc_status_vm_hwm_bytes, validate_jpeg_batch, validate_single_jpeg_pair,
+        validate_single_png_pair, validate_single_webp_pair, validate_webp_batch,
+        verify_4k_image_batch,
     };
     use fastconv_domain::{
         BenchmarkMetrics, BenchmarkSample, CpuInfo, HostHardware, ImageInputFormat, MediaKind,
@@ -3540,6 +3545,15 @@ VmRSS:\t   42000 kB
     #[test]
     #[allow(clippy::too_many_lines)] // Test covers codec-support parsing and summary edge cases.
     fn parses_ffmpeg_qoi_codec_support_and_formats_summary_edge_cases() -> Result<(), String> {
+        assert!(ffmpeg_encoder_line_matches(
+            " V....D libsvtav1           SVT-AV1",
+            "libsvtav1"
+        ));
+        assert!(!ffmpeg_encoder_line_matches(
+            " V....D libaom-av1          libaom AV1",
+            "libsvtav1"
+        ));
+
         let codecs_ok = "Codecs:\n -------\n DEVI.S qoi                  QOI (Quite OK Image)\n";
         assert_eq!(parse_ffmpeg_codec_support(codecs_ok, "qoi"), (true, true));
         let codecs_dec_only = "Codecs:\n -------\n D.VI.S qoi                  QOI\n";

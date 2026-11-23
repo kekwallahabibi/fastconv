@@ -8,6 +8,7 @@ use jxl::api::{
     JxlPixelFormat,
 };
 use tiff::decoder::Decoder as TiffDecoder;
+use tiff::tags::Tag;
 use zune_jpeg::JpegDecoder;
 use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
@@ -492,6 +493,15 @@ fn decode_tiff_slice_into(
         reason: "TIFF height exceeds addressable memory".to_owned(),
     })?;
     let mut has_non_opaque_native_alpha = false;
+    let alpha_associated = matches!(format, DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8)
+        && decoder
+            .find_tag_unsigned_vec::<u16>(Tag::ExtraSamples)
+            .map_err(|err| PipelineError::DecodeFailed {
+                path: item.source().to_path_buf(),
+                reason: format!("invalid TIFF ExtraSamples tag: {err}"),
+            })?
+            .and_then(|values| values.first().copied())
+            == Some(1);
 
     match result {
         tiff::decoder::DecodingResult::U8(samples) => {
@@ -521,10 +531,19 @@ fn decode_tiff_slice_into(
                 for y in 0..height_usize {
                     for x in 0..width_usize {
                         let bit_offset = x * usize::from(bits);
-                        let byte = samples[y * row_bytes + bit_offset / 8];
-                        let shift = 8_usize.saturating_sub(usize::from(bits) + bit_offset % 8);
-                        let mask = (1_u8 << bits) - 1;
-                        let value = (byte >> shift) & mask;
+                        let byte_index = bit_offset / 8;
+                        let intra_byte = bit_offset % 8;
+                        let row_start = y * row_bytes;
+                        let window = (u16::from(samples[row_start + byte_index]) << 8)
+                            | u16::from(
+                                samples
+                                    .get(row_start + byte_index + 1)
+                                    .copied()
+                                    .unwrap_or(0),
+                            );
+                        let shift = 16_usize - usize::from(bits) - intra_byte;
+                        let mask = (1_u16 << bits) - 1;
+                        let value = u8::try_from((window >> shift) & mask).unwrap_or(0);
                         pixel_buf[y * width_usize + x] = scale_u8(u32::from(value));
                     }
                 }
@@ -596,6 +615,24 @@ fn decode_tiff_slice_into(
                 path: item.source().to_path_buf(),
                 format: format!("TIFF decoded sample type {other:?}"),
             });
+        }
+    }
+
+    if alpha_associated {
+        let color_samples = if format == DecodedPixelFormat::La8 {
+            1
+        } else {
+            3
+        };
+        let stride = color_samples + 1;
+        for pixel in pixel_buf[..expected_len].chunks_exact_mut(stride) {
+            let alpha = u16::from(pixel[color_samples]);
+            for sample in &mut pixel[..color_samples] {
+                *sample = u16::from(*sample)
+                    .checked_mul(255)
+                    .and_then(|value| value.checked_div(alpha))
+                    .map_or(0, |value| u8::try_from(value.min(255)).unwrap_or(u8::MAX));
+            }
         }
     }
 
