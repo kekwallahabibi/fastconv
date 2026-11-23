@@ -13,6 +13,7 @@ use crate::bench::format_baseline_table;
 use crate::fixtures::{VIDEO_TOTAL_FRAMES, video_mp4_path};
 
 const REPETITIONS: usize = 3;
+const MAX_STDERR_BYTES: u64 = 8 * 1024;
 
 #[derive(Deserialize)]
 struct FfprobeOutput {
@@ -234,13 +235,14 @@ fn measure(program: &Path, args: &[String]) -> Result<(Duration, u64), String> {
     let mut peak = 0_u64;
     for _ in 0..REPETITIONS {
         let started = Instant::now();
-        let (status, rss) = run_timed(program, args)?;
+        let (status, rss, stderr) = run_timed(program, args)?;
         durations.push(started.elapsed());
         peak = peak.max(rss);
         if !status.success() {
             return Err(format!(
-                "'{}' failed during benchmark: {status}",
-                program.display()
+                "'{}' failed during benchmark: {status}: {}",
+                program.display(),
+                stderr.trim()
             ));
         }
     }
@@ -248,7 +250,10 @@ fn measure(program: &Path, args: &[String]) -> Result<(Duration, u64), String> {
     Ok((durations[durations.len() / 2], peak))
 }
 
-fn run_timed(program: &Path, args: &[String]) -> Result<(std::process::ExitStatus, u64), String> {
+fn run_timed(
+    program: &Path,
+    args: &[String],
+) -> Result<(std::process::ExitStatus, u64, String), String> {
     let mut child = Command::new(program)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -262,28 +267,36 @@ fn run_timed(program: &Path, args: &[String]) -> Result<(std::process::ExitStatu
         .spawn()
         .map_err(|err| format!("failed to launch '{}': {err}", program.display()))?;
     let pid = child.id();
-    let mut stderr_pipe = child
+    let stderr_pipe = child
         .stderr
         .take()
         .ok_or_else(|| "failed to capture stderr pipe".to_owned())?;
 
-    let mut rss = 0_u64;
-    let mut stderr = String::new();
-    loop {
-        if let Some(bytes) = sample_peak_rss(pid) {
-            rss = rss.max(bytes);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                stderr_pipe
-                    .read_to_string(&mut stderr)
-                    .map_err(|err| format!("failed to read stderr: {err}"))?;
-                return Ok((status, rss));
+    thread::scope(|scope| {
+        let reader = scope.spawn(move || -> Result<String, String> {
+            let mut buf = Vec::new();
+            let mut limited = stderr_pipe.take(MAX_STDERR_BYTES);
+            limited
+                .read_to_end(&mut buf)
+                .map_err(|err| format!("failed to drain stderr: {err}"))?;
+            Ok(String::from_utf8_lossy(&buf).into_owned())
+        });
+        let mut rss = 0_u64;
+        let status = loop {
+            if let Some(bytes) = sample_peak_rss(pid) {
+                rss = rss.max(bytes);
             }
-            Ok(None) => thread::sleep(Duration::from_millis(2)),
-            Err(err) => return Err(format!("failed while waiting for process: {err}")),
-        }
-    }
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => thread::sleep(Duration::from_millis(2)),
+                Err(err) => break Err(format!("failed while waiting for process: {err}")),
+            }
+        };
+        let stderr = reader
+            .join()
+            .map_err(|_| "stderr reader thread panicked".to_owned())??;
+        status.map(|status| (status, rss, stderr))
+    })
 }
 
 fn sample_peak_rss(pid: u32) -> Option<u64> {

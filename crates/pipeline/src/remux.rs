@@ -4,12 +4,18 @@
 //! re-encoded. No `ffmpeg`/`ffprobe` subprocess is involved.
 
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+/// Process-wide serial makes staging paths unique across concurrent invocations.
+static STAGING_SERIAL: AtomicUsize = AtomicUsize::new(0);
 
 use containr::Packet;
 use fastconv_domain::{
@@ -37,65 +43,86 @@ fn container_err(path: &Path, err: &containr::Error) -> PipelineError {
 }
 
 /// Remuxes a single file from one container to the other without re-encoding.
-fn remux_file(item: &VideoRemuxItem) -> Result<(), PipelineError> {
+fn remux_file(item: &VideoRemuxItem, target: &File) -> Result<(), PipelineError> {
     let source = item.source();
-    let target = item.target();
     match (item.input_format(), item.output_format()) {
-        (VideoContainerFormat::Mp4, VideoContainerFormat::Mkv) => mp4_to_mkv(source, target),
-        (VideoContainerFormat::Mkv, VideoContainerFormat::Mp4) => mkv_to_mp4(source, target),
-        (VideoContainerFormat::Mp4, VideoContainerFormat::Mp4) => mp4_to_mp4(source, target),
-        (VideoContainerFormat::Mkv, VideoContainerFormat::Mkv) => mkv_to_mkv(source, target),
+        (VideoContainerFormat::Mp4, VideoContainerFormat::Mkv) => {
+            mp4_to_mkv(source, target, item.target())
+        }
+        (VideoContainerFormat::Mkv, VideoContainerFormat::Mp4) => {
+            mkv_to_mp4(source, target, item.target())
+        }
+        (VideoContainerFormat::Mp4, VideoContainerFormat::Mp4) => {
+            mp4_to_mp4(source, target, item.target())
+        }
+        (VideoContainerFormat::Mkv, VideoContainerFormat::Mkv) => {
+            mkv_to_mkv(source, target, item.target())
+        }
     }
 }
 
-fn prepare_target(target: &Path) -> Result<PathBuf, PipelineError> {
-    if let Some(parent) = target.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|source| PipelineError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    Ok(target.to_path_buf())
-}
-
-/// A crash-safe staging target: writes go to a sibling temp file, then rename.
+/// A crash-safe staging target: the temp file is created exclusively, written
+/// through the owned handle, then published with a rename.
 struct StagingTarget {
     temp: PathBuf,
     target: PathBuf,
+    file: Option<File>,
 }
 
 impl StagingTarget {
-    fn new(target: &Path, tag: usize) -> Self {
+    fn new(target: &Path, tag: usize) -> Result<Self, PipelineError> {
+        if let Some(parent) = target.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|source| PipelineError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
         let name = target.file_name().map_or_else(
             || "remux.mp4".to_owned(),
             |n| n.to_string_lossy().into_owned(),
         );
-        let temp = target.with_file_name(format!(".{name}.remux-{tag}.tmp"));
-        Self {
+        let serial = STAGING_SERIAL.fetch_add(1, Ordering::Relaxed);
+        let temp = target.with_file_name(format!(
+            ".{name}.remux-{}-{serial}-{tag}.tmp",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(&temp).map_err(|source| PipelineError::Io {
+            path: temp.clone(),
+            source,
+        })?;
+        Ok(Self {
             temp,
             target: target.to_path_buf(),
-        }
+            file: Some(file),
+        })
     }
 
-    fn commit(&self) -> Result<(), PipelineError> {
-        match std::fs::rename(&self.temp, &self.target) {
-            Ok(()) => Ok(()),
-            Err(source) => {
-                let _ = std::fs::remove_file(&self.temp);
-                Err(PipelineError::Io {
-                    path: self.target.clone(),
-                    source,
-                })
-            }
-        }
+    fn file(&self) -> Result<&File, PipelineError> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| remux_failed(&self.target, "staging file is already committed"))
+    }
+
+    fn commit(mut self) -> Result<(), PipelineError> {
+        // Close the owned handle before the rename so no writer holds the inode.
+        drop(self.file.take());
+        std::fs::rename(&self.temp, &self.target).map_err(|source| PipelineError::Io {
+            path: self.target.clone(),
+            source,
+        })
     }
 }
 
 impl Drop for StagingTarget {
     fn drop(&mut self) {
-        if self.temp.exists() {
+        // Only remove the entry this invocation created exclusively.
+        if self.file.is_some() {
             let _ = std::fs::remove_file(&self.temp);
         }
     }
@@ -110,7 +137,7 @@ fn read_packets(
         .map_err(|err| container_err(path, &err))
 }
 
-fn mp4_to_mkv(source: &Path, target: &Path) -> Result<(), PipelineError> {
+fn mp4_to_mkv(source: &Path, target: &File, target_path: &Path) -> Result<(), PipelineError> {
     let mut input =
         containr::mp4::Demuxer::open_path(source).map_err(|err| container_err(source, &err))?;
 
@@ -141,28 +168,24 @@ fn mp4_to_mkv(source: &Path, target: &Path) -> Result<(), PipelineError> {
         ..containr::mkv::MkvOptions::default()
     };
 
-    let file = File::create(prepare_target(target)?).map_err(|source| PipelineError::Io {
-        path: target.to_path_buf(),
-        source,
-    })?;
-    let mut output =
-        containr::mkv::Muxer::new(file, options).map_err(|err| container_err(target, &err))?;
+    let mut output = containr::mkv::Muxer::new(target, options)
+        .map_err(|err| container_err(target_path, &err))?;
 
     let mut ids: Vec<(u32, containr::mkv::TrackId)> = Vec::with_capacity(plans.len());
     for (source_id, plan) in &plans {
         let id = output
             .add_track(plan.spec.clone())
-            .map_err(|err| container_err(target, &err))?;
+            .map_err(|err| container_err(target_path, &err))?;
         ids.push((*source_id, id));
     }
     let tags = containr::mkv::tags_from_mp4(input.metadata())
         .map_err(|err| container_err(source, &err))?;
     output
         .set_metadata(tags)
-        .map_err(|err| container_err(target, &err))?;
+        .map_err(|err| container_err(target_path, &err))?;
     output
         .set_chapters(input.chapters().to_vec())
-        .map_err(|err| container_err(target, &err))?;
+        .map_err(|err| container_err(target_path, &err))?;
 
     for packet in input.packets() {
         let packet = packet.map_err(|err| container_err(source, &err))?;
@@ -179,16 +202,21 @@ fn mp4_to_mkv(source: &Path, target: &Path) -> Result<(), PipelineError> {
         {
             output
                 .write_packet(ids[slot].1, &block)
-                .map_err(|err| container_err(target, &err))?;
+                .map_err(|err| container_err(target_path, &err))?;
         }
     }
-    output.finish().map_err(|err| container_err(target, &err))?;
+    output
+        .finish()
+        .map_err(|err| container_err(target_path, &err))?;
     Ok(())
 }
 
-fn mkv_to_mp4(source: &Path, target: &Path) -> Result<(), PipelineError> {
+fn mkv_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), PipelineError> {
     let mut input =
         containr::mkv::Demuxer::open_path(source).map_err(|err| container_err(source, &err))?;
+    if input.truncated() {
+        return Err(remux_failed(source, "truncated MKV input"));
+    }
     if !input.attachments().is_empty() {
         return Err(remux_failed(
             source,
@@ -202,19 +230,8 @@ fn mkv_to_mp4(source: &Path, target: &Path) -> Result<(), PipelineError> {
     };
     let movie_timescale = options.movie_timescale;
 
-    prepare_target(target)?;
-    let file = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(target)
-        .map_err(|source| PipelineError::Io {
-            path: target.to_path_buf(),
-            source,
-        })?;
-    let mut output =
-        containr::mp4::Muxer::new(file, options).map_err(|err| container_err(target, &err))?;
+    let mut output = containr::mp4::Muxer::new(target, options)
+        .map_err(|err| container_err(target_path, &err))?;
 
     let mut plans: HashMap<u32, (containr::mp4::StreamCopy, containr::mp4::TrackId)> =
         HashMap::new();
@@ -225,25 +242,36 @@ fn mkv_to_mp4(source: &Path, target: &Path) -> Result<(), PipelineError> {
                 .map_err(|e| container_err(source, &e))?,
             source,
         )?;
-        // containr's MP4 edit-list planner keeps a Matroska last block's full
-        // BlockDuration and ignores its positive DiscardPadding. Fold the pad
-        // into the last duration so the generated edit ends where the source
-        // edit did (no trailing samples silently played).
+        // containr's MP4 edit-list planner ignores DiscardPadding when the last
+        // block stores a duration. Only fold the pad into that duration when it
+        // still covers a whole frame; some muxers (notably FFmpeg) already trim
+        // BlockDuration, and subtracting again would shorten the edit twice.
+        let default_duration_ns = track
+            .matroska
+            .as_ref()
+            .and_then(|mkv| mkv.default_duration)
+            .map(i128::from);
         if let Some(last) = packets.last_mut()
             && let Some(padding) = last.discard_padding
             && padding > 0
             && let Some(duration) = last.duration
         {
             let tick_ns = i128::from(track.timebase.num.max(1));
-            let pad_ticks = u64::try_from(((i128::from(padding) + tick_ns / 2) / tick_ns).max(1))
-                .unwrap_or(u64::MAX);
-            last.duration = Some(duration.saturating_sub(pad_ticks).max(1));
+            let stored_ns = i128::from(duration) * tick_ns;
+            let covers_full_frame =
+                default_duration_ns.is_some_and(|frame_ns| stored_ns + tick_ns >= frame_ns);
+            if covers_full_frame {
+                let pad_ticks =
+                    u64::try_from(((i128::from(padding) + tick_ns / 2) / tick_ns).max(1))
+                        .unwrap_or(u64::MAX);
+                last.duration = Some(duration.saturating_sub(pad_ticks).max(1));
+            }
         }
         let plan = containr::mp4::StreamCopy::plan(track, &packets, movie_timescale)
             .map_err(|err| container_err(source, &err))?;
         let id = output
             .add_track(plan.spec.clone())
-            .map_err(|err| container_err(target, &err))?;
+            .map_err(|err| container_err(target_path, &err))?;
         plans.insert(track.id, (plan, id));
     }
     if plans.is_empty() {
@@ -251,10 +279,10 @@ fn mkv_to_mp4(source: &Path, target: &Path) -> Result<(), PipelineError> {
     }
     output
         .set_metadata(input.metadata().to_vec())
-        .map_err(|err| container_err(target, &err))?;
+        .map_err(|err| container_err(target_path, &err))?;
     output
         .set_chapters(containr::mp4::StreamCopy::chapters(input.chapters()))
-        .map_err(|err| container_err(target, &err))?;
+        .map_err(|err| container_err(target_path, &err))?;
 
     for packet in input.packets() {
         let packet = packet.map_err(|err| container_err(source, &err))?;
@@ -269,13 +297,15 @@ fn mkv_to_mp4(source: &Path, target: &Path) -> Result<(), PipelineError> {
             .map_err(|err| container_err(source, &err))?;
         output
             .write_packet(*id, &block)
-            .map_err(|err| container_err(target, &err))?;
+            .map_err(|err| container_err(target_path, &err))?;
     }
-    output.finish().map_err(|err| container_err(target, &err))?;
+    output
+        .finish()
+        .map_err(|err| container_err(target_path, &err))?;
     Ok(())
 }
 
-fn mp4_to_mp4(source: &Path, target: &Path) -> Result<(), PipelineError> {
+fn mp4_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), PipelineError> {
     let mut input =
         containr::mp4::Demuxer::open_path(source).map_err(|err| container_err(source, &err))?;
     let options = containr::mp4::MuxOptions {
@@ -284,19 +314,8 @@ fn mp4_to_mp4(source: &Path, target: &Path) -> Result<(), PipelineError> {
     };
     let movie_timescale = options.movie_timescale;
 
-    prepare_target(target)?;
-    let file = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(target)
-        .map_err(|source| PipelineError::Io {
-            path: target.to_path_buf(),
-            source,
-        })?;
-    let mut output =
-        containr::mp4::Muxer::new(file, options).map_err(|err| container_err(target, &err))?;
+    let mut output = containr::mp4::Muxer::new(target, options)
+        .map_err(|err| container_err(target_path, &err))?;
 
     let mut plans: HashMap<u32, (containr::mp4::StreamCopy, containr::mp4::TrackId)> =
         HashMap::new();
@@ -311,15 +330,15 @@ fn mp4_to_mp4(source: &Path, target: &Path) -> Result<(), PipelineError> {
             .map_err(|err| container_err(source, &err))?;
         let id = output
             .add_track(plan.spec.clone())
-            .map_err(|err| container_err(target, &err))?;
+            .map_err(|err| container_err(target_path, &err))?;
         plans.insert(track.id, (plan, id));
     }
     output
         .set_metadata(input.metadata().to_vec())
-        .map_err(|err| container_err(target, &err))?;
+        .map_err(|err| container_err(target_path, &err))?;
     output
         .set_chapters(containr::mp4::StreamCopy::chapters(input.chapters()))
-        .map_err(|err| container_err(target, &err))?;
+        .map_err(|err| container_err(target_path, &err))?;
     for packet in input.packets() {
         let packet = packet.map_err(|err| container_err(source, &err))?;
         let Some((plan, id)) = plans.get(&packet.track_id) else {
@@ -333,15 +352,20 @@ fn mp4_to_mp4(source: &Path, target: &Path) -> Result<(), PipelineError> {
             .map_err(|err| container_err(source, &err))?;
         output
             .write_packet(*id, &block)
-            .map_err(|err| container_err(target, &err))?;
+            .map_err(|err| container_err(target_path, &err))?;
     }
-    output.finish().map_err(|err| container_err(target, &err))?;
+    output
+        .finish()
+        .map_err(|err| container_err(target_path, &err))?;
     Ok(())
 }
 
-fn mkv_to_mkv(source: &Path, target: &Path) -> Result<(), PipelineError> {
+fn mkv_to_mkv(source: &Path, target: &File, target_path: &Path) -> Result<(), PipelineError> {
     let mut input =
         containr::mkv::Demuxer::open_path(source).map_err(|err| container_err(source, &err))?;
+    if input.truncated() {
+        return Err(remux_failed(source, "truncated MKV input"));
+    }
     let mut plans: Vec<(u32, containr::mkv::StreamCopy)> = Vec::new();
     for track in input.tracks() {
         let packets = read_packets(
@@ -360,28 +384,42 @@ fn mkv_to_mkv(source: &Path, target: &Path) -> Result<(), PipelineError> {
         ..containr::mkv::MkvOptions::default()
     };
 
-    prepare_target(target)?;
-    let file = File::create(target).map_err(|source| PipelineError::Io {
-        path: target.to_path_buf(),
-        source,
-    })?;
-    let mut output =
-        containr::mkv::Muxer::new(file, options).map_err(|err| container_err(target, &err))?;
+    let mut output = containr::mkv::Muxer::new(target, options)
+        .map_err(|err| container_err(target_path, &err))?;
     let mut ids: Vec<(u32, containr::mkv::TrackId)> = Vec::with_capacity(plans.len());
     for (source_id, plan) in &plans {
         ids.push((
             *source_id,
             output
                 .add_track(plan.spec.clone())
-                .map_err(|err| container_err(target, &err))?,
+                .map_err(|err| container_err(target_path, &err))?,
         ));
     }
     output
         .set_metadata(input.metadata().to_vec())
-        .map_err(|err| container_err(target, &err))?;
+        .map_err(|err| container_err(target_path, &err))?;
     output
         .set_chapters(input.chapters().to_vec())
-        .map_err(|err| container_err(target, &err))?;
+        .map_err(|err| container_err(target_path, &err))?;
+
+    // Copy attachments with their UIDs so tags targeting them stay valid.
+    let attachments = input.attachments().to_vec();
+    for attachment in &attachments {
+        let data = input
+            .read_attachment(attachment)
+            .map_err(|err| container_err(source, &err))?;
+        let item = containr::mkv::AttachmentIn {
+            name: &attachment.name,
+            mime: &attachment.mime,
+            description: attachment.description.as_deref(),
+            uid: Some(attachment.uid),
+            data: &data,
+        };
+        output
+            .attach(&item)
+            .map_err(|err| container_err(target_path, &err))?;
+    }
+
     for packet in input.packets() {
         let packet = packet.map_err(|err| container_err(source, &err))?;
         let Some(slot) = ids.iter().position(|(id, _)| *id == packet.track_id) else {
@@ -397,24 +435,18 @@ fn mkv_to_mkv(source: &Path, target: &Path) -> Result<(), PipelineError> {
         {
             output
                 .write_packet(ids[slot].1, &block)
-                .map_err(|err| container_err(target, &err))?;
+                .map_err(|err| container_err(target_path, &err))?;
         }
     }
-    output.finish().map_err(|err| container_err(target, &err))?;
+    output
+        .finish()
+        .map_err(|err| container_err(target_path, &err))?;
     Ok(())
 }
 
 fn remux_with_staging(item: &VideoRemuxItem, tag: usize) -> Result<(), PipelineError> {
-    let staging = StagingTarget::new(item.target(), tag);
-    // Route the copy to the staging path by building a temporary item.
-    let staged = VideoRemuxItem::new(
-        item.source().to_path_buf(),
-        staging.temp.clone(),
-        item.input_format(),
-        item.output_format(),
-        item.streams().to_vec(),
-    );
-    remux_file(&staged)?;
+    let staging = StagingTarget::new(item.target(), tag)?;
+    remux_file(item, staging.file()?)?;
     staging.commit()
 }
 

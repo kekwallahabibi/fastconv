@@ -183,13 +183,22 @@ fn probe_containr(
     path: &Path,
     format: VideoContainerFormat,
 ) -> Result<Vec<VideoStreamInfo>, ProbeError> {
-    let result = match format {
-        VideoContainerFormat::Mp4 => containr::mp4::Demuxer::open_path(path)
-            .map(|d| d.tracks().iter().map(stream_info).collect::<Vec<_>>()),
-        VideoContainerFormat::Mkv => containr::mkv::Demuxer::open_path(path)
-            .map(|d| d.tracks().iter().map(stream_info).collect::<Vec<_>>()),
+    let streams = match format {
+        VideoContainerFormat::Mp4 => {
+            let demuxer = containr::mp4::Demuxer::open_path(path)
+                .map_err(|err| invalid_video(path, format!("container parse failed: {err}")))?;
+            demuxer.tracks().iter().map(stream_info).collect::<Vec<_>>()
+        }
+        VideoContainerFormat::Mkv => {
+            let demuxer = containr::mkv::Demuxer::open_path(path)
+                .map_err(|err| invalid_video(path, format!("container parse failed: {err}")))?;
+            if demuxer.truncated() {
+                return Err(invalid_video(path, "truncated MKV input"));
+            }
+            demuxer.tracks().iter().map(stream_info).collect::<Vec<_>>()
+        }
     };
-    result.map_err(|err| invalid_video(path, format!("container parse failed: {err}")))
+    Ok(streams)
 }
 
 /// Probes a video file with magic-byte detection and extracts stream metadata.
@@ -226,6 +235,37 @@ pub fn probe_video(path: &Path) -> Result<ProbedVideo, ProbeError> {
         format,
         streams,
     })
+}
+
+/// Rejects targets that name the same file as the source through a different path spelling.
+fn reject_alias_collision(source: &Path, target: &Path) -> Result<(), ProbeError> {
+    let canonical_source = fs::canonicalize(source).map_err(|source_err| ProbeError::Io {
+        path: source.to_path_buf(),
+        source: source_err,
+    })?;
+    let canonical_target = if target.exists() {
+        fs::canonicalize(target).map_err(|err| ProbeError::Io {
+            path: target.to_path_buf(),
+            source: err,
+        })?
+    } else {
+        let parent = target
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let canonical_parent = fs::canonicalize(parent).map_err(|err| ProbeError::Io {
+            path: parent.to_path_buf(),
+            source: err,
+        })?;
+        match target.file_name() {
+            Some(name) => canonical_parent.join(name),
+            None => canonical_parent,
+        }
+    };
+    if canonical_source == canonical_target {
+        return Err(DomainError::IdenticalSourceAndTarget(source.to_path_buf()).into());
+    }
+    Ok(())
 }
 
 fn resolve_single_target(
@@ -328,6 +368,7 @@ fn prepare_directory_batch(
                 .into());
             }
         }
+        reject_alias_collision(&source, &target)?;
         items.push(VideoRemuxItem::new(
             source,
             target,
@@ -382,6 +423,7 @@ pub fn prepare_video_batch(
     }
 
     let (resolved_target, format) = resolve_single_target(source, target, to)?;
+    reject_alias_collision(source, &resolved_target)?;
     let probed = probe_video(source)?;
     for stream in &probed.streams {
         if !stream.codec().supported_in(format) {
