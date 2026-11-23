@@ -7,7 +7,7 @@
   - **Inputs**: `PNG` (`png`), `JPEG` (`zune-jpeg`), `WebP` (`zenwebp` VP8/VP8L/VP8X Still-Images), `BMP` (nativer safe-Rust-Decoder: 1/4/8-Bit Palette, 16-Bit, 24-Bit BGR, 32-Bit BGRA & `BI_BITFIELDS`/`BI_ALPHABITFIELDS`, Top-Down & Bottom-Up), `QOI` (nativer safe-Rust-Decoder 3/4 Kanäle); direkter `OpaqueRgba8`-Decode-Pfad für `JPEG`/`BMP`/`QOI` Richtung NVENC
   - **Outputs**: `WebP` (`zenwebp` CPU AVX2, Lossy/Lossless), `JPEG` (`jpeg-encoder` CPU-SIMD AVX2, Lossy), `PNG` (`png` Streaming mit `Compression::Fastest` = `fdeflate` + `Filter::Up`, 256 KiB IDAT / 512 KiB `BufWriter`, Lossless), `BMP` (nativer safe-Rust-Encoder mit 2 MiB Chunk-Batching ohne doppelte Pufferkopie, 24-Bit BGR / 32-Bit V4 BGRA / 8-Bit Gray, Lossless), `QOI` (nativer safe-Rust-Encoder mit L1-Cache-Stack-Staging, Lossless), `HEIC` (`--features nvenc` NVIDIA NVENC HEVC-Intra `ABGR` + nativer pure-Rust ISO/IEC 23008-12 Muxer)
 - **Video/Audio-Pipeline**: Generisches `execute(&ExecutionPlan)` in `crates/pipeline` liefert noch `PipelineError::BackendNotImplemented`
-- **Workload-Benchmarks (`cargo xtask bench`)**: 20× 4K PNG, 20× 4K JPEG & 20× 4K WebP Head-to-Head (`PNG -> WebP`, `PNG -> JPEG`, `JPEG -> WebP`, `WebP -> PNG`, `PNG -> QOI`, `WebP -> BMP`, optional `PNG/JPEG/WebP -> HEIC` auf NVENC) gegen `ffmpeg`, inkl. Dekodier-, Auflösungs-, Größen-, exakter Pixel-Gleichheits- (Lossless) bzw. RGB-PSNR-Validierung (`bench-output/head-to-head.json` Schema v4)
+- **Workload-Benchmarks (`cargo xtask bench`)**: 20× 4K PNG, 20× 4K JPEG & 20× 4K WebP Head-to-Head (`PNG -> WebP`, `PNG -> JPEG`, `JPEG -> WebP`, `WebP -> PNG`, `PNG -> QOI`, `WebP -> BMP`, optional `PNG/JPEG/WebP -> HEIC` auf NVENC) gegen `ffmpeg` (erfordert `ffmpeg` >= 5.1 mit QOI-Decoder/-Encoder), inkl. Dekodier-, Auflösungs-, Größen-, exakter RGB-Pixel-Gleichheits- (Lossless gegen eigene Decoder-Referenz) bzw. RGB-PSNR-Validierung (`bench-output/head-to-head.json` Schema v4)
 
 ## Dateikarte
 - `crates/cli/src/main.rs`: CLI-Einstiegspunkt, Argument-Parsing (`--to`, `--quality`, `--lossless`, `--threads`, `--backend`), Dispatch für `probe` & `convert`
@@ -17,7 +17,7 @@
 - `crates/domain/src/metrics.rs`: Benchmark- und Metrik-Typen (`BenchmarkMetrics`, `BenchmarkSample`, `PeakMemory`, `Throughput`, `WorkloadUnit`)
 - `crates/probe/src/lib.rs`: Systemgrenze für OS-File-Checks, CPU-Parallelität & `ProbeError`
 - `crates/probe/src/hardware.rs`: OS-Hardware-Erkennung (`/proc/cpuinfo`, `/proc/meminfo`, `wgpu`-Adapter, NVENC/VA-API Dynamic-Lib-Probe)
-- `crates/probe/src/image.rs`: Magic-Byte-Sniffing (`PNG`/`JPEG`/`WebP`/`BMP`/`QOI`), O(1)-Header-/Chunk-/Bitmask-Prüfungen und Aufbau validierter Einzel- sowie gemischter Batch-Pläne (`prepare_image_batch`)
+- `crates/probe/src/image.rs`: Magic-Byte-Sniffing (`PNG`/`JPEG`/`WebP`/`BMP`/`QOI`), feste Header-/Bitmask-Reads (bzw. konstanter Scratch-Space mit RIFF-Chunk-Scan in `probe_webp_vp8x`, dessen I/O linear mit der Chunk-Anzahl wächst) und Aufbau validierter Einzel- sowie gemischter Batch-Pläne (`prepare_image_batch`)
 - `crates/pipeline/src/lib.rs`: Dispatcher (`execute`, `execute_image_batch`) und `PipelineError`
 - `crates/pipeline/src/decode.rs`: Gemeinsamer 5-Format-Decoder (`decode_image_into`) mit `DecodeTargetHint` und wiederverwendbaren Puffern
 - `crates/pipeline/src/bmp.rs`: Pure-Rust BMP-Decoder und 2-MiB-Chunk-gebatchter BMP-Encoder (24-Bit BGR, 32-Bit V4 BGRA, 8-Bit Gray, ungerade Breiten & `BI_BITFIELDS`)
@@ -28,7 +28,7 @@
 - `crates/pipeline/src/gpu/heic.rs`: Pure-Rust Annex-B-HEVC-Parser (`VPS`/`SPS`/`PPS`/`IDR`) und ISO/IEC 23008-12 (`ftypheic`/`mif1`) Container-Muxer
 - `xtask/src/main.rs`: Orchestrierung für `verify` (No-FFmpeg-Scanner, `fmt`, `clippy -D warnings`, Tests inkl. `--features nvenc`), `gen-fixtures` & `bench`
 - `xtask/src/fixtures.rs`: Deterministische Testmedien (20× 4K PNG, 20× 4K JPEG, 20× 4K WebP, 60s WAV, 1080p60 MP4)
-- `xtask/src/bench.rs`: Head-to-Head Benchmark-Harness (`fastconv` vs. `ffmpeg`) mit Peak-RSS-Messung, Lossless-Exact-Pixel- und PSNR-Validierung sowie JSON-Export
+- `xtask/src/bench.rs`: Head-to-Head Benchmark-Harness (`fastconv` vs. `ffmpeg`) mit Peak-RSS-Messung, Lossless-Exact-RGB- und PSNR-Validierung sowie JSON-Export
 
 ## Harte Architektur-Entscheidungen
 - **Kein FFmpeg-Wrapper**: `crates/` darf null `ffmpeg`/`ffprobe`-Subprozesse oder -Bindings enthalten; verifiziert per Code-Scanner in `cargo xtask verify`.
@@ -42,7 +42,7 @@
 
 ## Aktuelle Baseline-Zahlen
 - **Host**: `Intel(R) Core(TM) i7-6700` (4C/8T, `x86:avx2+fma`, 32 GiB RAM) + `NVIDIA GeForce RTX 2060` (6 GB, Vulkan/NVENC, Treiber `620.73.04`)
-- **Validation**: `20/20` Outputs je Workload vollständig dekodiert, exakt `3840x2160` und je nach Pfad auf exakte Pixel-Gleichheit (`exact`) bzw. Quell-RGB-PSNR (`>= 25.0 dB`) geprüft (`cargo xtask bench`, 20× 4K Fixtures, Q=80 bzw. FFmpeg `mjpeg -q:v 3`):
+- **Validation**: `20/20` Outputs je Workload vollständig dekodiert, exakt `3840x2160` und je nach Pfad auf exakte RGB-Pixel-Gleichheit (`exact`, ohne Alpha-Prüfung, jeweils gegen die eigene Decoder-Referenz) bzw. Quell-RGB-PSNR (`>= 25.0 dB`) geprüft (`cargo xtask bench`, 20× 4K Fixtures, Q=80 bzw. FFmpeg `mjpeg -q:v 3`):
 
 | Workload | Tool | Zeit (ms) | Durchsatz | Peak RAM | Input | Output | Qualität | Speedup |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |

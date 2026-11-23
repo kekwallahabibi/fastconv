@@ -118,7 +118,9 @@ struct HeadToHeadEntry {
 struct HeadToHeadComparison {
     workload_name: String,
     fastconv_speedup_vs_ffmpeg: f64,
-    exact_pixel_match: bool,
+    /// True when both contenders matched their own decoded reference RGB pixels losslessly
+    /// (for lossy inputs like WebP, each tool is validated against its own decoder reference).
+    both_match_reference_rgb: bool,
     fastconv_psnr_delta_db: Option<f64>,
 }
 
@@ -147,13 +149,15 @@ struct HeadToHeadReport {
 
 /// Runs head-to-head benchmarks across 20× 4K PNG, JPEG, and WebP fixtures against `ffmpeg`
 /// (including `WebP -> PNG`, `PNG -> QOI`, `WebP -> BMP`, and optional NVENC HEIC), validating
-/// every generated image for decodability, exact resolution, size plausibility, and exact pixel
-/// equality (lossless) or RGB PSNR (lossy).
+/// every generated image for decodability, exact resolution, size plausibility, and exact RGB
+/// equality (lossless vs. each contender's decoder reference) or RGB PSNR (lossy).
+///
+/// Requires an installed `ffmpeg` build (>= 5.1) with QOI decoder and encoder support.
 ///
 /// # Errors
 ///
-/// Returns an error if fixtures are missing, building or executing any contender fails,
-/// or any output image fails decode/resolution/size/quality validation.
+/// Returns an error if fixtures are missing, `ffmpeg` lacks required QOI codec support,
+/// building or executing any contender fails, or any output image fails decode/resolution/size/quality validation.
 pub fn run_head_to_head(root: &Path) -> Result<(), String> {
     let hardware = fastconv_probe::detect_host_hardware()
         .map_err(|err| format!("failed to probe host hardware: {err}"))?;
@@ -162,6 +166,7 @@ pub fn run_head_to_head(root: &Path) -> Result<(), String> {
     let fixtures = verify_head_to_head_fixtures(root)?;
     let ffmpeg_version = read_ffmpeg_version()?;
     println!("ffmpeg        : {ffmpeg_version}");
+    verify_ffmpeg_qoi_support()?;
 
     let has_nvenc =
         hardware.supports_video_encode(GpuBackend::Nvenc) && crate::has_nvenc_link_libraries();
@@ -628,7 +633,7 @@ fn compare_entries(
     fastconv: &HeadToHeadEntry,
     ffmpeg: &HeadToHeadEntry,
 ) -> HeadToHeadComparison {
-    let exact_pixel_match =
+    let both_match_reference_rgb =
         fastconv.validation.exact_pixel_match && ffmpeg.validation.exact_pixel_match;
     let fastconv_psnr_delta_db = match (
         fastconv.validation.mean_psnr_db,
@@ -640,23 +645,39 @@ fn compare_entries(
     HeadToHeadComparison {
         workload_name: workload_name.to_owned(),
         fastconv_speedup_vs_ffmpeg: ffmpeg.metrics.duration_ms() / fastconv.metrics.duration_ms(),
-        exact_pixel_match,
+        both_match_reference_rgb,
         fastconv_psnr_delta_db,
     }
 }
 
-fn print_head_to_head_summary(report: &HeadToHeadReport) {
+fn format_validation_quality(validation: &BatchValidationSummary) -> String {
+    if validation.exact_pixel_match {
+        "exact".to_owned()
+    } else if let Some(psnr) = validation.mean_psnr_db {
+        format!("{psnr:.2} dB")
+    } else {
+        "n/a".to_owned()
+    }
+}
+
+fn format_head_to_head_summary(report: &HeadToHeadReport) -> String {
+    let mut lines = Vec::new();
     for cmp in &report.comparisons {
-        if cmp.exact_pixel_match {
-            println!(
-                "{:<28}: {:.2}x vs ffmpeg | exact lossless pixel match",
+        if cmp.both_match_reference_rgb {
+            lines.push(format!(
+                "{:<28}: {:.2}x vs ffmpeg | both lossless (exact RGB vs reference)",
                 cmp.workload_name, cmp.fastconv_speedup_vs_ffmpeg
-            );
+            ));
         } else if let Some(delta) = cmp.fastconv_psnr_delta_db {
-            println!(
+            lines.push(format!(
                 "{:<28}: {:.2}x vs ffmpeg | delta mean PSNR = {:+.2} dB",
                 cmp.workload_name, cmp.fastconv_speedup_vs_ffmpeg, delta
-            );
+            ));
+        } else {
+            lines.push(format!(
+                "{:<28}: {:.2}x vs ffmpeg",
+                cmp.workload_name, cmp.fastconv_speedup_vs_ffmpeg
+            ));
         }
     }
     if let Some(ref heic) = report.png_to_heic_nvenc {
@@ -664,38 +685,47 @@ fn print_head_to_head_summary(report: &HeadToHeadReport) {
             report.png_to_webp_ffmpeg.metrics.duration_ms() / heic.metrics.duration_ms();
         let vs_cpu_webp =
             report.png_to_webp_fastconv.metrics.duration_ms() / heic.metrics.duration_ms();
-        println!(
-            "png_to_heic gpu:nvenc       : {vs_ff_webp:.2}x vs ffmpeg(webp) | {vs_cpu_webp:.2}x vs cpu(webp) | mean PSNR = {:.2} dB | validated = {}/{} ({})",
-            heic.validation.mean_psnr_db.unwrap_or(0.0),
+        lines.push(format!(
+            "png_to_heic gpu:nvenc       : {vs_ff_webp:.2}x vs ffmpeg(webp) | {vs_cpu_webp:.2}x vs cpu(webp) | quality = {} | validated = {}/{} ({})",
+            format_validation_quality(&heic.validation),
             heic.validation.files_validated,
             IMAGE_BATCH_COUNT,
             heic.validation.resolution
-        );
+        ));
     }
     if let Some(ref heic) = report.jpeg_to_heic_nvenc {
         let vs_ff_webp =
             report.jpeg_to_webp_ffmpeg.metrics.duration_ms() / heic.metrics.duration_ms();
         let vs_cpu_webp =
             report.jpeg_to_webp_fastconv.metrics.duration_ms() / heic.metrics.duration_ms();
-        println!(
-            "jpeg_to_heic gpu:nvenc      : {vs_ff_webp:.2}x vs ffmpeg(webp) | {vs_cpu_webp:.2}x vs cpu(webp) | mean PSNR = {:.2} dB | validated = {}/{} ({})",
-            heic.validation.mean_psnr_db.unwrap_or(0.0),
+        lines.push(format!(
+            "jpeg_to_heic gpu:nvenc      : {vs_ff_webp:.2}x vs ffmpeg(webp) | {vs_cpu_webp:.2}x vs cpu(webp) | quality = {} | validated = {}/{} ({})",
+            format_validation_quality(&heic.validation),
             heic.validation.files_validated,
             IMAGE_BATCH_COUNT,
             heic.validation.resolution
-        );
+        ));
     }
     if let Some(ref heic) = report.webp_to_heic_nvenc {
-        println!(
-            "webp_to_heic gpu:nvenc      : {:.1} ms ({}) | mean PSNR = {:.2} dB | validated = {}/{} ({})",
+        lines.push(format!(
+            "webp_to_heic gpu:nvenc      : {:.1} ms ({}) | quality = {} | validated = {}/{} ({})",
             heic.metrics.duration_ms(),
             heic.metrics.throughput(),
-            heic.validation.mean_psnr_db.unwrap_or(0.0),
+            format_validation_quality(&heic.validation),
             heic.validation.files_validated,
             IMAGE_BATCH_COUNT,
             heic.validation.resolution
-        );
+        ));
     }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
+fn print_head_to_head_summary(report: &HeadToHeadReport) {
+    print!("{}", format_head_to_head_summary(report));
 }
 
 /// Runs the full `FFmpeg` reference baseline across image, audio, and video workloads.
@@ -2156,6 +2186,52 @@ fn read_ffmpeg_version() -> Result<String, String> {
     Ok(first_line.to_owned())
 }
 
+fn parse_ffmpeg_codec_support(codecs_output: &str, codec_name: &str) -> (bool, bool) {
+    let mut past_separator = false;
+    for line in codecs_output.lines() {
+        let trimmed = line.trim();
+        if !past_separator {
+            if trimmed.starts_with("------") {
+                past_separator = true;
+            }
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(flags) = parts.next() else {
+            continue;
+        };
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        if name == codec_name {
+            let bytes = flags.as_bytes();
+            let can_decode = bytes.first() == Some(&b'D');
+            let can_encode = bytes.get(1) == Some(&b'E');
+            return (can_decode, can_encode);
+        }
+    }
+    (false, false)
+}
+
+fn verify_ffmpeg_qoi_support() -> Result<(), String> {
+    let output = Command::new("ffmpeg")
+        .stdin(Stdio::null())
+        .args(["-hide_banner", "-loglevel", "error", "-codecs"])
+        .output()
+        .map_err(|err| format!("failed to run `ffmpeg -codecs`: {err}"))?;
+    if !output.status.success() {
+        return Err(format!("`ffmpeg -codecs` failed with {}", output.status));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (can_decode, can_encode) = parse_ffmpeg_codec_support(&stdout, "qoi");
+    if !can_decode || !can_encode {
+        return Err(format!(
+            "installed ffmpeg lacks required QOI support (decoder={can_decode}, encoder={can_encode}); install FFmpeg >= 5.1 built with QOI codec support before running `cargo xtask bench`"
+        ));
+    }
+    Ok(())
+}
+
 fn print_hardware_summary(hardware: &HostHardware) {
     let cpu = hardware.cpu();
     println!("==> fastconv benchmark oracle");
@@ -2482,13 +2558,7 @@ fn format_head_to_head_table(entries: &[&HeadToHeadEntry]) -> String {
             "{}/{} {}",
             entry.validation.files_validated, IMAGE_BATCH_COUNT, entry.validation.resolution
         );
-        let quality_str = if entry.validation.exact_pixel_match {
-            "exact".to_owned()
-        } else if let Some(psnr) = entry.validation.mean_psnr_db {
-            format!("{psnr:.2} dB")
-        } else {
-            "n/a".to_owned()
-        };
+        let quality_str = format_validation_quality(&entry.validation);
         lines.push(format!(
             "{:<28} | {:<26} | {:>10.1} | {:>14} | {:>10} | {:>10} | {:>10} | {:>10} | {:<15}",
             item.workload_name(),
@@ -2558,14 +2628,16 @@ fn u64_to_f64(value: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchValidationSummary, HeadToHeadEntry, QualityValidationMode, SourceBatchFormat,
-        ValidationPolicy, compute_rgb_psnr_db, format_baseline_table, format_head_to_head_table,
-        parse_proc_status_vm_hwm_bytes, validate_jpeg_batch, validate_single_jpeg_pair,
-        validate_single_png_pair, validate_single_webp_pair, validate_webp_batch,
-        verify_4k_image_batch,
+        BatchValidationSummary, HeadToHeadComparison, HeadToHeadEntry, HeadToHeadReport,
+        QualityValidationMode, SourceBatchFormat, ValidationPolicy, compute_rgb_psnr_db,
+        format_baseline_table, format_head_to_head_summary, format_head_to_head_table,
+        format_validation_quality, parse_ffmpeg_codec_support, parse_proc_status_vm_hwm_bytes,
+        validate_jpeg_batch, validate_single_jpeg_pair, validate_single_png_pair,
+        validate_single_webp_pair, validate_webp_batch, verify_4k_image_batch,
     };
     use fastconv_domain::{
-        BenchmarkMetrics, BenchmarkSample, ImageInputFormat, MediaKind, PeakMemory, WorkloadUnit,
+        BenchmarkMetrics, BenchmarkSample, CpuInfo, HostHardware, ImageInputFormat, MediaKind,
+        PeakMemory, SimdLevel, WorkloadUnit,
     };
     use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
     use std::env;
@@ -3008,6 +3080,114 @@ VmRSS:\t   42000 kB
         assert!(res_err.is_err());
 
         fs::remove_dir_all(&root).map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn parses_ffmpeg_qoi_codec_support_and_formats_summary_edge_cases() -> Result<(), String> {
+        let codecs_ok = "Codecs:\n -------\n DEVI.S qoi                  QOI (Quite OK Image)\n";
+        assert_eq!(parse_ffmpeg_codec_support(codecs_ok, "qoi"), (true, true));
+        let codecs_dec_only = "Codecs:\n -------\n D.VI.S qoi                  QOI\n";
+        assert_eq!(
+            parse_ffmpeg_codec_support(codecs_dec_only, "qoi"),
+            (true, false)
+        );
+        let codecs_missing = "Codecs:\n -------\n DEVI.S png                  PNG\n";
+        assert_eq!(
+            parse_ffmpeg_codec_support(codecs_missing, "qoi"),
+            (false, false)
+        );
+
+        let nz = |v: u64| NonZeroU64::new(v).ok_or_else(|| "bad const".to_owned());
+        let mk_entry = |name: &str,
+                        ms: u64,
+                        exact: bool,
+                        psnr: Option<f64>|
+         -> Result<HeadToHeadEntry, String> {
+            Ok(HeadToHeadEntry {
+                metrics: BenchmarkMetrics::new(
+                    name,
+                    MediaKind::Image,
+                    "tool",
+                    BenchmarkSample {
+                        duration: Duration::from_millis(ms),
+                        input_bytes: nz(1_000_000)?,
+                        output_bytes: nz(500_000)?,
+                        unit: WorkloadUnit::Bytes,
+                        peak_memory: PeakMemory::Unavailable,
+                    },
+                )
+                .map_err(|err| err.to_string())?,
+                validation: BatchValidationSummary {
+                    files_validated: 20,
+                    resolution: "3840x2160".to_owned(),
+                    total_output_bytes: nz(500_000)?,
+                    exact_pixel_match: exact,
+                    min_psnr_db: psnr,
+                    mean_psnr_db: psnr,
+                },
+            })
+        };
+
+        let exact_heic = mk_entry("image_batch_4k_png_to_heic", 1000, true, None)?;
+        assert_eq!(format_validation_quality(&exact_heic.validation), "exact");
+
+        let hw = HostHardware::new(
+            CpuInfo::new(
+                "Test CPU",
+                "x86_64",
+                std::num::NonZeroUsize::MIN,
+                std::num::NonZeroUsize::MIN,
+                SimdLevel::Scalar,
+                None,
+            )
+            .map_err(|err| err.to_string())?,
+            Vec::new(),
+            Vec::new(),
+        );
+        let report = HeadToHeadReport {
+            schema_version: 4,
+            ffmpeg_version: "ffmpeg test".to_owned(),
+            hardware: hw,
+            png_to_webp_fastconv: mk_entry("w", 1000, false, Some(34.0))?,
+            png_to_webp_ffmpeg: mk_entry("w", 2000, false, Some(33.5))?,
+            png_to_jpeg_fastconv: mk_entry("w", 1000, false, Some(34.0))?,
+            png_to_jpeg_ffmpeg: mk_entry("w", 2000, false, Some(33.5))?,
+            jpeg_to_webp_fastconv: mk_entry("w", 1000, false, Some(38.0))?,
+            jpeg_to_webp_ffmpeg: mk_entry("w", 2000, false, Some(38.0))?,
+            webp_to_png_fastconv: mk_entry("w", 1000, true, None)?,
+            webp_to_png_ffmpeg: mk_entry("w", 2000, true, None)?,
+            png_to_qoi_fastconv: mk_entry("w", 1000, true, None)?,
+            png_to_qoi_ffmpeg: mk_entry("w", 2000, true, None)?,
+            webp_to_bmp_fastconv: mk_entry("w", 1000, true, None)?,
+            webp_to_bmp_ffmpeg: mk_entry("w", 2000, true, None)?,
+            png_to_heic_nvenc: Some(exact_heic),
+            jpeg_to_heic_nvenc: Some(mk_entry("j", 1000, false, None)?),
+            webp_to_heic_nvenc: Some(mk_entry("wb", 1000, true, None)?),
+            comparisons: vec![
+                HeadToHeadComparison {
+                    workload_name: "mixed_exact_and_lossy".to_owned(),
+                    fastconv_speedup_vs_ffmpeg: 2.5,
+                    both_match_reference_rgb: false,
+                    fastconv_psnr_delta_db: None,
+                },
+                HeadToHeadComparison {
+                    workload_name: "lossless_pair".to_owned(),
+                    fastconv_speedup_vs_ffmpeg: 4.0,
+                    both_match_reference_rgb: true,
+                    fastconv_psnr_delta_db: None,
+                },
+            ],
+        };
+
+        let summary = format_head_to_head_summary(&report);
+        assert!(summary.contains("mixed_exact_and_lossy       : 2.50x vs ffmpeg"));
+        assert!(summary.contains(
+            "lossless_pair               : 4.00x vs ffmpeg | both lossless (exact RGB vs reference)"
+        ));
+        assert!(summary.contains("png_to_heic gpu:nvenc") && summary.contains("quality = exact"));
+        assert!(summary.contains("jpeg_to_heic gpu:nvenc") && summary.contains("quality = n/a"));
+        assert!(!summary.contains("0.00 dB"));
         Ok(())
     }
 }

@@ -6,6 +6,10 @@ use crate::decode::{DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat};
 const QOI_MAGIC: [u8; 4] = *b"qoif";
 const QOI_END_MARKER: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 1];
 const QOI_HEADER_LEN: usize = 14;
+const QOI_MAX_RUN: usize = 62;
+// Cap decoded QOI frame allocation at 512 MiB (e.g. >134 MP RGBA8) so malformed headers
+// cannot exhaust process memory before stream validation rejects the payload.
+const MAX_QOI_DECODED_BYTES: usize = 512 * 1024 * 1024;
 const QOI_OP_RUN: u8 = 0xC0;
 const QOI_OP_DIFF: u8 = 0x40;
 const QOI_OP_LUMA: u8 = 0x80;
@@ -518,7 +522,22 @@ fn prepare_qoi_output<'a>(
             path: source.to_path_buf(),
             reason: "QOI output buffer overflow".to_owned(),
         })?;
+    if out_len > MAX_QOI_DECODED_BYTES {
+        return Err(PipelineError::DecodeFailed {
+            path: source.to_path_buf(),
+            reason: format!(
+                "QOI decoded frame size ({out_len} bytes) exceeds {MAX_QOI_DECODED_BYTES}-byte limit"
+            ),
+        });
+    }
     if pixel_buf.len() < out_len {
+        let additional = out_len - pixel_buf.len();
+        pixel_buf
+            .try_reserve_exact(additional)
+            .map_err(|_| PipelineError::DecodeFailed {
+                path: source.to_path_buf(),
+                reason: format!("failed to reserve {out_len} bytes for decoded QOI frame"),
+            })?;
         pixel_buf.resize(out_len, 0);
     }
     pixel_buf
@@ -538,6 +557,18 @@ pub(crate) fn decode_qoi_slice_into(
 ) -> Result<(u32, u32, DecodedPixelFormat, usize), PipelineError> {
     let hdr = parse_qoi_header(source, file_bytes)?;
     let stream = &file_bytes[QOI_HEADER_LEN..file_bytes.len() - QOI_END_MARKER.len()];
+    // Each QOI byte encodes at most 62 pixels (QOI_OP_RUN); reject impossible streams before allocating.
+    let min_stream_bytes = hdr.pixel_count.div_ceil(QOI_MAX_RUN);
+    if stream.len() < min_stream_bytes {
+        return Err(PipelineError::DecodeFailed {
+            path: source.to_path_buf(),
+            reason: format!(
+                "QOI bitstream ({} bytes) is too short to represent {} pixels (minimum {min_stream_bytes} bytes)",
+                stream.len(),
+                hdr.pixel_count
+            ),
+        });
+    }
 
     match (hint, hdr.channels) {
         (DecodeTargetHint::Native, 3) => {
@@ -549,14 +580,16 @@ pub(crate) fn decode_qoi_slice_into(
         (DecodeTargetHint::Native, 4) => {
             let dst = prepare_qoi_output(source, hdr.pixel_count, 4, pixel_buf)?;
             let out_len = dst.len();
-            decode_qoi_rgba_stream(source, stream, dst, false, false)?;
+            decode_qoi_rgba_stream(source, stream, dst, false)?;
             Ok((hdr.width, hdr.height, DecodedPixelFormat::Rgba8, out_len))
         }
+        // QOI's header channel field is purely informative, so opaque-only callers must validate
+        // decoded alpha even when `channels == 3`.
         #[cfg(feature = "nvenc")]
-        (DecodeTargetHint::OpaqueRgba8, ch) => {
+        (DecodeTargetHint::OpaqueRgba8, 3 | 4) => {
             let dst = prepare_qoi_output(source, hdr.pixel_count, 4, pixel_buf)?;
             let out_len = dst.len();
-            decode_qoi_rgba_stream(source, stream, dst, ch == 3, ch == 4)?;
+            decode_qoi_rgba_stream(source, stream, dst, true)?;
             Ok((hdr.width, hdr.height, DecodedPixelFormat::Rgba8, out_len))
         }
         (_, other) => Err(PipelineError::DecodeFailed {
@@ -653,6 +686,8 @@ fn decode_qoi_rgb_stream(
                             path: source.to_path_buf(),
                             reason: "QOI_OP_RUN exceeds image pixel count".to_owned(),
                         })?;
+                    // QOI reference decoder updates the running index on QOI_OP_RUN as well.
+                    index[qoi_hash_rgba(px[0], px[1], px[2], px[3])] = px;
                     dst_pixels[out_idx..end].fill([px[0], px[1], px[2]]);
                     out_idx = end;
                 }
@@ -676,12 +711,9 @@ fn decode_qoi_rgb_stream(
 fn resolve_rgba_out_pixel(
     source: &Path,
     px: [u8; 4],
-    force_opaque_alpha: bool,
     reject_transparent: bool,
 ) -> Result<[u8; 4], PipelineError> {
-    if force_opaque_alpha {
-        Ok([px[0], px[1], px[2], 255])
-    } else if reject_transparent && px[3] < 255 {
+    if reject_transparent && px[3] < 255 {
         Err(PipelineError::UnsupportedPixelFormat {
             path: source.to_path_buf(),
             format:
@@ -697,7 +729,6 @@ fn decode_qoi_rgba_stream(
     source: &Path,
     stream: &[u8],
     dst: &mut [u8],
-    force_opaque_alpha: bool,
     reject_transparent: bool,
 ) -> Result<(), PipelineError> {
     let (dst_pixels, _) = dst.as_chunks_mut::<4>();
@@ -772,8 +803,8 @@ fn decode_qoi_rgba_stream(
                             path: source.to_path_buf(),
                             reason: "QOI_OP_RUN exceeds image pixel count".to_owned(),
                         })?;
-                    let out_px =
-                        resolve_rgba_out_pixel(source, px, force_opaque_alpha, reject_transparent)?;
+                    index[qoi_hash_rgba(px[0], px[1], px[2], px[3])] = px;
+                    let out_px = resolve_rgba_out_pixel(source, px, reject_transparent)?;
                     dst_pixels[out_idx..end].fill(out_px);
                     out_idx = end;
                     continue;
@@ -781,8 +812,7 @@ fn decode_qoi_rgba_stream(
             }
         }
 
-        dst_pixels[out_idx] =
-            resolve_rgba_out_pixel(source, px, force_opaque_alpha, reject_transparent)?;
+        dst_pixels[out_idx] = resolve_rgba_out_pixel(source, px, reject_transparent)?;
         out_idx += 1;
     }
 
@@ -923,5 +953,68 @@ mod tests {
         assert!(
             decode_qoi_slice_into(p, &overflow_run, DecodeTargetHint::Native, &mut buf).is_err()
         );
+
+        // Short QOI file declaring 1_000_000 x 1_000_000 must fail before allocation.
+        let mut huge_short = Vec::new();
+        huge_short.extend_from_slice(b"qoif");
+        huge_short.extend_from_slice(&1_000_000_u32.to_be_bytes());
+        huge_short.extend_from_slice(&1_000_000_u32.to_be_bytes());
+        huge_short.extend_from_slice(&[4, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert!(matches!(
+            decode_qoi_slice_into(p, &huge_short, DecodeTargetHint::Native, &mut buf),
+            Err(crate::PipelineError::DecodeFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn updates_color_index_on_initial_run_and_validates_alpha_regardless_of_header_channels()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let p = Path::new("hand_authored.qoi");
+        // Hand-authored 3x1 QOI:
+        //   px0 = QOI_OP_RUN(1) -> [0, 0, 0, 255] (hashes to slot 53, must update index[53])
+        //   px1 = QOI_OP_RGB(255, 0, 0) -> [255, 0, 0, 255]
+        //   px2 = QOI_OP_INDEX(53) -> must recall [0, 0, 0, 255], NOT transparent [0, 0, 0, 0]
+        let mut qoi_rgba = Vec::new();
+        qoi_rgba.extend_from_slice(b"qoif");
+        qoi_rgba.extend_from_slice(&3_u32.to_be_bytes());
+        qoi_rgba.extend_from_slice(&1_u32.to_be_bytes());
+        qoi_rgba.extend_from_slice(&[4, 0]);
+        qoi_rgba.extend_from_slice(&[0xC0, 0xFE, 255, 0, 0, 53]);
+        qoi_rgba.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+
+        let mut buf = Vec::new();
+        let (w, h, fmt, len) =
+            decode_qoi_slice_into(p, &qoi_rgba, DecodeTargetHint::Native, &mut buf)?;
+        assert_eq!((w, h, fmt, len), (3, 1, DecodedPixelFormat::Rgba8, 12));
+        assert_eq!(&buf[..len], &[0, 0, 0, 255, 255, 0, 0, 255, 0, 0, 0, 255]);
+
+        // Same hand-authored stream with channels=3.
+        qoi_rgba[12] = 3;
+        let (w, h, fmt, len) =
+            decode_qoi_slice_into(p, &qoi_rgba, DecodeTargetHint::Native, &mut buf)?;
+        assert_eq!((w, h, fmt, len), (3, 1, DecodedPixelFormat::Rgb8, 9));
+        assert_eq!(&buf[..len], &[0, 0, 0, 255, 0, 0, 0, 0, 0]);
+
+        #[cfg(feature = "nvenc")]
+        {
+            // Opaque 3-channel stream succeeds under OpaqueRgba8.
+            let (w, h, fmt, len) =
+                decode_qoi_slice_into(p, &qoi_rgba, DecodeTargetHint::OpaqueRgba8, &mut buf)?;
+            assert_eq!((w, h, fmt, len), (3, 1, DecodedPixelFormat::Rgba8, 12));
+            assert_eq!(&buf[..len], &[0, 0, 0, 255, 255, 0, 0, 255, 0, 0, 0, 255]);
+
+            // 3-channel QOI header with a QOI_OP_RGBA chunk supplying alpha=128 must be rejected.
+            let mut sneak_alpha = Vec::new();
+            sneak_alpha.extend_from_slice(b"qoif");
+            sneak_alpha.extend_from_slice(&1_u32.to_be_bytes());
+            sneak_alpha.extend_from_slice(&1_u32.to_be_bytes());
+            sneak_alpha.extend_from_slice(&[3, 0, 0xFF, 10, 20, 30, 128, 0, 0, 0, 0, 0, 0, 0, 1]);
+            assert!(matches!(
+                decode_qoi_slice_into(p, &sneak_alpha, DecodeTargetHint::OpaqueRgba8, &mut buf),
+                Err(crate::PipelineError::UnsupportedPixelFormat { .. })
+            ));
+        }
+
+        Ok(())
     }
 }

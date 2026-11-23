@@ -18,6 +18,8 @@ const RIFF_MAGIC: [u8; 4] = *b"RIFF";
 const WEBP_MAGIC: [u8; 4] = *b"WEBP";
 const QOI_MAGIC: [u8; 4] = *b"qoif";
 const QOI_END_MARKER: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 1];
+const QOI_MAX_RUN: u64 = 62;
+const MAX_QOI_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 const BMP_MAGIC: [u8; 2] = *b"BM";
 const KNOWN_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "qoi"];
 const UNRECOGNIZED_MAGIC_REASON: &str =
@@ -240,13 +242,13 @@ fn probe_webp_vp8x(
     }
     let width = (u32::from(vp8x[4]) | (u32::from(vp8x[5]) << 8) | (u32::from(vp8x[6]) << 16)) + 1;
     let height = (u32::from(vp8x[7]) | (u32::from(vp8x[8]) << 8) | (u32::from(vp8x[9]) << 16)) + 1;
+    let canvas_dims = ImageDimensions::new(width, height)?;
 
     let padded_vp8x = chunk_size + (chunk_size & 1);
     let mut pos = 20_u64
         .checked_add(padded_vp8x)
         .ok_or_else(|| invalid_image(path, "WebP VP8X chunk offset overflow"))?;
-    let mut has_vp8 = false;
-    let mut has_vp8l = false;
+    let mut has_image_chunk = false;
 
     while pos.saturating_add(8) <= riff_end {
         file.seek(SeekFrom::Start(pos))
@@ -276,8 +278,28 @@ fn probe_webp_vp8x(
                     "animated WebP is not supported by the still-image pipeline",
                 ));
             }
-            b"VP8 " => has_vp8 = true,
-            b"VP8L" => has_vp8l = true,
+            b"VP8 " | b"VP8L" => {
+                if has_image_chunk {
+                    return Err(invalid_image(
+                        path,
+                        "VP8X WebP container must contain exactly one VP8 or VP8L image chunk",
+                    ));
+                }
+                let frame_dims = if &fourcc == b"VP8 " {
+                    probe_webp_vp8(file, path, len)?
+                } else {
+                    probe_webp_vp8l(file, path, len)?
+                };
+                if frame_dims != canvas_dims {
+                    return Err(invalid_image(
+                        path,
+                        format!(
+                            "VP8X canvas dimensions {canvas_dims} do not match embedded frame {frame_dims}"
+                        ),
+                    ));
+                }
+                has_image_chunk = true;
+            }
             _ => {}
         }
 
@@ -288,21 +310,21 @@ fn probe_webp_vp8x(
             .ok_or_else(|| invalid_image(path, "WebP chunk offset overflow"))?;
     }
 
-    if has_vp8 == has_vp8l {
+    if !has_image_chunk {
         return Err(invalid_image(
             path,
             "VP8X WebP container must contain exactly one VP8 or VP8L image chunk",
         ));
     }
 
-    Ok(ImageDimensions::new(width, height)?)
+    Ok(canvas_dims)
 }
 
 fn read_bmp_dib_header(
     file: &mut File,
     path: &Path,
     dib_size: u32,
-) -> Result<(u32, u32, u16, u32), ProbeError> {
+) -> Result<(u32, u32, u16, u32, u32), ProbeError> {
     if dib_size == 12 {
         let mut core = [0_u8; 8];
         read_exact_or_invalid(file, path, &mut core, "truncated BITMAPCOREHEADER")?;
@@ -316,7 +338,7 @@ fn read_bmp_dib_header(
                 format!("unsupported BMP plane count {planes}"),
             ));
         }
-        return Ok((w, h, bpp, 0_u32));
+        return Ok((w, h, bpp, 0_u32, 0_u32));
     }
 
     let mut info = [0_u8; 36];
@@ -326,6 +348,7 @@ fn read_bmp_dib_header(
     let planes = u16::from_le_bytes([info[8], info[9]]);
     let bpp = u16::from_le_bytes([info[10], info[11]]);
     let comp = u32::from_le_bytes([info[12], info[13], info[14], info[15]]);
+    let colors_used = u32::from_le_bytes([info[28], info[29], info[30], info[31]]);
     if raw_w <= 0 || raw_h == 0 || raw_h == i32::MIN {
         return Err(invalid_image(
             path,
@@ -340,7 +363,7 @@ fn read_bmp_dib_header(
     }
     let w = u32::try_from(raw_w)
         .map_err(|_| invalid_image(path, format!("invalid BMP width {raw_w}")))?;
-    Ok((w, raw_h.unsigned_abs(), bpp, comp))
+    Ok((w, raw_h.unsigned_abs(), bpp, comp, colors_used))
 }
 
 fn probe_bmp(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError> {
@@ -383,7 +406,8 @@ fn probe_bmp(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError
         ));
     }
 
-    let (width, height, bit_count, compression) = read_bmp_dib_header(file, path, dib_size)?;
+    let (width, height, bit_count, compression, colors_used) =
+        read_bmp_dib_header(file, path, dib_size)?;
 
     validate_bmp_encoding(
         file,
@@ -393,6 +417,7 @@ fn probe_bmp(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError
         pixel_offset,
         bit_count,
         compression,
+        colors_used,
     )?;
 
     let dims = ImageDimensions::new(width, height)?;
@@ -420,6 +445,129 @@ fn probe_bmp(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError
     Ok(dims)
 }
 
+fn validate_bmp_palette_bounds(
+    path: &Path,
+    dib_size: u32,
+    header_end: u64,
+    pixel_offset: u64,
+    bit_count: u16,
+    colors_used: u32,
+) -> Result<(), ProbeError> {
+    let avail_palette_bytes = pixel_offset.saturating_sub(header_end);
+    if dib_size == 12 {
+        if avail_palette_bytes < 3 {
+            return Err(invalid_image(
+                path,
+                "indexed BMP is missing color palette entries",
+            ));
+        }
+        return Ok(());
+    }
+    let max_colors = 1_u32 << bit_count;
+    let declared = if colors_used == 0 {
+        max_colors
+    } else {
+        colors_used
+    };
+    if declared > max_colors {
+        return Err(invalid_image(
+            path,
+            format!(
+                "BMP biClrUsed ({declared}) exceeds maximum palette size ({max_colors}) for {bit_count}-bit image"
+            ),
+        ));
+    }
+    let required_bytes = u64::from(declared) * 4;
+    if avail_palette_bytes < required_bytes {
+        return Err(invalid_image(
+            path,
+            format!(
+                "indexed BMP palette truncated: declared {declared} entries ({required_bytes} bytes), only {avail_palette_bytes} bytes before pixel data"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bmp_bitfields_masks(
+    file: &mut File,
+    path: &Path,
+    dib_size: u32,
+    pixel_offset: u64,
+    bit_count: u16,
+    compression: u32,
+) -> Result<(), ProbeError> {
+    if !matches!(bit_count, 16 | 32) {
+        return Err(invalid_image(
+            path,
+            format!("BMP BI_BITFIELDS requires 16-bit or 32-bit pixels, got {bit_count}"),
+        ));
+    }
+    let need_alpha_mask = compression == 6 || dib_size >= 56;
+    let mask_bytes_needed = if need_alpha_mask { 16_u64 } else { 12_u64 };
+    let mask_offset = 54_u64;
+    if mask_offset + mask_bytes_needed > pixel_offset {
+        return Err(invalid_image(
+            path,
+            "truncated BMP BI_BITFIELDS channel masks",
+        ));
+    }
+    file.seek(SeekFrom::Start(mask_offset))
+        .map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut raw = [0_u8; 16];
+    let read_len = usize::try_from(mask_bytes_needed).unwrap_or(12);
+    read_exact_or_invalid(
+        file,
+        path,
+        &mut raw[..read_len],
+        "truncated BMP BI_BITFIELDS channel masks",
+    )?;
+    let r = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let g = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let b = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+    let a = if need_alpha_mask {
+        u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]])
+    } else {
+        0
+    };
+    if r == 0 || g == 0 || b == 0 {
+        return Err(invalid_image(
+            path,
+            "invalid BMP BI_BITFIELDS with zero RGB channel mask",
+        ));
+    }
+    let is_contiguous = |mask: u32| -> bool {
+        if mask == 0 {
+            return true;
+        }
+        let shifted = mask >> mask.trailing_zeros();
+        (shifted & shifted.wrapping_add(1)) == 0
+    };
+    if !is_contiguous(r) || !is_contiguous(g) || !is_contiguous(b) || !is_contiguous(a) {
+        return Err(invalid_image(
+            path,
+            "invalid BMP BI_BITFIELDS with non-contiguous channel mask",
+        ));
+    }
+    if (r & g) != 0 || (r & b) != 0 || (g & b) != 0 || ((r | g | b) & a) != 0 {
+        return Err(invalid_image(
+            path,
+            "invalid BMP BI_BITFIELDS with overlapping channel masks",
+        ));
+    }
+    if bit_count == 16 && ((r | g | b | a) >> 16) != 0 {
+        return Err(invalid_image(
+            path,
+            "invalid 16-bit BMP BI_BITFIELDS mask exceeding 16 bits",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn validate_bmp_encoding(
     file: &mut File,
     path: &Path,
@@ -428,6 +576,7 @@ fn validate_bmp_encoding(
     pixel_offset: u64,
     bit_count: u16,
     compression: u32,
+    colors_used: u32,
 ) -> Result<(), ProbeError> {
     match compression {
         0 => {
@@ -444,85 +593,19 @@ fn validate_bmp_encoding(
                 ));
             }
             if matches!(bit_count, 1 | 4 | 8) {
-                let entry_size = if dib_size == 12 { 3_u64 } else { 4_u64 };
-                if pixel_offset.saturating_sub(header_end) < entry_size {
-                    return Err(invalid_image(
-                        path,
-                        "indexed BMP is missing color palette entries",
-                    ));
-                }
+                validate_bmp_palette_bounds(
+                    path,
+                    dib_size,
+                    header_end,
+                    pixel_offset,
+                    bit_count,
+                    colors_used,
+                )?;
             }
             Ok(())
         }
         3 | 6 => {
-            if !matches!(bit_count, 16 | 32) {
-                return Err(invalid_image(
-                    path,
-                    format!("BMP BI_BITFIELDS requires 16-bit or 32-bit pixels, got {bit_count}"),
-                ));
-            }
-            let need_alpha_mask = compression == 6 || dib_size >= 56;
-            let mask_bytes_needed = if need_alpha_mask { 16_u64 } else { 12_u64 };
-            let mask_offset = 54_u64;
-            if mask_offset + mask_bytes_needed > pixel_offset {
-                return Err(invalid_image(
-                    path,
-                    "truncated BMP BI_BITFIELDS channel masks",
-                ));
-            }
-            file.seek(SeekFrom::Start(mask_offset))
-                .map_err(|source| ProbeError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
-            let mut raw = [0_u8; 16];
-            let read_len = usize::try_from(mask_bytes_needed).unwrap_or(12);
-            read_exact_or_invalid(
-                file,
-                path,
-                &mut raw[..read_len],
-                "truncated BMP BI_BITFIELDS channel masks",
-            )?;
-            let r = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-            let g = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
-            let b = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
-            let a = if need_alpha_mask {
-                u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]])
-            } else {
-                0
-            };
-            if r == 0 || g == 0 || b == 0 {
-                return Err(invalid_image(
-                    path,
-                    "invalid BMP BI_BITFIELDS with zero RGB channel mask",
-                ));
-            }
-            let is_contiguous = |mask: u32| -> bool {
-                if mask == 0 {
-                    return true;
-                }
-                let shifted = mask >> mask.trailing_zeros();
-                (shifted & shifted.wrapping_add(1)) == 0
-            };
-            if !is_contiguous(r) || !is_contiguous(g) || !is_contiguous(b) || !is_contiguous(a) {
-                return Err(invalid_image(
-                    path,
-                    "invalid BMP BI_BITFIELDS with non-contiguous channel mask",
-                ));
-            }
-            if (r & g) != 0 || (r & b) != 0 || (g & b) != 0 || ((r | g | b) & a) != 0 {
-                return Err(invalid_image(
-                    path,
-                    "invalid BMP BI_BITFIELDS with overlapping channel masks",
-                ));
-            }
-            if bit_count == 16 && ((r | g | b | a) >> 16) != 0 {
-                return Err(invalid_image(
-                    path,
-                    "invalid 16-bit BMP BI_BITFIELDS mask exceeding 16 bits",
-                ));
-            }
-            Ok(())
+            validate_bmp_bitfields_masks(file, path, dib_size, pixel_offset, bit_count, compression)
         }
         other => Err(invalid_image(
             path,
@@ -567,14 +650,29 @@ fn probe_qoi(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError
     }
 
     let dims = ImageDimensions::new(width, height)?;
-    let total_rgba = u64::from(width)
+    let pixel_count = u64::from(width)
         .checked_mul(u64::from(height))
-        .and_then(|px| px.checked_mul(4))
-        .and_then(|bytes| usize::try_from(bytes).ok());
-    if total_rgba.is_none() {
+        .ok_or_else(|| invalid_image(path, "QOI dimensions overflow pixel count"))?;
+    let total_rgba = pixel_count
+        .checked_mul(4)
+        .filter(|&bytes| usize::try_from(bytes).is_ok())
+        .ok_or_else(|| invalid_image(path, "QOI dimensions exceed addressable memory"))?;
+    if total_rgba > MAX_QOI_DECODED_BYTES {
         return Err(invalid_image(
             path,
-            "QOI dimensions exceed addressable memory",
+            format!(
+                "QOI decoded frame size ({total_rgba} bytes) exceeds {MAX_QOI_DECODED_BYTES}-byte limit"
+            ),
+        ));
+    }
+    let stream_len = file_len - 22;
+    let min_stream_bytes = pixel_count.div_ceil(QOI_MAX_RUN);
+    if stream_len < min_stream_bytes {
+        return Err(invalid_image(
+            path,
+            format!(
+                "QOI bitstream ({stream_len} bytes) is too short to represent {pixel_count} pixels (minimum {min_stream_bytes} bytes)"
+            ),
         ));
     }
 
@@ -1821,6 +1919,142 @@ mod tests {
             Err(ProbeError::InvalidDomain(
                 DomainError::IdenticalSourceAndTarget(_)
             ))
+        ));
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_and_duplicate_vp8x_frame_chunks() -> Result<(), ProbeError> {
+        let root = create_temp_dir("strict-vp8x")?;
+
+        // 1. VP8X with a zero-length VP8L chunk must be rejected.
+        let vp8x_empty_vp8l = root.join("vp8x_empty_vp8l.webp");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(4_u32 + 18 + 8).to_le_bytes());
+        bytes.extend_from_slice(b"WEBP");
+        bytes.extend_from_slice(b"VP8X");
+        bytes.extend_from_slice(&10_u32.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0, 0, 0, 15, 0, 0, 15, 0, 0]); // 16x16 canvas
+        bytes.extend_from_slice(b"VP8L");
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        fs::write(&vp8x_empty_vp8l, &bytes).map_err(|source| ProbeError::Io {
+            path: vp8x_empty_vp8l.clone(),
+            source,
+        })?;
+        assert!(matches!(
+            probe_image(&vp8x_empty_vp8l),
+            Err(ProbeError::InvalidImage { .. })
+        ));
+
+        let vp8l_16x16: [u8; 5] = {
+            let bits: u32 = 15 | (15 << 14);
+            let le = bits.to_le_bytes();
+            [0x2F, le[0], le[1], le[2], le[3]]
+        };
+        let vp8l_8x8: [u8; 5] = {
+            let bits: u32 = 7 | (7 << 14);
+            let le = bits.to_le_bytes();
+            [0x2F, le[0], le[1], le[2], le[3]]
+        };
+
+        // 2. VP8X canvas 16x16 with embedded 8x8 VP8L frame must be rejected.
+        let vp8x_mismatch = root.join("vp8x_mismatch.webp");
+        let mut mismatch = Vec::new();
+        mismatch.extend_from_slice(b"RIFF");
+        mismatch.extend_from_slice(&(4_u32 + 18 + 14).to_le_bytes());
+        mismatch.extend_from_slice(b"WEBP");
+        mismatch.extend_from_slice(b"VP8X");
+        mismatch.extend_from_slice(&10_u32.to_le_bytes());
+        mismatch.extend_from_slice(&[0, 0, 0, 0, 15, 0, 0, 15, 0, 0]);
+        mismatch.extend_from_slice(b"VP8L");
+        mismatch.extend_from_slice(&5_u32.to_le_bytes());
+        mismatch.extend_from_slice(&vp8l_8x8);
+        mismatch.push(0);
+        fs::write(&vp8x_mismatch, &mismatch).map_err(|source| ProbeError::Io {
+            path: vp8x_mismatch.clone(),
+            source,
+        })?;
+        assert!(matches!(
+            probe_image(&vp8x_mismatch),
+            Err(ProbeError::InvalidImage { .. })
+        ));
+
+        // 3. VP8X with two VP8L chunks of the same type must be rejected.
+        let vp8x_dup = root.join("vp8x_dup.webp");
+        let mut dup = Vec::new();
+        dup.extend_from_slice(b"RIFF");
+        dup.extend_from_slice(&(4_u32 + 18 + 14 + 14).to_le_bytes());
+        dup.extend_from_slice(b"WEBP");
+        dup.extend_from_slice(b"VP8X");
+        dup.extend_from_slice(&10_u32.to_le_bytes());
+        dup.extend_from_slice(&[0, 0, 0, 0, 15, 0, 0, 15, 0, 0]);
+        for _ in 0..2 {
+            dup.extend_from_slice(b"VP8L");
+            dup.extend_from_slice(&5_u32.to_le_bytes());
+            dup.extend_from_slice(&vp8l_16x16);
+            dup.push(0);
+        }
+        fs::write(&vp8x_dup, &dup).map_err(|source| ProbeError::Io {
+            path: vp8x_dup.clone(),
+            source,
+        })?;
+        assert!(matches!(
+            probe_image(&vp8x_dup),
+            Err(ProbeError::InvalidImage { .. })
+        ));
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_oversized_qoi_and_short_bmp_palettes() -> Result<(), ProbeError> {
+        let root = create_temp_dir("strict-qoi-bmp")?;
+
+        // Short QOI declaring 1_000_000 x 1_000_000 must be rejected at probe boundary.
+        let bad_qoi = root.join("bomb.qoi");
+        let mut qoi = Vec::new();
+        qoi.extend_from_slice(b"qoif");
+        qoi.extend_from_slice(&1_000_000_u32.to_be_bytes());
+        qoi.extend_from_slice(&1_000_000_u32.to_be_bytes());
+        qoi.extend_from_slice(&[4, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        fs::write(&bad_qoi, &qoi).map_err(|source| ProbeError::Io {
+            path: bad_qoi.clone(),
+            source,
+        })?;
+        assert!(matches!(
+            probe_image(&bad_qoi),
+            Err(ProbeError::InvalidImage { .. })
+        ));
+
+        // Indexed 8-bit BMP with biClrUsed = 16 but only 8 palette bytes must be rejected.
+        let bad_bmp = root.join("short_palette.bmp");
+        let mut bmp = Vec::new();
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&(54_u32 + 8 + 4).to_le_bytes());
+        bmp.extend_from_slice(&0_u32.to_le_bytes());
+        bmp.extend_from_slice(&(54_u32 + 8).to_le_bytes());
+        bmp.extend_from_slice(&40_u32.to_le_bytes());
+        bmp.extend_from_slice(&1_i32.to_le_bytes());
+        bmp.extend_from_slice(&1_i32.to_le_bytes());
+        bmp.extend_from_slice(&1_u16.to_le_bytes());
+        bmp.extend_from_slice(&8_u16.to_le_bytes());
+        bmp.extend_from_slice(&0_u32.to_le_bytes());
+        bmp.extend_from_slice(&4_u32.to_le_bytes());
+        bmp.extend_from_slice(&[0_u8; 8]);
+        bmp.extend_from_slice(&16_u32.to_le_bytes());
+        bmp.extend_from_slice(&0_u32.to_le_bytes());
+        bmp.extend_from_slice(&[0_u8; 12]);
+        fs::write(&bad_bmp, &bmp).map_err(|source| ProbeError::Io {
+            path: bad_bmp.clone(),
+            source,
+        })?;
+        assert!(matches!(
+            probe_image(&bad_bmp),
+            Err(ProbeError::InvalidImage { .. })
         ));
 
         fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;

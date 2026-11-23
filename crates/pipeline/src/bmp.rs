@@ -453,6 +453,11 @@ impl BitMask {
     }
 
     #[inline]
+    const fn is_opaque(self, value: u32) -> bool {
+        self.mask == 0 || (value & self.mask) == self.mask
+    }
+
+    #[inline]
     fn extract_u8(self, value: u32) -> u8 {
         if self.mask == 0 || self.bits == 0 {
             return 0;
@@ -475,6 +480,7 @@ struct ParsedBmp<'a> {
     bit_count: u16,
     compression: u32,
     dib_size: u32,
+    colors_used: u32,
     row_stride: usize,
     pixel_data: &'a [u8],
     palette_data: &'a [u8],
@@ -487,6 +493,7 @@ struct BmpDibInfo {
     top_down: bool,
     bit_count: u16,
     compression: u32,
+    colors_used: u32,
 }
 
 fn parse_bmp_dib_info(
@@ -511,6 +518,7 @@ fn parse_bmp_dib_info(
             top_down: false,
             bit_count: bpp,
             compression: 0,
+            colors_used: 0,
         });
     }
 
@@ -525,6 +533,7 @@ fn parse_bmp_dib_info(
     let planes = u16::from_le_bytes([data[26], data[27]]);
     let bpp = u16::from_le_bytes([data[28], data[29]]);
     let comp = u32::from_le_bytes([data[30], data[31], data[32], data[33]]);
+    let colors_used = u32::from_le_bytes([data[46], data[47], data[48], data[49]]);
     if raw_w <= 0 || raw_h == 0 || raw_h == i32::MIN || planes != 1 {
         return Err(PipelineError::DecodeFailed {
             path: source.to_path_buf(),
@@ -541,6 +550,7 @@ fn parse_bmp_dib_info(
         top_down: raw_h < 0,
         bit_count: bpp,
         compression: comp,
+        colors_used,
     })
 }
 
@@ -611,6 +621,7 @@ fn parse_bmp<'a>(source: &Path, data: &'a [u8]) -> Result<ParsedBmp<'a>, Pipelin
         bit_count: dib.bit_count,
         compression: dib.compression,
         dib_size,
+        colors_used: dib.colors_used,
         row_stride,
         pixel_data: &data[pixel_offset..pixel_end],
         palette_data: &data[header_end..pixel_offset],
@@ -690,11 +701,12 @@ pub(crate) fn decode_bmp_slice_into(
 
     match (bmp.compression, bmp.bit_count) {
         (0, 24) => decode_bmp_24(source, &bmp, width, height, pixel_count, hint, pixel_buf),
-        (0, 32) => decode_bmp_32_bgra(source, &bmp, width, height, pixel_count, hint, pixel_buf),
+        // Per BMP BITMAPINFOHEADER spec, the high byte of 32-bit BI_RGB pixels is unused padding.
+        (0, 32) => decode_bmp_32_bgrx(source, &bmp, width, height, pixel_count, hint, pixel_buf),
         (3 | 6, 32) => {
             decode_bmp_32_bitfields(source, &bmp, width, height, pixel_count, hint, pixel_buf)
         }
-        (0 | 3 | 6, 16) => decode_bmp_16(source, &bmp, width, height, pixel_count, pixel_buf),
+        (0 | 3 | 6, 16) => decode_bmp_16(source, &bmp, width, height, pixel_count, hint, pixel_buf),
         (0, 1 | 4 | 8) => decode_bmp_indexed(source, &bmp, width, height, pixel_count, pixel_buf),
         (comp, bpp) => Err(PipelineError::UnsupportedPixelFormat {
             path: source.to_path_buf(),
@@ -761,6 +773,73 @@ fn decode_bmp_24(
         let src_row = &bmp.pixel_data[src_y * bmp.row_stride..][..dst_row_bytes];
         let dst_row = &mut pixel_buf[dst_y * dst_row_bytes..(dst_y + 1) * dst_row_bytes];
         swizzle_rgb24_to_bgr24(src_row, dst_row);
+    }
+    Ok((bmp.width, bmp.height, DecodedPixelFormat::Rgb8, out_len))
+}
+
+fn decode_bmp_32_bgrx(
+    source: &Path,
+    bmp: &ParsedBmp<'_>,
+    width: usize,
+    height: usize,
+    pixel_count: usize,
+    hint: DecodeTargetHint,
+    pixel_buf: &mut Vec<u8>,
+) -> Result<(u32, u32, DecodedPixelFormat, usize), PipelineError> {
+    #[cfg(feature = "nvenc")]
+    if hint == DecodeTargetHint::OpaqueRgba8 {
+        let out_len = pixel_count
+            .checked_mul(4)
+            .ok_or_else(|| PipelineError::DecodeFailed {
+                path: source.to_path_buf(),
+                reason: "BMP RGBA8 output overflow".to_owned(),
+            })?;
+        if pixel_buf.len() < out_len {
+            pixel_buf.resize(out_len, 0);
+        }
+        let dst_row_bytes = width * 4;
+        for dst_y in 0..height {
+            let src_y = if bmp.top_down {
+                dst_y
+            } else {
+                height - 1 - dst_y
+            };
+            let src_row = &bmp.pixel_data[src_y * bmp.row_stride..][..dst_row_bytes];
+            let dst_row = &mut pixel_buf[dst_y * dst_row_bytes..(dst_y + 1) * dst_row_bytes];
+            let (src_quads, _) = src_row.as_chunks::<4>();
+            let (dst_quads, _) = dst_row.as_chunks_mut::<4>();
+            for (&[b, g, r, _], dst) in src_quads.iter().zip(dst_quads.iter_mut()) {
+                *dst = [r, g, b, 255];
+            }
+        }
+        return Ok((bmp.width, bmp.height, DecodedPixelFormat::Rgba8, out_len));
+    }
+
+    let _ = hint;
+    let out_len = pixel_count
+        .checked_mul(3)
+        .ok_or_else(|| PipelineError::DecodeFailed {
+            path: source.to_path_buf(),
+            reason: "BMP RGB8 output overflow".to_owned(),
+        })?;
+    if pixel_buf.len() < out_len {
+        pixel_buf.resize(out_len, 0);
+    }
+    let src_row_bytes = width * 4;
+    let dst_row_bytes = width * 3;
+    for dst_y in 0..height {
+        let src_y = if bmp.top_down {
+            dst_y
+        } else {
+            height - 1 - dst_y
+        };
+        let src_row = &bmp.pixel_data[src_y * bmp.row_stride..][..src_row_bytes];
+        let dst_row = &mut pixel_buf[dst_y * dst_row_bytes..(dst_y + 1) * dst_row_bytes];
+        let (src_quads, _) = src_row.as_chunks::<4>();
+        let (dst_triplets, _) = dst_row.as_chunks_mut::<3>();
+        for (&[b, g, r, _], dst) in src_quads.iter().zip(dst_triplets.iter_mut()) {
+            *dst = [r, g, b];
+        }
     }
     Ok((bmp.width, bmp.height, DecodedPixelFormat::Rgb8, out_len))
 }
@@ -866,14 +945,18 @@ fn decode_bmp_32_bitfields(
             let (dst_quads, _) = dst_row.as_chunks_mut::<4>();
             for (&bytes, dst) in src_quads.iter().zip(dst_quads.iter_mut()) {
                 let v = u32::from_le_bytes(bytes);
-                let a = am.extract_u8(v);
-                if reject_transparent && a < 255 {
+                if reject_transparent && !am.is_opaque(v) {
                     return Err(PipelineError::UnsupportedPixelFormat {
                         path: source.to_path_buf(),
                         format: "non-opaque alpha channel (NVENC HEVC-Intra HEIC currently supports opaque images)".to_owned(),
                     });
                 }
-                *dst = [rm.extract_u8(v), gm.extract_u8(v), bm.extract_u8(v), a];
+                *dst = [
+                    rm.extract_u8(v),
+                    gm.extract_u8(v),
+                    bm.extract_u8(v),
+                    am.extract_u8(v),
+                ];
             }
         }
         Ok((bmp.width, bmp.height, DecodedPixelFormat::Rgba8, out_len))
@@ -913,6 +996,7 @@ fn decode_bmp_16(
     width: usize,
     height: usize,
     pixel_count: usize,
+    hint: DecodeTargetHint,
     pixel_buf: &mut Vec<u8>,
 ) -> Result<(u32, u32, DecodedPixelFormat, usize), PipelineError> {
     let [rm, gm, bm, am] = if bmp.compression == 0 {
@@ -926,6 +1010,13 @@ fn decode_bmp_16(
         bmp.masks
     };
     let has_alpha = am.mask != 0;
+    #[cfg(feature = "nvenc")]
+    let reject_transparent = hint == DecodeTargetHint::OpaqueRgba8;
+    #[cfg(not(feature = "nvenc"))]
+    let reject_transparent = {
+        let _ = hint;
+        false
+    };
     let out_bpp = if has_alpha { 4_usize } else { 3_usize };
     let out_len = pixel_count
         .checked_mul(out_bpp)
@@ -951,6 +1042,12 @@ fn decode_bmp_16(
             let (dst_quads, _) = dst_row.as_chunks_mut::<4>();
             for (&bytes, dst) in src_pairs.iter().zip(dst_quads.iter_mut()) {
                 let v = u32::from(u16::from_le_bytes(bytes));
+                if reject_transparent && !am.is_opaque(v) {
+                    return Err(PipelineError::UnsupportedPixelFormat {
+                        path: source.to_path_buf(),
+                        format: "non-opaque alpha channel (NVENC HEVC-Intra HEIC currently supports opaque images)".to_owned(),
+                    });
+                }
                 *dst = [
                     rm.extract_u8(v),
                     gm.extract_u8(v),
@@ -975,16 +1072,53 @@ fn decode_bmp_16(
     Ok((bmp.width, bmp.height, format, out_len))
 }
 
-fn decode_bmp_indexed(
+fn parse_indexed_bmp_palette(
     source: &Path,
     bmp: &ParsedBmp<'_>,
-    width: usize,
-    height: usize,
-    pixel_count: usize,
-    pixel_buf: &mut Vec<u8>,
-) -> Result<(u32, u32, DecodedPixelFormat, usize), PipelineError> {
+) -> Result<([[u8; 3]; 256], usize), PipelineError> {
+    let max_colors = 1_usize << bmp.bit_count;
     let entry_size = if bmp.dib_size == 12 { 3_usize } else { 4_usize };
-    let entry_count = (bmp.palette_data.len() / entry_size).min(256);
+    let entry_count = if bmp.dib_size == 12 {
+        (bmp.palette_data.len() / entry_size).min(max_colors)
+    } else {
+        let declared = if bmp.colors_used == 0 {
+            max_colors
+        } else {
+            usize::try_from(bmp.colors_used).map_err(|_| PipelineError::DecodeFailed {
+                path: source.to_path_buf(),
+                reason: format!(
+                    "BMP biClrUsed {} exceeds addressable memory",
+                    bmp.colors_used
+                ),
+            })?
+        };
+        if declared > max_colors {
+            return Err(PipelineError::DecodeFailed {
+                path: source.to_path_buf(),
+                reason: format!(
+                    "BMP biClrUsed ({declared}) exceeds maximum palette size ({max_colors}) for {}-bit image",
+                    bmp.bit_count
+                ),
+            });
+        }
+        let required_bytes =
+            declared
+                .checked_mul(entry_size)
+                .ok_or_else(|| PipelineError::DecodeFailed {
+                    path: source.to_path_buf(),
+                    reason: "BMP palette byte size overflow".to_owned(),
+                })?;
+        if bmp.palette_data.len() < required_bytes {
+            return Err(PipelineError::DecodeFailed {
+                path: source.to_path_buf(),
+                reason: format!(
+                    "indexed BMP palette truncated: declared {declared} entries ({required_bytes} bytes), only {} bytes before pixel data",
+                    bmp.palette_data.len()
+                ),
+            });
+        }
+        declared
+    };
     if entry_count == 0 {
         return Err(PipelineError::DecodeFailed {
             path: source.to_path_buf(),
@@ -1000,6 +1134,18 @@ fn decode_bmp_indexed(
             bmp.palette_data[base],
         ];
     }
+    Ok((palette, entry_count))
+}
+
+fn decode_bmp_indexed(
+    source: &Path,
+    bmp: &ParsedBmp<'_>,
+    width: usize,
+    height: usize,
+    pixel_count: usize,
+    pixel_buf: &mut Vec<u8>,
+) -> Result<(u32, u32, DecodedPixelFormat, usize), PipelineError> {
+    let (palette, entry_count) = parse_indexed_bmp_palette(source, bmp)?;
 
     let out_len = pixel_count
         .checked_mul(3)
@@ -1177,6 +1323,154 @@ mod tests {
         assert_eq!((dw, dh, fmt), (w, h, DecodedPixelFormat::Rgb8));
         let expected_rgb: Vec<u8> = luma.iter().flat_map(|&v| [v, v, v]).collect();
         assert_eq!(&decoded[..len], expected_rgb.as_slice());
+
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_32bit_bi_rgb_as_opaque_bgrx_ignoring_zero_high_byte()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let p = Path::new("bgrx32.bmp");
+        // 2x1 32-bit BI_RGB BITMAPINFOHEADER where the unused high byte is 0x00.
+        let mut bmp = Vec::new();
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&(54_u32 + 8).to_le_bytes());
+        bmp.extend_from_slice(&0_u32.to_le_bytes());
+        bmp.extend_from_slice(&54_u32.to_le_bytes());
+        bmp.extend_from_slice(&40_u32.to_le_bytes());
+        bmp.extend_from_slice(&2_i32.to_le_bytes());
+        bmp.extend_from_slice(&1_i32.to_le_bytes());
+        bmp.extend_from_slice(&1_u16.to_le_bytes());
+        bmp.extend_from_slice(&32_u16.to_le_bytes());
+        bmp.extend_from_slice(&0_u32.to_le_bytes()); // BI_RGB
+        bmp.extend_from_slice(&8_u32.to_le_bytes());
+        bmp.extend_from_slice(&[0_u8; 16]);
+        // Pixel 0: B=10, G=20, R=30, X=0; Pixel 1: B=40, G=50, R=60, X=0.
+        bmp.extend_from_slice(&[10, 20, 30, 0, 40, 50, 60, 0]);
+
+        let mut decoded = Vec::new();
+        let (w, h, fmt, len) =
+            decode_bmp_slice_into(p, &bmp, DecodeTargetHint::Native, &mut decoded)?;
+        assert_eq!((w, h, fmt, len), (2, 1, DecodedPixelFormat::Rgb8, 6));
+        assert_eq!(&decoded[..len], &[30, 20, 10, 60, 50, 40]);
+
+        #[cfg(feature = "nvenc")]
+        {
+            let (w, h, fmt, len) =
+                decode_bmp_slice_into(p, &bmp, DecodeTargetHint::OpaqueRgba8, &mut decoded)?;
+            assert_eq!((w, h, fmt, len), (2, 1, DecodedPixelFormat::Rgba8, 8));
+            assert_eq!(&decoded[..len], &[30, 20, 10, 255, 60, 50, 40, 255]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn enforces_declared_palette_size_for_indexed_bmp() {
+        let p = Path::new("indexed.bmp");
+        // 8-bit BITMAPINFOHEADER declaring biClrUsed = 2, with 4 gap bytes before pixels.
+        let mut bmp = Vec::new();
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&(54_u32 + 12 + 4).to_le_bytes());
+        bmp.extend_from_slice(&0_u32.to_le_bytes());
+        bmp.extend_from_slice(&(54_u32 + 12).to_le_bytes()); // 8 bytes palette + 4 gap bytes
+        bmp.extend_from_slice(&40_u32.to_le_bytes());
+        bmp.extend_from_slice(&1_i32.to_le_bytes());
+        bmp.extend_from_slice(&1_i32.to_le_bytes());
+        bmp.extend_from_slice(&1_u16.to_le_bytes());
+        bmp.extend_from_slice(&8_u16.to_le_bytes());
+        bmp.extend_from_slice(&0_u32.to_le_bytes()); // BI_RGB
+        bmp.extend_from_slice(&4_u32.to_le_bytes());
+        bmp.extend_from_slice(&[0_u8; 8]); // ppm
+        bmp.extend_from_slice(&2_u32.to_le_bytes()); // biClrUsed = 2
+        bmp.extend_from_slice(&0_u32.to_le_bytes());
+        // 2 palette entries + 4 gap bytes pretending to be a 3rd entry.
+        bmp.extend_from_slice(&[0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0]);
+        // Pixel index 2 must be rejected because biClrUsed == 2.
+        bmp.extend_from_slice(&[2, 0, 0, 0]);
+
+        let mut decoded = Vec::new();
+        assert!(decode_bmp_slice_into(p, &bmp, DecodeTargetHint::Native, &mut decoded).is_err());
+
+        // Pixel index 1 is within biClrUsed == 2 and decodes cleanly.
+        bmp[54 + 12] = 1;
+        let res = decode_bmp_slice_into(p, &bmp, DecodeTargetHint::Native, &mut decoded);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn enforces_16bit_and_high_bitdepth_alpha_opacity_for_nvenc()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // 16-bit BI_ALPHABITFIELDS RGB555 + A1 (1x1 transparent pixel: alpha bit 0).
+        let mut bmp16 = Vec::new();
+        bmp16.extend_from_slice(b"BM");
+        bmp16.extend_from_slice(&(14_u32 + 56 + 4).to_le_bytes());
+        bmp16.extend_from_slice(&0_u32.to_le_bytes());
+        bmp16.extend_from_slice(&(14_u32 + 56).to_le_bytes());
+        bmp16.extend_from_slice(&56_u32.to_le_bytes());
+        bmp16.extend_from_slice(&1_i32.to_le_bytes());
+        bmp16.extend_from_slice(&1_i32.to_le_bytes());
+        bmp16.extend_from_slice(&1_u16.to_le_bytes());
+        bmp16.extend_from_slice(&16_u16.to_le_bytes());
+        bmp16.extend_from_slice(&6_u32.to_le_bytes()); // BI_ALPHABITFIELDS
+        bmp16.extend_from_slice(&4_u32.to_le_bytes());
+        bmp16.extend_from_slice(&[0_u8; 16]);
+        bmp16.extend_from_slice(&0x7C00_u32.to_le_bytes()); // R
+        bmp16.extend_from_slice(&0x03E0_u32.to_le_bytes()); // G
+        bmp16.extend_from_slice(&0x001F_u32.to_le_bytes()); // B
+        bmp16.extend_from_slice(&0x8000_u32.to_le_bytes()); // A (1 bit)
+        bmp16.extend_from_slice(&0x7FFF_u16.to_le_bytes()); // alpha bit = 0
+        bmp16.extend_from_slice(&[0, 0]);
+
+        let p16 = Path::new("argb1555.bmp");
+        let mut decoded = Vec::new();
+        let (_, _, fmt, len) =
+            decode_bmp_slice_into(p16, &bmp16, DecodeTargetHint::Native, &mut decoded)?;
+        assert_eq!((fmt, len), (DecodedPixelFormat::Rgba8, 4));
+        assert_eq!(decoded[3], 0);
+
+        #[cfg(feature = "nvenc")]
+        {
+            assert!(matches!(
+                decode_bmp_slice_into(p16, &bmp16, DecodeTargetHint::OpaqueRgba8, &mut decoded),
+                Err(crate::PipelineError::UnsupportedPixelFormat { .. })
+            ));
+        }
+
+        // 32-bit BI_BITFIELDS with 10-bit alpha mask (0xFFC0_0000): sample 1022/1023 rounds
+        // to 255 in 8-bit native output but is not fully opaque and must fail NVENC check.
+        let mut bmp32 = Vec::new();
+        bmp32.extend_from_slice(b"BM");
+        bmp32.extend_from_slice(&(14_u32 + 56 + 4).to_le_bytes());
+        bmp32.extend_from_slice(&0_u32.to_le_bytes());
+        bmp32.extend_from_slice(&(14_u32 + 56).to_le_bytes());
+        bmp32.extend_from_slice(&56_u32.to_le_bytes());
+        bmp32.extend_from_slice(&1_i32.to_le_bytes());
+        bmp32.extend_from_slice(&1_i32.to_le_bytes());
+        bmp32.extend_from_slice(&1_u16.to_le_bytes());
+        bmp32.extend_from_slice(&32_u16.to_le_bytes());
+        bmp32.extend_from_slice(&3_u32.to_le_bytes()); // BI_BITFIELDS
+        bmp32.extend_from_slice(&4_u32.to_le_bytes());
+        bmp32.extend_from_slice(&[0_u8; 16]);
+        bmp32.extend_from_slice(&0x003F_0000_u32.to_le_bytes()); // R (6 bits)
+        bmp32.extend_from_slice(&0x0000_FF00_u32.to_le_bytes()); // G (8 bits)
+        bmp32.extend_from_slice(&0x0000_00FF_u32.to_le_bytes()); // B (8 bits)
+        bmp32.extend_from_slice(&0xFFC0_0000_u32.to_le_bytes()); // A (10 bits)
+        let pixel_a1022: u32 = (1022_u32 << 22) | 0x0015_8040;
+        bmp32.extend_from_slice(&pixel_a1022.to_le_bytes());
+
+        let p32 = Path::new("alpha10.bmp");
+        let (_, _, fmt, len) =
+            decode_bmp_slice_into(p32, &bmp32, DecodeTargetHint::Native, &mut decoded)?;
+        assert_eq!((fmt, len), (DecodedPixelFormat::Rgba8, 4));
+        assert_eq!(decoded[3], 255);
+
+        #[cfg(feature = "nvenc")]
+        {
+            assert!(matches!(
+                decode_bmp_slice_into(p32, &bmp32, DecodeTargetHint::OpaqueRgba8, &mut decoded),
+                Err(crate::PipelineError::UnsupportedPixelFormat { .. })
+            ));
+        }
 
         Ok(())
     }
