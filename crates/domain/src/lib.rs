@@ -1,8 +1,13 @@
+pub mod audio;
 pub mod hardware;
 pub mod image;
 pub mod metrics;
 pub mod video;
 
+pub use audio::{
+    AudioBatchItem, AudioBatchPlan, AudioConversionReport, AudioExecutionMode, AudioInputFormat,
+    AudioOutputFormat, AudioStreamInfo,
+};
 pub use hardware::{
     CpuInfo, DetectedGpuBackend, GpuCapability, GpuDeviceType, GpuVendor, GraphicsApi,
     HostHardware, SimdLevel, WgpuAdapterInfo,
@@ -98,6 +103,11 @@ pub enum DomainError {
     UnsupportedVideoCodec {
         codec: VideoCodec,
         container: VideoContainerFormat,
+    },
+    UnsupportedAudioPipeline {
+        format: AudioOutputFormat,
+        backend: HardwareBackend,
+        reason: String,
     },
 }
 
@@ -214,6 +224,14 @@ impl fmt::Display for DomainError {
             } => write!(
                 f,
                 "backend '{backend}' cannot encode .{format} images: {reason}"
+            ),
+            Self::UnsupportedAudioPipeline {
+                format,
+                backend,
+                reason,
+            } => write!(
+                f,
+                "backend '{backend}' cannot encode {format} audio: {reason}"
             ),
         }
     }

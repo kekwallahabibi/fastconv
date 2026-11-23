@@ -1,11 +1,14 @@
 #![cfg_attr(not(feature = "nvenc"), forbid(unsafe_code))]
 
+pub mod audio;
 mod bmp;
 pub mod cpu;
 mod decode;
 pub mod gpu;
 mod qoi;
 pub mod remux;
+
+pub use audio::execute_audio_batch;
 
 use std::error::Error;
 use std::fmt;
@@ -30,8 +33,10 @@ pub enum PipelineError {
     EncodeFailed { path: PathBuf, reason: String },
     RemuxFailed { path: PathBuf, reason: String },
     UnsupportedPixelFormat { path: PathBuf, format: String },
+    UnsupportedSampleDepth { path: PathBuf, bits: usize },
     EmptyOutput(PathBuf),
     WorkerPanicked,
+    WorkerStartFailed(io::Error),
 }
 
 impl fmt::Display for PipelineError {
@@ -62,10 +67,18 @@ impl fmt::Display for PipelineError {
                     path.display()
                 )
             }
+            Self::UnsupportedSampleDepth { path, bits } => write!(
+                f,
+                "unsupported audio sample depth {bits} in '{}'; supported depths are 8, 16 and 24 bits",
+                path.display()
+            ),
             Self::EmptyOutput(path) => {
                 write!(f, "encoder produced empty output for '{}'", path.display())
             }
             Self::WorkerPanicked => f.write_str("conversion worker thread panicked"),
+            Self::WorkerStartFailed(source) => {
+                write!(f, "failed to start conversion worker: {source}")
+            }
         }
     }
 }
@@ -73,13 +86,14 @@ impl fmt::Display for PipelineError {
 impl Error for PipelineError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Io { source, .. } => Some(source),
+            Self::Io { source, .. } | Self::WorkerStartFailed(source) => Some(source),
             Self::BackendNotImplemented(_)
             | Self::GpuBackendFailed { .. }
             | Self::DecodeFailed { .. }
             | Self::EncodeFailed { .. }
             | Self::RemuxFailed { .. }
             | Self::UnsupportedPixelFormat { .. }
+            | Self::UnsupportedSampleDepth { .. }
             | Self::EmptyOutput(_)
             | Self::WorkerPanicked => None,
         }

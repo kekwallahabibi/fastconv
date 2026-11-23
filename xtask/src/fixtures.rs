@@ -18,6 +18,7 @@ pub const IMAGE_HEIGHT: u32 = 2160;
 pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
 pub const AUDIO_CHANNELS: u16 = 2;
 pub const AUDIO_DURATION_SECS: u32 = 60;
+pub const AUDIO_BATCH_SECS: u32 = 10;
 
 pub const VIDEO_FPS: u64 = 60;
 pub const VIDEO_DURATION_SECS: u64 = 10;
@@ -59,6 +60,22 @@ pub fn audio_wav_path(root: &Path) -> PathBuf {
 }
 
 #[must_use]
+pub fn audio_batch_dir(root: &Path) -> PathBuf {
+    root.join("fixtures/audio_batch")
+}
+
+/// Mixed-format input files used by `cargo xtask bench --audio`.
+#[must_use]
+pub fn audio_batch_inputs(root: &Path) -> [PathBuf; 3] {
+    let dir = audio_batch_dir(root);
+    [
+        dir.join("wav_track.wav"),
+        dir.join("flac_track.flac"),
+        dir.join("opus_track.opus"),
+    ]
+}
+
+#[must_use]
 pub fn video_mp4_path(root: &Path) -> PathBuf {
     root.join("fixtures/video_1080p60.mp4")
 }
@@ -69,6 +86,7 @@ pub fn generate_all(root: &Path, force: bool) -> Result<(), String> {
     generate_webp_batch(root, force)?;
     generate_audio_wav(root, force)?;
     generate_video_mp4(root, force)?;
+    generate_audio_batch(root, force)?;
     Ok(())
 }
 
@@ -338,6 +356,107 @@ fn generate_audio_wav(root: &Path, force: bool) -> Result<(), String> {
 
     println!("==> generated {}", target.display());
     Ok(())
+}
+
+fn generate_audio_batch(root: &Path, force: bool) -> Result<(), String> {
+    let dir = audio_batch_dir(root);
+    let inputs = audio_batch_inputs(root);
+    if !force && inputs.iter().all(|path| is_non_empty_file(path)) {
+        println!(
+            "==> skip mixed audio batch ({} files already exist in {})",
+            inputs.len(),
+            dir.display()
+        );
+        return Ok(());
+    }
+    fs::create_dir_all(&dir)
+        .map_err(|err| format!("failed to create '{}': {err}", dir.display()))?;
+    for obsolete in [dir.join("mp3_track.mp3"), dir.join("vorbis_track.ogg")] {
+        if obsolete.exists() {
+            let _ = fs::remove_file(&obsolete);
+        }
+    }
+
+    let source = audio_wav_path(root);
+    if !is_non_empty_file(&source) {
+        return Err(format!(
+            "missing WAV fixture '{}'; run `cargo xtask gen-fixtures` first",
+            source.display()
+        ));
+    }
+
+    // Build the short WAV slice natively, then derive the lossless/lossy inputs with our own
+    // converter. No FFmpeg is involved in fixture generation.
+    let wav_target = &inputs[0];
+    if force || !is_non_empty_file(wav_target) {
+        write_short_wav(&source, wav_target)?;
+        println!("==> generated {}", wav_target.display());
+    }
+    for (target, format) in [(&inputs[1], "flac"), (&inputs[2], "opus")] {
+        if !force && is_non_empty_file(target) {
+            continue;
+        }
+        let in_str = path_to_str(wav_target)?;
+        let out_str = path_to_str(target)?;
+        let status = Command::new(crate::cargo_bin())
+            .current_dir(root)
+            .args(["run", "--quiet", "-p", "fastconv-cli", "--", "audio"])
+            .args([in_str, out_str, "--to", format])
+            .status()
+            .map_err(|err| {
+                format!(
+                    "failed to run native converter for '{}': {err}",
+                    target.display()
+                )
+            })?;
+        if !status.success() {
+            return Err(format!(
+                "native conversion failed for '{}' with {status}",
+                target.display()
+            ));
+        }
+        println!("==> generated {}", target.display());
+    }
+    Ok(())
+}
+
+fn path_to_str(path: &Path) -> Result<&str, String> {
+    path.to_str()
+        .ok_or_else(|| format!("audio fixture path '{}' is not valid UTF-8", path.display()))
+}
+
+fn write_short_wav(source: &Path, target: &Path) -> Result<(), String> {
+    let mut reader = hound::WavReader::open(source)
+        .map_err(|err| format!("failed to open '{}': {err}", source.display()))?;
+    let spec = reader.spec();
+    let frames = usize::try_from(AUDIO_BATCH_SECS).unwrap_or(0)
+        * usize::try_from(spec.sample_rate).unwrap_or(48_000);
+    let wanted = frames.saturating_mul(usize::from(spec.channels));
+    let samples: Vec<i16> = reader
+        .samples::<i16>()
+        .take(wanted)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("failed to read '{}': {err}", source.display()))?;
+    let tmp = target.with_extension("wav.tmp");
+    {
+        let mut writer = hound::WavWriter::create(&tmp, spec)
+            .map_err(|err| format!("failed to create '{}': {err}", tmp.display()))?;
+        for sample in samples {
+            writer
+                .write_sample(sample)
+                .map_err(|err| format!("failed to write '{}': {err}", tmp.display()))?;
+        }
+        writer
+            .finalize()
+            .map_err(|err| format!("failed to finalize '{}': {err}", tmp.display()))?;
+    }
+    fs::rename(&tmp, target).map_err(|err| {
+        format!(
+            "failed to publish '{}' -> '{}': {err}",
+            tmp.display(),
+            target.display()
+        )
+    })
 }
 
 fn build_wav_header(

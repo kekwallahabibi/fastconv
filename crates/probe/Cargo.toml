@@ -2,12 +2,15 @@
 name = "fastconv-probe"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 fastconv-domain.workspace = true
 containr.workspace = true
+opus-pure.workspace = true
 png.workspace = true
 pollster.workspace = true
+symphonia.workspace = true
 wgpu.workspace = true
 zune-jpeg.workspace = true
 

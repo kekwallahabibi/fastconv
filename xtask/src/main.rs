@@ -1,3 +1,4 @@
+mod audio_bench;
 mod bench;
 mod fixtures;
 mod remux_bench;
@@ -19,7 +20,7 @@ fn workspace_root() -> Result<PathBuf, String> {
         .ok_or_else(|| "failed to resolve workspace root from xtask manifest path".to_owned())
 }
 
-fn cargo_bin() -> OsString {
+pub(crate) fn cargo_bin() -> OsString {
     env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"))
 }
 
@@ -41,6 +42,9 @@ fn run_cargo_step(root: &Path, label: &str, args: &[&str]) -> Result<(), String>
 fn cmd_verify(root: &Path) -> Result<(), String> {
     println!("==> check no ffmpeg/ffprobe in crates/");
     check_no_ffmpeg_in_crates(&root.join("crates"))?;
+
+    println!("==> check licenses (AGPL-3.0-compatible or permissive)");
+    check_licenses(root)?;
 
     run_cargo_step(
         root,
@@ -321,6 +325,233 @@ fn char_literal_len(bytes: &[u8], i: usize) -> Option<usize> {
     }
 }
 
+fn check_licenses(root: &Path) -> Result<(), String> {
+    let output = Command::new(cargo_bin())
+        .current_dir(root)
+        .args(["metadata", "--format-version", "1"])
+        .output()
+        .map_err(|err| format!("failed to launch cargo metadata: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("failed to parse cargo metadata JSON: {err}"))?;
+
+    scan_licenses(&metadata)
+}
+
+fn scan_licenses(metadata: &serde_json::Value) -> Result<(), String> {
+    let workspace_members = metadata
+        .get("workspace_members")
+        .and_then(serde_json::Value::as_array)
+        .map_or_default(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<String>>()
+        });
+
+    let packages = metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "cargo metadata is missing 'packages'".to_owned())?;
+
+    let mut forbidden: Vec<(String, String)> = Vec::new();
+    let mut checked = 0_usize;
+
+    for package in packages {
+        let id = package
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if workspace_members.contains(id) {
+            continue;
+        }
+
+        let name = package
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(id)
+            .to_owned();
+
+        let license = package
+            .get("license")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+
+        checked += 1;
+        if forbidden_license(&license) {
+            let shown = if license.is_empty() {
+                "<missing>".to_owned()
+            } else {
+                license
+            };
+            forbidden.push((name, shown));
+        }
+    }
+
+    if forbidden.is_empty() {
+        println!(
+            "checked {checked} dependencies: all licenses are AGPL-3.0-compatible or permissive"
+        );
+        Ok(())
+    } else {
+        let details = forbidden
+            .iter()
+            .map(|(name, license)| format!("{name} ({license})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!(
+            "forbidden or missing license in default dependency tree: {details}"
+        ))
+    }
+}
+
+/// `fastconv` is AGPL-3.0-only, so permissive licenses and AGPL-compatible copyleft are fine.
+/// Dual-license expressions are accepted when at least one alternative is compatible; a bare
+/// proprietary/non-commercial/unknown or GPL-2.0-only license is rejected.
+fn forbidden_license(license: &str) -> bool {
+    !license_allowed(license)
+}
+
+fn license_allowed(license: &str) -> bool {
+    let tokens: Vec<String> = license
+        .trim()
+        .to_ascii_lowercase()
+        .replace('/', " or ")
+        .replace('(', " ( ")
+        .replace(')', " ) ")
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    if tokens.is_empty() {
+        return false;
+    }
+    let mut parser = LicenseParser {
+        tokens: &tokens,
+        pos: 0,
+        malformed: false,
+    };
+    let value = parser.parse_or();
+    if parser.malformed || parser.pos != tokens.len() {
+        return false;
+    }
+    value
+}
+
+struct LicenseParser<'a> {
+    tokens: &'a [String],
+    pos: usize,
+    malformed: bool,
+}
+
+impl<'a> LicenseParser<'a> {
+    fn peek(&self) -> Option<&str> {
+        self.tokens.get(self.pos).map(String::as_str)
+    }
+
+    fn next(&mut self) -> Option<&'a str> {
+        let token = self.tokens.get(self.pos).map(String::as_str);
+        if token.is_some() {
+            self.pos += 1;
+        }
+        token
+    }
+
+    fn parse_or(&mut self) -> bool {
+        let mut value = self.parse_and();
+        while self.peek() == Some("or") {
+            self.pos += 1;
+            let rhs = self.parse_and();
+            value = value || rhs;
+        }
+        value
+    }
+
+    fn parse_and(&mut self) -> bool {
+        let mut value = self.parse_primary();
+        while self.peek() == Some("and") {
+            self.pos += 1;
+            let rhs = self.parse_primary();
+            value = value && rhs;
+        }
+        value
+    }
+
+    fn parse_primary(&mut self) -> bool {
+        if self.peek() == Some("(") {
+            self.pos += 1;
+            let value = self.parse_or();
+            if self.peek() == Some(")") {
+                self.pos += 1;
+            } else {
+                self.malformed = true;
+            }
+            return value;
+        }
+        let Some(base) = self.next() else {
+            self.malformed = true;
+            return false;
+        };
+        if self.peek() == Some("with") {
+            self.pos += 1;
+            let Some(exception) = self.next() else {
+                self.malformed = true;
+                return false;
+            };
+            return license_term_with_exception(base, exception);
+        }
+        license_term_allowed(base)
+    }
+}
+
+fn license_term_with_exception(base: &str, exception: &str) -> bool {
+    // Only the explicitly reviewed GPL-2.0 + Classpath combination is acceptable.
+    matches!(base, "gpl-2.0" | "gpl-2.0-only" | "gpl-2.0-or-later")
+        && exception == "classpath-exception-2.0"
+}
+
+fn license_term_allowed(term: &str) -> bool {
+    let base = term
+        .split(" with ")
+        .next()
+        .unwrap_or(term)
+        .trim()
+        .trim_matches('"');
+    matches!(
+        base,
+        "mit"
+            | "apache-2.0"
+            | "bsd-2-clause"
+            | "bsd-3-clause"
+            | "0bsd"
+            | "zlib"
+            | "isc"
+            | "unlicense"
+            | "cc0"
+            | "cc0-1.0"
+            | "mpl-2.0"
+            | "ijg"
+            | "unicode-3.0"
+            | "agpl-3.0"
+            | "agpl-3.0-only"
+            | "agpl-3.0-or-later"
+            | "gpl-3.0"
+            | "gpl-3.0-only"
+            | "gpl-3.0-or-later"
+            | "lgpl-3.0"
+            | "lgpl-3.0-only"
+            | "lgpl-3.0-or-later"
+    )
+}
+
 fn cmd_bench_status(root: &Path) {
     let png_count = (1..=IMAGE_BATCH_COUNT)
         .filter(|&idx| fixtures::is_non_empty_file(&image_path(root, idx)))
@@ -332,6 +563,10 @@ fn cmd_bench_status(root: &Path) {
         .filter(|&idx| fixtures::is_non_empty_file(&webp_image_path(root, idx)))
         .count();
     let has_wav = fixtures::is_non_empty_file(&audio_wav_path(root));
+    let audio_batch_count = fixtures::audio_batch_inputs(root)
+        .iter()
+        .filter(|path| fixtures::is_non_empty_file(path))
+        .count();
     let has_mp4 = fixtures::is_non_empty_file(&video_mp4_path(root));
 
     println!("==> fastconv benchmark harness");
@@ -344,12 +579,18 @@ fn cmd_bench_status(root: &Path) {
         if has_wav { "ready" } else { "missing" }
     );
     println!(
+        "Mixed audio  : {}/{}",
+        audio_batch_count,
+        fixtures::audio_batch_inputs(root).len()
+    );
+    println!(
         "1080p60 MP4  : {}",
         if has_mp4 { "ready" } else { "missing" }
     );
     println!("run `cargo xtask gen-fixtures` to generate missing fixtures.");
     println!("run `cargo xtask bench` to run the head-to-head benchmark (fastconv vs FFmpeg).");
     println!("run `cargo xtask bench --baseline` to execute and save the FFmpeg baseline.");
+    println!("run `cargo xtask bench --audio` for the native audio head-to-head benchmark.");
 }
 
 fn print_usage() {
@@ -367,6 +608,9 @@ fn print_usage() {
     );
     println!(
         "  cargo xtask bench --baseline  Run FFmpeg baseline across all workloads and save JSON"
+    );
+    println!(
+        "  cargo xtask bench --audio     Audio head-to-head (fastconv vs ffmpeg) with output validation"
     );
     println!(
         "  cargo xtask bench --remux     Video remux head-to-head (fastconv vs ffmpeg -c copy) with ffprobe validation"
@@ -390,6 +634,7 @@ fn main() -> ExitCode {
         }
         ["bench"] => workspace_root().and_then(|root| bench::run_head_to_head(&root)),
         ["bench", "--baseline"] => workspace_root().and_then(|root| bench::run_baseline(&root)),
+        ["bench", "--audio"] => workspace_root().and_then(|root| audio_bench::run(&root)),
         ["bench", "--status"] => workspace_root().map(|root| cmd_bench_status(&root)),
         ["bench", "--remux"] => workspace_root().and_then(|root| remux_bench::run(&root)),
         [] | ["-h" | "--help"] => {
@@ -414,7 +659,10 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_no_ffmpeg_in_crates, find_forbidden_ffmpeg_reference, workspace_root};
+    use super::{
+        check_no_ffmpeg_in_crates, find_forbidden_ffmpeg_reference, forbidden_license,
+        scan_licenses, workspace_root,
+    };
 
     #[test]
     fn crates_contain_no_ffmpeg_or_ffprobe_references() -> Result<(), String> {
@@ -454,5 +702,69 @@ fn helper<'a>(s: &'a str) -> char { let _ = s; '\"' }
             find_forbidden_ffmpeg_reference(raw_multiline),
             Some((2, "ffprobe".to_owned()))
         );
+    }
+
+    #[test]
+    fn license_policy_allows_agpl_compatible_and_permissive() {
+        for allowed in [
+            "MIT",
+            "Apache-2.0",
+            "BSD-3-Clause",
+            "0BSD OR MIT OR Apache-2.0",
+            "(MIT OR Apache-2.0) AND IJG",
+            "GPL-3.0-only",
+            "LGPL-3.0-only",
+            "AGPL-3.0-only OR LicenseRef-Imazen-Commercial",
+            "MPL-2.0",
+            "Zlib",
+            "ISC",
+            "Unlicense OR MIT",
+            "CC0-1.0",
+            "GPL-2.0-only WITH Classpath-exception-2.0",
+            "GPL-3.0-only AND (GPL-2.0-only WITH Classpath-exception-2.0)",
+        ] {
+            assert!(!forbidden_license(allowed), "should be allowed: {allowed}");
+        }
+    }
+
+    #[test]
+    fn license_policy_rejects_incompatible_missing_and_proprietary() {
+        for forbidden in [
+            "",
+            "LicenseRef-Imazen-Commercial",
+            "Proprietary",
+            "CC-BY-NC-4.0",
+            "GPL-2.0-only",
+            "MIT AND GPL-2.0-only",
+            "(MIT OR Apache-2.0) AND GPL-2.0-only",
+            "MIT ) AND GPL-2.0-only",
+            "(MIT",
+            "GPL-2.0-only WITH Unknown-exception",
+        ] {
+            assert!(
+                forbidden_license(forbidden),
+                "should be forbidden: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_licenses_detects_gpl2_and_missing_license() -> Result<(), String> {
+        let json = r#"{
+            "workspace_members": [],
+            "packages": [
+                { "id": "legacy 0.1.0", "name": "legacy", "license": "GPL-2.0-only" },
+                { "id": "unknown 0.2.0", "name": "unknown" }
+            ]
+        }"#;
+        let metadata: serde_json::Value =
+            serde_json::from_str(json).map_err(|err| format!("valid JSON expected: {err}"))?;
+        let err = scan_licenses(&metadata)
+            .err()
+            .ok_or_else(|| "incompatible licenses must be flagged".to_owned())?;
+        assert!(err.contains("legacy"), "{err}");
+        assert!(err.contains("unknown"), "{err}");
+        assert!(err.contains("<missing>"), "{err}");
+        Ok(())
     }
 }
