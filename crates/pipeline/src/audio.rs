@@ -303,6 +303,15 @@ fn encode_flac(
 ) -> Result<(), PipelineError> {
     let mut config = flacenc::config::Encoder::default();
     config.block_size = FLAC_BLOCK_SIZE;
+    // Prefer encode speed over compression ratio: fixed LPC (order <= 4) is cheap, while the
+    // quantized LPC search dominates runtime and only improves compression slightly.
+    config.subframe_coding.use_lpc = false;
+    config.multithread = true;
+    config.workers = NonZeroUsize::new(
+        std::thread::available_parallelism()
+            .map_or(1, NonZeroUsize::get)
+            .min(8),
+    );
     let config = config
         .into_verified()
         .map_err(|(_, err)| PipelineError::EncodeFailed {
@@ -499,9 +508,10 @@ fn encode_opus(
     }
     resample_to_opus_rate(rate, channels, buf)?;
     let total_frames = buf.resampled_f32.len() / channels;
-    buf.samples_f32.extend_from_slice(&buf.resampled_f32);
+    std::mem::swap(&mut buf.samples_f32, &mut buf.resampled_f32);
+    buf.resampled_f32.clear();
     quantize_for(AudioOutputFormat::Opus, 16, buf);
-    let pcm_i16 = buf.samples_i16.clone();
+    let pcm_i16 = std::mem::take(&mut buf.samples_i16);
     buf.samples_i16.clear();
 
     let mut encoder = OpusEncoder::new(
