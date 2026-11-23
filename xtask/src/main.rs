@@ -43,7 +43,7 @@ fn cmd_verify(root: &Path) -> Result<(), String> {
     println!("==> check no ffmpeg/ffprobe in crates/");
     check_no_ffmpeg_in_crates(&root.join("crates"))?;
 
-    println!("==> check licenses (no AGPL/GPL in default dependency tree)");
+    println!("==> check licenses (AGPL-3.0-compatible or permissive)");
     check_licenses(root)?;
 
     run_cargo_step(
@@ -386,18 +386,21 @@ fn scan_licenses(metadata: &serde_json::Value) -> Result<(), String> {
             .unwrap_or_default()
             .to_owned();
 
-        if license.is_empty() {
-            continue;
-        }
-
         checked += 1;
         if forbidden_license(&license) {
-            forbidden.push((name, license));
+            let shown = if license.is_empty() {
+                "<missing>".to_owned()
+            } else {
+                license
+            };
+            forbidden.push((name, shown));
         }
     }
 
     if forbidden.is_empty() {
-        println!("checked {checked} dependencies: no AGPL/GPL (without exception) found");
+        println!(
+            "checked {checked} dependencies: all licenses are AGPL-3.0-compatible or permissive"
+        );
         Ok(())
     } else {
         let details = forbidden
@@ -406,24 +409,75 @@ fn scan_licenses(metadata: &serde_json::Value) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(", ");
         Err(format!(
-            "forbidden (A)GPL license in default dependency tree: {details}"
+            "forbidden or missing license in default dependency tree: {details}"
         ))
     }
 }
 
+/// `fastconv` is AGPL-3.0-only, so permissive licenses and AGPL-compatible copyleft are fine.
+/// Dual-license expressions are accepted when at least one alternative is compatible; a bare
+/// proprietary/non-commercial/unknown or GPL-2.0-only license is rejected.
 fn forbidden_license(license: &str) -> bool {
-    let lower = license.to_ascii_lowercase();
-    // LGPL is weak copyleft and not in scope of this check; strip it before
-    // testing for strong copyleft (GPL/AGPL) so "LGPL" alone is not flagged.
-    let normalized = lower.replace("lgpl", "");
-    let has_strong_copyleft = normalized.contains("gpl");
-    if !has_strong_copyleft {
-        return false;
+    !license_allowed(license)
+}
+
+fn license_allowed(license: &str) -> bool {
+    let normalized = license
+        .trim()
+        .to_ascii_lowercase()
+        .replace('/', " or ")
+        .replace(['(', ')'], " ");
+    let or_terms: Vec<&str> = normalized
+        .split(" or ")
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .collect();
+    if or_terms.len() > 1 {
+        return or_terms.iter().any(|term| license_term_allowed(term));
     }
-    // An explicit exception clause (e.g. "GPL-2.0 WITH Classpath-exception")
-    // lifts the ban.
-    let has_exception = lower.contains("with") || lower.contains("exception");
-    !has_exception
+    let and_terms: Vec<&str> = normalized
+        .split(" and ")
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .collect();
+    if and_terms.len() > 1 {
+        return and_terms.iter().all(|term| license_term_allowed(term));
+    }
+    license_term_allowed(normalized.trim())
+}
+
+fn license_term_allowed(term: &str) -> bool {
+    let base = term
+        .split(" with ")
+        .next()
+        .unwrap_or(term)
+        .trim()
+        .trim_matches('"');
+    matches!(
+        base,
+        "mit"
+            | "apache-2.0"
+            | "bsd-2-clause"
+            | "bsd-3-clause"
+            | "0bsd"
+            | "zlib"
+            | "isc"
+            | "unlicense"
+            | "cc0"
+            | "cc0-1.0"
+            | "mpl-2.0"
+            | "ijg"
+            | "unicode-3.0"
+            | "agpl-3.0"
+            | "agpl-3.0-only"
+            | "agpl-3.0-or-later"
+            | "gpl-3.0"
+            | "gpl-3.0-only"
+            | "gpl-3.0-or-later"
+            | "lgpl-3.0"
+            | "lgpl-3.0-only"
+            | "lgpl-3.0-or-later"
+    )
 }
 
 fn cmd_bench_status(root: &Path) {
@@ -575,32 +629,61 @@ fn helper<'a>(s: &'a str) -> char { let _ = s; '\"' }
     }
 
     #[test]
-    fn forbidden_license_flags_agpl_and_gpl_without_exception() {
-        assert!(forbidden_license(
-            "AGPL-3.0-only OR LicenseRef-Imazen-Commercial"
-        ));
-        assert!(forbidden_license("GPL-3.0-only"));
-        assert!(forbidden_license("GPL-2.0-only"));
-        assert!(!forbidden_license("MIT OR Apache-2.0"));
-        assert!(!forbidden_license("GPL-2.0 WITH Classpath-exception-2.0"));
-        assert!(!forbidden_license("LGPL-2.1-only"));
-        assert!(!forbidden_license("MPL-2.0"));
+    fn license_policy_allows_agpl_compatible_and_permissive() {
+        for allowed in [
+            "MIT",
+            "Apache-2.0",
+            "BSD-3-Clause",
+            "0BSD OR MIT OR Apache-2.0",
+            "(MIT OR Apache-2.0) AND IJG",
+            "GPL-3.0-only",
+            "LGPL-3.0-only",
+            "AGPL-3.0-only OR LicenseRef-Imazen-Commercial",
+            "MPL-2.0",
+            "Zlib",
+            "ISC",
+            "Unlicense OR MIT",
+            "CC0-1.0",
+        ] {
+            assert!(!forbidden_license(allowed), "should be allowed: {allowed}");
+        }
     }
 
     #[test]
-    fn scan_licenses_detects_jxl_encoder() -> Result<(), String> {
+    fn license_policy_rejects_incompatible_missing_and_proprietary() {
+        for forbidden in [
+            "",
+            "LicenseRef-Imazen-Commercial",
+            "Proprietary",
+            "CC-BY-NC-4.0",
+            "GPL-2.0-only",
+            "GPL-2.0 WITH Classpath-exception-2.0",
+            "MIT AND GPL-2.0-only",
+        ] {
+            assert!(
+                forbidden_license(forbidden),
+                "should be forbidden: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_licenses_detects_gpl2_and_missing_license() -> Result<(), String> {
         let json = r#"{
             "workspace_members": [],
             "packages": [
-                { "id": "jxl-encoder 0.1.0", "name": "jxl-encoder", "license": "AGPL-3.0" }
+                { "id": "legacy 0.1.0", "name": "legacy", "license": "GPL-2.0-only" },
+                { "id": "unknown 0.2.0", "name": "unknown" }
             ]
         }"#;
         let metadata: serde_json::Value =
             serde_json::from_str(json).map_err(|err| format!("valid JSON expected: {err}"))?;
         let err = scan_licenses(&metadata)
             .err()
-            .ok_or_else(|| "jxl-encoder must be flagged".to_owned())?;
-        assert!(err.contains("jxl-encoder"), "{err}");
+            .ok_or_else(|| "incompatible licenses must be flagged".to_owned())?;
+        assert!(err.contains("legacy"), "{err}");
+        assert!(err.contains("unknown"), "{err}");
+        assert!(err.contains("<missing>"), "{err}");
         Ok(())
     }
 }

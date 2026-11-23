@@ -35,6 +35,18 @@
 7. **Lint-Disziplin**
    Workspace-Lints (`unsafe_code = "forbid"`, `unwrap_used = "deny"`, `expect_used = "deny"`, `panic = "deny"`, `pedantic = "warn"`) gelten überall. Keine lokalen `#[allow(...)]`-Umgehungen ohne zwingenden, dokumentierten Grund.
 
+8. **Lizenz-Policy (Default-Build)**
+   `fastconv` selbst steht unter **AGPL-3.0-only** (siehe `LICENSE`). Im Standard-Dependency-Baum sind erlaubt:
+   - permissive Lizenzen: MIT, Apache-2.0, BSD-2/3-Clause, Zlib, ISC, Unlicense, CC0, MPL-2.0;
+   - AGPL-3.0-kompatibles Copyleft: AGPL-3.0, GPL-3.0, LGPL-3.0 — auch in Dual-License-Ausdrücken wie `AGPL-3.0-only OR Commercial`.
+   Hart verboten bleiben fehlende/unbekannte Lizenzen, rein proprietäre oder rein nicht-kommerzielle Lizenzen ohne AGPL-Option sowie AGPL-3.0-inkompatible Lizenzen (z. B. `GPL-2.0-only`). `cargo xtask verify` prüft den `cargo metadata`-Dependency-Baum entsprechend und bricht bei Verstößen ab.
+
+9. **Faire Benchmark-Regeln (Anti-Preset-Cheating)**
+   - Geschwindigkeitsgewinne dürfen nicht dadurch erschummelt werden, dass `fastconv` die Kompression oder Qualität massiv absenkt, während `ffmpeg` im langsamen Default-Preset läuft.
+   - Bei verlustfreien Formaten (z. B. TIFF, PNG) müssen beide Tools dieselbe Kompressionsklasse vergleichen (z. B. beide Deflate oder beide unkomprimiert/PackBits).
+   - Bei verlustbehafteten Formaten (z. B. AVIF, JXL, WebP, JPEG) müssen Dateigröße und PSNR beider Tools in einer realistischen, vergleichbaren Größenordnung liegen (kein 5x bis 10x größerer Output bei `fastconv`, nur um den Balken schneller zu machen).
+   - **RAM-Disziplin:** Bei speicherhungrigen 4K-Codecs (wie AVIF/JXL) darf Parallelität den Peak-RAM nicht unkontrolliert explodieren lassen (kein 3+ GB Peak-RAM für marginale Speed-Gewinne). Wo nötig, Worker-Concurrency für schwere Encoder sauber deckeln.
+
 ## Git-Workflow
 
 Direkte Änderungen und Commits auf `main` sind nicht erlaubt. Halte vor und nach jeder Aufgabe strikt folgenden Ablauf ein:
