@@ -19,7 +19,8 @@ const WEBP_MAGIC: [u8; 4] = *b"WEBP";
 const QOI_MAGIC: [u8; 4] = *b"qoif";
 const QOI_END_MARKER: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 1];
 const QOI_MAX_RUN: u64 = 62;
-const MAX_QOI_DECODED_BYTES: u64 = 512 * 1024 * 1024;
+// Shared pixel budget matching `fastconv-pipeline` QOI encode/decode (128 Mi pixels = 512 MiB RGBA8).
+const MAX_QOI_PIXELS: u64 = 128 * 1024 * 1024;
 const BMP_MAGIC: [u8; 2] = *b"BM";
 const KNOWN_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "qoi"];
 const UNRECOGNIZED_MAGIC_REASON: &str =
@@ -455,7 +456,8 @@ fn validate_bmp_palette_bounds(
 ) -> Result<(), ProbeError> {
     let avail_palette_bytes = pixel_offset.saturating_sub(header_end);
     if dib_size == 12 {
-        if avail_palette_bytes < 3 {
+        let min_bytes = if bit_count == 1 { 6_u64 } else { 3_u64 };
+        if avail_palette_bytes < min_bytes {
             return Err(invalid_image(
                 path,
                 "indexed BMP is missing color palette entries",
@@ -653,16 +655,19 @@ fn probe_qoi(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError
     let pixel_count = u64::from(width)
         .checked_mul(u64::from(height))
         .ok_or_else(|| invalid_image(path, "QOI dimensions overflow pixel count"))?;
-    let total_rgba = pixel_count
-        .checked_mul(4)
-        .filter(|&bytes| usize::try_from(bytes).is_ok())
-        .ok_or_else(|| invalid_image(path, "QOI dimensions exceed addressable memory"))?;
-    if total_rgba > MAX_QOI_DECODED_BYTES {
+    if pixel_count > MAX_QOI_PIXELS {
         return Err(invalid_image(
             path,
-            format!(
-                "QOI decoded frame size ({total_rgba} bytes) exceeds {MAX_QOI_DECODED_BYTES}-byte limit"
-            ),
+            format!("QOI pixel count ({pixel_count}) exceeds {MAX_QOI_PIXELS}-pixel limit"),
+        ));
+    }
+    let total_rgba = pixel_count
+        .checked_mul(4)
+        .filter(|&bytes| usize::try_from(bytes).is_ok());
+    if total_rgba.is_none() {
+        return Err(invalid_image(
+            path,
+            "QOI dimensions exceed addressable memory",
         ));
     }
     let stream_len = file_len - 22;
@@ -2054,6 +2059,29 @@ mod tests {
         })?;
         assert!(matches!(
             probe_image(&bad_bmp),
+            Err(ProbeError::InvalidImage { .. })
+        ));
+
+        // 1-bit BITMAPCOREHEADER with only 1 palette entry (3 bytes) must be rejected (needs 6).
+        let bad_core_1bit = root.join("core_1bit_short_palette.bmp");
+        let mut core = Vec::new();
+        core.extend_from_slice(b"BM");
+        core.extend_from_slice(&(14_u32 + 12 + 3 + 4).to_le_bytes());
+        core.extend_from_slice(&0_u32.to_le_bytes());
+        core.extend_from_slice(&(14_u32 + 12 + 3).to_le_bytes()); // only 3 palette bytes
+        core.extend_from_slice(&12_u32.to_le_bytes());
+        core.extend_from_slice(&1_u16.to_le_bytes());
+        core.extend_from_slice(&1_u16.to_le_bytes());
+        core.extend_from_slice(&1_u16.to_le_bytes());
+        core.extend_from_slice(&1_u16.to_le_bytes());
+        core.extend_from_slice(&[0, 0, 0]); // 1 RGBTRIPLE
+        core.extend_from_slice(&[0, 0, 0, 0]); // 1 padded row
+        fs::write(&bad_core_1bit, &core).map_err(|source| ProbeError::Io {
+            path: bad_core_1bit.clone(),
+            source,
+        })?;
+        assert!(matches!(
+            probe_image(&bad_core_1bit),
             Err(ProbeError::InvalidImage { .. })
         ));
 

@@ -7,9 +7,9 @@ const QOI_MAGIC: [u8; 4] = *b"qoif";
 const QOI_END_MARKER: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 1];
 const QOI_HEADER_LEN: usize = 14;
 const QOI_MAX_RUN: usize = 62;
-// Cap decoded QOI frame allocation at 512 MiB (e.g. >134 MP RGBA8) so malformed headers
-// cannot exhaust process memory before stream validation rejects the payload.
-const MAX_QOI_DECODED_BYTES: usize = 512 * 1024 * 1024;
+// Shared pixel budget across QOI probe, decode, and encode (128 Mi pixels = 512 MiB RGBA8)
+// so fastconv always accepts its own QOI outputs and malformed headers cannot exhaust RAM.
+const MAX_QOI_PIXELS: usize = 128 * 1024 * 1024;
 const QOI_OP_RUN: u8 = 0xC0;
 const QOI_OP_DIFF: u8 = 0x40;
 const QOI_OP_LUMA: u8 = 0x80;
@@ -67,6 +67,12 @@ pub(crate) fn encode_qoi_into(
             path: target.to_path_buf(),
             reason: "QOI image pixel count overflow".to_owned(),
         })?;
+    if pixel_count > MAX_QOI_PIXELS {
+        return Err(PipelineError::EncodeFailed {
+            path: target.to_path_buf(),
+            reason: format!("QOI pixel count ({pixel_count}) exceeds {MAX_QOI_PIXELS}-pixel limit"),
+        });
+    }
 
     let channels = match decoded.format {
         DecodedPixelFormat::L8 | DecodedPixelFormat::Rgb8 => 3_u8,
@@ -516,20 +522,18 @@ fn prepare_qoi_output<'a>(
     bpp: usize,
     pixel_buf: &'a mut Vec<u8>,
 ) -> Result<&'a mut [u8], PipelineError> {
+    if pixel_count > MAX_QOI_PIXELS {
+        return Err(PipelineError::DecodeFailed {
+            path: source.to_path_buf(),
+            reason: format!("QOI pixel count ({pixel_count}) exceeds {MAX_QOI_PIXELS}-pixel limit"),
+        });
+    }
     let out_len = pixel_count
         .checked_mul(bpp)
         .ok_or_else(|| PipelineError::DecodeFailed {
             path: source.to_path_buf(),
             reason: "QOI output buffer overflow".to_owned(),
         })?;
-    if out_len > MAX_QOI_DECODED_BYTES {
-        return Err(PipelineError::DecodeFailed {
-            path: source.to_path_buf(),
-            reason: format!(
-                "QOI decoded frame size ({out_len} bytes) exceeds {MAX_QOI_DECODED_BYTES}-byte limit"
-            ),
-        });
-    }
     if pixel_buf.len() < out_len {
         let additional = out_len - pixel_buf.len();
         pixel_buf
@@ -556,6 +560,15 @@ pub(crate) fn decode_qoi_slice_into(
     pixel_buf: &mut Vec<u8>,
 ) -> Result<(u32, u32, DecodedPixelFormat, usize), PipelineError> {
     let hdr = parse_qoi_header(source, file_bytes)?;
+    if hdr.pixel_count > MAX_QOI_PIXELS {
+        return Err(PipelineError::DecodeFailed {
+            path: source.to_path_buf(),
+            reason: format!(
+                "QOI pixel count ({}) exceeds {MAX_QOI_PIXELS}-pixel limit",
+                hdr.pixel_count
+            ),
+        });
+    }
     let stream = &file_bytes[QOI_HEADER_LEN..file_bytes.len() - QOI_END_MARKER.len()];
     // Each QOI byte encodes at most 62 pixels (QOI_OP_RUN); reject impossible streams before allocating.
     let min_stream_bytes = hdr.pixel_count.div_ceil(QOI_MAX_RUN);
@@ -963,6 +976,24 @@ mod tests {
         assert!(matches!(
             decode_qoi_slice_into(p, &huge_short, DecodeTargetHint::Native, &mut buf),
             Err(crate::PipelineError::DecodeFailed { .. })
+        ));
+
+        // Encoder enforces the same pixel limit as probe/decoder (12000x12000 = 144M > 128 Mi).
+        let mut encoded = Vec::new();
+        assert!(matches!(
+            encode_qoi_into(
+                p,
+                &[],
+                DecodedFrameMeta {
+                    width: 12_000,
+                    height: 12_000,
+                    format: DecodedPixelFormat::Rgb8,
+                    byte_len: 0,
+                    input_file_bytes: 1,
+                },
+                &mut encoded,
+            ),
+            Err(crate::PipelineError::EncodeFailed { .. })
         ));
     }
 

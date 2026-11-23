@@ -1,6 +1,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -77,6 +79,11 @@ impl<W: Write> Write for CountingWriter<W> {
             return Err(io::Error::new(err.kind(), err.to_string()));
         }
         match self.inner.write(buf) {
+            Ok(0) if !buf.is_empty() => {
+                let err = io::Error::new(io::ErrorKind::WriteZero, "failed to write whole buffer");
+                self.record_error(&err);
+                Err(err)
+            }
             Ok(written) => {
                 self.bytes_written = self
                     .bytes_written
@@ -121,11 +128,13 @@ impl StagingFile {
         for _ in 0..64 {
             let seq = STAGING_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
             let tmp_path = parent.join(format!(".fastconv-{pid}-{seq}.tmp"));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)
-            {
+            let mut open_opts = OpenOptions::new();
+            open_opts.write(true).create_new(true);
+            // Create staging files owner-only regardless of process umask so image data is never
+            // exposed during staging or after replacing a restrictive destination file.
+            #[cfg(unix)]
+            open_opts.mode(0o600);
+            match open_opts.open(&tmp_path) {
                 Ok(file) => {
                     return Ok((
                         Self {
@@ -153,13 +162,33 @@ impl StagingFile {
         })
     }
 
-    fn commit(mut self, target: &Path) -> Result<(), PipelineError> {
+    fn commit(mut self, target: &Path, file: File) -> Result<(), PipelineError> {
+        preserve_existing_permissions(&file, target)?;
+        drop(file);
         fs::rename(&self.path, target).map_err(|source| PipelineError::Io {
             path: target.to_path_buf(),
             source,
         })?;
         self.committed = true;
         Ok(())
+    }
+}
+
+fn preserve_existing_permissions(file: &File, target: &Path) -> Result<(), PipelineError> {
+    match fs::symlink_metadata(target) {
+        Ok(meta) if meta.file_type().is_file() => {
+            file.set_permissions(meta.permissions())
+                .map_err(|source| PipelineError::Io {
+                    path: target.to_path_buf(),
+                    source,
+                })
+        }
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(PipelineError::Io {
+            path: target.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -448,13 +477,13 @@ fn encode_png_streaming(
     decoded: DecodedFrameMeta,
 ) -> Result<u64, PipelineError> {
     let (staging, file) = StagingFile::create_for(target)?;
-    let bytes = encode_png_to_writer(
-        target,
-        pixels,
-        decoded,
-        BufWriter::with_capacity(STREAM_IO_BUF_BYTES, file),
-    )?;
-    staging.commit(target)?;
+    let mut buf_writer = BufWriter::with_capacity(STREAM_IO_BUF_BYTES, file);
+    let bytes = encode_png_to_writer(target, pixels, decoded, &mut buf_writer)?;
+    let file = buf_writer.into_inner().map_err(|err| PipelineError::Io {
+        path: target.to_path_buf(),
+        source: err.into_error(),
+    })?;
+    staging.commit(target, file)?;
     Ok(bytes)
 }
 
@@ -474,8 +503,7 @@ fn encode_bmp_streaming(
         path: target.to_path_buf(),
         source,
     })?;
-    drop(file);
-    staging.commit(target)?;
+    staging.commit(target, file)?;
     Ok(bytes)
 }
 
@@ -641,6 +669,28 @@ mod tests {
         }
     }
 
+    struct ZeroWriteOnceAfterIdat {
+        saw_idat: bool,
+        returned_zero: bool,
+    }
+
+    impl Write for ZeroWriteOnceAfterIdat {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.saw_idat && !self.returned_zero && !buf.is_empty() {
+                self.returned_zero = true;
+                return Ok(0);
+            }
+            if buf == b"IDAT" {
+                self.saw_idat = true;
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn png_encode_propagates_transient_final_idat_write_error() {
         let pixels = vec![42_u8; 16 * 16 * 3];
@@ -655,6 +705,61 @@ mod tests {
         let res = encode_png_to_writer(Path::new("fault.png"), &pixels, meta, &mut sink);
         assert!(sink.failed_once, "fault injector should have failed IDAT");
         assert!(matches!(res, Err(PipelineError::Io { .. })));
+
+        // Also verify Ok(0) on a non-empty buffer during final IDAT is latched as WriteZero.
+        let mut zero_sink = ZeroWriteOnceAfterIdat {
+            saw_idat: false,
+            returned_zero: false,
+        };
+        let zero_res = encode_png_to_writer(Path::new("zero.png"), &pixels, meta, &mut zero_sink);
+        assert!(zero_sink.returned_zero);
+        assert!(matches!(
+            zero_res,
+            Err(PipelineError::Io { ref source, .. }) if source.kind() == io::ErrorKind::WriteZero
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_png_and_bmp_outputs_do_not_widen_private_permissions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let id = CPU_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = env::temp_dir().join(format!("fastconv-cpu-perms-{}-{id}", process::id()));
+        fs::create_dir_all(&dir)?;
+
+        let pixels = vec![99_u8; 8 * 8 * 3];
+        let meta = DecodedFrameMeta {
+            width: 8,
+            height: 8,
+            format: DecodedPixelFormat::Rgb8,
+            byte_len: pixels.len(),
+            input_file_bytes: 1,
+        };
+
+        let png_target = dir.join("private.png");
+        let bmp_target = dir.join("private.bmp");
+        fs::write(&png_target, b"old")?;
+        fs::write(&bmp_target, b"old")?;
+        fs::set_permissions(&png_target, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(&bmp_target, fs::Permissions::from_mode(0o600))?;
+
+        encode_png_streaming(&png_target, &pixels, meta)?;
+        let mut scratch = Vec::new();
+        encode_bmp_streaming(&bmp_target, &pixels, meta, &mut scratch)?;
+
+        assert_eq!(
+            fs::metadata(&png_target)?.permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&bmp_target)?.permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]

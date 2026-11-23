@@ -152,12 +152,14 @@ struct HeadToHeadReport {
 /// every generated image for decodability, exact resolution, size plausibility, and exact RGB
 /// equality (lossless vs. each contender's decoder reference) or RGB PSNR (lossy).
 ///
-/// Requires an installed `ffmpeg` build (>= 5.1) with QOI decoder and encoder support.
+/// Requires an installed `ffmpeg` build (>= 5.1) with QOI decoder and encoder support
+/// alongside `ffprobe` for lossless/HEIC validation.
 ///
 /// # Errors
 ///
 /// Returns an error if fixtures are missing, `ffmpeg` lacks required QOI codec support,
-/// building or executing any contender fails, or any output image fails decode/resolution/size/quality validation.
+/// `ffprobe` is unavailable, building or executing any contender fails, or any output image
+/// fails decode/resolution/size/quality validation.
 pub fn run_head_to_head(root: &Path) -> Result<(), String> {
     let hardware = fastconv_probe::detect_host_hardware()
         .map_err(|err| format!("failed to probe host hardware: {err}"))?;
@@ -167,6 +169,7 @@ pub fn run_head_to_head(root: &Path) -> Result<(), String> {
     let ffmpeg_version = read_ffmpeg_version()?;
     println!("ffmpeg        : {ffmpeg_version}");
     verify_ffmpeg_qoi_support()?;
+    verify_ffprobe_available()?;
 
     let has_nvenc =
         hardware.supports_video_encode(GpuBackend::Nvenc) && crate::has_nvenc_link_libraries();
@@ -2228,6 +2231,22 @@ fn verify_ffmpeg_qoi_support() -> Result<(), String> {
         return Err(format!(
             "installed ffmpeg lacks required QOI support (decoder={can_decode}, encoder={can_encode}); install FFmpeg >= 5.1 built with QOI codec support before running `cargo xtask bench`"
         ));
+    }
+    Ok(())
+}
+
+fn verify_ffprobe_available() -> Result<(), String> {
+    let output = Command::new("ffprobe")
+        .stdin(Stdio::null())
+        .arg("-version")
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to run `ffprobe -version`: {err}; install `ffprobe` alongside `ffmpeg` before running `cargo xtask bench`"
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!("`ffprobe -version` failed with {}", output.status));
     }
     Ok(())
 }

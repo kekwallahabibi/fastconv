@@ -362,7 +362,7 @@ fn print_usage() {
     println!("  cargo xtask gen-fixtures --force");
     println!("                                Regenerate all fixtures from scratch");
     println!(
-        "  cargo xtask bench             Run 4K image head-to-head benchmarks (fastconv vs ffmpeg >= 5.1 with QOI codec) + validation"
+        "  cargo xtask bench             Run 4K image head-to-head benchmarks (fastconv vs ffmpeg >= 5.1 with QOI codec + ffprobe) + validation"
     );
     println!(
         "  cargo xtask bench --baseline  Run FFmpeg baseline across all workloads and save JSON"

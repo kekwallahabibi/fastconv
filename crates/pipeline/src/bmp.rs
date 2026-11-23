@@ -1079,7 +1079,14 @@ fn parse_indexed_bmp_palette(
     let max_colors = 1_usize << bmp.bit_count;
     let entry_size = if bmp.dib_size == 12 { 3_usize } else { 4_usize };
     let entry_count = if bmp.dib_size == 12 {
-        (bmp.palette_data.len() / entry_size).min(max_colors)
+        let count = (bmp.palette_data.len() / entry_size).min(max_colors);
+        if bmp.bit_count == 1 && count < 2 {
+            return Err(PipelineError::DecodeFailed {
+                path: source.to_path_buf(),
+                reason: "1-bit BITMAPCOREHEADER BMP requires 2 color palette entries".to_owned(),
+            });
+        }
+        count
     } else {
         let declared = if bmp.colors_used == 0 {
             max_colors
