@@ -1,3 +1,4 @@
+mod audio_bench;
 mod bench;
 mod fixtures;
 mod remux_bench;
@@ -19,7 +20,7 @@ fn workspace_root() -> Result<PathBuf, String> {
         .ok_or_else(|| "failed to resolve workspace root from xtask manifest path".to_owned())
 }
 
-fn cargo_bin() -> OsString {
+pub(crate) fn cargo_bin() -> OsString {
     env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"))
 }
 
@@ -332,6 +333,10 @@ fn cmd_bench_status(root: &Path) {
         .filter(|&idx| fixtures::is_non_empty_file(&webp_image_path(root, idx)))
         .count();
     let has_wav = fixtures::is_non_empty_file(&audio_wav_path(root));
+    let audio_batch_count = fixtures::audio_batch_inputs(root)
+        .iter()
+        .filter(|path| fixtures::is_non_empty_file(path))
+        .count();
     let has_mp4 = fixtures::is_non_empty_file(&video_mp4_path(root));
 
     println!("==> fastconv benchmark harness");
@@ -343,6 +348,7 @@ fn cmd_bench_status(root: &Path) {
         "60s WAV      : {}",
         if has_wav { "ready" } else { "missing" }
     );
+    println!("Mixed audio  : {audio_batch_count}/4");
     println!(
         "1080p60 MP4  : {}",
         if has_mp4 { "ready" } else { "missing" }
@@ -350,6 +356,7 @@ fn cmd_bench_status(root: &Path) {
     println!("run `cargo xtask gen-fixtures` to generate missing fixtures.");
     println!("run `cargo xtask bench` to run the head-to-head benchmark (fastconv vs FFmpeg).");
     println!("run `cargo xtask bench --baseline` to execute and save the FFmpeg baseline.");
+    println!("run `cargo xtask bench --audio` for the native audio head-to-head benchmark.");
 }
 
 fn print_usage() {
@@ -367,6 +374,9 @@ fn print_usage() {
     );
     println!(
         "  cargo xtask bench --baseline  Run FFmpeg baseline across all workloads and save JSON"
+    );
+    println!(
+        "  cargo xtask bench --audio     Audio head-to-head (fastconv vs ffmpeg) with output validation"
     );
     println!(
         "  cargo xtask bench --remux     Video remux head-to-head (fastconv vs ffmpeg -c copy) with ffprobe validation"
@@ -390,6 +400,7 @@ fn main() -> ExitCode {
         }
         ["bench"] => workspace_root().and_then(|root| bench::run_head_to_head(&root)),
         ["bench", "--baseline"] => workspace_root().and_then(|root| bench::run_baseline(&root)),
+        ["bench", "--audio"] => workspace_root().and_then(|root| audio_bench::run(&root)),
         ["bench", "--status"] => workspace_root().map(|root| cmd_bench_status(&root)),
         ["bench", "--remux"] => workspace_root().and_then(|root| remux_bench::run(&root)),
         [] | ["-h" | "--help"] => {

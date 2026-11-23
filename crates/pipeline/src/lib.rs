@@ -1,11 +1,14 @@
 #![cfg_attr(not(feature = "nvenc"), forbid(unsafe_code))]
 
+pub mod audio;
 mod bmp;
 pub mod cpu;
 mod decode;
 pub mod gpu;
 mod qoi;
 pub mod remux;
+
+pub use audio::execute_audio_batch;
 
 use std::error::Error;
 use std::fmt;

@@ -11,9 +11,14 @@ nvenc = ["dep:cudarc", "dep:nvidia-video-codec-sdk"]
 cudarc = { workspace = true, optional = true }
 fastconv-domain.workspace = true
 containr.workspace = true
+flacenc = { workspace = true, features = ["par"] }
+hound.workspace = true
 jpeg-encoder.workspace = true
 nvidia-video-codec-sdk = { workspace = true, optional = true }
+opus-pure.workspace = true
 png.workspace = true
+rubato.workspace = true
+symphonia.workspace = true
 zenwebp.workspace = true
 zune-jpeg.workspace = true
 

@@ -1,3 +1,4 @@
+mod audio;
 mod video;
 
 use std::env;
@@ -17,6 +18,9 @@ fn print_usage() {
     println!("  fastconv probe");
     println!(
         "  fastconv convert <source> <target> [--quality <0..=100> | --lossless] [--to <webp|heic|jpeg|png|bmp|qoi>] [--threads <N>] [--backend <cpu|nvenc|vaapi|qsv|amf|videotoolbox|vulkan>]"
+    );
+    println!(
+        "  fastconv audio <source> <target> [--to <flac|wav|opus>] [--threads <N>] [--backend <cpu|...>]"
     );
     println!("  fastconv remux <source> <target> [--to <mp4|mkv>] [--threads <N>]");
     println!("  fastconv --version");
@@ -39,7 +43,7 @@ enum ConvertCommand {
     Run(ConvertArgs),
 }
 
-fn parse_backend(value: &str) -> Result<HardwareBackend, String> {
+pub(crate) fn parse_backend(value: &str) -> Result<HardwareBackend, String> {
     match value {
         "cpu" => Ok(HardwareBackend::Cpu),
         "nvenc" => Ok(HardwareBackend::Gpu(GpuBackend::Nvenc)),
@@ -265,7 +269,7 @@ fn run_convert(args: &ConvertArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn u64_to_f64(value: u64) -> f64 {
+pub(crate) fn u64_to_f64(value: u64) -> f64 {
     let hi = u32::try_from(value >> 32).unwrap_or(u32::MAX);
     let lo = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
     f64::from(hi) * 4_294_967_296.0 + f64::from(lo)
@@ -290,6 +294,23 @@ fn main() -> ExitCode {
         }
         ["probe"] => match run_probe() {
             Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("error: {message}");
+                ExitCode::FAILURE
+            }
+        },
+        ["audio", rest @ ..] => match audio::parse_audio_args(rest) {
+            Ok(audio::AudioCommand::Help) => {
+                print_usage();
+                ExitCode::SUCCESS
+            }
+            Ok(audio::AudioCommand::Run(parsed)) => match audio::run_audio(&parsed) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(message) => {
+                    eprintln!("error: {message}");
+                    ExitCode::FAILURE
+                }
+            },
             Err(message) => {
                 eprintln!("error: {message}");
                 ExitCode::FAILURE

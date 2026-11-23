@@ -1,7 +1,9 @@
+pub mod audio;
 pub mod hardware;
 pub mod image;
 pub mod video;
 
+pub use audio::{ProbedAudio, prepare_audio_batch, probe_audio};
 pub use hardware::detect_host_hardware;
 pub use image::{ProbedImage, prepare_image_batch, probe_image};
 pub use video::{ProbedVideo, detect_video_magic, prepare_video_batch, probe_video};
@@ -27,6 +29,7 @@ pub enum ProbeError {
     NotAFileOrDirectory(PathBuf),
     TargetNotADirectory(PathBuf),
     EmptySourceDirectory(PathBuf),
+    EmptyAudioDirectory(PathBuf),
     InvalidImage {
         path: PathBuf,
         reason: String,
@@ -36,6 +39,10 @@ pub enum ProbeError {
         reason: String,
     },
     EmptyVideoDirectory(PathBuf),
+    InvalidAudio {
+        path: PathBuf,
+        reason: String,
+    },
     UnsupportedTargetFormat {
         path: PathBuf,
         expected: &'static str,
@@ -74,6 +81,13 @@ impl fmt::Display for ProbeError {
                     path.display()
                 )
             }
+            Self::EmptyAudioDirectory(path) => {
+                write!(
+                    f,
+                    "no supported audio files (WAV, FLAC, MP3, OGG, or Opus) found in source directory: {}",
+                    path.display()
+                )
+            }
             Self::InvalidImage { path, reason } => {
                 write!(f, "invalid image '{}': {reason}", path.display())
             }
@@ -86,6 +100,9 @@ impl fmt::Display for ProbeError {
                     "no supported video files (MP4, MOV, or MKV) found in source directory: {}",
                     path.display()
                 )
+            }
+            Self::InvalidAudio { path, reason } => {
+                write!(f, "invalid audio '{}': {reason}", path.display())
             }
             Self::UnsupportedTargetFormat { path, expected } => {
                 write!(
@@ -111,9 +128,11 @@ impl Error for ProbeError {
             | Self::NotAFileOrDirectory(_)
             | Self::TargetNotADirectory(_)
             | Self::EmptySourceDirectory(_)
+            | Self::EmptyAudioDirectory(_)
             | Self::InvalidImage { .. }
             | Self::InvalidVideo { .. }
             | Self::EmptyVideoDirectory(_)
+            | Self::InvalidAudio { .. }
             | Self::UnsupportedTargetFormat { .. } => None,
         }
     }

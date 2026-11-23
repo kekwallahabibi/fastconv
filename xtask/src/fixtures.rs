@@ -18,6 +18,7 @@ pub const IMAGE_HEIGHT: u32 = 2160;
 pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
 pub const AUDIO_CHANNELS: u16 = 2;
 pub const AUDIO_DURATION_SECS: u32 = 60;
+pub const AUDIO_BATCH_SECS: u32 = 10;
 
 pub const VIDEO_FPS: u64 = 60;
 pub const VIDEO_DURATION_SECS: u64 = 10;
@@ -59,6 +60,23 @@ pub fn audio_wav_path(root: &Path) -> PathBuf {
 }
 
 #[must_use]
+pub fn audio_batch_dir(root: &Path) -> PathBuf {
+    root.join("fixtures/audio_batch")
+}
+
+/// Mixed-format input files used by `cargo xtask bench --audio`.
+#[must_use]
+pub fn audio_batch_inputs(root: &Path) -> [PathBuf; 4] {
+    let dir = audio_batch_dir(root);
+    [
+        dir.join("wav_track.wav"),
+        dir.join("flac_track.flac"),
+        dir.join("mp3_track.mp3"),
+        dir.join("vorbis_track.ogg"),
+    ]
+}
+
+#[must_use]
 pub fn video_mp4_path(root: &Path) -> PathBuf {
     root.join("fixtures/video_1080p60.mp4")
 }
@@ -68,6 +86,7 @@ pub fn generate_all(root: &Path, force: bool) -> Result<(), String> {
     generate_jpeg_batch(root, force)?;
     generate_webp_batch(root, force)?;
     generate_audio_wav(root, force)?;
+    generate_audio_batch(root, force)?;
     generate_video_mp4(root, force)?;
     Ok(())
 }
@@ -337,6 +356,73 @@ fn generate_audio_wav(root: &Path, force: bool) -> Result<(), String> {
     })?;
 
     println!("==> generated {}", target.display());
+    Ok(())
+}
+
+fn generate_audio_batch(root: &Path, force: bool) -> Result<(), String> {
+    let dir = audio_batch_dir(root);
+    let inputs = audio_batch_inputs(root);
+    if !force && inputs.iter().all(|path| is_non_empty_file(path)) {
+        println!(
+            "==> skip mixed audio batch (4 files already exist in {})",
+            dir.display()
+        );
+        return Ok(());
+    }
+    fs::create_dir_all(&dir)
+        .map_err(|err| format!("failed to create '{}': {err}", dir.display()))?;
+
+    let source = audio_wav_path(root);
+    if !is_non_empty_file(&source) {
+        return Err(format!(
+            "missing WAV fixture '{}'; run `cargo xtask gen-fixtures` first",
+            source.display()
+        ));
+    }
+    let source_str = source
+        .to_str()
+        .ok_or_else(|| "audio WAV fixture path is not valid UTF-8".to_owned())?;
+    let secs = AUDIO_BATCH_SECS.to_string();
+
+    for (path, args) in [
+        (&inputs[0], vec!["-c:a", "pcm_s16le"]),
+        (&inputs[1], vec!["-c:a", "flac", "-compression_level", "5"]),
+        (&inputs[2], vec!["-c:a", "libmp3lame", "-b:a", "192k"]),
+        (&inputs[3], vec!["-c:a", "libvorbis", "-q:a", "5"]),
+    ] {
+        if !force && is_non_empty_file(path) {
+            continue;
+        }
+        let out = path
+            .to_str()
+            .ok_or_else(|| "audio batch fixture path is not valid UTF-8".to_owned())?;
+        let mut cmd = Command::new("ffmpeg");
+        cmd.stdin(Stdio::null())
+            .args([
+                "-nostdin",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                source_str,
+                "-t",
+                &secs,
+            ])
+            .args(args)
+            .arg(out);
+        let output = cmd
+            .output()
+            .map_err(|err| format!("failed to launch ffmpeg for '{}': {err}", path.display()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "ffmpeg failed to generate '{}': {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        println!("==> generated {}", path.display());
+    }
     Ok(())
 }
 
