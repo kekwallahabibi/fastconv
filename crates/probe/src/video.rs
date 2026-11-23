@@ -110,6 +110,9 @@ fn stream_codec(track: &Track) -> VideoCodec {
         if codec_id == "A_VORBIS" {
             return VideoCodec::Vorbis;
         }
+        if codec_id == "S_TEXT/UTF8" {
+            return VideoCodec::TimedText;
+        }
         return VideoCodec::Unknown;
     }
 
@@ -121,6 +124,7 @@ fn stream_codec(track: &Track) -> VideoCodec {
         Some([b'v', b'p', b'0', b'9']) => VideoCodec::Vp9,
         Some([b'm', b'p', b'4', b'a']) => VideoCodec::Aac,
         Some([b'O', b'p', b'u', b's']) => VideoCodec::Opus,
+        Some([b't', b'x', b'3', b'g']) => VideoCodec::TimedText,
         _ => VideoCodec::Unknown,
     }
 }

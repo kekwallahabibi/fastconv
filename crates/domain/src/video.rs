@@ -57,6 +57,7 @@ pub enum VideoCodec {
     Aac,
     Opus,
     Vorbis,
+    TimedText,
     Unknown,
 }
 
@@ -71,6 +72,7 @@ impl VideoCodec {
             Self::Aac => "AAC",
             Self::Opus => "Opus",
             Self::Vorbis => "Vorbis",
+            Self::TimedText => "Timed text",
             Self::Unknown => "unknown",
         }
     }
@@ -81,7 +83,7 @@ impl VideoCodec {
         match container {
             VideoContainerFormat::Mp4 => matches!(
                 self,
-                Self::H264 | Self::Hevc | Self::Av1 | Self::Aac | Self::Opus
+                Self::H264 | Self::Hevc | Self::Av1 | Self::Aac | Self::Opus | Self::TimedText
             ),
             VideoContainerFormat::Mkv => matches!(
                 self,
@@ -92,6 +94,7 @@ impl VideoCodec {
                     | Self::Aac
                     | Self::Opus
                     | Self::Vorbis
+                    | Self::TimedText
             ),
         }
     }
@@ -440,6 +443,9 @@ mod tests {
         assert!(VideoCodec::Aac.supported_in(VideoContainerFormat::Mp4));
         assert!(VideoCodec::Aac.supported_in(VideoContainerFormat::Mkv));
         assert!(!VideoCodec::Vorbis.supported_in(VideoContainerFormat::Mp4));
+        // tx3g <-> S_TEXT/UTF8 is a pure container mapping in both directions.
+        assert!(VideoCodec::TimedText.supported_in(VideoContainerFormat::Mp4));
+        assert!(VideoCodec::TimedText.supported_in(VideoContainerFormat::Mkv));
     }
 
     #[test]
