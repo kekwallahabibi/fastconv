@@ -536,7 +536,10 @@ mod enabled {
                 std::mem::swap(pixel_buf, &mut rgba_bytes);
                 finish_rgba_expansion(item_index, item, decoded, pixel_buf, rgba_bytes)
             }
-            ImageInputFormat::Png | ImageInputFormat::Webp => {
+            ImageInputFormat::Png
+            | ImageInputFormat::Webp
+            | ImageInputFormat::Tiff
+            | ImageInputFormat::Jxl => {
                 let decoded =
                     decode_image_into(item, DecodeTargetHint::Native, file_bytes, pixel_buf)?;
                 finish_rgba_expansion(item_index, item, decoded, pixel_buf, rgba_bytes)

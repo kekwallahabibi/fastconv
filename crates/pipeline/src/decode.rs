@@ -3,6 +3,11 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 
 use fastconv_domain::{ImageBatchItem, ImageInputFormat};
+use jxl::api::{
+    Event, JxlColorType, JxlDataFormat, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer,
+    JxlPixelFormat,
+};
+use tiff::decoder::Decoder as TiffDecoder;
 use zune_jpeg::JpegDecoder;
 use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
@@ -115,6 +120,12 @@ pub(crate) fn decode_image_into(
                 input_file_bytes,
             })
         }
+        ImageInputFormat::Tiff => {
+            decode_tiff_slice_into(item, file_bytes.as_slice(), input_file_bytes, pixel_buf)
+        }
+        ImageInputFormat::Jxl => {
+            decode_jxl_slice_into(item, file_bytes.as_slice(), input_file_bytes, pixel_buf)
+        }
     }
 }
 
@@ -125,7 +136,7 @@ fn decode_webp_slice_into(
     pixel_buf: &mut Vec<u8>,
 ) -> Result<DecodedFrameMeta, PipelineError> {
     let mut decoder =
-        zenwebp::WebPDecoder::build(file_bytes).map_err(|err| PipelineError::DecodeFailed {
+        zenwebp::WebPDecoder::new(file_bytes).map_err(|err| PipelineError::DecodeFailed {
             path: item.source().to_path_buf(),
             reason: err.to_string(),
         })?;
@@ -359,6 +370,281 @@ fn decode_jpeg_slice_into(
         height,
         format,
         byte_len: required_len,
+        input_file_bytes,
+    })
+}
+
+#[allow(clippy::too_many_lines)] // TIFF decoding validates headers and converts all supported sample widths in one cohesive path.
+fn decode_tiff_slice_into(
+    item: &ImageBatchItem,
+    file_bytes: &[u8],
+    input_file_bytes: u64,
+    pixel_buf: &mut Vec<u8>,
+) -> Result<DecodedFrameMeta, PipelineError> {
+    let mut decoder = TiffDecoder::new(io::Cursor::new(file_bytes)).map_err(|err| {
+        PipelineError::DecodeFailed {
+            path: item.source().to_path_buf(),
+            reason: format!("invalid TIFF stream: {err}"),
+        }
+    })?;
+
+    let (width, height) = decoder
+        .dimensions()
+        .map_err(|err| PipelineError::DecodeFailed {
+            path: item.source().to_path_buf(),
+            reason: format!("invalid TIFF dimensions: {err}"),
+        })?;
+    verify_decoded_dimensions(item, width, height)?;
+
+    let color = decoder
+        .colortype()
+        .map_err(|err| PipelineError::DecodeFailed {
+            path: item.source().to_path_buf(),
+            reason: format!("invalid TIFF color type: {err}"),
+        })?;
+
+    let (channels, format, bits) = match color {
+        tiff::ColorType::Gray(bits) => (1_usize, DecodedPixelFormat::L8, bits),
+        tiff::ColorType::GrayA(bits) => (2_usize, DecodedPixelFormat::La8, bits),
+        tiff::ColorType::RGB(bits) => (3_usize, DecodedPixelFormat::Rgb8, bits),
+        tiff::ColorType::RGBA(bits) => (4_usize, DecodedPixelFormat::Rgba8, bits),
+        other => {
+            return Err(PipelineError::UnsupportedPixelFormat {
+                path: item.source().to_path_buf(),
+                format: format!("TIFF color type {other:?}"),
+            });
+        }
+    };
+    if bits == 0 || bits > 16 {
+        return Err(PipelineError::UnsupportedPixelFormat {
+            path: item.source().to_path_buf(),
+            format: format!("TIFF sample depth {bits}"),
+        });
+    }
+
+    let expected_len = usize::try_from(width)
+        .ok()
+        .and_then(|w| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|h| w.checked_mul(h).and_then(|p| p.checked_mul(channels)))
+        })
+        .ok_or_else(|| PipelineError::DecodeFailed {
+            path: item.source().to_path_buf(),
+            reason: "TIFF dimensions overflow decoded buffer size".to_owned(),
+        })?;
+    if pixel_buf.len() < expected_len {
+        pixel_buf.resize(expected_len, 0);
+    }
+
+    let result = decoder
+        .read_image()
+        .map_err(|err| PipelineError::DecodeFailed {
+            path: item.source().to_path_buf(),
+            reason: format!("failed to decode TIFF image: {err}"),
+        })?;
+
+    let max_sample = (1_u32 << bits) - 1;
+    let scale_u8 = |value: u32| -> u8 {
+        u8::try_from((value * 255 + max_sample / 2) / max_sample).unwrap_or(u8::MAX)
+    };
+
+    match result {
+        tiff::decoder::DecodingResult::U8(samples) => {
+            if samples.len() < expected_len {
+                return Err(PipelineError::DecodeFailed {
+                    path: item.source().to_path_buf(),
+                    reason: format!(
+                        "decoded TIFF buffer is too short: {} < {expected_len}",
+                        samples.len()
+                    ),
+                });
+            }
+            if bits == 8 {
+                pixel_buf[..expected_len].copy_from_slice(&samples[..expected_len]);
+            } else {
+                for (dst, src) in pixel_buf[..expected_len]
+                    .iter_mut()
+                    .zip(samples[..expected_len].iter().copied())
+                {
+                    *dst = scale_u8(u32::from(src));
+                }
+            }
+        }
+        tiff::decoder::DecodingResult::U16(samples) => {
+            if samples.len() < expected_len {
+                return Err(PipelineError::DecodeFailed {
+                    path: item.source().to_path_buf(),
+                    reason: format!(
+                        "decoded TIFF buffer is too short: {} < {expected_len}",
+                        samples.len()
+                    ),
+                });
+            }
+            for (dst, src) in pixel_buf[..expected_len]
+                .iter_mut()
+                .zip(samples[..expected_len].iter().copied())
+            {
+                *dst = scale_u8(u32::from(src));
+            }
+        }
+        other => {
+            return Err(PipelineError::UnsupportedPixelFormat {
+                path: item.source().to_path_buf(),
+                format: format!("TIFF decoded sample type {other:?}"),
+            });
+        }
+    }
+
+    Ok(DecodedFrameMeta {
+        width,
+        height,
+        format,
+        byte_len: expected_len,
+        input_file_bytes,
+    })
+}
+
+#[allow(clippy::too_many_lines)] // JPEG XL decoding drives the full libjxl event loop and output-buffer setup.
+fn decode_jxl_slice_into(
+    item: &ImageBatchItem,
+    file_bytes: &[u8],
+    input_file_bytes: u64,
+    pixel_buf: &mut Vec<u8>,
+) -> Result<DecodedFrameMeta, PipelineError> {
+    let mut options = JxlDecoderOptions::default();
+    options.sample_limit = Some(512 * 1024 * 1024);
+    let mut decoder = JxlDecoder::new(options);
+
+    let mut input = file_bytes;
+    let mut buffers: Option<[JxlOutputBuffer<'_>; 1]> = None;
+    let mut width = 0_u32;
+    let mut height = 0_u32;
+    let mut channels = 0_usize;
+    let mut format = DecodedPixelFormat::Rgba8;
+
+    loop {
+        let out = buffers.as_mut().map(|bufs| &mut bufs[..]);
+        let event =
+            decoder
+                .process(&mut input, out, None)
+                .map_err(|err| PipelineError::DecodeFailed {
+                    path: item.source().to_path_buf(),
+                    reason: format!("invalid JPEG XL stream: {err}"),
+                })?;
+
+        match event {
+            Event::BasicInfo => {
+                let info = decoder
+                    .basic_info()
+                    .ok_or_else(|| PipelineError::DecodeFailed {
+                        path: item.source().to_path_buf(),
+                        reason: "missing JPEG XL basic image information".to_owned(),
+                    })?;
+                let (w, h) = info.size;
+                width = u32::try_from(w).map_err(|_| PipelineError::DecodeFailed {
+                    path: item.source().to_path_buf(),
+                    reason: format!("JPEG XL width {w} is too large"),
+                })?;
+                height = u32::try_from(h).map_err(|_| PipelineError::DecodeFailed {
+                    path: item.source().to_path_buf(),
+                    reason: format!("JPEG XL height {h} is too large"),
+                })?;
+                verify_decoded_dimensions(item, width, height)?;
+
+                let grayscale = decoder
+                    .embedded_color_profile()
+                    .is_some_and(|profile| profile.channels() == 1);
+                let has_alpha = info
+                    .extra_channels
+                    .iter()
+                    .any(|channel| format!("{:?}", channel.ec_type) == "Alpha")
+                    || decoder
+                        .current_pixel_format()
+                        .is_some_and(|format| format.color_type.has_alpha());
+
+                let color_type = match (grayscale, has_alpha) {
+                    (true, true) => JxlColorType::GrayscaleAlpha,
+                    (true, false) => JxlColorType::Grayscale,
+                    (false, true) => JxlColorType::Rgba,
+                    (false, false) => JxlColorType::Rgb,
+                };
+                channels = color_type.samples_per_pixel();
+                format = if color_type == JxlColorType::Grayscale {
+                    DecodedPixelFormat::L8
+                } else if color_type == JxlColorType::GrayscaleAlpha {
+                    DecodedPixelFormat::La8
+                } else if color_type == JxlColorType::Rgb {
+                    DecodedPixelFormat::Rgb8
+                } else {
+                    DecodedPixelFormat::Rgba8
+                };
+
+                let required = channels
+                    .checked_mul(width as usize)
+                    .and_then(|row| row.checked_mul(height as usize))
+                    .ok_or_else(|| PipelineError::DecodeFailed {
+                        path: item.source().to_path_buf(),
+                        reason: "JPEG XL dimensions overflow decoded buffer size".to_owned(),
+                    })?;
+                if pixel_buf.len() < required {
+                    pixel_buf.resize(required, 0);
+                }
+
+                let pixel_format = JxlPixelFormat {
+                    color_type,
+                    color_data_format: Some(JxlDataFormat::U8 { bit_depth: 8 }),
+                    extra_channel_format: vec![None; info.extra_channels.len()],
+                };
+                decoder.set_pixel_format(pixel_format).map_err(|err| {
+                    PipelineError::DecodeFailed {
+                        path: item.source().to_path_buf(),
+                        reason: format!("failed to configure JPEG XL output format: {err}"),
+                    }
+                })?;
+
+                let buffer = JxlOutputBuffer::new(
+                    pixel_buf.as_mut_slice(),
+                    height as usize,
+                    width as usize * channels,
+                );
+                buffers = Some([buffer]);
+            }
+            Event::FrameHeader => {}
+            Event::FrameComplete { has_more_frames } => {
+                if has_more_frames {
+                    return Err(PipelineError::DecodeFailed {
+                        path: item.source().to_path_buf(),
+                        reason: "animated JPEG XL is not supported by the still-image pipeline"
+                            .to_owned(),
+                    });
+                }
+            }
+            Event::Complete => break,
+            Event::NeedMoreInput { .. } => {
+                if input.is_empty() {
+                    return Err(PipelineError::DecodeFailed {
+                        path: item.source().to_path_buf(),
+                        reason: "truncated JPEG XL stream".to_owned(),
+                    });
+                }
+            }
+        }
+    }
+
+    if channels == 0 {
+        return Err(PipelineError::DecodeFailed {
+            path: item.source().to_path_buf(),
+            reason: "JPEG XL decoder produced no image data".to_owned(),
+        });
+    }
+
+    let byte_len = channels * width as usize * height as usize;
+    Ok(DecodedFrameMeta {
+        width,
+        height,
+        format,
+        byte_len,
         input_file_bytes,
     })
 }

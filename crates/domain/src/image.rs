@@ -58,6 +58,8 @@ pub enum ImageInputFormat {
     Webp,
     Bmp,
     Qoi,
+    Tiff,
+    Jxl,
 }
 
 impl ImageInputFormat {
@@ -69,6 +71,8 @@ impl ImageInputFormat {
             Self::Webp => "webp",
             Self::Bmp => "bmp",
             Self::Qoi => "qoi",
+            Self::Tiff => "tiff",
+            Self::Jxl => "jxl",
         }
     }
 }
@@ -88,6 +92,9 @@ pub enum ImageOutputFormat {
     Png,
     Bmp,
     Qoi,
+    Tiff,
+    Jxl,
+    Avif,
 }
 
 impl ImageOutputFormat {
@@ -100,6 +107,9 @@ impl ImageOutputFormat {
             Self::Png => "png",
             Self::Bmp => "bmp",
             Self::Qoi => "qoi",
+            Self::Tiff => "tiff",
+            Self::Jxl => "jxl",
+            Self::Avif => "avif",
         }
     }
 }
@@ -163,9 +173,9 @@ impl fmt::Display for ImageCompression {
 
 /// Compile-time-legal combination of output image format, codec mode, and hardware backend.
 ///
-/// Illegal pairings (e.g. NVENC + WebP/JPEG/PNG/BMP/QOI, Vulkan + images, CPU + HEIC,
-/// lossless + JPEG/HEIC, lossy quality + PNG/BMP/QOI, or hardware-absent video encoder
-/// backends) cannot be constructed.
+/// Illegal pairings (e.g. NVENC + WebP/JPEG/PNG/BMP/QOI/TIFF/JXL/AVIF, Vulkan + images,
+/// CPU + HEIC, lossless + JPEG/HEIC/AVIF, lossy quality + PNG/BMP/QOI/TIFF, or
+/// hardware-absent video encoder backends) cannot be constructed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum ImageExecutionMode {
     CpuWebp(ImageCompression),
@@ -173,6 +183,9 @@ pub enum ImageExecutionMode {
     CpuPng,
     CpuBmp,
     CpuQoi,
+    CpuTiff,
+    CpuJxl(ImageCompression),
+    CpuAvif { quality: ImageQuality },
     NvencHeic { quality: ImageQuality },
 }
 
@@ -180,7 +193,7 @@ impl ImageExecutionMode {
     /// Resolves a CPU-only [`ImageExecutionMode`] for `format` without probing GPU hardware.
     ///
     /// When `compression` is `None`, selects the natural default for `format` (lossy quality 80
-    /// for WebP/JPEG, lossless for PNG/BMP/QOI).
+    /// for WebP/JPEG/JXL/AVIF, lossless for PNG/BMP/QOI/TIFF).
     ///
     /// # Errors
     ///
@@ -212,6 +225,27 @@ impl ImageExecutionMode {
             ImageOutputFormat::Png => resolve_lossless_only_cpu(format, "PNG", compression, Self::CpuPng),
             ImageOutputFormat::Bmp => resolve_lossless_only_cpu(format, "BMP", compression, Self::CpuBmp),
             ImageOutputFormat::Qoi => resolve_lossless_only_cpu(format, "QOI", compression, Self::CpuQoi),
+            ImageOutputFormat::Tiff => {
+                resolve_lossless_only_cpu(format, "TIFF", compression, Self::CpuTiff)
+            }
+            ImageOutputFormat::Jxl => Ok(Self::CpuJxl(compression.unwrap_or(
+                ImageCompression::Lossy {
+                    quality: ImageQuality::DEFAULT,
+                },
+            ))),
+            ImageOutputFormat::Avif => match compression {
+                None => Ok(Self::CpuAvif {
+                    quality: ImageQuality::DEFAULT,
+                }),
+                Some(ImageCompression::Lossy { quality }) => Ok(Self::CpuAvif { quality }),
+                Some(ImageCompression::Lossless) => Err(DomainError::UnsupportedImagePipeline {
+                    format,
+                    backend: HardwareBackend::Cpu,
+                    reason:
+                        "AVIF via ravif is lossy-only and does not support --lossless; use --quality 0..=100"
+                            .to_owned(),
+                }),
+            },
             ImageOutputFormat::Heic => Err(DomainError::UnsupportedImagePipeline {
                 format,
                 backend: HardwareBackend::Cpu,
@@ -252,6 +286,15 @@ impl ImageExecutionMode {
             (ImageOutputFormat::Qoi, HardwareBackend::Gpu(GpuBackend::Nvenc)) => Err(
                 nvenc_unsupported_image_error(format, "QOI", ".qoi", hardware),
             ),
+            (ImageOutputFormat::Tiff, HardwareBackend::Gpu(GpuBackend::Nvenc)) => Err(
+                nvenc_unsupported_image_error(format, "TIFF", ".tiff", hardware),
+            ),
+            (ImageOutputFormat::Jxl, HardwareBackend::Gpu(GpuBackend::Nvenc)) => Err(
+                nvenc_unsupported_image_error(format, "JPEG XL", ".jxl", hardware),
+            ),
+            (ImageOutputFormat::Avif, HardwareBackend::Gpu(GpuBackend::Nvenc)) => Err(
+                nvenc_unsupported_image_error(format, "AV1/AVIF still images", ".avif", hardware),
+            ),
             (ImageOutputFormat::Heic, HardwareBackend::Gpu(GpuBackend::Nvenc)) => {
                 if !hardware.supports_video_encode(GpuBackend::Nvenc) {
                     return Err(DomainError::UnsupportedImagePipeline {
@@ -291,6 +334,9 @@ impl ImageExecutionMode {
             Self::CpuPng => ImageOutputFormat::Png,
             Self::CpuBmp => ImageOutputFormat::Bmp,
             Self::CpuQoi => ImageOutputFormat::Qoi,
+            Self::CpuTiff => ImageOutputFormat::Tiff,
+            Self::CpuJxl(_) => ImageOutputFormat::Jxl,
+            Self::CpuAvif { .. } => ImageOutputFormat::Avif,
             Self::NvencHeic { .. } => ImageOutputFormat::Heic,
         }
     }
@@ -302,7 +348,10 @@ impl ImageExecutionMode {
             | Self::CpuJpeg { .. }
             | Self::CpuPng
             | Self::CpuBmp
-            | Self::CpuQoi => HardwareBackend::Cpu,
+            | Self::CpuQoi
+            | Self::CpuTiff
+            | Self::CpuJxl(_)
+            | Self::CpuAvif { .. } => HardwareBackend::Cpu,
             Self::NvencHeic { .. } => HardwareBackend::Gpu(GpuBackend::Nvenc),
         }
     }
@@ -316,6 +365,9 @@ impl fmt::Display for ImageExecutionMode {
             Self::CpuPng => f.write_str("png lossless"),
             Self::CpuBmp => f.write_str("bmp lossless"),
             Self::CpuQoi => f.write_str("qoi lossless"),
+            Self::CpuTiff => f.write_str("tiff lossless"),
+            Self::CpuJxl(compression) => write!(f, "jxl {compression}"),
+            Self::CpuAvif { quality } => write!(f, "avif av1 q={}", quality.get()),
             Self::NvencHeic { quality } => {
                 write!(f, "heic hevc-intra q={}", quality.get())
             }
@@ -349,7 +401,7 @@ fn nvenc_unsupported_image_error(
 ) -> DomainError {
     let reason = if hardware.supports_video_encode(GpuBackend::Nvenc) {
         format!(
-            "NVENC only provides hardware H.264/HEVC/AV1 encoders, not {codec_label}; use --backend cpu for {cpu_ext}, or target .heic (--to heic) for NVENC HEVC-Intra"
+            "NVENC provides hardware video encoders (H.264/HEVC/AV1 on supported GPUs), not {codec_label}; use --backend cpu for {cpu_ext}, or target .heic (--to heic) for NVENC HEVC-Intra"
         )
     } else {
         format!("NVENC is not available on this host and does not provide a {codec_label} encoder")
@@ -914,6 +966,7 @@ mod tests {
             ImageOutputFormat::Png,
             ImageOutputFormat::Bmp,
             ImageOutputFormat::Qoi,
+            ImageOutputFormat::Tiff,
         ] {
             let quality_rejected =
                 ImageExecutionMode::resolve(fmt, lossy, HardwareBackend::Cpu, &cpu_only);
@@ -956,6 +1009,82 @@ mod tests {
                 }) if format == fmt && reason.contains("--to heic")
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_jxl_avif_and_tiff_constraints() -> Result<(), DomainError> {
+        let rtx = rtx_2060_hardware()?;
+        let cpu_only = cpu_only_hardware()?;
+        let lossy = Some(ImageCompression::Lossy {
+            quality: ImageQuality::DEFAULT,
+        });
+
+        assert_eq!(
+            ImageExecutionMode::resolve(
+                ImageOutputFormat::Jxl,
+                lossy,
+                HardwareBackend::Cpu,
+                &cpu_only
+            )?,
+            ImageExecutionMode::CpuJxl(ImageCompression::Lossy {
+                quality: ImageQuality::DEFAULT
+            })
+        );
+        assert_eq!(
+            ImageExecutionMode::CpuAvif {
+                quality: ImageQuality::DEFAULT
+            }
+            .output_format(),
+            ImageOutputFormat::Avif
+        );
+        assert_eq!(
+            ImageExecutionMode::CpuJxl(ImageCompression::Lossless).output_format(),
+            ImageOutputFormat::Jxl
+        );
+        assert_eq!(
+            ImageExecutionMode::CpuTiff.output_format(),
+            ImageOutputFormat::Tiff
+        );
+
+        let avif_lossless = ImageExecutionMode::resolve(
+            ImageOutputFormat::Avif,
+            Some(ImageCompression::Lossless),
+            HardwareBackend::Cpu,
+            &cpu_only,
+        );
+        assert!(matches!(
+            avif_lossless,
+            Err(DomainError::UnsupportedImagePipeline {
+                format: ImageOutputFormat::Avif,
+                backend: HardwareBackend::Cpu,
+                ref reason,
+            }) if reason.contains("lossy-only")
+        ));
+
+        for (fmt, needle) in [
+            (ImageOutputFormat::Tiff, "TIFF"),
+            (ImageOutputFormat::Jxl, "JPEG XL"),
+            (ImageOutputFormat::Avif, "AV1/AVIF"),
+        ] {
+            let nvenc_rejected = ImageExecutionMode::resolve(
+                fmt,
+                Some(ImageCompression::Lossy {
+                    quality: ImageQuality::DEFAULT,
+                }),
+                HardwareBackend::Gpu(GpuBackend::Nvenc),
+                &rtx,
+            );
+            assert!(matches!(
+                nvenc_rejected,
+                Err(DomainError::UnsupportedImagePipeline {
+                    format,
+                    backend: HardwareBackend::Gpu(GpuBackend::Nvenc),
+                    ref reason,
+                }) if format == fmt && reason.contains(needle) && reason.contains("cpu")
+            ));
+        }
+
         Ok(())
     }
 
