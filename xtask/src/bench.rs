@@ -61,18 +61,22 @@ struct HeadToHeadReport {
     schema_version: u32,
     ffmpeg_version: String,
     hardware: HostHardware,
-    fastconv: HeadToHeadEntry,
-    ffmpeg: HeadToHeadEntry,
-    speedup: f64,
-    mean_psnr_delta_db: f64,
+    fastconv_cpu: HeadToHeadEntry,
+    ffmpeg_webp: HeadToHeadEntry,
+    fastconv_gpu_nvenc_heic: Option<HeadToHeadEntry>,
+    cpu_vs_ffmpeg_speedup: f64,
+    cpu_vs_ffmpeg_psnr_delta_db: f64,
+    nvenc_heic_vs_ffmpeg_webp_speedup: Option<f64>,
 }
 
-/// Runs a head-to-head benchmark (`fastconv --release` vs `ffmpeg`) on the 4K PNG batch.
+/// Runs a head-to-head benchmark (`fastconv cpu` WebP vs `ffmpeg` WebP, plus optional GPU NVENC
+/// HEIC) on the 4K PNG batch, validating every generated image for decodability, exact resolution,
+/// size plausibility, and RGB PSNR.
 ///
 /// # Errors
 ///
-/// Returns an error if fixtures are missing, building or executing either contender fails,
-/// or any output image fails decode/resolution/size validation.
+/// Returns an error if fixtures are missing, building or executing any contender fails,
+/// or any output image fails decode/resolution/size/PSNR validation.
 pub fn run_head_to_head(root: &Path) -> Result<(), String> {
     let hardware = fastconv_probe::detect_host_hardware()
         .map_err(|err| format!("failed to probe host hardware: {err}"))?;
@@ -82,7 +86,9 @@ pub fn run_head_to_head(root: &Path) -> Result<(), String> {
     let ffmpeg_version = read_ffmpeg_version()?;
     println!("ffmpeg        : {ffmpeg_version}");
 
-    let fastconv_bin = build_release_fastconv(root)?;
+    let has_nvenc =
+        hardware.supports_video_encode(GpuBackend::Nvenc) && crate::has_nvenc_link_libraries();
+    let fastconv_bin = build_release_fastconv(root, has_nvenc)?;
 
     let bench_dir = root.join("bench-output");
     let h2h_tmp = bench_dir.join("tmp/head_to_head");
@@ -90,24 +96,40 @@ pub fn run_head_to_head(root: &Path) -> Result<(), String> {
         fs::remove_dir_all(&h2h_tmp)
             .map_err(|err| format!("failed to clean '{}': {err}", h2h_tmp.display()))?;
     }
-    let fastconv_out = h2h_tmp.join("fastconv_webp");
+    let cpu_out = h2h_tmp.join("fastconv_cpu_webp");
     let ffmpeg_out = h2h_tmp.join("ffmpeg_webp");
-    fs::create_dir_all(&fastconv_out)
-        .map_err(|err| format!("failed to create '{}': {err}", fastconv_out.display()))?;
-    fs::create_dir_all(&ffmpeg_out)
-        .map_err(|err| format!("failed to create '{}': {err}", ffmpeg_out.display()))?;
+    let nvenc_out = h2h_tmp.join("fastconv_nvenc_heic");
+    for dir in [&cpu_out, &ffmpeg_out, &nvenc_out] {
+        fs::create_dir_all(dir)
+            .map_err(|err| format!("failed to create '{}': {err}", dir.display()))?;
+    }
 
-    let fastconv_entry = run_fastconv_image_batch(
+    let fastconv_cpu = run_fastconv_cpu_webp_batch(
         &fastconv_bin,
         &fixtures.images_dir,
         fixtures.image_batch_bytes,
-        &fastconv_out,
+        &cpu_out,
     )?;
-    let ffmpeg_entry = run_ffmpeg_image_batch_validated(
+
+    let ffmpeg_webp = run_ffmpeg_image_batch_validated(
         &fixtures.images_dir,
         fixtures.image_batch_bytes,
         &ffmpeg_out,
     )?;
+
+    let fastconv_gpu_nvenc_heic = if has_nvenc {
+        Some(run_fastconv_nvenc_heic_batch(
+            &fastconv_bin,
+            &fixtures.images_dir,
+            fixtures.image_batch_bytes,
+            &nvenc_out,
+        )?)
+    } else {
+        println!(
+            "==> skipping fastconv (gpu:nvenc heic): NVENC hardware or link libraries unavailable"
+        );
+        None
+    };
 
     if h2h_tmp.exists() {
         fs::remove_dir_all(&h2h_tmp).map_err(|err| {
@@ -118,32 +140,26 @@ pub fn run_head_to_head(root: &Path) -> Result<(), String> {
         })?;
     }
 
-    let speedup = ffmpeg_entry.metrics.duration_ms() / fastconv_entry.metrics.duration_ms();
-    let mean_psnr_delta_db =
-        fastconv_entry.validation.mean_psnr_db - ffmpeg_entry.validation.mean_psnr_db;
-
-    println!();
-    print!(
-        "{}",
-        format_head_to_head_table(&fastconv_entry, &ffmpeg_entry)
-    );
-    println!(
-        "summary: speedup = {speedup:.2}x | delta mean PSNR = {mean_psnr_delta_db:+.2} dB | validated = {}/{} ({})",
-        fastconv_entry.validation.files_validated,
-        IMAGE_BATCH_COUNT,
-        fastconv_entry.validation.resolution
-    );
-
-    let json_path = bench_dir.join("head-to-head.json");
-    let report = HeadToHeadReport {
-        schema_version: 1,
+    let report = build_head_to_head_report(
         ffmpeg_version,
         hardware,
-        fastconv: fastconv_entry,
-        ffmpeg: ffmpeg_entry,
-        speedup,
-        mean_psnr_delta_db,
-    };
+        fastconv_cpu,
+        ffmpeg_webp,
+        fastconv_gpu_nvenc_heic,
+    );
+
+    let mut rows: Vec<&HeadToHeadEntry> = Vec::with_capacity(3);
+    rows.push(&report.fastconv_cpu);
+    rows.push(&report.ffmpeg_webp);
+    if let Some(ref heic) = report.fastconv_gpu_nvenc_heic {
+        rows.push(heic);
+    }
+
+    println!();
+    print!("{}", format_head_to_head_table(&rows));
+    print_head_to_head_summary(&report);
+
+    let json_path = bench_dir.join("head-to-head.json");
     let json = serde_json::to_string_pretty(&report)
         .map_err(|err| format!("failed to serialize head-to-head report: {err}"))?;
     fs::write(&json_path, format!("{json}\n"))
@@ -151,6 +167,58 @@ pub fn run_head_to_head(root: &Path) -> Result<(), String> {
 
     println!("head-to-head saved: {}", json_path.display());
     Ok(())
+}
+
+fn build_head_to_head_report(
+    ffmpeg_version: String,
+    hardware: HostHardware,
+    fastconv_cpu: HeadToHeadEntry,
+    ffmpeg_webp: HeadToHeadEntry,
+    fastconv_gpu_nvenc_heic: Option<HeadToHeadEntry>,
+) -> HeadToHeadReport {
+    let cpu_vs_ffmpeg_speedup =
+        ffmpeg_webp.metrics.duration_ms() / fastconv_cpu.metrics.duration_ms();
+    let cpu_vs_ffmpeg_psnr_delta_db =
+        fastconv_cpu.validation.mean_psnr_db - ffmpeg_webp.validation.mean_psnr_db;
+    let nvenc_heic_vs_ffmpeg_webp_speedup = fastconv_gpu_nvenc_heic
+        .as_ref()
+        .map(|nv| ffmpeg_webp.metrics.duration_ms() / nv.metrics.duration_ms());
+
+    HeadToHeadReport {
+        schema_version: 2,
+        ffmpeg_version,
+        hardware,
+        fastconv_cpu,
+        ffmpeg_webp,
+        fastconv_gpu_nvenc_heic,
+        cpu_vs_ffmpeg_speedup,
+        cpu_vs_ffmpeg_psnr_delta_db,
+        nvenc_heic_vs_ffmpeg_webp_speedup,
+    }
+}
+
+fn print_head_to_head_summary(report: &HeadToHeadReport) {
+    println!(
+        "webp cpu vs ffmpeg  : {:.2}x | delta mean PSNR = {:+.2} dB | validated = {}/{} ({})",
+        report.cpu_vs_ffmpeg_speedup,
+        report.cpu_vs_ffmpeg_psnr_delta_db,
+        report.fastconv_cpu.validation.files_validated,
+        IMAGE_BATCH_COUNT,
+        report.fastconv_cpu.validation.resolution
+    );
+    if let (Some(heic), Some(vs_ff)) = (
+        report.fastconv_gpu_nvenc_heic.as_ref(),
+        report.nvenc_heic_vs_ffmpeg_webp_speedup,
+    ) {
+        let vs_cpu_webp = report.fastconv_cpu.metrics.duration_ms() / heic.metrics.duration_ms();
+        println!(
+            "heic gpu:nvenc      : {vs_ff:.2}x vs ffmpeg(webp) | {vs_cpu_webp:.2}x vs cpu(webp) | mean PSNR = {:.2} dB | validated = {}/{} ({})",
+            heic.validation.mean_psnr_db,
+            heic.validation.files_validated,
+            IMAGE_BATCH_COUNT,
+            heic.validation.resolution
+        );
+    }
 }
 
 /// Runs the full `FFmpeg` reference baseline across image, audio, and video workloads.
@@ -260,18 +328,22 @@ pub fn run_baseline(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn build_release_fastconv(root: &Path) -> Result<PathBuf, String> {
+fn build_release_fastconv(root: &Path, enable_nvenc: bool) -> Result<PathBuf, String> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    println!("==> building fastconv --release");
+    let mut args = vec!["build", "--release", "-p", "fastconv-cli"];
+    if enable_nvenc {
+        args.extend_from_slice(&["--features", "nvenc"]);
+        println!("==> building fastconv --release --features nvenc");
+    } else {
+        println!("==> building fastconv --release");
+    }
     let status = Command::new(cargo)
         .current_dir(root)
-        .args(["build", "--release", "-p", "fastconv-cli"])
+        .args(&args)
         .status()
         .map_err(|err| format!("failed to launch cargo build --release: {err}"))?;
     if !status.success() {
-        return Err(format!(
-            "`cargo build --release -p fastconv-cli` failed with {status}"
-        ));
+        return Err(format!("`cargo {}` failed with {status}", args.join(" ")));
     }
 
     let bin_name = format!("fastconv{}", env::consts::EXE_SUFFIX);
@@ -285,19 +357,22 @@ fn build_release_fastconv(root: &Path) -> Result<PathBuf, String> {
     Ok(bin_path)
 }
 
-fn run_fastconv_image_batch(
+fn run_fastconv_cpu_webp_batch(
     bin_path: &Path,
     images_dir: &Path,
     input_bytes: NonZeroU64,
     out_dir: &Path,
 ) -> Result<HeadToHeadEntry, String> {
-    println!("==> running fastconv --release (zenwebp q=80)...");
+    let tool_label = "fastconv (cpu q=80)";
+    println!("==> running {tool_label}...");
     let args = [
         OsStr::new("convert"),
         images_dir.as_os_str(),
         out_dir.as_os_str(),
         OsStr::new("--quality"),
         OsStr::new("80"),
+        OsStr::new("--backend"),
+        OsStr::new("cpu"),
     ];
     let (duration, peak_memory) = run_timed_command(bin_path.as_os_str(), &args)?;
     let validation = validate_webp_batch(
@@ -310,7 +385,54 @@ fn run_fastconv_image_batch(
     let metrics = BenchmarkMetrics::new(
         "image_batch_4k_png_to_webp",
         MediaKind::Image,
-        "fastconv (zenwebp q=80)",
+        tool_label,
+        BenchmarkSample {
+            duration,
+            input_bytes,
+            output_bytes: validation.total_output_bytes,
+            unit: WorkloadUnit::Bytes,
+            peak_memory,
+        },
+    )
+    .map_err(|err| err.to_string())?;
+
+    Ok(HeadToHeadEntry {
+        metrics,
+        validation,
+    })
+}
+
+fn run_fastconv_nvenc_heic_batch(
+    bin_path: &Path,
+    images_dir: &Path,
+    input_bytes: NonZeroU64,
+    out_dir: &Path,
+) -> Result<HeadToHeadEntry, String> {
+    let tool_label = "fastconv (gpu:nvenc q=80)";
+    println!("==> running {tool_label} [heic]...");
+    let args = [
+        OsStr::new("convert"),
+        images_dir.as_os_str(),
+        out_dir.as_os_str(),
+        OsStr::new("--format"),
+        OsStr::new("heic"),
+        OsStr::new("--quality"),
+        OsStr::new("80"),
+        OsStr::new("--backend"),
+        OsStr::new("nvenc"),
+    ];
+    let (duration, peak_memory) = run_timed_command(bin_path.as_os_str(), &args)?;
+    let validation = validate_heic_batch(
+        images_dir,
+        out_dir,
+        IMAGE_BATCH_COUNT,
+        HEAD_TO_HEAD_VALIDATION_POLICY,
+    )?;
+
+    let metrics = BenchmarkMetrics::new(
+        "image_batch_4k_png_to_heic",
+        MediaKind::Image,
+        tool_label,
         BenchmarkSample {
             duration,
             input_bytes,
@@ -391,14 +513,10 @@ struct ValidatedImageResult {
 fn ensure_exact_dir_entry_count(dir: &Path, expected: usize) -> Result<(), String> {
     let mut actual = 0_usize;
     for entry_result in fs::read_dir(dir)
-        .map_err(|err| format!("failed to read WebP output dir '{}': {err}", dir.display()))?
+        .map_err(|err| format!("failed to read output dir '{}': {err}", dir.display()))?
     {
-        entry_result.map_err(|err| {
-            format!(
-                "failed to inspect WebP output dir '{}': {err}",
-                dir.display()
-            )
-        })?;
+        entry_result
+            .map_err(|err| format!("failed to inspect output dir '{}': {err}", dir.display()))?;
         actual += 1;
     }
     if actual != expected {
@@ -460,51 +578,7 @@ fn validate_webp_batch(
             .collect()
     });
 
-    let mut total_bytes = 0_u64;
-    let mut expected_dims: Option<(u32, u32)> = None;
-    let mut min_psnr = f64::INFINITY;
-    let mut psnr_sum = 0_f64;
-    let mut validated_count = 0_usize;
-
-    for worker_result in per_worker {
-        for item in worker_result? {
-            if let Some((ew, eh)) = expected_dims {
-                if (item.width, item.height) != (ew, eh) {
-                    return Err(format!(
-                        "inconsistent batch resolution: expected {ew}x{eh}, got {}x{}",
-                        item.width, item.height
-                    ));
-                }
-            } else {
-                expected_dims = Some((item.width, item.height));
-            }
-            total_bytes = total_bytes
-                .checked_add(item.bytes)
-                .ok_or_else(|| "validated WebP byte size overflow".to_owned())?;
-            min_psnr = min_psnr.min(item.psnr_db);
-            psnr_sum += item.psnr_db;
-            validated_count += 1;
-        }
-    }
-
-    if validated_count != count {
-        return Err(format!(
-            "expected {count} validated WebP files, verified {validated_count}"
-        ));
-    }
-
-    let (width, height) = expected_dims.ok_or_else(|| "no images validated".to_owned())?;
-    let total_output_bytes = NonZeroU64::new(total_bytes)
-        .ok_or_else(|| "validated batch output size is zero".to_owned())?;
-    let mean_psnr_db = psnr_sum / u64_to_f64(u64::try_from(validated_count).unwrap_or(1));
-
-    Ok(BatchValidationSummary {
-        files_validated: validated_count,
-        resolution: format!("{width}x{height}"),
-        total_output_bytes,
-        min_psnr_db: min_psnr,
-        mean_psnr_db,
-    })
+    summarize_validated_batch(per_worker, count, "WebP")
 }
 
 fn validate_single_webp_pair(
@@ -556,6 +630,259 @@ fn validate_single_webp_pair(
         height: webp_h,
         psnr_db: psnr,
     })
+}
+
+fn validate_heic_batch(
+    images_dir: &Path,
+    heic_dir: &Path,
+    count: usize,
+    policy: ValidationPolicy,
+) -> Result<BatchValidationSummary, String> {
+    println!(
+        "==> validating {count} generated HEIC outputs in {}...",
+        heic_dir.display()
+    );
+    if count == 0 {
+        return Err("cannot validate empty HEIC batch".to_owned());
+    }
+    ensure_exact_dir_entry_count(heic_dir, count)?;
+
+    let workers = thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .min(count);
+    let next_index = AtomicUsize::new(1);
+
+    let per_worker: Vec<Result<Vec<ValidatedImageResult>, String>> = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            handles.push(
+                scope.spawn(|| -> Result<Vec<ValidatedImageResult>, String> {
+                    let mut items = Vec::new();
+                    loop {
+                        let index = next_index.fetch_add(1, Ordering::Relaxed);
+                        if index > count {
+                            break;
+                        }
+                        let png_path = images_dir.join(format!("img_{index:02}.png"));
+                        let heic_path = heic_dir.join(format!("img_{index:02}.heic"));
+                        items.push(validate_single_heic_pair(&png_path, &heic_path, policy)?);
+                    }
+                    Ok(items)
+                }),
+            );
+        }
+
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err("HEIC validation worker thread panicked".to_owned()))
+            })
+            .collect()
+    });
+
+    summarize_validated_batch(per_worker, count, "HEIC")
+}
+
+fn summarize_validated_batch(
+    per_worker: Vec<Result<Vec<ValidatedImageResult>, String>>,
+    count: usize,
+    label: &str,
+) -> Result<BatchValidationSummary, String> {
+    let mut total_bytes = 0_u64;
+    let mut expected_dims: Option<(u32, u32)> = None;
+    let mut min_psnr = f64::INFINITY;
+    let mut psnr_sum = 0_f64;
+    let mut validated_count = 0_usize;
+
+    for worker_result in per_worker {
+        for item in worker_result? {
+            if let Some((ew, eh)) = expected_dims {
+                if (item.width, item.height) != (ew, eh) {
+                    return Err(format!(
+                        "inconsistent {label} batch resolution: expected {ew}x{eh}, got {}x{}",
+                        item.width, item.height
+                    ));
+                }
+            } else {
+                expected_dims = Some((item.width, item.height));
+            }
+            total_bytes = total_bytes
+                .checked_add(item.bytes)
+                .ok_or_else(|| format!("validated {label} byte size overflow"))?;
+            min_psnr = min_psnr.min(item.psnr_db);
+            psnr_sum += item.psnr_db;
+            validated_count += 1;
+        }
+    }
+
+    if validated_count != count {
+        return Err(format!(
+            "expected {count} validated {label} files, verified {validated_count}"
+        ));
+    }
+
+    let (width, height) = expected_dims.ok_or_else(|| format!("no {label} images validated"))?;
+    let total_output_bytes = NonZeroU64::new(total_bytes)
+        .ok_or_else(|| format!("validated {label} batch output size is zero"))?;
+    let mean_psnr_db = psnr_sum / u64_to_f64(u64::try_from(validated_count).unwrap_or(1));
+
+    Ok(BatchValidationSummary {
+        files_validated: validated_count,
+        resolution: format!("{width}x{height}"),
+        total_output_bytes,
+        min_psnr_db: min_psnr,
+        mean_psnr_db,
+    })
+}
+
+fn validate_single_heic_pair(
+    png_path: &Path,
+    heic_path: &Path,
+    policy: ValidationPolicy,
+) -> Result<ValidatedImageResult, String> {
+    let png_bytes = file_size_nonzero(png_path)?.get();
+    let out_bytes = file_size_nonzero(heic_path)?.get();
+    if out_bytes < policy.min_output_bytes {
+        return Err(format!(
+            "implausibly small HEIC output '{}' ({out_bytes} bytes < {} bytes)",
+            heic_path.display(),
+            policy.min_output_bytes
+        ));
+    }
+    if policy.require_smaller_than_source && out_bytes >= png_bytes {
+        return Err(format!(
+            "implausibly large HEIC output '{}' ({out_bytes} bytes >= source PNG {png_bytes} bytes)",
+            heic_path.display()
+        ));
+    }
+
+    let header = fs::read(heic_path)
+        .map_err(|err| format!("failed to read HEIC '{}': {err}", heic_path.display()))?;
+    if header.get(4..12) != Some(b"ftypheic".as_slice()) {
+        return Err(format!(
+            "invalid HEIC container header in '{}' (expected ftypheic)",
+            heic_path.display()
+        ));
+    }
+
+    let (src_rgb, src_w, src_h) = decode_png_to_rgb8(png_path)?;
+    let (heic_w, heic_h) = probe_heic_dimensions_via_ffprobe(heic_path)?;
+    if (heic_w, heic_h) != (src_w, src_h) {
+        return Err(format!(
+            "resolution mismatch for '{}': source PNG is {src_w}x{src_h}, probed HEIC is {heic_w}x{heic_h}",
+            heic_path.display()
+        ));
+    }
+
+    let heic_rgb = decode_heic_to_rgb8_via_ffmpeg(heic_path, heic_w, heic_h)?;
+    let psnr = compute_rgb_psnr_db(&src_rgb, &heic_rgb)?;
+    if psnr.is_nan() || psnr < policy.min_psnr_db {
+        return Err(format!(
+            "implausibly low visual quality for '{}' (PSNR {psnr:.2} dB < {:.2} dB)",
+            heic_path.display(),
+            policy.min_psnr_db
+        ));
+    }
+
+    Ok(ValidatedImageResult {
+        bytes: out_bytes,
+        width: heic_w,
+        height: heic_h,
+        psnr_db: psnr,
+    })
+}
+
+fn probe_heic_dimensions_via_ffprobe(path: &Path) -> Result<(u32, u32), String> {
+    let output = Command::new("ffprobe")
+        .stdin(Stdio::null())
+        .args([
+            OsStr::new("-v"),
+            OsStr::new("error"),
+            OsStr::new("-select_streams"),
+            OsStr::new("v:0"),
+            OsStr::new("-show_entries"),
+            OsStr::new("stream=width,height"),
+            OsStr::new("-of"),
+            OsStr::new("csv=s=x:p=0"),
+            path.as_os_str(),
+        ])
+        .output()
+        .map_err(|err| format!("failed to run ffprobe on '{}': {err}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffprobe rejected HEIC '{}': {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text
+        .lines()
+        .next()
+        .map(str::trim)
+        .ok_or_else(|| format!("ffprobe returned empty output for '{}'", path.display()))?;
+    let (w_str, h_str) = line.split_once('x').ok_or_else(|| {
+        format!(
+            "unexpected ffprobe dimensions '{line}' for '{}'",
+            path.display()
+        )
+    })?;
+    let w = w_str
+        .parse::<u32>()
+        .map_err(|err| format!("invalid HEIC width '{w_str}': {err}"))?;
+    let h = h_str
+        .parse::<u32>()
+        .map_err(|err| format!("invalid HEIC height '{h_str}': {err}"))?;
+    Ok((w, h))
+}
+
+fn decode_heic_to_rgb8_via_ffmpeg(path: &Path, width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let output = Command::new("ffmpeg")
+        .stdin(Stdio::null())
+        .args([
+            OsStr::new("-nostdin"),
+            OsStr::new("-hide_banner"),
+            OsStr::new("-loglevel"),
+            OsStr::new("error"),
+            OsStr::new("-i"),
+            path.as_os_str(),
+            OsStr::new("-frames:v"),
+            OsStr::new("1"),
+            OsStr::new("-f"),
+            OsStr::new("rawvideo"),
+            OsStr::new("-pix_fmt"),
+            OsStr::new("rgb24"),
+            OsStr::new("-"),
+        ])
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to decode HEIC '{}' via ffmpeg: {err}",
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffmpeg failed to decode HEIC '{}': {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let expected_len = usize::try_from(width)
+        .ok()
+        .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
+        .and_then(|px| px.checked_mul(3))
+        .ok_or_else(|| "decoded HEIC RGB24 size overflow".to_owned())?;
+    if output.stdout.len() != expected_len {
+        return Err(format!(
+            "decoded HEIC '{}' produced {} bytes, expected {expected_len} ({width}x{height} rgb24)",
+            path.display(),
+            output.stdout.len()
+        ));
+    }
+    Ok(output.stdout)
 }
 
 fn decode_png_to_rgb8(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
@@ -1029,11 +1356,10 @@ fn parse_proc_status_vm_hwm_bytes(status: &str) -> Option<u64> {
 }
 
 #[must_use]
-fn format_head_to_head_table(fastconv: &HeadToHeadEntry, ffmpeg: &HeadToHeadEntry) -> String {
-    let entries = [fastconv, ffmpeg];
+fn format_head_to_head_table(entries: &[&HeadToHeadEntry]) -> String {
     let mut lines = Vec::with_capacity(entries.len() + 2);
     lines.push(format!(
-        "{:<26} | {:<24} | {:>10} | {:>14} | {:>10} | {:>10} | {:>10} | {:>10} | {:<15}",
+        "{:<26} | {:<26} | {:>10} | {:>14} | {:>10} | {:>10} | {:>10} | {:>10} | {:<15}",
         "Workload",
         "Tool",
         "Time (ms)",
@@ -1045,7 +1371,7 @@ fn format_head_to_head_table(fastconv: &HeadToHeadEntry, ffmpeg: &HeadToHeadEntr
         "Validated"
     ));
     lines.push(format!(
-        "{:-<26}-+-{:-<24}-+-{:-<10}-+-{:-<14}-+-{:-<10}-+-{:-<10}-+-{:-<10}-+-{:-<10}-+-{:-<15}",
+        "{:-<26}-+-{:-<26}-+-{:-<10}-+-{:-<14}-+-{:-<10}-+-{:-<10}-+-{:-<10}-+-{:-<10}-+-{:-<15}",
         "", "", "", "", "", "", "", "", ""
     ));
 
@@ -1060,7 +1386,7 @@ fn format_head_to_head_table(fastconv: &HeadToHeadEntry, ffmpeg: &HeadToHeadEntr
             entry.validation.files_validated, IMAGE_BATCH_COUNT, entry.validation.resolution
         );
         lines.push(format!(
-            "{:<26} | {:<24} | {:>10.1} | {:>14} | {:>10} | {:>10} | {:>10} | {:>7.2} dB | {:<15}",
+            "{:<26} | {:<26} | {:>10.1} | {:>14} | {:>10} | {:>10} | {:>10} | {:>7.2} dB | {:<15}",
             item.workload_name(),
             item.tool_label(),
             item.duration_ms(),
@@ -1339,29 +1665,51 @@ VmRSS:\t   42000 kB
         assert!(baseline.contains("image_batch_4k_png_to_webp"));
         assert!(baseline.contains("64.0 MiB"));
 
-        let h2h = format_head_to_head_table(
-            &HeadToHeadEntry {
-                metrics: fastconv_metrics,
-                validation: BatchValidationSummary {
-                    files_validated: 20,
-                    resolution: "3840x2160".to_owned(),
-                    total_output_bytes: output,
-                    min_psnr_db: 39.5,
-                    mean_psnr_db: 40.2,
-                },
+        let cpu_entry = HeadToHeadEntry {
+            metrics: fastconv_metrics,
+            validation: BatchValidationSummary {
+                files_validated: 20,
+                resolution: "3840x2160".to_owned(),
+                total_output_bytes: output,
+                min_psnr_db: 39.5,
+                mean_psnr_db: 40.2,
             },
-            &HeadToHeadEntry {
-                metrics: ffmpeg_metrics,
-                validation: BatchValidationSummary {
-                    files_validated: 20,
-                    resolution: "3840x2160".to_owned(),
-                    total_output_bytes: output,
-                    min_psnr_db: 39.4,
-                    mean_psnr_db: 40.1,
-                },
+        };
+        let ffmpeg_entry = HeadToHeadEntry {
+            metrics: ffmpeg_metrics,
+            validation: BatchValidationSummary {
+                files_validated: 20,
+                resolution: "3840x2160".to_owned(),
+                total_output_bytes: output,
+                min_psnr_db: 39.4,
+                mean_psnr_db: 40.1,
             },
-        );
+        };
+        let nvenc_entry = HeadToHeadEntry {
+            metrics: BenchmarkMetrics::new(
+                "image_batch_4k_png_to_heic",
+                MediaKind::Image,
+                "fastconv (gpu:nvenc q=80)",
+                BenchmarkSample {
+                    duration: Duration::from_millis(1_100),
+                    input_bytes: input,
+                    output_bytes: output,
+                    unit: WorkloadUnit::Bytes,
+                    peak_memory: PeakMemory::MeasuredBytes(mem),
+                },
+            )
+            .map_err(|err| err.to_string())?,
+            validation: BatchValidationSummary {
+                files_validated: 20,
+                resolution: "3840x2160".to_owned(),
+                total_output_bytes: output,
+                min_psnr_db: 38.5,
+                mean_psnr_db: 39.2,
+            },
+        };
+        let h2h = format_head_to_head_table(&[&cpu_entry, &ffmpeg_entry, &nvenc_entry]);
         assert!(h2h.contains("Mean PSNR"));
+        assert!(h2h.contains("fastconv (gpu:nvenc q=80)"));
         assert!(h2h.contains("40.20 dB"));
         assert!(h2h.contains("20/20 3840x2160"));
         Ok(())

@@ -57,8 +57,67 @@ fn cmd_verify(root: &Path) -> Result<(), String> {
         ],
     )?;
     run_cargo_step(root, "cargo test --workspace", &["test", "--workspace"])?;
+
+    if has_nvenc_link_libraries() {
+        run_cargo_step(
+            root,
+            "cargo clippy -p fastconv-pipeline -p fastconv-cli --all-targets --features nvenc -- -D warnings",
+            &[
+                "clippy",
+                "-p",
+                "fastconv-pipeline",
+                "-p",
+                "fastconv-cli",
+                "--all-targets",
+                "--features",
+                "nvenc",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        )?;
+        run_cargo_step(
+            root,
+            "cargo test -p fastconv-pipeline -p fastconv-cli --features nvenc",
+            &[
+                "test",
+                "-p",
+                "fastconv-pipeline",
+                "-p",
+                "fastconv-cli",
+                "--features",
+                "nvenc",
+            ],
+        )?;
+    }
+
     println!("==> verify passed");
     Ok(())
+}
+
+pub(crate) fn has_nvenc_link_libraries() -> bool {
+    if !cfg!(unix) {
+        return false;
+    }
+    let mut dirs = vec![
+        PathBuf::from("/usr/lib"),
+        PathBuf::from("/usr/lib64"),
+        PathBuf::from("/usr/lib/x86_64-linux-gnu"),
+        PathBuf::from("/usr/local/cuda/lib64"),
+        PathBuf::from("/opt/cuda/lib64"),
+    ];
+    for var in ["NVIDIA_VIDEO_CODEC_SDK_PATH", "CUDA_PATH", "CUDA_ROOT"] {
+        if let Some(root) = env::var_os(var) {
+            let base = PathBuf::from(root);
+            dirs.push(base.join("lib64"));
+            dirs.push(base.join("lib"));
+            dirs.push(base);
+        }
+    }
+
+    let has_encode = dirs.iter().any(|d| d.join("libnvidia-encode.so").is_file());
+    let has_cuvid = dirs.iter().any(|d| d.join("libnvcuvid.so").is_file());
+    has_encode && has_cuvid
 }
 
 fn check_no_ffmpeg_in_crates(crates_dir: &Path) -> Result<(), String> {
@@ -293,7 +352,7 @@ fn print_usage() {
     println!("  cargo xtask gen-fixtures --force");
     println!("                                Regenerate all fixtures from scratch");
     println!(
-        "  cargo xtask bench             Run head-to-head benchmark (fastconv --release vs ffmpeg) + output validation"
+        "  cargo xtask bench             Run 4K WebP (fastconv cpu vs ffmpeg) + NVENC HEIC benchmark + output validation"
     );
     println!(
         "  cargo xtask bench --baseline  Run FFmpeg baseline across all workloads and save JSON"
