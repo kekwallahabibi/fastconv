@@ -13,6 +13,7 @@ edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
+containr = { version = "0.1.1", features = ["mp4", "mkv"] }
 cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12090"] }
 fastconv-domain = { path = "crates/domain" }
 fastconv-probe = { path = "crates/probe" }

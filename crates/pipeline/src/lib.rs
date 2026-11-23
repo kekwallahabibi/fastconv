@@ -5,6 +5,7 @@ pub mod cpu;
 mod decode;
 pub mod gpu;
 mod qoi;
+pub mod remux;
 
 use std::error::Error;
 use std::fmt;
@@ -12,10 +13,12 @@ use std::io;
 use std::path::PathBuf;
 
 use cpu::CpuImageEncoder;
+
 use fastconv_domain::{
     ExecutionPlan, GpuBackend, HardwareBackend, ImageBatchPlan, ImageConversionReport,
     ImageExecutionMode,
 };
+pub use remux::execute_video_batch;
 
 /// Errors raised while executing a concrete media conversion pipeline.
 #[derive(Debug)]
@@ -25,6 +28,7 @@ pub enum PipelineError {
     Io { path: PathBuf, source: io::Error },
     DecodeFailed { path: PathBuf, reason: String },
     EncodeFailed { path: PathBuf, reason: String },
+    RemuxFailed { path: PathBuf, reason: String },
     UnsupportedPixelFormat { path: PathBuf, format: String },
     EmptyOutput(PathBuf),
     WorkerPanicked,
@@ -47,6 +51,9 @@ impl fmt::Display for PipelineError {
             }
             Self::EncodeFailed { path, reason } => {
                 write!(f, "failed to encode image '{}': {reason}", path.display())
+            }
+            Self::RemuxFailed { path, reason } => {
+                write!(f, "remux failed for '{}': {reason}", path.display())
             }
             Self::UnsupportedPixelFormat { path, format } => {
                 write!(
@@ -71,6 +78,7 @@ impl Error for PipelineError {
             | Self::GpuBackendFailed { .. }
             | Self::DecodeFailed { .. }
             | Self::EncodeFailed { .. }
+            | Self::RemuxFailed { .. }
             | Self::UnsupportedPixelFormat { .. }
             | Self::EmptyOutput(_)
             | Self::WorkerPanicked => None,
