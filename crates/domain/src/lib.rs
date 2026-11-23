@@ -1,6 +1,7 @@
 pub mod hardware;
 pub mod image;
 pub mod metrics;
+pub mod video;
 
 pub use hardware::{
     CpuInfo, DetectedGpuBackend, GpuCapability, GpuDeviceType, GpuVendor, GraphicsApi,
@@ -11,6 +12,10 @@ pub use image::{
     ImageExecutionMode, ImageInputFormat, ImageOutputFormat, ImageQuality,
 };
 pub use metrics::{BenchmarkMetrics, BenchmarkSample, PeakMemory, Throughput, WorkloadUnit};
+pub use video::{
+    VideoCodec, VideoContainerFormat, VideoRemuxItem, VideoRemuxPlan, VideoRemuxReport,
+    VideoStreamInfo, VideoStreamKind,
+};
 
 use std::error::Error;
 use std::fmt;
@@ -90,6 +95,10 @@ pub enum DomainError {
         backend: HardwareBackend,
         reason: String,
     },
+    UnsupportedVideoCodec {
+        codec: VideoCodec,
+        container: VideoContainerFormat,
+    },
 }
 
 pub(crate) fn require_non_empty(value: &str, field: &'static str) -> Result<String, DomainError> {
@@ -167,6 +176,10 @@ impl fmt::Display for DomainError {
             Self::InvalidDimensions { width, height } => {
                 write!(f, "image dimensions must be non-zero, got {width}x{height}")
             }
+            Self::UnsupportedVideoCodec { codec, container } => write!(
+                f,
+                "codec '{codec}' is not supported in {container} containers"
+            ),
             Self::InvalidQuality { value, max } => {
                 write!(f, "image quality must be in 0..={max}, got {value}")
             }

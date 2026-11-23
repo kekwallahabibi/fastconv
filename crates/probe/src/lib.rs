@@ -1,8 +1,10 @@
 pub mod hardware;
 pub mod image;
+pub mod video;
 
 pub use hardware::detect_host_hardware;
 pub use image::{ProbedImage, prepare_image_batch, probe_image};
+pub use video::{ProbedVideo, detect_video_magic, prepare_video_batch, probe_video};
 
 use std::error::Error;
 use std::fmt;
@@ -29,6 +31,11 @@ pub enum ProbeError {
         path: PathBuf,
         reason: String,
     },
+    InvalidVideo {
+        path: PathBuf,
+        reason: String,
+    },
+    EmptyVideoDirectory(PathBuf),
     UnsupportedTargetFormat {
         path: PathBuf,
         expected: &'static str,
@@ -70,6 +77,16 @@ impl fmt::Display for ProbeError {
             Self::InvalidImage { path, reason } => {
                 write!(f, "invalid image '{}': {reason}", path.display())
             }
+            Self::InvalidVideo { path, reason } => {
+                write!(f, "invalid video '{}': {reason}", path.display())
+            }
+            Self::EmptyVideoDirectory(path) => {
+                write!(
+                    f,
+                    "no supported video files (MP4, MOV, or MKV) found in source directory: {}",
+                    path.display()
+                )
+            }
             Self::UnsupportedTargetFormat { path, expected } => {
                 write!(
                     f,
@@ -95,7 +112,18 @@ impl Error for ProbeError {
             | Self::TargetNotADirectory(_)
             | Self::EmptySourceDirectory(_)
             | Self::InvalidImage { .. }
+            | Self::InvalidVideo { .. }
+            | Self::EmptyVideoDirectory(_)
             | Self::UnsupportedTargetFormat { .. } => None,
+        }
+    }
+}
+
+impl ProbeError {
+    pub(crate) fn requires_to_for_video_directory() -> Self {
+        Self::InvalidVideo {
+            path: PathBuf::new(),
+            reason: "batch remux requires --to <mp4|mkv> when the target is a directory".to_owned(),
         }
     }
 }

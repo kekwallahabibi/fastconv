@@ -10,6 +10,7 @@ nvenc = ["dep:cudarc", "dep:nvidia-video-codec-sdk"]
 [dependencies]
 cudarc = { workspace = true, optional = true }
 fastconv-domain.workspace = true
+containr.workspace = true
 jpeg-encoder.workspace = true
 nvidia-video-codec-sdk = { workspace = true, optional = true }
 png.workspace = true

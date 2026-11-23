@@ -1,3 +1,5 @@
+mod video;
+
 use std::env;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -16,6 +18,7 @@ fn print_usage() {
     println!(
         "  fastconv convert <source> <target> [--quality <0..=100> | --lossless] [--to <webp|heic|jpeg|png|bmp|qoi>] [--threads <N>] [--backend <cpu|nvenc|vaapi|qsv|amf|videotoolbox|vulkan>]"
     );
+    println!("  fastconv remux <source> <target> [--to <mp4|mkv>] [--threads <N>]");
     println!("  fastconv --version");
     println!("  fastconv --help");
 }
@@ -287,6 +290,23 @@ fn main() -> ExitCode {
         }
         ["probe"] => match run_probe() {
             Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("error: {message}");
+                ExitCode::FAILURE
+            }
+        },
+        ["remux", rest @ ..] => match video::parse_remux_args(rest) {
+            Ok(video::RemuxCommand::Help) => {
+                video::print_remux_help();
+                ExitCode::SUCCESS
+            }
+            Ok(video::RemuxCommand::Run(parsed)) => match video::run_remux(&parsed) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(message) => {
+                    eprintln!("error: {message}");
+                    ExitCode::FAILURE
+                }
+            },
             Err(message) => {
                 eprintln!("error: {message}");
                 ExitCode::FAILURE

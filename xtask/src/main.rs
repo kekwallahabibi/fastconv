@@ -1,5 +1,6 @@
 mod bench;
 mod fixtures;
+mod remux_bench;
 
 use std::env;
 use std::ffi::OsString;
@@ -367,6 +368,9 @@ fn print_usage() {
     println!(
         "  cargo xtask bench --baseline  Run FFmpeg baseline across all workloads and save JSON"
     );
+    println!(
+        "  cargo xtask bench --remux     Video remux head-to-head (fastconv vs ffmpeg -c copy) with ffprobe validation"
+    );
     println!("  cargo xtask bench --status    Report local fixture availability");
 }
 
@@ -387,6 +391,7 @@ fn main() -> ExitCode {
         ["bench"] => workspace_root().and_then(|root| bench::run_head_to_head(&root)),
         ["bench", "--baseline"] => workspace_root().and_then(|root| bench::run_baseline(&root)),
         ["bench", "--status"] => workspace_root().map(|root| cmd_bench_status(&root)),
+        ["bench", "--remux"] => workspace_root().and_then(|root| remux_bench::run(&root)),
         [] | ["-h" | "--help"] => {
             print_usage();
             Ok(())
