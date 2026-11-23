@@ -36,6 +36,7 @@ pub enum PipelineError {
     UnsupportedSampleDepth { path: PathBuf, bits: usize },
     EmptyOutput(PathBuf),
     WorkerPanicked,
+    WorkerStartFailed(io::Error),
 }
 
 impl fmt::Display for PipelineError {
@@ -75,6 +76,9 @@ impl fmt::Display for PipelineError {
                 write!(f, "encoder produced empty output for '{}'", path.display())
             }
             Self::WorkerPanicked => f.write_str("conversion worker thread panicked"),
+            Self::WorkerStartFailed(source) => {
+                write!(f, "failed to start conversion worker: {source}")
+            }
         }
     }
 }
@@ -82,7 +86,7 @@ impl fmt::Display for PipelineError {
 impl Error for PipelineError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Io { source, .. } => Some(source),
+            Self::Io { source, .. } | Self::WorkerStartFailed(source) => Some(source),
             Self::BackendNotImplemented(_)
             | Self::GpuBackendFailed { .. }
             | Self::DecodeFailed { .. }

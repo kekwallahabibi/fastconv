@@ -437,13 +437,19 @@ fn license_allowed(license: &str) -> bool {
     let mut parser = LicenseParser {
         tokens: &tokens,
         pos: 0,
+        malformed: false,
     };
-    parser.parse_or()
+    let value = parser.parse_or();
+    if parser.malformed || parser.pos != tokens.len() {
+        return false;
+    }
+    value
 }
 
 struct LicenseParser<'a> {
     tokens: &'a [String],
     pos: usize,
+    malformed: bool,
 }
 
 impl<'a> LicenseParser<'a> {
@@ -485,15 +491,19 @@ impl<'a> LicenseParser<'a> {
             let value = self.parse_or();
             if self.peek() == Some(")") {
                 self.pos += 1;
+            } else {
+                self.malformed = true;
             }
             return value;
         }
         let Some(base) = self.next() else {
+            self.malformed = true;
             return false;
         };
         if self.peek() == Some("with") {
             self.pos += 1;
             let Some(exception) = self.next() else {
+                self.malformed = true;
                 return false;
             };
             return license_term_with_exception(base, exception);
@@ -503,10 +513,9 @@ impl<'a> LicenseParser<'a> {
 }
 
 fn license_term_with_exception(base: &str, exception: &str) -> bool {
-    if exception.is_empty() {
-        return false;
-    }
-    matches!(base, "gpl-2.0" | "gpl-2.0-only" | "gpl-2.0-or-later") || license_term_allowed(base)
+    // Only the explicitly reviewed GPL-2.0 + Classpath combination is acceptable.
+    matches!(base, "gpl-2.0" | "gpl-2.0-only" | "gpl-2.0-or-later")
+        && exception == "classpath-exception-2.0"
 }
 
 fn license_term_allowed(term: &str) -> bool {
@@ -728,6 +737,9 @@ fn helper<'a>(s: &'a str) -> char { let _ = s; '\"' }
             "GPL-2.0-only",
             "MIT AND GPL-2.0-only",
             "(MIT OR Apache-2.0) AND GPL-2.0-only",
+            "MIT ) AND GPL-2.0-only",
+            "(MIT",
+            "GPL-2.0-only WITH Unknown-exception",
         ] {
             assert!(
                 forbidden_license(forbidden),

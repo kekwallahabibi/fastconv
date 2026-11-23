@@ -47,21 +47,37 @@ pub fn detect_audio_magic(bytes: &[u8]) -> Option<AudioInputFormat> {
     {
         return Some(AudioInputFormat::Mp3);
     }
-    if bytes.starts_with(b"OggS") {
-        if contains_marker(bytes, b"OpusHead") {
+    if bytes.starts_with(b"OggS")
+        && let Some(identification) = ogg_identification_packet(bytes)
+    {
+        if identification.starts_with(b"OpusHead") {
             return Some(AudioInputFormat::Opus);
         }
-        if contains_marker(bytes, b"\x01vorbis") {
+        if identification.starts_with(b"\x01vorbis") {
             return Some(AudioInputFormat::Vorbis);
         }
     }
     None
 }
 
-fn contains_marker(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack.len() >= needle.len()
-        && haystack.windows(needle.len()).any(|w| w == needle)
+/// Extracts the first packet from the leading Ogg page. Codec must be read from this framed
+/// identification packet; scanning arbitrary bytes can mistake Vorbis comments for Opus.
+fn ogg_identification_packet(bytes: &[u8]) -> Option<&[u8]> {
+    if !bytes.starts_with(b"OggS") || bytes.len() < 28 {
+        return None;
+    }
+    let segments = usize::from(*bytes.get(26)?);
+    let table_start = 27;
+    let table = bytes.get(table_start..table_start + segments)?;
+    let mut packet_len = 0_usize;
+    for &lacing in table {
+        packet_len += usize::from(lacing);
+        if lacing < 255 {
+            break;
+        }
+    }
+    let payload_start = table_start + segments;
+    bytes.get(payload_start..payload_start + packet_len)
 }
 
 fn read_magic_prefix(path: &Path) -> Result<[u8; MAGIC_PREFIX_BYTES], ProbeError> {
@@ -299,21 +315,46 @@ fn prepare_directory_batch(
 /// Resolves a path to an absolute location, using the parent directory for outputs that do not
 /// exist yet. This makes relative/absolute aliases comparable at the boundary.
 fn canonical_or_parent(path: &Path) -> Result<PathBuf, ProbeError> {
-    if let Ok(canonical) = fs::canonicalize(path) {
-        return Ok(canonical);
+    let mut cursor = path.to_path_buf();
+    let mut missing = std::collections::VecDeque::new();
+    loop {
+        match fs::canonicalize(&cursor) {
+            Ok(mut canonical) => {
+                for component in missing {
+                    canonical = canonical.join(component);
+                }
+                return Ok(canonical);
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ProbeError::Io {
+                    path: cursor,
+                    source,
+                });
+            }
+        }
+        match cursor.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                if let Some(name) = cursor.file_name() {
+                    missing.push_front(name.to_os_string());
+                }
+                cursor = parent.to_path_buf();
+            }
+            _ => {
+                let mut canonical = fs::canonicalize(".").map_err(|source| ProbeError::Io {
+                    path: PathBuf::from("."),
+                    source,
+                })?;
+                if let Some(name) = cursor.file_name() {
+                    missing.push_front(name.to_os_string());
+                }
+                for component in missing {
+                    canonical = canonical.join(component);
+                }
+                return Ok(canonical);
+            }
+        }
     }
-    let parent = path
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let parent = fs::canonicalize(parent).map_err(|source| ProbeError::Io {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| invalid_audio(path, "path has no file name"))?;
-    Ok(parent.join(name))
 }
 
 /// Parses external paths and options once, then returns a domain [`AudioBatchPlan`].
@@ -393,15 +434,38 @@ mod tests {
             detect_audio_magic(&[0xFF, 0xFB, 0x90, 0x64]),
             Some(AudioInputFormat::Mp3)
         );
+        let mut vorbis_page = b"OggS".to_vec();
+        vorbis_page.extend_from_slice(&[0_u8; 22]);
+        vorbis_page.extend_from_slice(&[1, 7]);
+        vorbis_page.extend_from_slice(b"\x01vorbis");
         assert_eq!(
-            detect_audio_magic(b"OggS\x00\x02\x01vorbis"),
+            detect_audio_magic(&vorbis_page),
             Some(AudioInputFormat::Vorbis)
         );
-        assert_eq!(
-            detect_audio_magic(b"OggS\x00\x02OpusHead"),
-            Some(AudioInputFormat::Opus)
-        );
+        let mut opus_page = b"OggS".to_vec();
+        opus_page.extend_from_slice(&[0_u8; 22]);
+        opus_page.extend_from_slice(&[1, 8]);
+        opus_page.extend_from_slice(b"OpusHead");
+        assert_eq!(detect_audio_magic(&opus_page), Some(AudioInputFormat::Opus));
         assert_eq!(detect_audio_magic(b"UNKNOWN"), None);
+    }
+
+    #[test]
+    fn identifies_ogg_codec_from_identification_packet() {
+        let mut vorbis = b"OggS".to_vec();
+        vorbis.extend_from_slice(&[0_u8; 22]);
+        vorbis.extend_from_slice(&[2, 7, 20]);
+        vorbis.extend_from_slice(b"\x01vorbis");
+        let mut comment = b"TITLE=OpusHead".to_vec();
+        comment.resize(20, 0);
+        vorbis.extend_from_slice(&comment);
+        assert_eq!(detect_audio_magic(&vorbis), Some(AudioInputFormat::Vorbis));
+
+        let mut opus = b"OggS".to_vec();
+        opus.extend_from_slice(&[0_u8; 22]);
+        opus.extend_from_slice(&[1, 8]);
+        opus.extend_from_slice(b"OpusHead");
+        assert_eq!(detect_audio_magic(&opus), Some(AudioInputFormat::Opus));
     }
 
     #[test]
@@ -421,6 +485,15 @@ mod tests {
                 .unwrap_or_else(|_| (PathBuf::new(), AudioOutputFormat::Wav));
         assert_eq!(dir_target, PathBuf::from("dist/track.opus"));
         assert_eq!(format, AudioOutputFormat::Opus);
+    }
+
+    #[test]
+    fn canonicalizes_paths_with_missing_parent_directories() -> Result<(), String> {
+        let cwd = std::env::current_dir().map_err(|err| err.to_string())?;
+        let nested = cwd.join("target/nested/does/not/exist/output.flac");
+        let resolved = canonical_or_parent(&nested).map_err(|err| err.to_string())?;
+        assert_eq!(resolved, nested);
+        Ok(())
     }
 
     #[test]
@@ -446,13 +519,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_gpu_backend_before_building_a_plan() {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    fn rejects_gpu_backend_before_building_a_plan() -> Result<(), String> {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = manifest.join("Cargo.toml");
+        let probe_dir = manifest
+            .join("target")
+            .join(format!("fastconv-audio-gpu-test-{}", std::process::id()));
+        fs::create_dir_all(&probe_dir).map_err(|err| err.to_string())?;
+        let target = probe_dir.join("out.flac");
         let result = prepare_audio_batch(
             &source,
-            Path::new("/tmp/fastconv-audio-gpu.flac"),
+            &target,
             Some(AudioOutputFormat::Flac),
-            None,
+            Some(NonZeroUsize::MIN),
             HardwareBackend::Gpu(fastconv_domain::GpuBackend::Nvenc),
         );
         assert!(matches!(
@@ -461,5 +540,6 @@ mod tests {
                 DomainError::UnsupportedAudioPipeline { .. }
             ))
         ));
+        Ok(())
     }
 }

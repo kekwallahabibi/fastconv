@@ -7,7 +7,7 @@ use std::io;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -25,7 +25,6 @@ use opus_pure::{
 };
 use rubato::{FftFixedInOut, Resampler};
 use symphonia::core::codecs::audio::AudioDecoderOptions;
-use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::formats::TrackType;
 use symphonia::core::formats::probe::Hint;
@@ -170,7 +169,7 @@ fn decode_symphonia(
     path: &Path,
     format: AudioInputFormat,
     buf: &mut AudioWorkerBuffer,
-) -> Result<(), PipelineError> {
+) -> Result<(u32, usize, usize), PipelineError> {
     let file = File::open(path).map_err(|source| PipelineError::Io {
         path: path.to_path_buf(),
         source,
@@ -205,6 +204,18 @@ fn decode_symphonia(
             reason: "audio track has no codec parameters".to_owned(),
         })?
         .clone();
+    let sample_rate = params.sample_rate.unwrap_or(0);
+    let channels = params
+        .channels
+        .as_ref()
+        .map_or(0, symphonia::core::audio::Channels::count);
+    let bits = usize::try_from(params.bits_per_sample.unwrap_or(0)).unwrap_or(0);
+    if sample_rate == 0 || channels == 0 {
+        return Err(PipelineError::DecodeFailed {
+            path: path.to_path_buf(),
+            reason: format!("invalid decoded stream format: {sample_rate} Hz, {channels} channels"),
+        });
+    }
     let track_id = track.id;
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(&params, &AudioDecoderOptions::default())
@@ -217,7 +228,6 @@ fn decode_symphonia(
         let packet = match reader.next_packet() {
             Ok(Some(packet)) => packet,
             Ok(None) => break,
-            Err(SymphoniaError::DecodeError(_)) => continue,
             Err(err) => {
                 return Err(PipelineError::DecodeFailed {
                     path: path.to_path_buf(),
@@ -230,7 +240,6 @@ fn decode_symphonia(
         }
         let audio_frame = match decoder.decode(&packet) {
             Ok(frame) => frame,
-            Err(SymphoniaError::DecodeError(_)) => continue,
             Err(err) => {
                 return Err(PipelineError::DecodeFailed {
                     path: path.to_path_buf(),
@@ -245,7 +254,7 @@ fn decode_symphonia(
             audio_frame.copy_to_slice_interleaved(slot);
         }
     }
-    Ok(())
+    Ok((sample_rate, channels, bits))
 }
 
 fn decode_audio(
@@ -253,15 +262,11 @@ fn decode_audio(
     buf: &mut AudioWorkerBuffer,
 ) -> Result<(u32, usize, usize), PipelineError> {
     buf.reset();
-    let (rate, channels) = if item.input_format() == AudioInputFormat::Opus {
-        decode_opus(item.source(), buf)?
+    let (rate, channels, source_bits) = if item.input_format() == AudioInputFormat::Opus {
+        let (rate, channels) = decode_opus(item.source(), buf)?;
+        (rate, channels, 16)
     } else {
-        decode_symphonia(item.source(), item.input_format(), buf)?;
-        let stream = item.stream();
-        (
-            stream.sample_rate().get(),
-            usize::from(stream.channels().get()),
-        )
+        decode_symphonia(item.source(), item.input_format(), buf)?
     };
 
     if channels == 0 {
@@ -274,10 +279,6 @@ fn decode_audio(
         return Err(PipelineError::EmptyOutput(item.source().to_path_buf()));
     }
 
-    let source_bits = item
-        .stream()
-        .bits_per_sample()
-        .map_or(0, |bits| usize::from(bits.get()));
     Ok((rate, channels, source_bits))
 }
 
@@ -569,6 +570,9 @@ fn encode_opus(
     }
     resample_to_opus_rate(rate, channels, buf)?;
     let total_frames = buf.resampled_f32.len() / channels;
+    if total_frames == 0 {
+        return Err(PipelineError::EmptyOutput(path.to_path_buf()));
+    }
     std::mem::swap(&mut buf.samples_f32, &mut buf.resampled_f32);
     buf.resampled_f32.clear();
     quantize_for(AudioOutputFormat::Opus, 16, buf);
@@ -702,15 +706,21 @@ fn encode_audio(
         })?;
     }
     let temp = create_staging_file(target)?;
-    let bits = match bits {
-        0 => 16, // lossy source with no declared depth
-        8 | 16 | 24 => bits,
-        unsupported => {
-            let _ = fs::remove_file(&temp);
-            return Err(PipelineError::UnsupportedSampleDepth {
-                path: item.source().to_path_buf(),
-                bits: unsupported,
-            });
+    let bits = if mode.output_format() == AudioOutputFormat::Opus {
+        // Opus quantizes decoded samples to its own 16-bit input depth, so any supported
+        // mono/stereo source precision is acceptable here.
+        16
+    } else {
+        match bits {
+            0 => 16, // lossy source with no declared depth
+            8 | 16 | 24 => bits,
+            unsupported => {
+                let _ = fs::remove_file(&temp);
+                return Err(PipelineError::UnsupportedSampleDepth {
+                    path: item.source().to_path_buf(),
+                    bits: unsupported,
+                });
+            }
         }
     };
     if mode.output_format() != AudioOutputFormat::Opus {
@@ -747,7 +757,12 @@ fn convert_item(
     buf: &mut AudioWorkerBuffer,
     batch_workers: usize,
 ) -> Result<(u64, u64), PipelineError> {
-    let input_bytes = fs::metadata(item.source()).map_or(0, |meta| meta.len());
+    let input_bytes = fs::metadata(item.source())
+        .map_err(|source| PipelineError::Io {
+            path: item.source().to_path_buf(),
+            source,
+        })?
+        .len();
     let (rate, channels, bits) = decode_audio(item, buf)?;
     let output_bytes = encode_audio(item, mode, rate, channels, bits, buf, batch_workers)?;
     Ok((input_bytes, output_bytes))
@@ -768,17 +783,10 @@ fn estimate_pcm_bytes(item: &AudioBatchItem) -> u64 {
     frames.saturating_mul(channels).saturating_mul(4)
 }
 
-/// Executes a validated [`AudioBatchPlan`] on reusable per-worker sample buffers.
-///
-/// # Errors
-///
-/// Returns [`PipelineError`] if decoding, encoding, staging, or writing any item fails.
-pub fn execute_audio_batch(plan: &AudioBatchPlan) -> Result<AudioConversionReport, PipelineError> {
-    let started = Instant::now();
-    let items = plan.items();
-    let next = AtomicUsize::new(0);
-    let first_error: Mutex<Option<PipelineError>> = Mutex::new(None);
-    let requested_workers = plan.effective_workers().get();
+fn resolve_worker_count(
+    items: &[AudioBatchItem],
+    requested: usize,
+) -> Result<usize, PipelineError> {
     let largest_pcm = items.iter().map(estimate_pcm_bytes).max().unwrap_or(0);
     if largest_pcm > MAX_PCM_BYTES_PER_FILE {
         return Err(PipelineError::DecodeFailed {
@@ -788,35 +796,88 @@ pub fn execute_audio_batch(plan: &AudioBatchPlan) -> Result<AudioConversionRepor
             ),
         });
     }
-    let budget_workers = u64::try_from(requested_workers)
+    let budget_workers = u64::try_from(requested)
         .unwrap_or(u64::MAX)
         .min(MAX_PCM_BYTES_PER_BATCH / largest_pcm.max(1));
-    let worker_count = usize::try_from(budget_workers.max(1))
+    Ok(usize::try_from(budget_workers.max(1))
         .unwrap_or(usize::MAX)
-        .min(requested_workers);
+        .min(requested))
+}
+
+/// Executes a validated [`AudioBatchPlan`] on reusable per-worker sample buffers.
+///
+/// # Errors
+///
+/// Returns [`PipelineError`] if decoding, encoding, staging, or writing any item fails.
+pub fn execute_audio_batch(plan: &AudioBatchPlan) -> Result<AudioConversionReport, PipelineError> {
+    let started = Instant::now();
+    let items = plan.items();
+    let next = AtomicUsize::new(0);
+    let abort = AtomicBool::new(false);
+    let first_error: Mutex<Option<PipelineError>> = Mutex::new(None);
+    let input_total = AtomicU64::new(0);
+    let output_total = AtomicU64::new(0);
+    let worker_count = resolve_worker_count(items, plan.effective_workers().get())?;
 
     thread::scope(|scope| {
-        for _worker_id in 0..worker_count {
+        let mut handles = Vec::with_capacity(worker_count);
+        let mut startup_error = None;
+        for worker_id in 0..worker_count {
             let next = &next;
+            let abort = &abort;
             let first_error = &first_error;
-            scope.spawn(move || {
-                let mut buffer = AudioWorkerBuffer::new();
-                loop {
-                    if first_error.lock().is_ok_and(|guard| guard.is_some()) {
-                        break;
-                    }
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(item) = items.get(index) else { break };
-                    if let Err(err) = convert_item(item, plan.mode(), &mut buffer, worker_count) {
-                        if let Ok(mut guard) = first_error.lock()
-                            && guard.is_none()
+            let input_total = &input_total;
+            let output_total = &output_total;
+            let worker = thread::Builder::new()
+                .name(format!("fastconv-audio-{worker_id}"))
+                .spawn_scoped(scope, move || {
+                    let mut buffer = AudioWorkerBuffer::new();
+                    loop {
+                        if abort.load(Ordering::Relaxed)
+                            || first_error.lock().is_ok_and(|guard| guard.is_some())
                         {
-                            *guard = Some(err);
+                            break;
                         }
-                        break;
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(index) else { break };
+                        match convert_item(item, plan.mode(), &mut buffer, worker_count) {
+                            Ok((in_bytes, out_bytes)) => {
+                                input_total.fetch_add(in_bytes, Ordering::Relaxed);
+                                output_total.fetch_add(out_bytes, Ordering::Relaxed);
+                            }
+                            Err(err) => {
+                                if let Ok(mut guard) = first_error.lock()
+                                    && guard.is_none()
+                                {
+                                    *guard = Some(err);
+                                }
+                                break;
+                            }
+                        }
                     }
+                });
+            match worker {
+                Ok(handle) => handles.push(handle),
+                Err(err) => {
+                    abort.store(true, Ordering::Relaxed);
+                    startup_error = Some(err);
+                    break;
                 }
-            });
+            }
+        }
+        for handle in handles {
+            if handle.join().is_err()
+                && let Ok(mut guard) = first_error.lock()
+                && guard.is_none()
+            {
+                *guard = Some(PipelineError::WorkerPanicked);
+            }
+        }
+        if let Some(err) = startup_error
+            && let Ok(mut guard) = first_error.lock()
+            && guard.is_none()
+        {
+            *guard = Some(PipelineError::WorkerStartFailed(err));
         }
     });
 
@@ -826,14 +887,8 @@ pub fn execute_audio_batch(plan: &AudioBatchPlan) -> Result<AudioConversionRepor
         return Err(err);
     }
 
-    let mut input_bytes = 0_u64;
-    let mut output_bytes = 0_u64;
-    for item in items {
-        input_bytes =
-            input_bytes.saturating_add(fs::metadata(item.source()).map_or(0, |m| m.len()));
-        output_bytes =
-            output_bytes.saturating_add(fs::metadata(item.target()).map_or(0, |m| m.len()));
-    }
+    let input_bytes = input_total.load(Ordering::Relaxed);
+    let output_bytes = output_total.load(Ordering::Relaxed);
     let input = NonZeroU64::new(input_bytes)
         .ok_or_else(|| PipelineError::EmptyOutput(items[0].source().to_path_buf()))?;
     let output = NonZeroU64::new(output_bytes)
