@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fastconv_domain::{
-    BenchmarkMetrics, BenchmarkSample, GpuBackend, HostHardware, ImageOutputFormat, MediaKind,
-    PeakMemory, WorkloadUnit,
+    BenchmarkMetrics, BenchmarkSample, GpuBackend, HostHardware, ImageInputFormat,
+    ImageOutputFormat, MediaKind, PeakMemory, WorkloadUnit,
 };
 use serde::Serialize;
 use zune_jpeg::JpegDecoder;
@@ -19,7 +19,7 @@ use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
 
-use crate::fixtures::{self, IMAGE_BATCH_COUNT, VIDEO_TOTAL_FRAMES};
+use crate::fixtures::{self, IMAGE_BATCH_COUNT, IMAGE_HEIGHT, IMAGE_WIDTH, VIDEO_TOTAL_FRAMES};
 
 const MIN_PLAUSIBLE_4K_IMAGE_BYTES: u64 = 1024;
 const MIN_LOSSY_PSNR_DB: f64 = 25.0;
@@ -131,7 +131,7 @@ pub fn run_head_to_head(root: &Path) -> Result<(), String> {
         .map_err(|err| format!("failed to probe host hardware: {err}"))?;
     print_hardware_summary(&hardware);
 
-    let fixtures = verify_fixtures(root)?;
+    let fixtures = verify_head_to_head_fixtures(root)?;
     let ffmpeg_version = read_ffmpeg_version()?;
     println!("ffmpeg        : {ffmpeg_version}");
 
@@ -239,7 +239,7 @@ fn create_h2h_dir(base: &Path, name: &str) -> Result<PathBuf, String> {
 
 fn run_head_to_head_suite(
     fastconv_bin: &Path,
-    fixtures: &VerifiedFixtures,
+    fixtures: &VerifiedHeadToHeadFixtures,
     h2h_tmp: &Path,
     has_nvenc: bool,
     ffmpeg_version: String,
@@ -340,7 +340,7 @@ fn run_head_to_head_suite(
 
 fn run_nvenc_heic_contenders(
     fastconv_bin: &Path,
-    fixtures: &VerifiedFixtures,
+    fixtures: &VerifiedHeadToHeadFixtures,
     png_out_dir: &Path,
     jpeg_out_dir: &Path,
     has_nvenc: bool,
@@ -479,7 +479,7 @@ pub fn run_baseline(root: &Path) -> Result<(), String> {
         .map_err(|err| format!("failed to probe host hardware: {err}"))?;
     print_hardware_summary(&hardware);
 
-    let fixtures = verify_fixtures(root)?;
+    let fixtures = verify_baseline_fixtures(root)?;
     let ffmpeg_version = read_ffmpeg_version()?;
     println!("ffmpeg        : {ffmpeg_version}");
 
@@ -1340,7 +1340,9 @@ fn decode_jpeg_to_rgb8(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
 }
 
 fn decode_jpeg_bytes_to_rgb8(bytes: &[u8], path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
-    let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
+    let options = DecoderOptions::default()
+        .set_strict_mode(true)
+        .jpeg_set_out_colorspace(ColorSpace::RGB);
     let mut decoder = JpegDecoder::new_with_options(ZCursor::new(bytes), options);
     decoder
         .decode_headers()
@@ -1409,39 +1411,92 @@ fn compute_rgb_psnr_db(src: &[u8], dst: &[u8]) -> Result<f64, String> {
     Ok(10.0 * ((255.0_f64 * 255.0) / mse).log10())
 }
 
-struct VerifiedFixtures {
+struct VerifiedHeadToHeadFixtures {
     images_dir: PathBuf,
     image_batch_bytes: NonZeroU64,
     jpeg_images_dir: PathBuf,
     jpeg_batch_bytes: NonZeroU64,
+}
+
+struct VerifiedBaselineFixtures {
+    images_dir: PathBuf,
+    image_batch_bytes: NonZeroU64,
     audio_wav: PathBuf,
     audio_bytes: NonZeroU64,
     video_mp4: PathBuf,
     video_bytes: NonZeroU64,
 }
 
-fn verify_fixtures(root: &Path) -> Result<VerifiedFixtures, String> {
-    let mut image_total = 0_u64;
-    let mut jpeg_total = 0_u64;
-    for index in 1..=IMAGE_BATCH_COUNT {
-        let png_path = fixtures::image_path(root, index);
-        let png_bytes = file_size_nonzero(&png_path)
-            .map_err(|err| format!("{err}; run `cargo xtask gen-fixtures` first"))?;
-        image_total = image_total
-            .checked_add(png_bytes.get())
-            .ok_or_else(|| "PNG batch byte size overflow".to_owned())?;
+fn verify_image_batch_with_dims(
+    root: &Path,
+    expected_format: ImageInputFormat,
+    expected_width: u32,
+    expected_height: u32,
+) -> Result<NonZeroU64, String> {
+    let mut total_bytes = 0_u64;
+    let label = match expected_format {
+        ImageInputFormat::Png => "PNG",
+        ImageInputFormat::Jpeg => "JPEG",
+    };
 
-        let jpg_path = fixtures::jpeg_image_path(root, index);
-        let jpg_bytes = file_size_nonzero(&jpg_path)
-            .map_err(|err| format!("{err}; run `cargo xtask gen-fixtures` first"))?;
-        jpeg_total = jpeg_total
-            .checked_add(jpg_bytes.get())
-            .ok_or_else(|| "JPEG batch byte size overflow".to_owned())?;
+    for index in 1..=IMAGE_BATCH_COUNT {
+        let path = match expected_format {
+            ImageInputFormat::Png => fixtures::image_path(root, index),
+            ImageInputFormat::Jpeg => fixtures::jpeg_image_path(root, index),
+        };
+        let bytes = file_size_nonzero(&path)
+            .map_err(|err| format!("{err}; run `cargo xtask gen-fixtures --force` first"))?;
+        let probed = fastconv_probe::probe_image(&path).map_err(|err| {
+            format!(
+                "invalid {label} fixture '{}': {err}; remove it or run `cargo xtask gen-fixtures --force`",
+                path.display()
+            )
+        })?;
+        if probed.format != expected_format {
+            return Err(format!(
+                "fixture '{}' has format {}, expected {label}; remove it or run `cargo xtask gen-fixtures --force`",
+                path.display(),
+                probed.format
+            ));
+        }
+        if probed.dimensions.width().get() != expected_width
+            || probed.dimensions.height().get() != expected_height
+        {
+            return Err(format!(
+                "fixture '{}' has resolution {}, expected {expected_width}x{expected_height}; run `cargo xtask gen-fixtures --force`",
+                path.display(),
+                probed.dimensions
+            ));
+        }
+        total_bytes = total_bytes
+            .checked_add(bytes.get())
+            .ok_or_else(|| format!("{label} batch byte size overflow"))?;
     }
-    let image_batch_bytes =
-        NonZeroU64::new(image_total).ok_or_else(|| "4K PNG batch is empty".to_owned())?;
-    let jpeg_batch_bytes =
-        NonZeroU64::new(jpeg_total).ok_or_else(|| "4K JPEG batch is empty".to_owned())?;
+
+    NonZeroU64::new(total_bytes).ok_or_else(|| format!("{label} batch is empty"))
+}
+
+fn verify_4k_image_batch(
+    root: &Path,
+    expected_format: ImageInputFormat,
+) -> Result<NonZeroU64, String> {
+    verify_image_batch_with_dims(root, expected_format, IMAGE_WIDTH, IMAGE_HEIGHT)
+}
+
+fn verify_head_to_head_fixtures(root: &Path) -> Result<VerifiedHeadToHeadFixtures, String> {
+    let image_batch_bytes = verify_4k_image_batch(root, ImageInputFormat::Png)?;
+    let jpeg_batch_bytes = verify_4k_image_batch(root, ImageInputFormat::Jpeg)?;
+
+    Ok(VerifiedHeadToHeadFixtures {
+        images_dir: fixtures::images_dir(root),
+        image_batch_bytes,
+        jpeg_images_dir: fixtures::jpeg_images_dir(root),
+        jpeg_batch_bytes,
+    })
+}
+
+fn verify_baseline_fixtures(root: &Path) -> Result<VerifiedBaselineFixtures, String> {
+    let image_batch_bytes = verify_4k_image_batch(root, ImageInputFormat::Png)?;
 
     let audio_wav = fixtures::audio_wav_path(root);
     let audio_bytes = file_size_nonzero(&audio_wav)
@@ -1451,11 +1506,9 @@ fn verify_fixtures(root: &Path) -> Result<VerifiedFixtures, String> {
     let video_bytes = file_size_nonzero(&video_mp4)
         .map_err(|err| format!("{err}; run `cargo xtask gen-fixtures` first"))?;
 
-    Ok(VerifiedFixtures {
+    Ok(VerifiedBaselineFixtures {
         images_dir: fixtures::images_dir(root),
         image_batch_bytes,
-        jpeg_images_dir: fixtures::jpeg_images_dir(root),
-        jpeg_batch_bytes,
         audio_wav,
         audio_bytes,
         video_mp4,
@@ -1890,9 +1943,11 @@ mod tests {
         BatchValidationSummary, HeadToHeadEntry, SourceBatchFormat, ValidationPolicy,
         compute_rgb_psnr_db, format_baseline_table, format_head_to_head_table,
         parse_proc_status_vm_hwm_bytes, validate_jpeg_batch, validate_single_jpeg_pair,
-        validate_single_webp_pair, validate_webp_batch,
+        validate_single_webp_pair, validate_webp_batch, verify_4k_image_batch,
     };
-    use fastconv_domain::{BenchmarkMetrics, BenchmarkSample, MediaKind, PeakMemory, WorkloadUnit};
+    use fastconv_domain::{
+        BenchmarkMetrics, BenchmarkSample, ImageInputFormat, MediaKind, PeakMemory, WorkloadUnit,
+    };
     use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
     use std::env;
     use std::fs::{self, File};
@@ -2244,6 +2299,58 @@ VmRSS:\t   42000 kB
         assert!(h2h.contains("fastconv (gpu:nvenc q=80)"));
         assert!(h2h.contains("40.20 dB"));
         assert!(h2h.contains("20/20 3840x2160"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_truncated_jpeg_scan_and_non_4k_fixture() -> Result<(), String> {
+        let root = env::temp_dir().join(format!("fastconv-xtask-strict-jpg-{}", process::id()));
+        fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+
+        let mut rgb = Vec::with_capacity(128 * 128 * 3);
+        for y in 0_u8..128 {
+            for x in 0_u8..128 {
+                rgb.extend_from_slice(&[x.wrapping_mul(3), y.wrapping_mul(5), x ^ y]);
+            }
+        }
+        let png_src = root.join("src.png");
+        let trunc_jpg = root.join("truncated.jpg");
+        write_rgb_png(&png_src, 128, 128, &rgb)?;
+        write_rgb_jpeg(&trunc_jpg, 128, 128, &rgb)?;
+
+        let mut jpg_bytes = fs::read(&trunc_jpg).map_err(|err| err.to_string())?;
+        if jpg_bytes.len() <= 1088 {
+            return Err(format!(
+                "test JPEG unexpectedly small: {} bytes",
+                jpg_bytes.len()
+            ));
+        }
+        jpg_bytes.truncate(jpg_bytes.len() - 64);
+        fs::write(&trunc_jpg, &jpg_bytes).map_err(|err| err.to_string())?;
+
+        let policy = ValidationPolicy {
+            min_output_bytes: 1024,
+            require_smaller_than_source: false,
+            min_psnr_db: 25.0,
+        };
+        assert!(
+            validate_single_jpeg_pair(&png_src, SourceBatchFormat::Png, &trunc_jpg, policy)
+                .is_err()
+        );
+
+        let fixture_root = root.join("bad_fixtures");
+        let bad_jpg_dir = fixture_root.join("fixtures/images_4k_jpeg");
+        fs::create_dir_all(&bad_jpg_dir).map_err(|err| err.to_string())?;
+        write_rgb_jpeg(
+            &bad_jpg_dir.join("img_01.jpg"),
+            32,
+            24,
+            &make_pattern_rgb(32, 24),
+        )?;
+        let res_err = verify_4k_image_batch(&fixture_root, ImageInputFormat::Jpeg);
+        assert!(res_err.is_err());
+
+        fs::remove_dir_all(&root).map_err(|err| err.to_string())?;
         Ok(())
     }
 }

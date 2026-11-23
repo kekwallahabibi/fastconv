@@ -322,13 +322,13 @@ fn char_literal_len(bytes: &[u8], i: usize) -> Option<usize> {
 
 fn cmd_bench_status(root: &Path) {
     let png_count = (1..=IMAGE_BATCH_COUNT)
-        .filter(|&idx| image_path(root, idx).is_file())
+        .filter(|&idx| fixtures::is_non_empty_file(&image_path(root, idx)))
         .count();
     let jpeg_count = (1..=IMAGE_BATCH_COUNT)
-        .filter(|&idx| jpeg_image_path(root, idx).is_file())
+        .filter(|&idx| fixtures::is_non_empty_file(&jpeg_image_path(root, idx)))
         .count();
-    let has_wav = audio_wav_path(root).is_file();
-    let has_mp4 = video_mp4_path(root).is_file();
+    let has_wav = fixtures::is_non_empty_file(&audio_wav_path(root));
+    let has_mp4 = fixtures::is_non_empty_file(&video_mp4_path(root));
 
     println!("==> fastconv benchmark harness");
     println!("fixtures dir : {}", root.join("fixtures").display());

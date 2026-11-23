@@ -60,7 +60,8 @@ pub fn generate_all(root: &Path, force: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn is_non_empty_file(path: &Path) -> bool {
+#[must_use]
+pub fn is_non_empty_file(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
 }
 
