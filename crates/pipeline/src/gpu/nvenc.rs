@@ -516,7 +516,7 @@ mod enabled {
         mut rgba_bytes: Vec<u8>,
     ) -> Result<DecodedRgbaFrame, PipelineError> {
         match item.input_format() {
-            ImageInputFormat::Jpeg => {
+            ImageInputFormat::Jpeg | ImageInputFormat::Qoi | ImageInputFormat::Bmp => {
                 let decoded = decode_image_into(
                     item,
                     DecodeTargetHint::OpaqueRgba8,
@@ -536,7 +536,7 @@ mod enabled {
                 std::mem::swap(pixel_buf, &mut rgba_bytes);
                 finish_rgba_expansion(item_index, item, decoded, pixel_buf, rgba_bytes)
             }
-            ImageInputFormat::Png => {
+            ImageInputFormat::Png | ImageInputFormat::Webp => {
                 let decoded =
                     decode_image_into(item, DecodeTargetHint::Native, file_bytes, pixel_buf)?;
                 finish_rgba_expansion(item_index, item, decoded, pixel_buf, rgba_bytes)

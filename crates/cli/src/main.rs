@@ -14,7 +14,7 @@ fn print_usage() {
     println!("Usage:");
     println!("  fastconv probe");
     println!(
-        "  fastconv convert <source> <target> [--quality <0..=100> | --lossless] [--to <webp|heic|jpeg>] [--threads <N>] [--backend <cpu|nvenc|vaapi|qsv|amf|videotoolbox|vulkan>]"
+        "  fastconv convert <source> <target> [--quality <0..=100> | --lossless] [--to <webp|heic|jpeg|png|bmp|qoi>] [--threads <N>] [--backend <cpu|nvenc|vaapi|qsv|amf|videotoolbox|vulkan>]"
     );
     println!("  fastconv --version");
     println!("  fastconv --help");
@@ -24,7 +24,7 @@ fn print_usage() {
 struct ConvertArgs {
     source: PathBuf,
     target: PathBuf,
-    compression: ImageCompression,
+    compression: Option<ImageCompression>,
     to: Option<ImageOutputFormat>,
     threads: Option<NonZeroUsize>,
     backend: HardwareBackend,
@@ -56,8 +56,11 @@ fn parse_target_format(value: &str) -> Result<ImageOutputFormat, String> {
         "webp" => Ok(ImageOutputFormat::Webp),
         "heic" => Ok(ImageOutputFormat::Heic),
         "jpeg" | "jpg" => Ok(ImageOutputFormat::Jpeg),
+        "png" => Ok(ImageOutputFormat::Png),
+        "bmp" => Ok(ImageOutputFormat::Bmp),
+        "qoi" => Ok(ImageOutputFormat::Qoi),
         other => Err(format!(
-            "unknown format '{other}' (expected webp, heic, or jpeg)"
+            "unknown format '{other}' (expected webp, heic, jpeg, png, bmp, or qoi)"
         )),
     }
 }
@@ -152,11 +155,9 @@ fn parse_convert_args(args: &[&str]) -> Result<ConvertCommand, String> {
     };
 
     let compression = if lossless {
-        ImageCompression::Lossless
+        Some(ImageCompression::Lossless)
     } else {
-        ImageCompression::Lossy {
-            quality: quality_arg.unwrap_or(ImageQuality::DEFAULT),
-        }
+        quality_arg.map(|quality| ImageCompression::Lossy { quality })
     };
 
     Ok(ConvertCommand::Run(ConvertArgs {
@@ -336,9 +337,7 @@ mod tests {
             ConvertCommand::Run(ConvertArgs {
                 source: PathBuf::from("in.png"),
                 target: PathBuf::from("out.webp"),
-                compression: ImageCompression::Lossy {
-                    quality: ImageQuality::DEFAULT
-                },
+                compression: None,
                 to: None,
                 threads: None,
                 backend: HardwareBackend::Cpu,
@@ -362,27 +361,29 @@ mod tests {
         };
         assert_eq!(
             flagged.compression,
-            ImageCompression::Lossy {
+            Some(ImageCompression::Lossy {
                 quality: ImageQuality::new(85).map_err(|err| err.to_string())?
-            }
+            })
         );
         assert_eq!(flagged.to, Some(ImageOutputFormat::Heic));
         assert_eq!(flagged.threads, NonZeroUsize::new(4));
         assert_eq!(flagged.backend, HardwareBackend::Gpu(GpuBackend::Nvenc));
 
-        let ConvertCommand::Run(to_jpeg) =
-            parse_convert_args(&["src_dir", "out_dir", "--to", "jpeg"])?
-        else {
-            return Err("expected ConvertCommand::Run".to_owned());
-        };
-        assert_eq!(to_jpeg.to, Some(ImageOutputFormat::Jpeg));
-
-        let ConvertCommand::Run(jpeg_alias) =
-            parse_convert_args(&["src_dir", "out_dir", "--to", "jpg"])?
-        else {
-            return Err("expected ConvertCommand::Run".to_owned());
-        };
-        assert_eq!(jpeg_alias.to, Some(ImageOutputFormat::Jpeg));
+        for (flag, expected) in [
+            ("jpeg", ImageOutputFormat::Jpeg),
+            ("jpg", ImageOutputFormat::Jpeg),
+            ("png", ImageOutputFormat::Png),
+            ("bmp", ImageOutputFormat::Bmp),
+            ("qoi", ImageOutputFormat::Qoi),
+        ] {
+            let ConvertCommand::Run(parsed) =
+                parse_convert_args(&["src_dir", "out_dir", "--to", flag])?
+            else {
+                return Err("expected ConvertCommand::Run".to_owned());
+            };
+            assert_eq!(parsed.to, Some(expected));
+            assert_eq!(parsed.compression, None);
+        }
 
         let ConvertCommand::Run(vulkan_webp) =
             parse_convert_args(&["a.png", "b.webp", "--backend", "vulkan"])?

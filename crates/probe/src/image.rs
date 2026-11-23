@@ -14,7 +14,14 @@ use crate::{ProbeError, available_cpu_threads, detect_host_hardware};
 
 const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 const JPEG_MAGIC: [u8; 3] = [0xFF, 0xD8, 0xFF];
-const UNRECOGNIZED_MAGIC_REASON: &str = "unrecognized image magic bytes (expected PNG or JPEG)";
+const RIFF_MAGIC: [u8; 4] = *b"RIFF";
+const WEBP_MAGIC: [u8; 4] = *b"WEBP";
+const QOI_MAGIC: [u8; 4] = *b"qoif";
+const QOI_END_MARKER: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 1];
+const BMP_MAGIC: [u8; 2] = *b"BM";
+const KNOWN_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "qoi"];
+const UNRECOGNIZED_MAGIC_REASON: &str =
+    "unrecognized image magic bytes (expected PNG, JPEG, WebP, BMP, or QOI)";
 
 /// Detected input container format and validated pixel dimensions from image headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,18 +30,35 @@ pub struct ProbedImage {
     pub dimensions: ImageDimensions,
 }
 
-fn sniff_magic_format(header: &[u8]) -> Option<ImageInputFormat> {
+fn is_known_bmp_dib_size(size: u32) -> bool {
+    matches!(size, 12 | 40 | 52 | 56 | 108 | 124)
+}
+
+fn sniff_magic_format(header: &[u8], strict_bmp_dib: bool) -> Option<ImageInputFormat> {
     if header.starts_with(&PNG_MAGIC) {
         Some(ImageInputFormat::Png)
     } else if header.starts_with(&JPEG_MAGIC) {
         Some(ImageInputFormat::Jpeg)
+    } else if header.get(0..4) == Some(RIFF_MAGIC.as_slice())
+        && header.get(8..12) == Some(WEBP_MAGIC.as_slice())
+    {
+        Some(ImageInputFormat::Webp)
+    } else if header.starts_with(&QOI_MAGIC) {
+        Some(ImageInputFormat::Qoi)
+    } else if header.starts_with(&BMP_MAGIC) {
+        if !strict_bmp_dib {
+            return Some(ImageInputFormat::Bmp);
+        }
+        let dib_bytes = header.get(14..18)?;
+        let dib_size = u32::from_le_bytes([dib_bytes[0], dib_bytes[1], dib_bytes[2], dib_bytes[3]]);
+        is_known_bmp_dib_size(dib_size).then_some(ImageInputFormat::Bmp)
     } else {
         None
     }
 }
 
-fn read_magic_prefix(file: &mut File, path: &Path) -> Result<([u8; 8], usize), ProbeError> {
-    let mut buf = [0_u8; 8];
+fn read_magic_prefix(file: &mut File, path: &Path) -> Result<([u8; 18], usize), ProbeError> {
+    let mut buf = [0_u8; 18];
     let mut filled = 0_usize;
     while filled < buf.len() {
         let slot = buf
@@ -58,6 +82,34 @@ fn read_magic_prefix(file: &mut File, path: &Path) -> Result<([u8; 8], usize), P
     Ok((buf, filled))
 }
 
+fn read_exact_or_invalid(
+    file: &mut File,
+    path: &Path,
+    buf: &mut [u8],
+    eof_reason: &str,
+) -> Result<(), ProbeError> {
+    file.read_exact(buf).map_err(|err| {
+        if err.kind() == io::ErrorKind::UnexpectedEof {
+            ProbeError::InvalidImage {
+                path: path.to_path_buf(),
+                reason: eof_reason.to_owned(),
+            }
+        } else {
+            ProbeError::Io {
+                path: path.to_path_buf(),
+                source: err,
+            }
+        }
+    })
+}
+
+fn invalid_image(path: &Path, reason: impl Into<String>) -> ProbeError {
+    ProbeError::InvalidImage {
+        path: path.to_path_buf(),
+        reason: reason.into(),
+    }
+}
+
 fn is_supported_jpeg_colorspace(cs: Option<ColorSpace>) -> bool {
     matches!(
         cs,
@@ -69,6 +121,475 @@ fn is_supported_jpeg_colorspace(cs: Option<ColorSpace>) -> bool {
                 | ColorSpace::YCCK
         )
     )
+}
+
+fn probe_webp(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+    let file_len = file
+        .metadata()
+        .map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if file_len < 20 {
+        return Err(invalid_image(path, "truncated WebP RIFF container"));
+    }
+
+    let mut header = [0_u8; 20];
+    read_exact_or_invalid(file, path, &mut header, "truncated WebP header")?;
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WEBP" {
+        return Err(invalid_image(path, "invalid RIFF/WEBP header signature"));
+    }
+    let riff_size = u64::from(u32::from_le_bytes([
+        header[4], header[5], header[6], header[7],
+    ]));
+    if riff_size < 12 || riff_size.saturating_add(8) > file_len {
+        return Err(invalid_image(
+            path,
+            format!(
+                "invalid or truncated WebP RIFF size ({riff_size} bytes, file {file_len} bytes)"
+            ),
+        ));
+    }
+    let riff_end = riff_size + 8;
+
+    let first_fourcc = [header[12], header[13], header[14], header[15]];
+    let chunk_size = u64::from(u32::from_le_bytes([
+        header[16], header[17], header[18], header[19],
+    ]));
+    let chunk_end = 20_u64
+        .checked_add(chunk_size)
+        .ok_or_else(|| invalid_image(path, "WebP chunk size overflow"))?;
+    if chunk_end > riff_end {
+        return Err(invalid_image(path, "truncated WebP primary chunk payload"));
+    }
+
+    match &first_fourcc {
+        b"VP8 " => probe_webp_vp8(file, path, chunk_size),
+        b"VP8L" => probe_webp_vp8l(file, path, chunk_size),
+        b"VP8X" => probe_webp_vp8x(file, path, chunk_size, riff_end),
+        other => Err(invalid_image(
+            path,
+            format!("unsupported WebP primary chunk {other:?}"),
+        )),
+    }
+}
+
+fn probe_webp_vp8(
+    file: &mut File,
+    path: &Path,
+    chunk_size: u64,
+) -> Result<ImageDimensions, ProbeError> {
+    if chunk_size < 10 {
+        return Err(invalid_image(path, "truncated VP8 lossy frame header"));
+    }
+    let mut vp8 = [0_u8; 10];
+    read_exact_or_invalid(file, path, &mut vp8, "truncated VP8 lossy frame header")?;
+    if (vp8[0] & 1) != 0 {
+        return Err(invalid_image(path, "VP8 frame is not a keyframe"));
+    }
+    if vp8[3..6] != [0x9D, 0x01, 0x2A] {
+        return Err(invalid_image(path, "invalid VP8 keyframe start code"));
+    }
+    let width = u32::from(u16::from_le_bytes([vp8[6], vp8[7]]) & 0x3FFF);
+    let height = u32::from(u16::from_le_bytes([vp8[8], vp8[9]]) & 0x3FFF);
+    Ok(ImageDimensions::new(width, height)?)
+}
+
+fn probe_webp_vp8l(
+    file: &mut File,
+    path: &Path,
+    chunk_size: u64,
+) -> Result<ImageDimensions, ProbeError> {
+    if chunk_size < 5 {
+        return Err(invalid_image(path, "truncated VP8L lossless header"));
+    }
+    let mut vp8l = [0_u8; 5];
+    read_exact_or_invalid(file, path, &mut vp8l, "truncated VP8L lossless header")?;
+    if vp8l[0] != 0x2F {
+        return Err(invalid_image(path, "invalid VP8L lossless signature byte"));
+    }
+    let bits = u32::from_le_bytes([vp8l[1], vp8l[2], vp8l[3], vp8l[4]]);
+    if (bits >> 29) != 0 {
+        return Err(invalid_image(
+            path,
+            format!("unsupported VP8L version {}", bits >> 29),
+        ));
+    }
+    let width = (bits & 0x3FFF) + 1;
+    let height = ((bits >> 14) & 0x3FFF) + 1;
+    Ok(ImageDimensions::new(width, height)?)
+}
+
+fn probe_webp_vp8x(
+    file: &mut File,
+    path: &Path,
+    chunk_size: u64,
+    riff_end: u64,
+) -> Result<ImageDimensions, ProbeError> {
+    if chunk_size < 10 {
+        return Err(invalid_image(path, "truncated VP8X extended header"));
+    }
+    let mut vp8x = [0_u8; 10];
+    read_exact_or_invalid(file, path, &mut vp8x, "truncated VP8X extended header")?;
+    if (vp8x[0] & 0x02) != 0 {
+        return Err(invalid_image(
+            path,
+            "animated WebP is not supported by the still-image pipeline",
+        ));
+    }
+    let width = (u32::from(vp8x[4]) | (u32::from(vp8x[5]) << 8) | (u32::from(vp8x[6]) << 16)) + 1;
+    let height = (u32::from(vp8x[7]) | (u32::from(vp8x[8]) << 8) | (u32::from(vp8x[9]) << 16)) + 1;
+
+    let padded_vp8x = chunk_size + (chunk_size & 1);
+    let mut pos = 20_u64
+        .checked_add(padded_vp8x)
+        .ok_or_else(|| invalid_image(path, "WebP VP8X chunk offset overflow"))?;
+    let mut has_vp8 = false;
+    let mut has_vp8l = false;
+
+    while pos.saturating_add(8) <= riff_end {
+        file.seek(SeekFrom::Start(pos))
+            .map_err(|source| ProbeError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let mut hdr = [0_u8; 8];
+        read_exact_or_invalid(file, path, &mut hdr, "truncated WebP chunk header")?;
+        let fourcc = [hdr[0], hdr[1], hdr[2], hdr[3]];
+        let len = u64::from(u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]));
+        let payload_end = pos
+            .checked_add(8)
+            .and_then(|p| p.checked_add(len))
+            .ok_or_else(|| invalid_image(path, "WebP chunk length overflow"))?;
+        if payload_end > riff_end {
+            return Err(invalid_image(
+                path,
+                "truncated chunk inside VP8X WebP container",
+            ));
+        }
+
+        match &fourcc {
+            b"ANIM" | b"ANMF" => {
+                return Err(invalid_image(
+                    path,
+                    "animated WebP is not supported by the still-image pipeline",
+                ));
+            }
+            b"VP8 " => has_vp8 = true,
+            b"VP8L" => has_vp8l = true,
+            _ => {}
+        }
+
+        let padded_len = len + (len & 1);
+        pos = pos
+            .checked_add(8)
+            .and_then(|p| p.checked_add(padded_len))
+            .ok_or_else(|| invalid_image(path, "WebP chunk offset overflow"))?;
+    }
+
+    if has_vp8 == has_vp8l {
+        return Err(invalid_image(
+            path,
+            "VP8X WebP container must contain exactly one VP8 or VP8L image chunk",
+        ));
+    }
+
+    Ok(ImageDimensions::new(width, height)?)
+}
+
+fn read_bmp_dib_header(
+    file: &mut File,
+    path: &Path,
+    dib_size: u32,
+) -> Result<(u32, u32, u16, u32), ProbeError> {
+    if dib_size == 12 {
+        let mut core = [0_u8; 8];
+        read_exact_or_invalid(file, path, &mut core, "truncated BITMAPCOREHEADER")?;
+        let w = u32::from(u16::from_le_bytes([core[0], core[1]]));
+        let h = u32::from(u16::from_le_bytes([core[2], core[3]]));
+        let planes = u16::from_le_bytes([core[4], core[5]]);
+        let bpp = u16::from_le_bytes([core[6], core[7]]);
+        if planes != 1 {
+            return Err(invalid_image(
+                path,
+                format!("unsupported BMP plane count {planes}"),
+            ));
+        }
+        return Ok((w, h, bpp, 0_u32));
+    }
+
+    let mut info = [0_u8; 36];
+    read_exact_or_invalid(file, path, &mut info, "truncated BITMAPINFOHEADER")?;
+    let raw_w = i32::from_le_bytes([info[0], info[1], info[2], info[3]]);
+    let raw_h = i32::from_le_bytes([info[4], info[5], info[6], info[7]]);
+    let planes = u16::from_le_bytes([info[8], info[9]]);
+    let bpp = u16::from_le_bytes([info[10], info[11]]);
+    let comp = u32::from_le_bytes([info[12], info[13], info[14], info[15]]);
+    if raw_w <= 0 || raw_h == 0 || raw_h == i32::MIN {
+        return Err(invalid_image(
+            path,
+            format!("invalid BMP dimensions {raw_w}x{raw_h}"),
+        ));
+    }
+    if planes != 1 {
+        return Err(invalid_image(
+            path,
+            format!("unsupported BMP plane count {planes}"),
+        ));
+    }
+    let w = u32::try_from(raw_w)
+        .map_err(|_| invalid_image(path, format!("invalid BMP width {raw_w}")))?;
+    Ok((w, raw_h.unsigned_abs(), bpp, comp))
+}
+
+fn probe_bmp(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+    let file_len = file
+        .metadata()
+        .map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if file_len < 26 {
+        return Err(invalid_image(path, "truncated BMP header"));
+    }
+
+    let mut file_hdr = [0_u8; 18];
+    read_exact_or_invalid(file, path, &mut file_hdr, "truncated BMP file header")?;
+    if &file_hdr[0..2] != b"BM" {
+        return Err(invalid_image(path, "invalid BMP signature"));
+    }
+    let pixel_offset = u64::from(u32::from_le_bytes([
+        file_hdr[10],
+        file_hdr[11],
+        file_hdr[12],
+        file_hdr[13],
+    ]));
+    let dib_size = u32::from_le_bytes([file_hdr[14], file_hdr[15], file_hdr[16], file_hdr[17]]);
+    if !is_known_bmp_dib_size(dib_size) {
+        return Err(invalid_image(
+            path,
+            format!("unsupported BMP DIB header size {dib_size}"),
+        ));
+    }
+    let header_end = 14_u64 + u64::from(dib_size);
+    if pixel_offset < header_end || pixel_offset > file_len {
+        return Err(invalid_image(
+            path,
+            format!(
+                "invalid BMP pixel offset {pixel_offset} (header ends at {header_end}, file is {file_len} bytes)"
+            ),
+        ));
+    }
+
+    let (width, height, bit_count, compression) = read_bmp_dib_header(file, path, dib_size)?;
+
+    validate_bmp_encoding(
+        file,
+        path,
+        dib_size,
+        header_end,
+        pixel_offset,
+        bit_count,
+        compression,
+    )?;
+
+    let dims = ImageDimensions::new(width, height)?;
+    let row_bits = u64::from(width)
+        .checked_mul(u64::from(bit_count))
+        .ok_or_else(|| invalid_image(path, "BMP row bit count overflow"))?;
+    let row_stride = row_bits
+        .checked_add(31)
+        .ok_or_else(|| invalid_image(path, "BMP row stride overflow"))?
+        / 32
+        * 4;
+    let pixel_bytes = row_stride
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| invalid_image(path, "BMP pixel data size overflow"))?;
+    let required_len = pixel_offset
+        .checked_add(pixel_bytes)
+        .ok_or_else(|| invalid_image(path, "BMP total size overflow"))?;
+    if required_len > file_len {
+        return Err(invalid_image(
+            path,
+            format!("truncated BMP pixel payload (need {required_len} bytes, file has {file_len})"),
+        ));
+    }
+
+    Ok(dims)
+}
+
+fn validate_bmp_encoding(
+    file: &mut File,
+    path: &Path,
+    dib_size: u32,
+    header_end: u64,
+    pixel_offset: u64,
+    bit_count: u16,
+    compression: u32,
+) -> Result<(), ProbeError> {
+    match compression {
+        0 => {
+            if !matches!(bit_count, 1 | 4 | 8 | 16 | 24 | 32) {
+                return Err(invalid_image(
+                    path,
+                    format!("unsupported uncompressed BMP bit depth {bit_count}"),
+                ));
+            }
+            if dib_size == 12 && !matches!(bit_count, 1 | 4 | 8 | 24) {
+                return Err(invalid_image(
+                    path,
+                    format!("unsupported BITMAPCOREHEADER bit depth {bit_count}"),
+                ));
+            }
+            if matches!(bit_count, 1 | 4 | 8) {
+                let entry_size = if dib_size == 12 { 3_u64 } else { 4_u64 };
+                if pixel_offset.saturating_sub(header_end) < entry_size {
+                    return Err(invalid_image(
+                        path,
+                        "indexed BMP is missing color palette entries",
+                    ));
+                }
+            }
+            Ok(())
+        }
+        3 | 6 => {
+            if !matches!(bit_count, 16 | 32) {
+                return Err(invalid_image(
+                    path,
+                    format!("BMP BI_BITFIELDS requires 16-bit or 32-bit pixels, got {bit_count}"),
+                ));
+            }
+            let need_alpha_mask = compression == 6 || dib_size >= 56;
+            let mask_bytes_needed = if need_alpha_mask { 16_u64 } else { 12_u64 };
+            let mask_offset = 54_u64;
+            if mask_offset + mask_bytes_needed > pixel_offset {
+                return Err(invalid_image(
+                    path,
+                    "truncated BMP BI_BITFIELDS channel masks",
+                ));
+            }
+            file.seek(SeekFrom::Start(mask_offset))
+                .map_err(|source| ProbeError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            let mut raw = [0_u8; 16];
+            let read_len = usize::try_from(mask_bytes_needed).unwrap_or(12);
+            read_exact_or_invalid(
+                file,
+                path,
+                &mut raw[..read_len],
+                "truncated BMP BI_BITFIELDS channel masks",
+            )?;
+            let r = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            let g = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+            let b = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+            let a = if need_alpha_mask {
+                u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]])
+            } else {
+                0
+            };
+            if r == 0 || g == 0 || b == 0 {
+                return Err(invalid_image(
+                    path,
+                    "invalid BMP BI_BITFIELDS with zero RGB channel mask",
+                ));
+            }
+            let is_contiguous = |mask: u32| -> bool {
+                if mask == 0 {
+                    return true;
+                }
+                let shifted = mask >> mask.trailing_zeros();
+                (shifted & shifted.wrapping_add(1)) == 0
+            };
+            if !is_contiguous(r) || !is_contiguous(g) || !is_contiguous(b) || !is_contiguous(a) {
+                return Err(invalid_image(
+                    path,
+                    "invalid BMP BI_BITFIELDS with non-contiguous channel mask",
+                ));
+            }
+            if (r & g) != 0 || (r & b) != 0 || (g & b) != 0 || ((r | g | b) & a) != 0 {
+                return Err(invalid_image(
+                    path,
+                    "invalid BMP BI_BITFIELDS with overlapping channel masks",
+                ));
+            }
+            if bit_count == 16 && ((r | g | b | a) >> 16) != 0 {
+                return Err(invalid_image(
+                    path,
+                    "invalid 16-bit BMP BI_BITFIELDS mask exceeding 16 bits",
+                ));
+            }
+            Ok(())
+        }
+        other => Err(invalid_image(
+            path,
+            format!("unsupported BMP compression mode {other}"),
+        )),
+    }
+}
+
+fn probe_qoi(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+    let file_len = file
+        .metadata()
+        .map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if file_len < 22 {
+        return Err(invalid_image(path, "truncated QOI image"));
+    }
+
+    let mut hdr = [0_u8; 14];
+    read_exact_or_invalid(file, path, &mut hdr, "truncated QOI header")?;
+    if hdr[0..4] != QOI_MAGIC {
+        return Err(invalid_image(path, "invalid QOI magic bytes"));
+    }
+    let width = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+    let height = u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
+    let channels = hdr[12];
+    let colorspace = hdr[13];
+
+    if !matches!(channels, 3 | 4) {
+        return Err(invalid_image(
+            path,
+            format!("invalid QOI channel count {channels} (expected 3 or 4)"),
+        ));
+    }
+    if !matches!(colorspace, 0 | 1) {
+        return Err(invalid_image(
+            path,
+            format!("invalid QOI colorspace {colorspace} (expected 0 or 1)"),
+        ));
+    }
+
+    let dims = ImageDimensions::new(width, height)?;
+    let total_rgba = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|px| px.checked_mul(4))
+        .and_then(|bytes| usize::try_from(bytes).ok());
+    if total_rgba.is_none() {
+        return Err(invalid_image(
+            path,
+            "QOI dimensions exceed addressable memory",
+        ));
+    }
+
+    file.seek(SeekFrom::Start(file_len - 8))
+        .map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut tail = [0_u8; 8];
+    read_exact_or_invalid(file, path, &mut tail, "truncated QOI end marker")?;
+    if tail != QOI_END_MARKER {
+        return Err(invalid_image(path, "invalid or missing QOI end marker"));
+    }
+
+    Ok(dims)
 }
 
 fn probe_opened_image(
@@ -88,10 +609,7 @@ fn probe_opened_image(
             decoder.set_ignore_text_chunk(true);
             let reader = decoder
                 .read_info()
-                .map_err(|err| ProbeError::InvalidImage {
-                    path: path.to_path_buf(),
-                    reason: err.to_string(),
-                })?;
+                .map_err(|err| invalid_image(path, err.to_string()))?;
             let info = reader.info();
             ImageDimensions::new(info.width, info.height)?
         }
@@ -99,23 +617,22 @@ fn probe_opened_image(
             let mut decoder = JpegDecoder::new(BufReader::new(file));
             decoder
                 .decode_headers()
-                .map_err(|err| ProbeError::InvalidImage {
-                    path: path.to_path_buf(),
-                    reason: err.to_string(),
-                })?;
-            let info = decoder.info().ok_or_else(|| ProbeError::InvalidImage {
-                path: path.to_path_buf(),
-                reason: "missing JPEG SOF header metadata".to_owned(),
-            })?;
+                .map_err(|err| invalid_image(path, err.to_string()))?;
+            let info = decoder
+                .info()
+                .ok_or_else(|| invalid_image(path, "missing JPEG SOF header metadata"))?;
             let input_cs = decoder.input_colorspace();
             if !is_supported_jpeg_colorspace(input_cs) {
-                return Err(ProbeError::InvalidImage {
-                    path: path.to_path_buf(),
-                    reason: format!("unsupported JPEG color space: {input_cs:?}"),
-                });
+                return Err(invalid_image(
+                    path,
+                    format!("unsupported JPEG color space: {input_cs:?}"),
+                ));
             }
             ImageDimensions::new(u32::from(info.width), u32::from(info.height))?
         }
+        ImageInputFormat::Webp => probe_webp(&mut file, path)?,
+        ImageInputFormat::Bmp => probe_bmp(&mut file, path)?,
+        ImageInputFormat::Qoi => probe_qoi(&mut file, path)?,
     };
 
     Ok(ProbedImage { format, dimensions })
@@ -126,7 +643,7 @@ fn probe_opened_image(
 /// # Errors
 ///
 /// Returns [`ProbeError::Io`] if `path` cannot be opened/seeked, [`ProbeError::InvalidImage`]
-/// if magic bytes, headers, or JPEG color space are not valid/supported, or
+/// if magic bytes, headers, or pixel/color encodings are not valid/supported, or
 /// [`ProbeError::InvalidDomain`] if dimensions are zero.
 pub fn probe_image(path: &Path) -> Result<ProbedImage, ProbeError> {
     let mut file = File::open(path).map_err(|source| ProbeError::Io {
@@ -135,15 +652,13 @@ pub fn probe_image(path: &Path) -> Result<ProbedImage, ProbeError> {
     })?;
     let (prefix, len) = read_magic_prefix(&mut file, path)?;
     let header_slice = prefix.get(..len).unwrap_or(&prefix);
-    let format = sniff_magic_format(header_slice).ok_or_else(|| ProbeError::InvalidImage {
-        path: path.to_path_buf(),
-        reason: UNRECOGNIZED_MAGIC_REASON.to_owned(),
-    })?;
+    let format = sniff_magic_format(header_slice, false)
+        .ok_or_else(|| invalid_image(path, UNRECOGNIZED_MAGIC_REASON))?;
 
     probe_opened_image(file, path, format)
 }
 
-/// Validates a single image file or mixed PNG/JPEG folder at the boundary against live host
+/// Validates a single image file or mixed image folder at the boundary against live host
 /// hardware and returns a compile-time-legal [`ImageBatchPlan`].
 ///
 /// Avoids initializing GPU probing (`wgpu`/Vulkan) when [`HardwareBackend::Cpu`] is explicitly
@@ -156,7 +671,7 @@ pub fn probe_image(path: &Path) -> Result<ProbedImage, ProbeError> {
 pub fn prepare_image_batch(
     source: &Path,
     target: &Path,
-    compression: ImageCompression,
+    compression: Option<ImageCompression>,
     output_format: Option<ImageOutputFormat>,
     worker_threads: Option<NonZeroUsize>,
     backend: HardwareBackend,
@@ -175,7 +690,7 @@ pub fn prepare_image_batch(
 fn prepare_image_batch_inner(
     source: &Path,
     target: &Path,
-    compression: ImageCompression,
+    compression: Option<ImageCompression>,
     output_format: Option<ImageOutputFormat>,
     worker_threads: Option<NonZeroUsize>,
     backend: HardwareBackend,
@@ -228,7 +743,7 @@ fn prepare_image_batch_inner(
 
 fn resolve_execution_mode(
     format: ImageOutputFormat,
-    compression: ImageCompression,
+    compression: Option<ImageCompression>,
     backend: HardwareBackend,
     hardware: Option<&HostHardware>,
 ) -> Result<ImageExecutionMode, ProbeError> {
@@ -333,15 +848,13 @@ fn probe_directory_entry(path: &Path) -> Result<Option<ProbedImage>, ProbeError>
     })?;
     let (prefix, len) = read_magic_prefix(&mut file, path)?;
     let header_slice = prefix.get(..len).unwrap_or(&prefix);
-    if let Some(format) = sniff_magic_format(header_slice) {
+    let has_bmp_ext = has_extension(path, "bmp");
+    if let Some(format) = sniff_magic_format(header_slice, !has_bmp_ext) {
         return probe_opened_image(file, path, format).map(Some);
     }
 
-    if has_any_extension(path, &["png", "jpg", "jpeg"]) {
-        return Err(ProbeError::InvalidImage {
-            path: path.to_path_buf(),
-            reason: UNRECOGNIZED_MAGIC_REASON.to_owned(),
-        });
+    if has_any_extension(path, KNOWN_IMAGE_EXTENSIONS) {
+        return Err(invalid_image(path, UNRECOGNIZED_MAGIC_REASON));
     }
 
     Ok(None)
@@ -382,12 +895,15 @@ fn resolve_single_target(
                 ImageOutputFormat::Webp => ".webp",
                 ImageOutputFormat::Heic => ".heic",
                 ImageOutputFormat::Jpeg => ".jpg or .jpeg",
+                ImageOutputFormat::Png => ".png",
+                ImageOutputFormat::Bmp => ".bmp",
+                ImageOutputFormat::Qoi => ".qoi",
             },
         }),
         (None, Some(actual)) => Ok((target.to_path_buf(), actual)),
         (None, None) => Err(ProbeError::UnsupportedTargetFormat {
             path: target.to_path_buf(),
-            expected: ".webp, .heic, .jpg, or .jpeg",
+            expected: ".webp, .heic, .jpg, .jpeg, .png, .bmp, or .qoi",
         }),
     }
 }
@@ -399,6 +915,12 @@ fn infer_format_from_extension(path: &Path) -> Option<ImageOutputFormat> {
         Some(ImageOutputFormat::Heic)
     } else if has_any_extension(path, &["jpg", "jpeg"]) {
         Some(ImageOutputFormat::Jpeg)
+    } else if has_extension(path, "png") {
+        Some(ImageOutputFormat::Png)
+    } else if has_extension(path, "bmp") {
+        Some(ImageOutputFormat::Bmp)
+    } else if has_extension(path, "qoi") {
+        Some(ImageOutputFormat::Qoi)
     } else {
         None
     }
@@ -522,6 +1044,88 @@ mod tests {
         Ok(())
     }
 
+    fn write_tiny_webp(
+        path: &Path,
+        width: u32,
+        height: u32,
+        lossless: bool,
+        with_alpha: bool,
+    ) -> Result<(), ProbeError> {
+        let bpp = if with_alpha { 4_usize } else { 3_usize };
+        let len = usize::try_from(width * height).unwrap_or(0) * bpp;
+        let pixels = vec![180_u8; len];
+        let layout = if with_alpha {
+            zenwebp::PixelLayout::Rgba8
+        } else {
+            zenwebp::PixelLayout::Rgb8
+        };
+        let encoded = if lossless {
+            let cfg = zenwebp::LosslessConfig::new();
+            zenwebp::EncodeRequest::lossless(&cfg, &pixels, layout, width, height).encode()
+        } else {
+            let cfg = zenwebp::LossyConfig::new().with_quality(80.0);
+            zenwebp::EncodeRequest::lossy(&cfg, &pixels, layout, width, height).encode()
+        }
+        .map_err(|err| ProbeError::InvalidImage {
+            path: path.to_path_buf(),
+            reason: err.to_string(),
+        })?;
+        fs::write(path, encoded).map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn write_tiny_bmp(path: &Path, width: u32, height: i32) -> Result<(), ProbeError> {
+        let abs_h = height.unsigned_abs();
+        let row_stride = (width * 3).div_ceil(4) * 4;
+        let pixel_bytes = row_stride * abs_h;
+        let file_size = 54 + pixel_bytes;
+        let mut bytes = Vec::with_capacity(usize::try_from(file_size).unwrap_or(54));
+        bytes.extend_from_slice(b"BM");
+        bytes.extend_from_slice(&file_size.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&54_u32.to_le_bytes());
+        bytes.extend_from_slice(&40_u32.to_le_bytes());
+        bytes.extend_from_slice(&i32::try_from(width).unwrap_or(1).to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&24_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&pixel_bytes.to_le_bytes());
+        bytes.extend_from_slice(&[0_u8; 16]);
+        bytes.resize(usize::try_from(file_size).unwrap_or(54), 90);
+        fs::write(path, bytes).map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn write_tiny_qoi(
+        path: &Path,
+        width: u32,
+        height: u32,
+        channels: u8,
+    ) -> Result<(), ProbeError> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"qoif");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.push(channels);
+        bytes.push(0);
+        let mut remaining = usize::try_from(width * height).unwrap_or(0);
+        while remaining > 0 {
+            let run = remaining.min(62);
+            bytes.push(0xC0 | u8::try_from(run - 1).unwrap_or(0));
+            remaining -= run;
+        }
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+        fs::write(path, bytes).map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
     fn synthetic_rtx_hardware() -> Result<HostHardware, ProbeError> {
         let cores =
             NonZeroUsize::new(4).ok_or(ProbeError::InvalidDomain(DomainError::EmptyBatch))?;
@@ -591,9 +1195,9 @@ mod tests {
         );
 
         let rtx = synthetic_rtx_hardware()?;
-        let lossy = ImageCompression::Lossy {
+        let lossy = Some(ImageCompression::Lossy {
             quality: ImageQuality::DEFAULT,
-        };
+        });
         let single_jpeg = prepare_image_batch(
             &png_path,
             &root.join("single.jpeg"),
@@ -608,6 +1212,36 @@ mod tests {
                 quality: ImageQuality::DEFAULT
             }
         );
+
+        let single_png = prepare_image_batch(
+            &jpg_path,
+            &root.join("single.png"),
+            None,
+            None,
+            None,
+            HardwareBackend::Cpu,
+        )?;
+        assert_eq!(single_png.mode(), ImageExecutionMode::CpuPng);
+
+        let single_bmp = prepare_image_batch(
+            &png_path,
+            &root.join("single.bmp"),
+            None,
+            Some(ImageOutputFormat::Bmp),
+            None,
+            HardwareBackend::Cpu,
+        )?;
+        assert_eq!(single_bmp.mode(), ImageExecutionMode::CpuBmp);
+
+        let single_qoi = prepare_image_batch(
+            &png_path,
+            &root.join("single.qoi"),
+            None,
+            Some(ImageOutputFormat::Qoi),
+            None,
+            HardwareBackend::Cpu,
+        )?;
+        assert_eq!(single_qoi.mode(), ImageExecutionMode::CpuQoi);
 
         let heic_single = prepare_image_batch_inner(
             &jpg_path,
@@ -650,22 +1284,35 @@ mod tests {
             source,
         })?;
 
-        let img_a = src_dir.join("alpha.png");
-        let img_b = src_dir.join("beta.JPG");
+        let img_a = src_dir.join("01_alpha.png");
+        let img_b = src_dir.join("02_beta.JPG");
+        let img_c = src_dir.join("03_gamma.webp");
+        let img_d = src_dir.join("04_delta.bmp");
+        let img_e = src_dir.join("05_epsilon.qoi");
         let hidden = src_dir.join(".hidden.jpg");
         let non_img = src_dir.join("notes.txt");
+        let bm_text = src_dir.join("bmx.txt");
         write_tiny_png(&img_a, 16, 12)?;
         write_tiny_jpeg(&img_b, 32, 24)?;
+        write_tiny_webp(&img_c, 20, 14, false, false)?;
+        write_tiny_bmp(&img_d, 15, -10)?;
+        write_tiny_qoi(&img_e, 18, 12, 4)?;
         write_tiny_jpeg(&hidden, 8, 8)?;
         fs::write(&non_img, b"ignore").map_err(|source| ProbeError::Io {
             path: non_img.clone(),
             source,
         })?;
+        fs::write(&bm_text, b"BMX riding notes are not a bitmap").map_err(|source| {
+            ProbeError::Io {
+                path: bm_text.clone(),
+                source,
+            }
+        })?;
 
         let rtx = synthetic_rtx_hardware()?;
-        let lossy = ImageCompression::Lossy {
+        let lossy = Some(ImageCompression::Lossy {
             quality: ImageQuality::DEFAULT,
-        };
+        });
         let heic_batch = prepare_image_batch_inner(
             &src_dir,
             &out_dir,
@@ -675,23 +1322,152 @@ mod tests {
             HardwareBackend::Gpu(GpuBackend::Nvenc),
             Some(&rtx),
         )?;
-        assert_eq!(heic_batch.items().len(), 2);
+        assert_eq!(heic_batch.items().len(), 5);
         assert_eq!(heic_batch.items()[0].input_format(), ImageInputFormat::Png);
-        assert_eq!(heic_batch.items()[0].target(), out_dir.join("alpha.heic"));
         assert_eq!(heic_batch.items()[1].input_format(), ImageInputFormat::Jpeg);
-        assert_eq!(heic_batch.items()[1].target(), out_dir.join("beta.heic"));
+        assert_eq!(heic_batch.items()[2].input_format(), ImageInputFormat::Webp);
+        assert_eq!(heic_batch.items()[3].input_format(), ImageInputFormat::Bmp);
+        assert_eq!(heic_batch.items()[4].input_format(), ImageInputFormat::Qoi);
+        assert_eq!(
+            heic_batch.items()[3].dimensions(),
+            ImageDimensions::new(15, 10)?
+        );
+        assert_eq!(
+            heic_batch.items()[4].target(),
+            out_dir.join("05_epsilon.heic")
+        );
 
-        let jpeg_batch = prepare_image_batch(
+        let png_batch = prepare_image_batch(
             &src_dir,
             &out_dir,
-            lossy,
-            Some(ImageOutputFormat::Jpeg),
+            None,
+            Some(ImageOutputFormat::Png),
             None,
             HardwareBackend::Cpu,
         )?;
-        assert_eq!(jpeg_batch.items().len(), 2);
-        assert_eq!(jpeg_batch.items()[0].target(), out_dir.join("alpha.jpg"));
-        assert_eq!(jpeg_batch.items()[1].target(), out_dir.join("beta.jpg"));
+        assert_eq!(png_batch.mode(), ImageExecutionMode::CpuPng);
+        assert_eq!(png_batch.items().len(), 5);
+        assert_eq!(png_batch.items()[2].target(), out_dir.join("03_gamma.png"));
+
+        let qoi_batch = prepare_image_batch(
+            &src_dir,
+            &out_dir,
+            None,
+            Some(ImageOutputFormat::Qoi),
+            None,
+            HardwareBackend::Cpu,
+        )?;
+        assert_eq!(qoi_batch.mode(), ImageExecutionMode::CpuQoi);
+        assert_eq!(qoi_batch.items()[0].target(), out_dir.join("01_alpha.qoi"));
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn probes_webp_bmp_qoi_via_magic_bytes_and_rejects_corrupt_or_animated()
+    -> Result<(), ProbeError> {
+        let root = create_temp_dir("magic-new")?;
+
+        let webp_lossy = root.join("misnamed_lossy.png");
+        write_tiny_webp(&webp_lossy, 24, 16, false, false)?;
+        assert_eq!(
+            probe_image(&webp_lossy)?,
+            ProbedImage {
+                format: ImageInputFormat::Webp,
+                dimensions: ImageDimensions::new(24, 16)?,
+            }
+        );
+
+        let webp_lossless = root.join("misnamed_lossless.jpg");
+        write_tiny_webp(&webp_lossless, 20, 14, true, false)?;
+        assert_eq!(
+            probe_image(&webp_lossless)?,
+            ProbedImage {
+                format: ImageInputFormat::Webp,
+                dimensions: ImageDimensions::new(20, 14)?,
+            }
+        );
+
+        let webp_vp8x = root.join("extended_alpha.bin");
+        write_tiny_webp(&webp_vp8x, 18, 12, false, true)?;
+        assert_eq!(
+            probe_image(&webp_vp8x)?,
+            ProbedImage {
+                format: ImageInputFormat::Webp,
+                dimensions: ImageDimensions::new(18, 12)?,
+            }
+        );
+
+        // Synthetic animated VP8X header (animation bit 0x02 set) must be rejected cleanly.
+        let animated_webp = root.join("anim.webp");
+        let mut anim_bytes = Vec::new();
+        anim_bytes.extend_from_slice(b"RIFF");
+        anim_bytes.extend_from_slice(&22_u32.to_le_bytes());
+        anim_bytes.extend_from_slice(b"WEBP");
+        anim_bytes.extend_from_slice(b"VP8X");
+        anim_bytes.extend_from_slice(&10_u32.to_le_bytes());
+        anim_bytes.extend_from_slice(&[0x02, 0, 0, 0, 15, 0, 0, 15, 0, 0]);
+        fs::write(&animated_webp, anim_bytes).map_err(|source| ProbeError::Io {
+            path: animated_webp.clone(),
+            source,
+        })?;
+        assert!(matches!(
+            probe_image(&animated_webp),
+            Err(ProbeError::InvalidImage { ref reason, .. }) if reason.contains("animated WebP")
+        ));
+
+        let misnamed_bmp = root.join("actually_bmp.png");
+        write_tiny_bmp(&misnamed_bmp, 17, 9)?;
+        assert_eq!(
+            probe_image(&misnamed_bmp)?,
+            ProbedImage {
+                format: ImageInputFormat::Bmp,
+                dimensions: ImageDimensions::new(17, 9)?,
+            }
+        );
+
+        let misnamed_qoi = root.join("actually_qoi.bmp");
+        write_tiny_qoi(&misnamed_qoi, 19, 11, 3)?;
+        assert_eq!(
+            probe_image(&misnamed_qoi)?,
+            ProbedImage {
+                format: ImageInputFormat::Qoi,
+                dimensions: ImageDimensions::new(19, 11)?,
+            }
+        );
+
+        let bad_qoi_tail = root.join("bad_tail.qoi");
+        let mut qoi_bytes = fs::read(&misnamed_qoi).map_err(|source| ProbeError::Io {
+            path: misnamed_qoi.clone(),
+            source,
+        })?;
+        if let Some(last) = qoi_bytes.last_mut() {
+            *last = 0;
+        }
+        fs::write(&bad_qoi_tail, qoi_bytes).map_err(|source| ProbeError::Io {
+            path: bad_qoi_tail.clone(),
+            source,
+        })?;
+        assert!(matches!(
+            probe_image(&bad_qoi_tail),
+            Err(ProbeError::InvalidImage { .. })
+        ));
+
+        let trunc_bmp = root.join("trunc.bmp");
+        let mut bmp_bytes = fs::read(&misnamed_bmp).map_err(|source| ProbeError::Io {
+            path: misnamed_bmp.clone(),
+            source,
+        })?;
+        bmp_bytes.truncate(60);
+        fs::write(&trunc_bmp, bmp_bytes).map_err(|source| ProbeError::Io {
+            path: trunc_bmp.clone(),
+            source,
+        })?;
+        assert!(matches!(
+            probe_image(&trunc_bmp),
+            Err(ProbeError::InvalidImage { .. })
+        ));
 
         fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
         Ok(())
@@ -743,9 +1519,9 @@ mod tests {
         let batch_err = prepare_image_batch(
             &dir,
             &root.join("out"),
-            ImageCompression::Lossy {
+            Some(ImageCompression::Lossy {
                 quality: ImageQuality::DEFAULT,
-            },
+            }),
             None,
             None,
             HardwareBackend::Cpu,
@@ -763,9 +1539,9 @@ mod tests {
         write_tiny_png(&valid, 8, 8)?;
 
         let rtx = synthetic_rtx_hardware()?;
-        let lossy = ImageCompression::Lossy {
+        let lossy = Some(ImageCompression::Lossy {
             quality: ImageQuality::DEFAULT,
-        };
+        });
 
         let nvenc_webp = prepare_image_batch_inner(
             &valid,
@@ -843,6 +1619,25 @@ mod tests {
             })
         ));
 
+        let png_quality_err = prepare_image_batch_inner(
+            &valid,
+            &root.join("out.png"),
+            lossy,
+            None,
+            None,
+            HardwareBackend::Cpu,
+            Some(&rtx),
+        );
+        assert!(matches!(
+            png_quality_err,
+            Err(ProbeError::InvalidDomain(
+                DomainError::UnsupportedImagePipeline {
+                    format: ImageOutputFormat::Png,
+                    ..
+                }
+            ))
+        ));
+
         fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
         Ok(())
     }
@@ -866,7 +1661,7 @@ mod tests {
         let corrupt_err = prepare_image_batch(
             &corrupt,
             &root.join("out.webp"),
-            ImageCompression::Lossless,
+            Some(ImageCompression::Lossless),
             None,
             None,
             HardwareBackend::Cpu,
@@ -876,7 +1671,7 @@ mod tests {
         let ext_err = prepare_image_batch(
             &valid,
             &root.join("out.avif"),
-            ImageCompression::Lossless,
+            Some(ImageCompression::Lossless),
             None,
             None,
             HardwareBackend::Cpu,
@@ -889,7 +1684,7 @@ mod tests {
         let jpeg_lossless_err = prepare_image_batch(
             &valid,
             &root.join("out.jpg"),
-            ImageCompression::Lossless,
+            Some(ImageCompression::Lossless),
             None,
             None,
             HardwareBackend::Cpu,
@@ -907,7 +1702,7 @@ mod tests {
         let empty_err = prepare_image_batch(
             &empty_dir,
             &root.join("out"),
-            ImageCompression::Lossless,
+            Some(ImageCompression::Lossless),
             None,
             None,
             HardwareBackend::Cpu,
@@ -920,7 +1715,7 @@ mod tests {
         let dir_to_file = prepare_image_batch(
             &root,
             &valid,
-            ImageCompression::Lossless,
+            Some(ImageCompression::Lossless),
             None,
             None,
             HardwareBackend::Cpu,
@@ -937,7 +1732,7 @@ mod tests {
     #[test]
     fn rejects_empty_paths_duplicate_targets_and_same_file_overwrite() -> Result<(), ProbeError> {
         let root = create_temp_dir("collisions")?;
-        let compression = ImageCompression::Lossless;
+        let compression = Some(ImageCompression::Lossless);
 
         assert!(matches!(
             prepare_image_batch(
@@ -1014,9 +1809,9 @@ mod tests {
         let in_place_err = prepare_image_batch(
             &in_place_dir,
             &in_place_dir,
-            ImageCompression::Lossy {
+            Some(ImageCompression::Lossy {
                 quality: ImageQuality::DEFAULT,
-            },
+            }),
             Some(ImageOutputFormat::Jpeg),
             None,
             HardwareBackend::Cpu,

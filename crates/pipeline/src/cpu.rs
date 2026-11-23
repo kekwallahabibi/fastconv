@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::{self, BufWriter, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -12,10 +13,15 @@ use jpeg_encoder::{ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder 
 use zenwebp::{EncodeRequest, LosslessConfig, LossyConfig, PixelLayout};
 
 use crate::PipelineError;
+use crate::bmp::encode_bmp_to_writer;
 use crate::decode::{
     DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat, decode_image_into,
     precreate_target_directories,
 };
+use crate::qoi::encode_qoi_into;
+
+const STREAM_IO_BUF_BYTES: usize = 512 * 1024;
+const PNG_IDAT_CHUNK_BYTES: usize = 256 * 1024;
 
 /// Concrete CPU execution backend entry point.
 ///
@@ -31,6 +37,43 @@ pub const fn execute(_plan: &ExecutionPlan) -> Result<(), PipelineError> {
 pub(crate) enum CpuImageEncoder {
     Webp(ImageCompression),
     Jpeg { quality: ImageQuality },
+    Png,
+    Bmp,
+    Qoi,
+}
+
+struct CountingWriter<W> {
+    inner: W,
+    bytes_written: u64,
+}
+
+impl<W> CountingWriter<W> {
+    const fn new(inner: W) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+        }
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.bytes_written = self
+            .bytes_written
+            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn cleanup_partial_output(path: &Path) {
+    if fs::remove_file(path).is_err() {
+        // Best-effort cleanup when a streaming encode already failed.
+    }
 }
 
 struct WorkerScratch {
@@ -181,36 +224,148 @@ fn convert_single_item(
                 reason: "decoded image frame exceeded allocated pixel buffer".to_owned(),
             })?;
 
-    scratch.encoded_buf.clear();
-    match encoder {
-        CpuImageEncoder::Webp(compression) => encode_webp_into(
-            item.target(),
-            compression,
-            pixels,
-            decoded,
-            &mut scratch.encoded_buf,
-        )?,
-        CpuImageEncoder::Jpeg { quality } => encode_jpeg_into(
-            item,
-            quality,
-            pixels,
-            decoded,
-            &mut scratch.aux_buf,
-            &mut scratch.encoded_buf,
-        )?,
-    }
+    let output_bytes = match encoder {
+        CpuImageEncoder::Webp(compression) => {
+            scratch.encoded_buf.clear();
+            encode_webp_into(
+                item.target(),
+                compression,
+                pixels,
+                decoded,
+                &mut scratch.encoded_buf,
+            )?;
+            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
+        }
+        CpuImageEncoder::Jpeg { quality } => {
+            scratch.encoded_buf.clear();
+            encode_jpeg_into(
+                item,
+                quality,
+                pixels,
+                decoded,
+                &mut scratch.aux_buf,
+                &mut scratch.encoded_buf,
+            )?;
+            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
+        }
+        CpuImageEncoder::Qoi => {
+            scratch.encoded_buf.clear();
+            encode_qoi_into(item.target(), pixels, decoded, &mut scratch.encoded_buf)?;
+            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
+        }
+        CpuImageEncoder::Png => encode_png_streaming(item.target(), pixels, decoded)?,
+        CpuImageEncoder::Bmp => {
+            encode_bmp_streaming(item.target(), pixels, decoded, &mut scratch.aux_buf)?
+        }
+    };
 
-    if scratch.encoded_buf.is_empty() {
-        return Err(PipelineError::EmptyOutput(item.target().to_path_buf()));
-    }
+    Ok((decoded.input_file_bytes, output_bytes))
+}
 
-    fs::write(item.target(), &scratch.encoded_buf).map_err(|source| PipelineError::Io {
-        path: item.target().to_path_buf(),
+fn write_encoded_buffer(target: &Path, encoded_buf: &[u8]) -> Result<u64, PipelineError> {
+    if encoded_buf.is_empty() {
+        return Err(PipelineError::EmptyOutput(target.to_path_buf()));
+    }
+    fs::write(target, encoded_buf).map_err(|source| PipelineError::Io {
+        path: target.to_path_buf(),
         source,
     })?;
+    Ok(u64::try_from(encoded_buf.len()).unwrap_or(u64::MAX))
+}
 
-    let output_bytes = u64::try_from(scratch.encoded_buf.len()).unwrap_or(u64::MAX);
-    Ok((decoded.input_file_bytes, output_bytes))
+fn encode_png_streaming(
+    target: &Path,
+    pixels: &[u8],
+    decoded: DecodedFrameMeta,
+) -> Result<u64, PipelineError> {
+    let file = File::create(target).map_err(|source| PipelineError::Io {
+        path: target.to_path_buf(),
+        source,
+    })?;
+    let mut writer = CountingWriter::new(BufWriter::with_capacity(STREAM_IO_BUF_BYTES, file));
+
+    let write_res = (|| -> Result<(), PipelineError> {
+        let mut encoder = png::Encoder::new(&mut writer, decoded.width, decoded.height);
+        encoder.set_color(match decoded.format {
+            DecodedPixelFormat::L8 => png::ColorType::Grayscale,
+            DecodedPixelFormat::La8 => png::ColorType::GrayscaleAlpha,
+            DecodedPixelFormat::Rgb8 => png::ColorType::Rgb,
+            DecodedPixelFormat::Rgba8 => png::ColorType::Rgba,
+        });
+        encoder.set_depth(png::BitDepth::Eight);
+        // `Compression::Fastest` selects `fdeflate` + `Filter::Up` for high CPU throughput
+        // while keeping PNG file sizes well compressed and avoiding full-frame zlib buffering.
+        encoder.set_compression(png::Compression::Fastest);
+
+        let mut png_writer = encoder
+            .write_header()
+            .map_err(|err| PipelineError::EncodeFailed {
+                path: target.to_path_buf(),
+                reason: err.to_string(),
+            })?;
+        {
+            let mut stream = png_writer
+                .stream_writer_with_size(PNG_IDAT_CHUNK_BYTES)
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: target.to_path_buf(),
+                    reason: err.to_string(),
+                })?;
+            stream
+                .write_all(pixels)
+                .map_err(|source| PipelineError::Io {
+                    path: target.to_path_buf(),
+                    source,
+                })?;
+            stream.finish().map_err(|err| PipelineError::EncodeFailed {
+                path: target.to_path_buf(),
+                reason: err.to_string(),
+            })?;
+        }
+        png_writer
+            .finish()
+            .map_err(|err| PipelineError::EncodeFailed {
+                path: target.to_path_buf(),
+                reason: err.to_string(),
+            })?;
+        writer.flush().map_err(|source| PipelineError::Io {
+            path: target.to_path_buf(),
+            source,
+        })
+    })();
+
+    if let Err(err) = write_res {
+        drop(writer);
+        cleanup_partial_output(target);
+        return Err(err);
+    }
+
+    if writer.bytes_written == 0 {
+        return Err(PipelineError::EmptyOutput(target.to_path_buf()));
+    }
+    Ok(writer.bytes_written)
+}
+
+fn encode_bmp_streaming(
+    target: &Path,
+    pixels: &[u8],
+    decoded: DecodedFrameMeta,
+    batch_scratch: &mut Vec<u8>,
+) -> Result<u64, PipelineError> {
+    let mut file = File::create(target).map_err(|source| PipelineError::Io {
+        path: target.to_path_buf(),
+        source,
+    })?;
+    let write_res = encode_bmp_to_writer(target, pixels, decoded, batch_scratch, &mut file);
+
+    match write_res {
+        Ok(0) => Err(PipelineError::EmptyOutput(target.to_path_buf())),
+        Ok(bytes) => Ok(bytes),
+        Err(err) => {
+            drop(file);
+            cleanup_partial_output(target);
+            Err(err)
+        }
+    }
 }
 
 fn encode_webp_into(

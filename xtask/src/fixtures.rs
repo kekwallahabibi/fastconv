@@ -9,6 +9,7 @@ use std::thread;
 use jpeg_encoder::{
     ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor,
 };
+use zenwebp::{EncodeRequest, LossyConfig, PixelLayout};
 
 pub const IMAGE_BATCH_COUNT: usize = 20;
 pub const IMAGE_WIDTH: u32 = 3840;
@@ -43,6 +44,16 @@ pub fn jpeg_image_path(root: &Path, index: usize) -> PathBuf {
 }
 
 #[must_use]
+pub fn webp_images_dir(root: &Path) -> PathBuf {
+    root.join("fixtures/images_4k_webp")
+}
+
+#[must_use]
+pub fn webp_image_path(root: &Path, index: usize) -> PathBuf {
+    webp_images_dir(root).join(format!("img_{index:02}.webp"))
+}
+
+#[must_use]
 pub fn audio_wav_path(root: &Path) -> PathBuf {
     root.join("fixtures/audio_60s_stereo.wav")
 }
@@ -55,6 +66,7 @@ pub fn video_mp4_path(root: &Path) -> PathBuf {
 pub fn generate_all(root: &Path, force: bool) -> Result<(), String> {
     generate_image_batch(root, force)?;
     generate_jpeg_batch(root, force)?;
+    generate_webp_batch(root, force)?;
     generate_audio_wav(root, force)?;
     generate_video_mp4(root, force)?;
     Ok(())
@@ -98,6 +110,24 @@ fn generate_jpeg_batch(root: &Path, force: bool) -> Result<(), String> {
     }
 
     run_parallel_4k_generation("JPEG", |index| write_single_4k_jpeg(root, index))
+}
+
+fn generate_webp_batch(root: &Path, force: bool) -> Result<(), String> {
+    let dir = webp_images_dir(root);
+    fs::create_dir_all(&dir)
+        .map_err(|err| format!("failed to create '{}': {err}", dir.display()))?;
+
+    let all_present =
+        (1..=IMAGE_BATCH_COUNT).all(|idx| is_non_empty_file(&webp_image_path(root, idx)));
+    if all_present && !force {
+        println!(
+            "==> skip 4K WebP batch ({IMAGE_BATCH_COUNT} files already exist in {})",
+            dir.display()
+        );
+        return Ok(());
+    }
+
+    run_parallel_4k_generation("WebP", |index| write_single_4k_webp(root, index))
 }
 
 fn run_parallel_4k_generation<F>(label: &str, generate_one: F) -> Result<(), String>
@@ -238,6 +268,29 @@ fn write_single_4k_jpeg(root: &Path, index: usize) -> Result<(), String> {
     fs::rename(&tmp, &target).map_err(|err| {
         format!(
             "failed to finalize JPEG '{}' -> '{}': {err}",
+            tmp.display(),
+            target.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn write_single_4k_webp(root: &Path, index: usize) -> Result<(), String> {
+    let target = webp_image_path(root, index);
+    let tmp = webp_images_dir(root).join(format!(".img_{index:02}.webp.tmp"));
+    let rgb = generate_4k_rgb_frame(index)?;
+
+    let cfg = LossyConfig::new().with_quality(80.0).with_method(4);
+    let encoded = EncodeRequest::lossy(&cfg, &rgb, PixelLayout::Rgb8, IMAGE_WIDTH, IMAGE_HEIGHT)
+        .encode()
+        .map_err(|err| format!("failed to encode WebP '{}': {err}", tmp.display()))?;
+    fs::write(&tmp, &encoded)
+        .map_err(|err| format!("failed to write WebP '{}': {err}", tmp.display()))?;
+
+    fs::rename(&tmp, &target).map_err(|err| {
+        format!(
+            "failed to finalize WebP '{}' -> '{}': {err}",
             tmp.display(),
             target.display()
         )
