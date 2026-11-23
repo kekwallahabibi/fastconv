@@ -210,16 +210,17 @@ fn decode_jpeg_slice_into(
             DecodeTargetHint::Native,
             Some(ColorSpace::YCbCr | ColorSpace::RGB | ColorSpace::CMYK | ColorSpace::YCCK),
         ) => (ColorSpace::RGB, DecodedPixelFormat::Rgb8),
-        // `zune-jpeg` leaves RGB->RGBA unimplemented; fall back to RGB so the caller appends alpha.
-        #[cfg(feature = "nvenc")]
-        (DecodeTargetHint::OpaqueRgba8, Some(ColorSpace::RGB)) => {
-            (ColorSpace::RGB, DecodedPixelFormat::Rgb8)
-        }
+        // `zune-jpeg` leaves RGB->RGBA unimplemented and packs 3-byte pixels/strides into
+        // CMYK/YCCK->RGBA outputs; route all three via RGB so the caller expands to RGBA8 cleanly.
         #[cfg(feature = "nvenc")]
         (
             DecodeTargetHint::OpaqueRgba8,
-            Some(ColorSpace::Luma | ColorSpace::YCbCr | ColorSpace::CMYK | ColorSpace::YCCK),
-        ) => (ColorSpace::RGBA, DecodedPixelFormat::Rgba8),
+            Some(ColorSpace::RGB | ColorSpace::CMYK | ColorSpace::YCCK),
+        ) => (ColorSpace::RGB, DecodedPixelFormat::Rgb8),
+        #[cfg(feature = "nvenc")]
+        (DecodeTargetHint::OpaqueRgba8, Some(ColorSpace::Luma | ColorSpace::YCbCr)) => {
+            (ColorSpace::RGBA, DecodedPixelFormat::Rgba8)
+        }
         (_, other) => {
             return Err(PipelineError::UnsupportedPixelFormat {
                 path: item.source().to_path_buf(),
@@ -272,4 +273,136 @@ fn decode_jpeg_slice_into(
         byte_len: required_len,
         input_file_bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DecodeTargetHint, DecodedPixelFormat, decode_image_into};
+    use crate::PipelineError;
+    use fastconv_domain::{ImageBatchItem, ImageDimensions, ImageInputFormat};
+    use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor};
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static DECODE_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn create_temp_dir(label: &str) -> Result<PathBuf, PipelineError> {
+        let id = DECODE_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = env::temp_dir().join(format!("fastconv-decode-{label}-{}-{id}", process::id()));
+        fs::create_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn decodes_optimized_huffman_solid_green_jpeg_with_accurate_color()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = create_temp_dir("huffman-green")?;
+        let src = root.join("solid_green.jpg");
+        let dst = root.join("unused.webp");
+
+        let mut pixels = Vec::with_capacity(16 * 16 * 3);
+        for _ in 0..(16 * 16) {
+            pixels.extend_from_slice(&[0, 255, 0]);
+        }
+
+        let mut encoder = JpegEncoder::new_file(&src, 80)?;
+        encoder.set_sampling_factor(SamplingFactor::F_2_2);
+        encoder.set_optimized_huffman_tables(true);
+        encoder.encode(&pixels, 16, 16, JpegColorType::Rgb)?;
+
+        let item = ImageBatchItem::new(
+            src,
+            dst,
+            ImageInputFormat::Jpeg,
+            ImageDimensions::new(16, 16)?,
+        )?;
+        let mut file_bytes = Vec::new();
+        let mut pixel_buf = Vec::new();
+        let meta = decode_image_into(
+            &item,
+            DecodeTargetHint::Native,
+            &mut file_bytes,
+            &mut pixel_buf,
+        )?;
+
+        assert_eq!(meta.format, DecodedPixelFormat::Rgb8);
+        assert_eq!(meta.byte_len, 16 * 16 * 3);
+        let center_idx = (8 * 16 + 8) * 3;
+        let center = pixel_buf
+            .get(center_idx..center_idx + 3)
+            .ok_or("missing center pixel")?;
+        assert!(
+            center[0] <= 5 && center[1] >= 245 && center[2] <= 5,
+            "unexpected decoded RGB color for solid green JPEG: {center:?}"
+        );
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "nvenc")]
+    #[test]
+    fn decodes_cmyk_and_ycck_jpegs_via_rgb_for_opaque_rgba_hint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = create_temp_dir("cmyk-ycck")?;
+        let mut cmyk_pixels = Vec::with_capacity(16 * 16 * 4);
+        for y in 0_u8..16 {
+            for x in 0_u8..16 {
+                cmyk_pixels.extend_from_slice(&[
+                    x.saturating_mul(16),
+                    y.saturating_mul(16),
+                    (x ^ y).saturating_mul(16),
+                    (x + y).saturating_mul(4),
+                ]);
+            }
+        }
+
+        for (name, color_type) in [
+            ("cmyk.jpg", JpegColorType::Cmyk),
+            ("ycck.jpg", JpegColorType::CmykAsYcck),
+        ] {
+            let src = root.join(name);
+            let encoder = JpegEncoder::new_file(&src, 90)?;
+            encoder.encode(&cmyk_pixels, 16, 16, color_type)?;
+
+            let item = ImageBatchItem::new(
+                src,
+                root.join(format!("{name}.heic")),
+                ImageInputFormat::Jpeg,
+                ImageDimensions::new(16, 16)?,
+            )?;
+            let mut file_bytes = Vec::new();
+            let mut native_buf = Vec::new();
+            let native_meta = decode_image_into(
+                &item,
+                DecodeTargetHint::Native,
+                &mut file_bytes,
+                &mut native_buf,
+            )?;
+            let mut hint_buf = Vec::new();
+            let hint_meta = decode_image_into(
+                &item,
+                DecodeTargetHint::OpaqueRgba8,
+                &mut file_bytes,
+                &mut hint_buf,
+            )?;
+
+            assert_eq!(native_meta.format, DecodedPixelFormat::Rgb8);
+            assert_eq!(hint_meta.format, DecodedPixelFormat::Rgb8);
+            assert_eq!(hint_meta.byte_len, 16 * 16 * 3);
+            assert_eq!(
+                hint_buf.get(..hint_meta.byte_len),
+                native_buf.get(..native_meta.byte_len)
+            );
+        }
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
 }
