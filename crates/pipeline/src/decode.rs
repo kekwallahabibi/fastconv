@@ -17,6 +17,9 @@ use crate::PipelineError;
 use crate::bmp::decode_bmp_slice_into;
 use crate::qoi::decode_qoi_slice_into;
 
+// 512 MiB decoded RGBA8, matching the probe budget for hostile headers.
+const MAX_TIFF_DECODED_BYTES: usize = 512 * 1024 * 1024;
+
 /// Decoded 8-bit pixel format supported across CPU and GPU image pipelines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecodedPixelFormat {
@@ -43,6 +46,9 @@ pub(crate) struct DecodedFrameMeta {
     pub format: DecodedPixelFormat,
     pub byte_len: usize,
     pub input_file_bytes: u64,
+    // Only the NVENC path needs to inspect native alpha before 8-bit scaling.
+    #[cfg_attr(not(feature = "nvenc"), allow(dead_code))]
+    pub has_non_opaque_native_alpha: bool,
 }
 
 pub(crate) fn precreate_target_directories(items: &[ImageBatchItem]) -> Result<(), PipelineError> {
@@ -106,6 +112,7 @@ pub(crate) fn decode_image_into(
                 format,
                 byte_len,
                 input_file_bytes,
+                has_non_opaque_native_alpha: false,
             })
         }
         ImageInputFormat::Qoi => {
@@ -118,6 +125,7 @@ pub(crate) fn decode_image_into(
                 format,
                 byte_len,
                 input_file_bytes,
+                has_non_opaque_native_alpha: false,
             })
         }
         ImageInputFormat::Tiff => {
@@ -185,6 +193,7 @@ fn decode_webp_slice_into(
         format,
         byte_len: required_len,
         input_file_bytes,
+        has_non_opaque_native_alpha: false,
     })
 }
 
@@ -266,6 +275,7 @@ fn decode_png_slice_into(
         format,
         byte_len,
         input_file_bytes,
+        has_non_opaque_native_alpha: false,
     })
 }
 
@@ -371,6 +381,7 @@ fn decode_jpeg_slice_into(
         format,
         byte_len: required_len,
         input_file_bytes,
+        has_non_opaque_native_alpha: false,
     })
 }
 
@@ -433,6 +444,29 @@ fn decode_tiff_slice_into(
             path: item.source().to_path_buf(),
             reason: "TIFF dimensions overflow decoded buffer size".to_owned(),
         })?;
+    if expected_len > MAX_TIFF_DECODED_BYTES {
+        return Err(PipelineError::DecodeFailed {
+            path: item.source().to_path_buf(),
+            reason: format!(
+                "TIFF decoded output ({expected_len} bytes) exceeds the {MAX_TIFF_DECODED_BYTES}-byte budget"
+            ),
+        });
+    }
+    let layout = decoder
+        .image_buffer_layout()
+        .map_err(|err| PipelineError::DecodeFailed {
+            path: item.source().to_path_buf(),
+            reason: format!("invalid TIFF buffer layout: {err}"),
+        })?;
+    if layout.complete_len > MAX_TIFF_DECODED_BYTES {
+        return Err(PipelineError::DecodeFailed {
+            path: item.source().to_path_buf(),
+            reason: format!(
+                "TIFF decoder buffer ({} bytes) exceeds the {MAX_TIFF_DECODED_BYTES}-byte budget",
+                layout.complete_len
+            ),
+        });
+    }
     if pixel_buf.len() < expected_len {
         pixel_buf.resize(expected_len, 0);
     }
@@ -449,25 +483,82 @@ fn decode_tiff_slice_into(
         u8::try_from((value * 255 + max_sample / 2) / max_sample).unwrap_or(u8::MAX)
     };
 
+    let width_usize = usize::try_from(width).map_err(|_| PipelineError::DecodeFailed {
+        path: item.source().to_path_buf(),
+        reason: "TIFF width exceeds addressable memory".to_owned(),
+    })?;
+    let height_usize = usize::try_from(height).map_err(|_| PipelineError::DecodeFailed {
+        path: item.source().to_path_buf(),
+        reason: "TIFF height exceeds addressable memory".to_owned(),
+    })?;
+    let mut has_non_opaque_native_alpha = false;
+
     match result {
         tiff::decoder::DecodingResult::U8(samples) => {
-            if samples.len() < expected_len {
-                return Err(PipelineError::DecodeFailed {
-                    path: item.source().to_path_buf(),
-                    reason: format!(
-                        "decoded TIFF buffer is too short: {} < {expected_len}",
-                        samples.len()
-                    ),
-                });
-            }
-            if bits == 8 {
-                pixel_buf[..expected_len].copy_from_slice(&samples[..expected_len]);
+            if bits < 8 && format == DecodedPixelFormat::L8 {
+                let row_bytes = width_usize
+                    .checked_mul(usize::from(bits))
+                    .map(|bits| bits.div_ceil(8))
+                    .ok_or_else(|| PipelineError::DecodeFailed {
+                        path: item.source().to_path_buf(),
+                        reason: "TIFF row bit count overflow".to_owned(),
+                    })?;
+                let needed = row_bytes.checked_mul(height_usize).ok_or_else(|| {
+                    PipelineError::DecodeFailed {
+                        path: item.source().to_path_buf(),
+                        reason: "TIFF packed buffer size overflow".to_owned(),
+                    }
+                })?;
+                if samples.len() < needed {
+                    return Err(PipelineError::DecodeFailed {
+                        path: item.source().to_path_buf(),
+                        reason: format!(
+                            "decoded TIFF buffer is too short: {} < {needed}",
+                            samples.len()
+                        ),
+                    });
+                }
+                for y in 0..height_usize {
+                    for x in 0..width_usize {
+                        let bit_offset = x * usize::from(bits);
+                        let byte = samples[y * row_bytes + bit_offset / 8];
+                        let shift = 8_usize.saturating_sub(usize::from(bits) + bit_offset % 8);
+                        let mask = (1_u8 << bits) - 1;
+                        let value = (byte >> shift) & mask;
+                        pixel_buf[y * width_usize + x] = scale_u8(u32::from(value));
+                    }
+                }
             } else {
-                for (dst, src) in pixel_buf[..expected_len]
-                    .iter_mut()
-                    .zip(samples[..expected_len].iter().copied())
-                {
-                    *dst = scale_u8(u32::from(src));
+                if samples.len() < expected_len {
+                    return Err(PipelineError::DecodeFailed {
+                        path: item.source().to_path_buf(),
+                        reason: format!(
+                            "decoded TIFF buffer is too short: {} < {expected_len}",
+                            samples.len()
+                        ),
+                    });
+                }
+                if bits == 8 {
+                    pixel_buf[..expected_len].copy_from_slice(&samples[..expected_len]);
+                    if matches!(format, DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8) {
+                        let alpha_stride = if format == DecodedPixelFormat::La8 {
+                            2
+                        } else {
+                            4
+                        };
+                        has_non_opaque_native_alpha = samples[..expected_len]
+                            .iter()
+                            .skip(alpha_stride - 1)
+                            .step_by(alpha_stride)
+                            .any(|&alpha| u32::from(alpha) < max_sample);
+                    }
+                } else {
+                    for (dst, src) in pixel_buf[..expected_len]
+                        .iter_mut()
+                        .zip(samples[..expected_len].iter().copied())
+                    {
+                        *dst = scale_u8(u32::from(src));
+                    }
                 }
             }
         }
@@ -480,6 +571,18 @@ fn decode_tiff_slice_into(
                         samples.len()
                     ),
                 });
+            }
+            if matches!(format, DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8) {
+                let alpha_stride = if format == DecodedPixelFormat::La8 {
+                    2
+                } else {
+                    4
+                };
+                has_non_opaque_native_alpha = samples[..expected_len]
+                    .iter()
+                    .skip(alpha_stride - 1)
+                    .step_by(alpha_stride)
+                    .any(|&alpha| u32::from(alpha) < max_sample);
             }
             for (dst, src) in pixel_buf[..expected_len]
                 .iter_mut()
@@ -502,6 +605,7 @@ fn decode_tiff_slice_into(
         format,
         byte_len: expected_len,
         input_file_bytes,
+        has_non_opaque_native_alpha,
     })
 }
 
@@ -514,6 +618,7 @@ fn decode_jxl_slice_into(
 ) -> Result<DecodedFrameMeta, PipelineError> {
     let mut options = JxlDecoderOptions::default();
     options.sample_limit = Some(512 * 1024 * 1024);
+    options.alpha_mode = jxl::api::AlphaMode::Unpremultiplied;
     let mut decoder = JxlDecoder::new(options);
 
     let mut input = file_bytes;
@@ -551,6 +656,13 @@ fn decode_jxl_slice_into(
                     reason: format!("JPEG XL height {h} is too large"),
                 })?;
                 verify_decoded_dimensions(item, width, height)?;
+                if info.animation.is_some() {
+                    return Err(PipelineError::DecodeFailed {
+                        path: item.source().to_path_buf(),
+                        reason: "animated JPEG XL is not supported by the still-image pipeline"
+                            .to_owned(),
+                    });
+                }
 
                 let grayscale = decoder
                     .embedded_color_profile()
@@ -646,6 +758,7 @@ fn decode_jxl_slice_into(
         format,
         byte_len,
         input_file_bytes,
+        has_non_opaque_native_alpha: false,
     })
 }
 

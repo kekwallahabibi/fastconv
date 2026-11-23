@@ -25,8 +25,6 @@ const MAX_QOI_PIXELS: u64 = 128 * 1024 * 1024;
 const BMP_MAGIC: [u8; 2] = *b"BM";
 const TIFF_LE_MAGIC: [u8; 4] = *b"II*\0";
 const TIFF_BE_MAGIC: [u8; 4] = *b"MM\0*";
-const JXL_CODESTREAM_MAGIC: [u8; 2] = [0xFF, 0x0A];
-const JXL_CONTAINER_MAGIC: [u8; 4] = *b"JXL ";
 // 512 Mi samples = 512 MiB RGBA8; keeps a hostile JXL header from forcing huge allocations.
 const MAX_JXL_SAMPLES: usize = 512 * 1024 * 1024;
 const KNOWN_IMAGE_EXTENSIONS: &[&str] = &[
@@ -66,10 +64,10 @@ fn sniff_magic_format(header: &[u8], strict_bmp_dib: bool) -> Option<ImageInputF
         is_known_bmp_dib_size(dib_size).then_some(ImageInputFormat::Bmp)
     } else if header.starts_with(&TIFF_LE_MAGIC) || header.starts_with(&TIFF_BE_MAGIC) {
         Some(ImageInputFormat::Tiff)
-    } else if header.starts_with(&JXL_CODESTREAM_MAGIC)
-        || (header.get(4..8) == Some(JXL_CONTAINER_MAGIC.as_slice())
-            && header.get(0..4).is_some_and(|size| size != [0, 0, 0, 0]))
-    {
+    } else if matches!(
+        jxl::api::check_signature(header),
+        jxl::api::JxlSignature::Codestream | jxl::api::JxlSignature::Container
+    ) {
         Some(ImageInputFormat::Jxl)
     } else {
         None

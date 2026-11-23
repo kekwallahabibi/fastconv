@@ -888,6 +888,7 @@ mod tests {
                 format: DecodedPixelFormat::Rgba8,
                 byte_len: rgba.len(),
                 input_file_bytes: 1,
+                has_non_opaque_native_alpha: false,
             },
             &mut encoded,
         )?;
@@ -917,6 +918,7 @@ mod tests {
                 format: DecodedPixelFormat::Rgb8,
                 byte_len: rgb.len(),
                 input_file_bytes: 1,
+                has_non_opaque_native_alpha: false,
             },
             &mut encoded,
         )?;
@@ -939,6 +941,7 @@ mod tests {
                 format: DecodedPixelFormat::L8,
                 byte_len: luma.len(),
                 input_file_bytes: 1,
+                has_non_opaque_native_alpha: false,
             },
             &mut encoded,
         )?;
@@ -990,6 +993,7 @@ mod tests {
                     format: DecodedPixelFormat::Rgb8,
                     byte_len: 0,
                     input_file_bytes: 1,
+                    has_non_opaque_native_alpha: false,
                 },
                 &mut encoded,
             ),

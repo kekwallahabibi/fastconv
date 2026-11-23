@@ -2649,16 +2649,20 @@ fn verify_ffmpeg_qoi_support() -> Result<(), String> {
 fn ffmpeg_has_encoder(encoder: &str) -> Result<bool, String> {
     let output = Command::new("ffmpeg")
         .stdin(Stdio::null())
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-h",
-            &format!("encoder={encoder}"),
-        ])
+        .args(["-hide_banner", "-loglevel", "error", "-encoders"])
         .output()
-        .map_err(|err| format!("failed to query ffmpeg encoder '{encoder}': {err}"))?;
-    Ok(output.status.success())
+        .map_err(|err| format!("failed to query ffmpeg encoders: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffmpeg -encoders failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.lines().any(|line| {
+        let mut parts = line.split_whitespace();
+        parts.next().is_some_and(|flags| flags.contains('E')) && parts.next() == Some(encoder)
+    }))
 }
 
 fn verify_ffprobe_available() -> Result<(), String> {

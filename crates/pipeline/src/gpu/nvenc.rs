@@ -554,6 +554,12 @@ mod enabled {
         pixel_buf: &[u8],
         mut rgba_bytes: Vec<u8>,
     ) -> Result<DecodedRgbaFrame, PipelineError> {
+        if decoded.has_non_opaque_native_alpha {
+            return Err(PipelineError::UnsupportedPixelFormat {
+                path: item.source().to_path_buf(),
+                format: "TIFF alpha sample is not fully opaque at native bit depth".to_owned(),
+            });
+        }
         let pixels =
             pixel_buf
                 .get(..decoded.byte_len)

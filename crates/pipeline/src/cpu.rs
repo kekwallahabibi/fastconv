@@ -18,6 +18,7 @@ use jixel::{
 };
 use jpeg_encoder::{ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder as JpegEncoder};
 use tiff::encoder::{Compression as TiffCompression, DeflateLevel, TiffEncoder, colortype};
+use tiff::tags::ExtraSamples;
 use zenwebp::{Encoder as WebpEncoder, EncoderConfig as WebpEncoderConfig};
 
 use crate::PipelineError;
@@ -706,8 +707,20 @@ fn encode_tiff_into(
                 let value = pair[0];
                 rgba.extend_from_slice(&[value, value, value, pair[1]]);
             }
-            encoder
-                .write_image::<colortype::RGBA8>(width, height, &rgba)
+            let mut image = encoder
+                .new_image::<colortype::RGB8>(width, height)
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: target.to_path_buf(),
+                    reason: format!("failed to create TIFF gray+alpha image: {err}"),
+                })?;
+            image
+                .extra_samples(&[ExtraSamples::UnassociatedAlpha])
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: target.to_path_buf(),
+                    reason: format!("failed to declare TIFF alpha sample: {err}"),
+                })?;
+            image
+                .write_data(&rgba)
                 .map_err(|err| PipelineError::EncodeFailed {
                     path: target.to_path_buf(),
                     reason: format!("failed to encode TIFF gray+alpha image: {err}"),
@@ -719,12 +732,26 @@ fn encode_tiff_into(
                 path: target.to_path_buf(),
                 reason: format!("failed to encode TIFF RGB image: {err}"),
             })?,
-        DecodedPixelFormat::Rgba8 => encoder
-            .write_image::<colortype::RGBA8>(width, height, pixels)
-            .map_err(|err| PipelineError::EncodeFailed {
-                path: target.to_path_buf(),
-                reason: format!("failed to encode TIFF RGBA image: {err}"),
-            })?,
+        DecodedPixelFormat::Rgba8 => {
+            let mut image = encoder
+                .new_image::<colortype::RGB8>(width, height)
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: target.to_path_buf(),
+                    reason: format!("failed to create TIFF RGBA image: {err}"),
+                })?;
+            image
+                .extra_samples(&[ExtraSamples::UnassociatedAlpha])
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: target.to_path_buf(),
+                    reason: format!("failed to declare TIFF alpha sample: {err}"),
+                })?;
+            image
+                .write_data(pixels)
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: target.to_path_buf(),
+                    reason: format!("failed to encode TIFF RGBA image: {err}"),
+                })?;
+        }
     }
 
     Ok(())
@@ -985,6 +1012,7 @@ mod tests {
             format: DecodedPixelFormat::Rgb8,
             byte_len: pixels.len(),
             input_file_bytes: 1,
+            has_non_opaque_native_alpha: false,
         };
         let mut sink = FailOnceAfterIdatHeader::new();
         let res = encode_png_to_writer(Path::new("fault.png"), &pixels, meta, &mut sink);
@@ -1021,6 +1049,7 @@ mod tests {
             format: DecodedPixelFormat::Rgb8,
             byte_len: pixels.len(),
             input_file_bytes: 1,
+            has_non_opaque_native_alpha: false,
         };
 
         let png_target = dir.join("private.png");
@@ -1068,6 +1097,7 @@ mod tests {
             format: DecodedPixelFormat::Rgb8,
             byte_len: bad_pixels.len(),
             input_file_bytes: 1,
+            has_non_opaque_native_alpha: false,
         };
         assert!(encode_png_streaming(&png_target, &bad_pixels, meta).is_err());
         let mut scratch = Vec::new();
