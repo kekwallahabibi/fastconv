@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 fastconv-domain.workspace = true
 fastconv-probe.workspace = true
+hound.workspace = true
 jpeg-encoder.workspace = true
 png.workspace = true
 serde.workspace = true

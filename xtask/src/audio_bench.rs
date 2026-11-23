@@ -5,7 +5,7 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fastconv_domain::{
     BenchmarkMetrics, BenchmarkSample, HostHardware, MediaKind, PeakMemory, WorkloadUnit,
@@ -78,23 +78,30 @@ pub fn run(root: &Path) -> Result<(), String> {
     let hardware = fastconv_probe::detect_host_hardware()
         .map_err(|err| format!("failed to probe host hardware: {err}"))?;
     let ffmpeg_version = ffmpeg_version()?;
-    let fastconv = build_fastconv(root)?;
     let threads = thread::available_parallelism()
         .map_err(|err| format!("failed to determine CPU parallelism: {err}"))?;
 
     let wav = audio_wav_path(root);
     let batch_inputs = audio_batch_inputs(root);
     for path in std::iter::once(&wav).chain(batch_inputs.iter()) {
-        if !path.is_file() {
+        if !fixtures::is_non_empty_file(path) {
             return Err(format!(
-                "missing audio fixture '{}'; run `cargo xtask gen-fixtures` first",
+                "missing or empty audio fixture '{}'; run `cargo xtask gen-fixtures` first",
                 path.display()
             ));
         }
     }
+    let fastconv = build_fastconv(root)?;
 
     let bench_dir = root.join("bench-output");
-    let tmp = bench_dir.join("tmp_audio");
+    let run_id = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    );
+    let tmp = bench_dir.join(format!("tmp_audio_{run_id}"));
     fs::create_dir_all(&bench_dir)
         .map_err(|err| format!("failed to create '{}': {err}", bench_dir.display()))?;
     if tmp.exists() {
@@ -124,6 +131,22 @@ pub fn run(root: &Path) -> Result<(), String> {
     let batch_out = tmp.join("batch");
     fs::create_dir_all(&batch_out)
         .map_err(|err| format!("failed to create '{}': {err}", batch_out.display()))?;
+    let controlled_inputs = tmp.join("batch_inputs");
+    fs::create_dir_all(&controlled_inputs)
+        .map_err(|err| format!("failed to create '{}': {err}", controlled_inputs.display()))?;
+    for source in &batch_inputs {
+        let name = source
+            .file_name()
+            .ok_or_else(|| "audio fixture has no file name".to_owned())?;
+        let linked = controlled_inputs.join(name);
+        fs::hard_link(source, &linked).map_err(|err| {
+            format!(
+                "failed to link '{}' into '{}': {err}",
+                source.display(),
+                linked.display()
+            )
+        })?;
+    }
 
     let mut results = Vec::new();
     let mut validation = Vec::new();
@@ -244,10 +267,9 @@ pub fn run(root: &Path) -> Result<(), String> {
         60.0,
     )?);
 
-    let batch_dir = fixtures::audio_batch_dir(root);
     let fastconv_batch_args = vec![
         "audio".to_owned(),
-        path_str(&batch_dir)?,
+        path_str(&controlled_inputs)?,
         path_str(&batch_out)?,
         "--to".to_owned(),
         "flac".to_owned(),
@@ -256,7 +278,7 @@ pub fn run(root: &Path) -> Result<(), String> {
     ];
     results.push(measure_batch(
         "audio_batch_mixed_to_flac",
-        "fastconv (parallel, 4 inputs)",
+        &format!("fastconv (parallel, {} inputs)", batch_inputs.len()),
         &fastconv,
         &fastconv_batch_args,
         batch_bytes,
@@ -283,7 +305,7 @@ pub fn run(root: &Path) -> Result<(), String> {
 
     results.push(measure_batch(
         "audio_batch_mixed_to_flac",
-        "ffmpeg (sequential, 4 inputs)",
+        &format!("ffmpeg (sequential, {} inputs)", batch_inputs.len()),
         Path::new("ffmpeg"),
         &[],
         batch_bytes,
@@ -471,16 +493,7 @@ fn check_lossless_roundtrip(source: &Path, flac: &Path) -> Result<ContentCheck, 
     })
 }
 
-fn check_opus_signal(source: &Path, opus: &Path) -> Result<ContentCheck, String> {
-    let reference = decode_via_ffmpeg_i16(source)?;
-    let decoded = decode_via_ffmpeg_i16(opus)?;
-    if decoded.len() < reference.len().saturating_sub(2 * 48_000) {
-        return Err(format!(
-            "Opus output lost too many samples: {} vs {}",
-            decoded.len(),
-            reference.len()
-        ));
-    }
+fn signal_snr(reference: &[i16], decoded: &[i16]) -> (f64, usize, i32) {
     let count = reference.len().min(decoded.len());
     let mut signal_energy = 0_f64;
     let mut error_energy = 0_f64;
@@ -497,6 +510,20 @@ fn check_opus_signal(source: &Path, opus: &Path) -> Result<ContentCheck, String>
     } else {
         10.0 * (signal_energy / error_energy).log10()
     };
+    (snr, count, peak)
+}
+
+fn check_opus_signal(source: &Path, opus: &Path) -> Result<ContentCheck, String> {
+    let reference = decode_via_ffmpeg_i16(source)?;
+    let decoded = decode_via_ffmpeg_i16(opus)?;
+    if decoded.len() < reference.len().saturating_sub(2 * 48_000) {
+        return Err(format!(
+            "Opus output lost too many samples: {} vs {}",
+            decoded.len(),
+            reference.len()
+        ));
+    }
+    let (snr, count, peak) = signal_snr(&reference, &decoded);
     let passed = snr >= 18.0 && peak > 0;
     let check = ContentCheck {
         check: "wav->opus SNR".to_owned(),
@@ -511,22 +538,55 @@ fn check_opus_signal(source: &Path, opus: &Path) -> Result<ContentCheck, String>
 }
 
 fn check_batch_samples(source: &Path, output: &Path, label: &str) -> Result<ContentCheck, String> {
-    let source_samples = decode_i16(source)?;
+    let extension = source
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let source_samples = if extension == "opus" {
+        decode_via_ffmpeg_i16(source)?
+    } else {
+        decode_i16(source)?
+    };
     let output_samples = decode_i16(output)?;
-    let passed = source_samples.len() == output_samples.len();
-    let check = ContentCheck {
-        check: format!("batch {label} samples"),
-        detail: format!(
-            "{} source samples -> {} decoded FLAC samples",
+    if source_samples.len() != output_samples.len() {
+        return Err(format!(
+            "batch {label} sample count mismatch: {} source samples vs {} decoded FLAC samples",
             source_samples.len(),
             output_samples.len()
-        ),
+        ));
+    }
+    let lossless = matches!(extension.as_str(), "wav" | "wave" | "flac");
+    let (detail, passed) = if lossless {
+        let identical = source_samples == output_samples;
+        (
+            format!(
+                "{} samples {}",
+                source_samples.len(),
+                if identical {
+                    "bit-identical"
+                } else {
+                    "changed"
+                }
+            ),
+            identical,
+        )
+    } else {
+        let (snr, count, peak) = signal_snr(&source_samples, &output_samples);
+        (
+            format!("{snr:.1} dB over {count} samples (peak {peak})"),
+            snr >= 25.0 && peak > 0,
+        )
+    };
+    let check = ContentCheck {
+        check: format!("batch {label} PCM"),
+        detail,
         passed,
     };
     if passed {
         Ok(check)
     } else {
-        Err(format!("Batch sample count mismatch: {}", check.detail))
+        Err(format!("Batch content check failed: {}", check.detail))
     }
 }
 
@@ -554,15 +614,45 @@ fn ffmpeg_version() -> Result<String, String> {
 
 fn build_fastconv(root: &Path) -> Result<PathBuf, String> {
     println!("==> cargo build --release -p fastconv-cli");
-    let status = Command::new(crate::cargo_bin())
+    let output = Command::new(crate::cargo_bin())
         .current_dir(root)
-        .args(["build", "--release", "-p", "fastconv-cli"])
-        .status()
+        .args([
+            "build",
+            "--release",
+            "-p",
+            "fastconv-cli",
+            "--message-format=json",
+        ])
+        .output()
         .map_err(|err| format!("failed to build fastconv release binary: {err}"))?;
-    if !status.success() {
-        return Err(format!("fastconv release build failed with {status}"));
+    if !output.status.success() {
+        return Err(format!(
+            "fastconv release build failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
-    Ok(root.join("target/release/fastconv"))
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if message.get("reason").and_then(|v| v.as_str()) != Some("compiler-artifact") {
+            continue;
+        }
+        if message
+            .get("target")
+            .and_then(|v| v.get("name"))
+            .and_then(|v| v.as_str())
+            != Some("fastconv")
+        {
+            continue;
+        }
+        if let Some(executable) = message.get("executable").and_then(|v| v.as_str()) {
+            return Ok(PathBuf::from(executable));
+        }
+    }
+    Err("cargo did not report a fastconv executable artifact".to_owned())
 }
 
 fn file_size(path: &Path) -> Result<NonZeroU64, String> {
@@ -780,6 +870,7 @@ fn validate(
         .args([
             "-v",
             "error",
+            "-xerror",
             "-nostdin",
             "-i",
             &path_str(output)?,

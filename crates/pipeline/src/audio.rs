@@ -2,11 +2,12 @@
 //! `opus-pure`, a dependency-free pure-Rust RFC 6716/Ogg Opus implementation. C-backed crates
 //! such as `libopus`/`vorbis_rs` are deliberately avoided so CI needs no system audio libraries.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::io;
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -38,6 +39,8 @@ const OPUS_RATE: u32 = 48_000;
 const OPUS_FRAME_MS: u32 = 20;
 const OPUS_BITRATE: i32 = 128_000;
 const RESAMPLE_CHUNK: usize = 1024;
+const MAX_PCM_BYTES_PER_FILE: u64 = 512 * 1024 * 1024;
+const MAX_PCM_BYTES_PER_BATCH: u64 = 1024 * 1024 * 1024;
 
 /// Per-worker scratch space. All buffers are retained across files so a batch does not
 /// reallocate its decode/encode working set for every item.
@@ -100,6 +103,11 @@ fn to_i32_saturating(value: f32) -> i32 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let narrowed = value.round() as i32;
     narrowed
+}
+
+fn quantize_i8(sample: f32) -> i8 {
+    let value = to_i32_saturating(sample.clamp(-1.0, 1.0) * 128.0).clamp(-128, 127);
+    i8::try_from(value).unwrap_or(if value < 0 { i8::MIN } else { i8::MAX })
 }
 
 fn quantize_i16(sample: f32) -> i16 {
@@ -276,22 +284,45 @@ fn decode_audio(
 fn quantize_for(target: AudioOutputFormat, bits: usize, buf: &mut AudioWorkerBuffer) {
     buf.samples_i16.clear();
     buf.samples_i32.clear();
-    match target {
-        AudioOutputFormat::Opus => {
+    match (target, bits) {
+        (AudioOutputFormat::Opus, _) | (AudioOutputFormat::Wav, 16 | 0) => {
             buf.samples_i16
                 .extend(buf.samples_f32.iter().copied().map(quantize_i16));
         }
-        AudioOutputFormat::Wav | AudioOutputFormat::Flac if bits == 24 => {
+        (AudioOutputFormat::Wav, 8) => {
+            buf.samples_i16.extend(
+                buf.samples_f32
+                    .iter()
+                    .copied()
+                    .map(|s| i16::from(quantize_i8(s))),
+            );
+        }
+        (AudioOutputFormat::Wav | AudioOutputFormat::Flac, 24) => {
             buf.samples_i32
                 .extend(buf.samples_f32.iter().copied().map(quantize_i24));
         }
-        AudioOutputFormat::Wav | AudioOutputFormat::Flac => {
-            buf.samples_i16
-                .extend(buf.samples_f32.iter().copied().map(quantize_i16));
-            buf.samples_i32
-                .extend(buf.samples_i16.iter().copied().map(i32::from));
+        (AudioOutputFormat::Flac, 8) => {
+            buf.samples_i32.extend(
+                buf.samples_f32
+                    .iter()
+                    .copied()
+                    .map(|s| i32::from(quantize_i8(s))),
+            );
         }
+        (AudioOutputFormat::Flac, _) => {
+            buf.samples_i32.extend(
+                buf.samples_f32
+                    .iter()
+                    .copied()
+                    .map(|s| i32::from(quantize_i16(s))),
+            );
+        }
+        // Unsupported depths are rejected before quantization; keep the match exhaustive.
+        _ => {}
     }
+    // Only one PCM representation is needed after quantization; release the float copy so peak
+    // memory stays bounded to a single full-file sample array per active worker.
+    buf.samples_f32.clear();
 }
 
 fn encode_flac(
@@ -300,6 +331,7 @@ fn encode_flac(
     channels: usize,
     bits: usize,
     buf: &AudioWorkerBuffer,
+    batch_workers: usize,
 ) -> Result<(), PipelineError> {
     let mut config = flacenc::config::Encoder::default();
     config.block_size = FLAC_BLOCK_SIZE;
@@ -308,12 +340,17 @@ fn encode_flac(
     // Measured on the 60s fixture with `par` workers: QLPC on => 432.7 ms (slower than ffmpeg's
     // 240.3 ms), QLPC off => ~135 ms (faster than ffmpeg) at the same decoded samples.
     config.subframe_coding.use_lpc = false;
-    config.multithread = true;
-    config.workers = NonZeroUsize::new(
-        std::thread::available_parallelism()
-            .map_or(1, NonZeroUsize::get)
-            .min(8),
-    );
+    let available = std::thread::available_parallelism()
+        .map_or(1, NonZeroUsize::get)
+        .min(8);
+    // A batch already saturates the host with its worker threads; only use inner parallelism
+    // for a single-file conversion where capacity is otherwise idle.
+    config.multithread = batch_workers <= 1 && available > 1;
+    config.workers = if config.multithread {
+        NonZeroUsize::new(available)
+    } else {
+        None
+    };
     let config = config
         .into_verified()
         .map_err(|(_, err)| PipelineError::EncodeFailed {
@@ -384,6 +421,16 @@ fn encode_wav(
                     reason: format!("WAV sample write failed: {err}"),
                 })?;
         }
+    } else if bits == 8 {
+        for &sample in &buf.samples_i16 {
+            let value = i8::try_from(sample).unwrap_or(if sample < 0 { i8::MIN } else { i8::MAX });
+            writer
+                .write_sample(value)
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: path.to_path_buf(),
+                    reason: format!("WAV sample write failed: {err}"),
+                })?;
+        }
     } else {
         for &sample in &buf.samples_i16 {
             writer
@@ -444,10 +491,27 @@ fn resample_to_opus_rate(
         reason: format!("failed to create resampler from {rate} Hz to 48000 Hz: {err}"),
     })?;
     let chunk_in = resampler.input_frames_next();
+    let chunk_out = resampler.output_frames_next().max(1);
     let mut out_chunk = resampler.output_buffer_allocate(true);
     let input_frames = input.len() / channels;
-    let mut offset = 0_usize;
-    while offset < input_frames {
+    let expected_u64 = (u64::try_from(input_frames).unwrap_or(u64::MAX))
+        .saturating_mul(u64::from(OPUS_RATE))
+        / u64::from(rate);
+    let expected = usize::try_from(expected_u64).unwrap_or(usize::MAX);
+    let delay = resampler.output_delay();
+    let needed = expected.saturating_add(delay);
+    let max_calls = input_frames
+        .div_ceil(chunk_in)
+        .saturating_add(needed.div_ceil(chunk_out))
+        .saturating_add(4);
+
+    let mut calls = 0_usize;
+    loop {
+        let produced_frames = planar_out.first().map_or(0, Vec::len);
+        if produced_frames >= needed || calls >= max_calls {
+            break;
+        }
+        let offset = calls.saturating_mul(chunk_in);
         let take = chunk_in.min(input_frames.saturating_sub(offset));
         for slot in &mut out_chunk {
             slot.fill(0.0);
@@ -463,30 +527,25 @@ fn resample_to_opus_rate(
                 }
             }
         }
-        let (consumed, produced) = resampler
+        let (_, produced) = resampler
             .process_into_buffer(&chunk, &mut out_chunk, None)
             .map_err(|err| PipelineError::EncodeFailed {
                 path: Path::new("opus-resampler").to_path_buf(),
                 reason: format!("resampling failed: {err}"),
             })?;
-        if consumed == 0 {
-            break;
-        }
         for channel in 0..channels {
             if let (Some(dst), Some(src)) = (planar_out.get_mut(channel), out_chunk.get(channel)) {
                 dst.extend_from_slice(&src[..produced.min(src.len())]);
             }
         }
-        offset = offset.saturating_add(consumed);
+        calls += 1;
     }
 
-    let expected_u64 = (u64::try_from(input_frames).unwrap_or(u64::MAX))
-        .saturating_mul(u64::from(OPUS_RATE))
-        / u64::from(rate);
-    let expected = usize::try_from(expected_u64).unwrap_or(usize::MAX);
+    let available = planar_out.first().map_or(0, Vec::len);
+    let skip = delay.min(available);
+    let total_frames = expected.min(available.saturating_sub(skip));
     buf.resampled_f32.clear();
-    let total_frames = planar_out.first().map_or(0, Vec::len).min(expected);
-    for frame in 0..total_frames {
+    for frame in skip..skip.saturating_add(total_frames) {
         for channel in 0..channels {
             if let Some(value) = planar_out.get(channel).and_then(|v| v.get(frame)) {
                 buf.resampled_f32.push(*value);
@@ -513,8 +572,7 @@ fn encode_opus(
     std::mem::swap(&mut buf.samples_f32, &mut buf.resampled_f32);
     buf.resampled_f32.clear();
     quantize_for(AudioOutputFormat::Opus, 16, buf);
-    let pcm_i16 = std::mem::take(&mut buf.samples_i16);
-    buf.samples_i16.clear();
+    let pcm_i16 = &buf.samples_i16;
 
     let mut encoder = OpusEncoder::new(
         i32::try_from(OPUS_RATE).unwrap_or(i32::MAX),
@@ -588,6 +646,45 @@ fn encode_opus(
         })
 }
 
+static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Reserves a unique, exclusively created staging file in the target directory so concurrent
+/// processes and source/target aliases cannot collide with an existing file.
+fn create_staging_file(target: &Path) -> Result<PathBuf, PipelineError> {
+    let parent = target
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    for _ in 0..64 {
+        let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let staging = parent.join(format!(
+            ".fastconv-audio-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+        {
+            Ok(_) => return Ok(staging),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                return Err(PipelineError::Io {
+                    path: staging,
+                    source,
+                });
+            }
+        }
+    }
+    Err(PipelineError::Io {
+        path: target.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "failed to reserve a unique staging file",
+        ),
+    })
+}
+
 fn encode_audio(
     item: &AudioBatchItem,
     mode: fastconv_domain::AudioExecutionMode,
@@ -595,7 +692,7 @@ fn encode_audio(
     channels: usize,
     bits: usize,
     buf: &mut AudioWorkerBuffer,
-    worker_id: usize,
+    batch_workers: usize,
 ) -> Result<u64, PipelineError> {
     let target = item.target();
     if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -604,48 +701,71 @@ fn encode_audio(
             source,
         })?;
     }
-    let temp = target.with_extension(format!(
-        "fastconv-{worker_id}-{}",
-        mode.output_format().extension()
-    ));
-    let bits = if bits == 8 || bits == 16 || bits == 24 {
-        bits
-    } else {
-        16
+    let temp = create_staging_file(target)?;
+    let bits = match bits {
+        0 => 16, // lossy source with no declared depth
+        8 | 16 | 24 => bits,
+        unsupported => {
+            let _ = fs::remove_file(&temp);
+            return Err(PipelineError::UnsupportedSampleDepth {
+                path: item.source().to_path_buf(),
+                bits: unsupported,
+            });
+        }
     };
-    quantize_for(mode.output_format(), bits, buf);
+    if mode.output_format() != AudioOutputFormat::Opus {
+        quantize_for(mode.output_format(), bits, buf);
+    }
 
-    let result = match mode.output_format() {
-        AudioOutputFormat::Wav => encode_wav(&temp, rate, channels, bits, buf),
-        AudioOutputFormat::Flac => encode_flac(&temp, rate, channels, bits, buf),
-        AudioOutputFormat::Opus => encode_opus(&temp, rate, channels, buf),
-    };
-    let output_bytes = fs::metadata(&temp).map_or(0, |meta| meta.len());
-    if let Err(err) = result {
+    let encode = (|| -> Result<u64, PipelineError> {
+        match mode.output_format() {
+            AudioOutputFormat::Wav => encode_wav(&temp, rate, channels, bits, buf)?,
+            AudioOutputFormat::Flac => {
+                encode_flac(&temp, rate, channels, bits, buf, batch_workers)?;
+            }
+            AudioOutputFormat::Opus => encode_opus(&temp, rate, channels, buf)?,
+        }
+        let output_bytes = fs::metadata(&temp).map_or(0, |meta| meta.len());
+        if output_bytes == 0 {
+            return Err(PipelineError::EmptyOutput(target.to_path_buf()));
+        }
+        fs::rename(&temp, target).map_err(|source| PipelineError::Io {
+            path: target.to_path_buf(),
+            source,
+        })?;
+        Ok(output_bytes)
+    })();
+    if encode.is_err() {
         let _ = fs::remove_file(&temp);
-        return Err(err);
     }
-    if output_bytes == 0 {
-        let _ = fs::remove_file(&temp);
-        return Err(PipelineError::EmptyOutput(target.to_path_buf()));
-    }
-    fs::rename(&temp, target).map_err(|source| PipelineError::Io {
-        path: target.to_path_buf(),
-        source,
-    })?;
-    Ok(output_bytes)
+    encode
 }
 
 fn convert_item(
     item: &AudioBatchItem,
     mode: fastconv_domain::AudioExecutionMode,
     buf: &mut AudioWorkerBuffer,
-    worker_id: usize,
+    batch_workers: usize,
 ) -> Result<(u64, u64), PipelineError> {
     let input_bytes = fs::metadata(item.source()).map_or(0, |meta| meta.len());
     let (rate, channels, bits) = decode_audio(item, buf)?;
-    let output_bytes = encode_audio(item, mode, rate, channels, bits, buf, worker_id)?;
+    let output_bytes = encode_audio(item, mode, rate, channels, bits, buf, batch_workers)?;
     Ok((input_bytes, output_bytes))
+}
+
+/// Worst-case working-set estimate for one file: interleaved f32 (or i32) samples.
+fn estimate_pcm_bytes(item: &AudioBatchItem) -> u64 {
+    let stream = item.stream();
+    let channels = u64::from(stream.channels().get()).max(1);
+    let bits = stream
+        .bits_per_sample()
+        .map_or(16, |value| u64::from(value.get()))
+        .max(8);
+    let frames = stream.total_samples().unwrap_or_else(|| {
+        let file_bytes = fs::metadata(item.source()).map_or(0, |meta| meta.len());
+        file_bytes / channels / (bits / 8).max(1)
+    });
+    frames.saturating_mul(channels).saturating_mul(4)
 }
 
 /// Executes a validated [`AudioBatchPlan`] on reusable per-worker sample buffers.
@@ -658,10 +778,25 @@ pub fn execute_audio_batch(plan: &AudioBatchPlan) -> Result<AudioConversionRepor
     let items = plan.items();
     let next = AtomicUsize::new(0);
     let first_error: Mutex<Option<PipelineError>> = Mutex::new(None);
-    let worker_count = plan.effective_workers().get();
+    let requested_workers = plan.effective_workers().get();
+    let largest_pcm = items.iter().map(estimate_pcm_bytes).max().unwrap_or(0);
+    if largest_pcm > MAX_PCM_BYTES_PER_FILE {
+        return Err(PipelineError::DecodeFailed {
+            path: items[0].source().to_path_buf(),
+            reason: format!(
+                "estimated PCM working set {largest_pcm} bytes exceeds the {MAX_PCM_BYTES_PER_FILE} byte per-file limit"
+            ),
+        });
+    }
+    let budget_workers = u64::try_from(requested_workers)
+        .unwrap_or(u64::MAX)
+        .min(MAX_PCM_BYTES_PER_BATCH / largest_pcm.max(1));
+    let worker_count = usize::try_from(budget_workers.max(1))
+        .unwrap_or(usize::MAX)
+        .min(requested_workers);
 
     thread::scope(|scope| {
-        for worker_id in 0..worker_count {
+        for _worker_id in 0..worker_count {
             let next = &next;
             let first_error = &first_error;
             scope.spawn(move || {
@@ -672,7 +807,7 @@ pub fn execute_audio_batch(plan: &AudioBatchPlan) -> Result<AudioConversionRepor
                     }
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some(item) = items.get(index) else { break };
-                    if let Err(err) = convert_item(item, plan.mode(), &mut buffer, worker_id) {
+                    if let Err(err) = convert_item(item, plan.mode(), &mut buffer, worker_count) {
                         if let Ok(mut guard) = first_error.lock()
                             && guard.is_none()
                         {
@@ -710,7 +845,7 @@ pub fn execute_audio_batch(plan: &AudioBatchPlan) -> Result<AudioConversionRepor
         input,
         output,
         started.elapsed(),
-        plan.effective_workers(),
+        NonZeroUsize::new(worker_count).unwrap_or(plan.effective_workers()),
         HardwareBackend::Cpu,
     )
     .map_err(|err| PipelineError::EncodeFailed {

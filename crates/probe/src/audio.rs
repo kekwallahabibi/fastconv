@@ -139,7 +139,7 @@ fn probe_symphonia(path: &Path, format: AudioInputFormat) -> Result<AudioStreamI
     let bits_per_sample = params
         .bits_per_sample
         .and_then(|bits| NonZeroU16::new(u16::try_from(bits).unwrap_or(u16::MAX)));
-    AudioStreamInfo::new(channels, sample_rate, bits_per_sample, None)
+    AudioStreamInfo::new(channels, sample_rate, bits_per_sample, track.num_frames)
         .map_err(|err| invalid_audio(path, err.to_string()))
 }
 
@@ -241,6 +241,10 @@ fn prepare_directory_batch(
         }
     }
 
+    if canonical_or_parent(source_dir)? == canonical_or_parent(target_dir)? {
+        return Err(DomainError::IdenticalSourceAndTarget(source_dir.to_path_buf()).into());
+    }
+
     let mut candidates = Vec::new();
     for entry in fs::read_dir(source_dir).map_err(|source| ProbeError::Io {
         path: source_dir.to_path_buf(),
@@ -278,7 +282,7 @@ fn prepare_directory_batch(
         name.push(".");
         name.push(format.extension());
         items.push(AudioBatchItem::new(
-            path,
+            canonical_or_parent(&path)?,
             target_dir.join(name),
             probed.format,
             probed.stream,
@@ -290,6 +294,26 @@ fn prepare_directory_batch(
 
     let mode = AudioExecutionMode::resolve(format, HardwareBackend::Cpu)?;
     Ok(AudioBatchPlan::new(items, mode, threads)?)
+}
+
+/// Resolves a path to an absolute location, using the parent directory for outputs that do not
+/// exist yet. This makes relative/absolute aliases comparable at the boundary.
+fn canonical_or_parent(path: &Path) -> Result<PathBuf, ProbeError> {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return Ok(canonical);
+    }
+    let parent = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent).map_err(|source| ProbeError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid_audio(path, "path has no file name"))?;
+    Ok(parent.join(name))
 }
 
 /// Parses external paths and options once, then returns a domain [`AudioBatchPlan`].
@@ -331,10 +355,15 @@ pub fn prepare_audio_batch(
     }
 
     let (resolved_target, format) = resolve_single_target(source, target, to)?;
+    let canonical_source = canonical_or_parent(source)?;
+    let canonical_target = canonical_or_parent(&resolved_target)?;
+    if canonical_source == canonical_target {
+        return Err(DomainError::IdenticalSourceAndTarget(source.to_path_buf()).into());
+    }
     let mode = AudioExecutionMode::resolve(format, backend)?;
     let probed = probe_audio(source)?;
     let item = AudioBatchItem::new(
-        source.to_path_buf(),
+        canonical_source,
         resolved_target,
         probed.format,
         probed.stream,
@@ -392,6 +421,28 @@ mod tests {
                 .unwrap_or_else(|_| (PathBuf::new(), AudioOutputFormat::Wav));
         assert_eq!(dir_target, PathBuf::from("dist/track.opus"));
         assert_eq!(format, AudioOutputFormat::Opus);
+    }
+
+    #[test]
+    fn rejects_relative_and_absolute_path_aliases() -> Result<(), String> {
+        let cwd = std::env::current_dir().map_err(|err| err.to_string())?;
+        let dir = cwd.join(format!("target/audio-alias-{}", std::process::id()));
+        fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let absolute = dir.join("track.wav");
+        fs::write(&absolute, b"RIFF").map_err(|err| err.to_string())?;
+        let relative = absolute
+            .strip_prefix(&cwd)
+            .unwrap_or(&absolute)
+            .to_path_buf();
+        let result = prepare_audio_batch(&relative, &absolute, None, None, HardwareBackend::Cpu);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(matches!(
+            result,
+            Err(ProbeError::InvalidDomain(
+                DomainError::IdenticalSourceAndTarget(_)
+            ))
+        ));
+        Ok(())
     }
 
     #[test]

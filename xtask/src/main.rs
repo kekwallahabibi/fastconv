@@ -422,28 +422,91 @@ fn forbidden_license(license: &str) -> bool {
 }
 
 fn license_allowed(license: &str) -> bool {
-    let normalized = license
+    let tokens: Vec<String> = license
         .trim()
         .to_ascii_lowercase()
         .replace('/', " or ")
-        .replace(['(', ')'], " ");
-    let or_terms: Vec<&str> = normalized
-        .split(" or ")
-        .map(str::trim)
-        .filter(|term| !term.is_empty())
+        .replace('(', " ( ")
+        .replace(')', " ) ")
+        .split_whitespace()
+        .map(str::to_owned)
         .collect();
-    if or_terms.len() > 1 {
-        return or_terms.iter().any(|term| license_term_allowed(term));
+    if tokens.is_empty() {
+        return false;
     }
-    let and_terms: Vec<&str> = normalized
-        .split(" and ")
-        .map(str::trim)
-        .filter(|term| !term.is_empty())
-        .collect();
-    if and_terms.len() > 1 {
-        return and_terms.iter().all(|term| license_term_allowed(term));
+    let mut parser = LicenseParser {
+        tokens: &tokens,
+        pos: 0,
+    };
+    parser.parse_or()
+}
+
+struct LicenseParser<'a> {
+    tokens: &'a [String],
+    pos: usize,
+}
+
+impl<'a> LicenseParser<'a> {
+    fn peek(&self) -> Option<&str> {
+        self.tokens.get(self.pos).map(String::as_str)
     }
-    license_term_allowed(normalized.trim())
+
+    fn next(&mut self) -> Option<&'a str> {
+        let token = self.tokens.get(self.pos).map(String::as_str);
+        if token.is_some() {
+            self.pos += 1;
+        }
+        token
+    }
+
+    fn parse_or(&mut self) -> bool {
+        let mut value = self.parse_and();
+        while self.peek() == Some("or") {
+            self.pos += 1;
+            let rhs = self.parse_and();
+            value = value || rhs;
+        }
+        value
+    }
+
+    fn parse_and(&mut self) -> bool {
+        let mut value = self.parse_primary();
+        while self.peek() == Some("and") {
+            self.pos += 1;
+            let rhs = self.parse_primary();
+            value = value && rhs;
+        }
+        value
+    }
+
+    fn parse_primary(&mut self) -> bool {
+        if self.peek() == Some("(") {
+            self.pos += 1;
+            let value = self.parse_or();
+            if self.peek() == Some(")") {
+                self.pos += 1;
+            }
+            return value;
+        }
+        let Some(base) = self.next() else {
+            return false;
+        };
+        if self.peek() == Some("with") {
+            self.pos += 1;
+            let Some(exception) = self.next() else {
+                return false;
+            };
+            return license_term_with_exception(base, exception);
+        }
+        license_term_allowed(base)
+    }
+}
+
+fn license_term_with_exception(base: &str, exception: &str) -> bool {
+    if exception.is_empty() {
+        return false;
+    }
+    matches!(base, "gpl-2.0" | "gpl-2.0-only" | "gpl-2.0-or-later") || license_term_allowed(base)
 }
 
 fn license_term_allowed(term: &str) -> bool {
@@ -506,7 +569,11 @@ fn cmd_bench_status(root: &Path) {
         "60s WAV      : {}",
         if has_wav { "ready" } else { "missing" }
     );
-    println!("Mixed audio  : {audio_batch_count}/4");
+    println!(
+        "Mixed audio  : {}/{}",
+        audio_batch_count,
+        fixtures::audio_batch_inputs(root).len()
+    );
     println!(
         "1080p60 MP4  : {}",
         if has_mp4 { "ready" } else { "missing" }
@@ -644,6 +711,8 @@ fn helper<'a>(s: &'a str) -> char { let _ = s; '\"' }
             "ISC",
             "Unlicense OR MIT",
             "CC0-1.0",
+            "GPL-2.0-only WITH Classpath-exception-2.0",
+            "GPL-3.0-only AND (GPL-2.0-only WITH Classpath-exception-2.0)",
         ] {
             assert!(!forbidden_license(allowed), "should be allowed: {allowed}");
         }
@@ -657,8 +726,8 @@ fn helper<'a>(s: &'a str) -> char { let _ = s; '\"' }
             "Proprietary",
             "CC-BY-NC-4.0",
             "GPL-2.0-only",
-            "GPL-2.0 WITH Classpath-exception-2.0",
             "MIT AND GPL-2.0-only",
+            "(MIT OR Apache-2.0) AND GPL-2.0-only",
         ] {
             assert!(
                 forbidden_license(forbidden),

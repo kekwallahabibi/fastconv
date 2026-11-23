@@ -33,6 +33,7 @@ pub enum PipelineError {
     EncodeFailed { path: PathBuf, reason: String },
     RemuxFailed { path: PathBuf, reason: String },
     UnsupportedPixelFormat { path: PathBuf, format: String },
+    UnsupportedSampleDepth { path: PathBuf, bits: usize },
     EmptyOutput(PathBuf),
     WorkerPanicked,
 }
@@ -65,6 +66,11 @@ impl fmt::Display for PipelineError {
                     path.display()
                 )
             }
+            Self::UnsupportedSampleDepth { path, bits } => write!(
+                f,
+                "unsupported audio sample depth {bits} in '{}'; supported depths are 8, 16 and 24 bits",
+                path.display()
+            ),
             Self::EmptyOutput(path) => {
                 write!(f, "encoder produced empty output for '{}'", path.display())
             }
@@ -83,6 +89,7 @@ impl Error for PipelineError {
             | Self::EncodeFailed { .. }
             | Self::RemuxFailed { .. }
             | Self::UnsupportedPixelFormat { .. }
+            | Self::UnsupportedSampleDepth { .. }
             | Self::EmptyOutput(_)
             | Self::WorkerPanicked => None,
         }
