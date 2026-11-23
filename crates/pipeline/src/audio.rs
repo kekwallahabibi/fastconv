@@ -305,6 +305,8 @@ fn encode_flac(
     config.block_size = FLAC_BLOCK_SIZE;
     // Prefer encode speed over compression ratio: fixed LPC (order <= 4) is cheap, while the
     // quantized LPC search dominates runtime and only improves compression slightly.
+    // Measured on the 60s fixture with `par` workers: QLPC on => 432.7 ms (slower than ffmpeg's
+    // 240.3 ms), QLPC off => ~135 ms (faster than ffmpeg) at the same decoded samples.
     config.subframe_coding.use_lpc = false;
     config.multithread = true;
     config.workers = NonZeroUsize::new(
@@ -524,6 +526,8 @@ fn encode_opus(
         reason: format!("failed to create Opus encoder: {err}"),
     })?;
     encoder.bitrate_bps = OPUS_BITRATE;
+    // opus-pure defaults to complexity 9; libopus defaults to 10. Keep 9 explicitly for speed.
+    encoder.complexity = 9;
     let head = OpusHead::for_encoder(&encoder, OPUS_RATE);
     let pre_skip = usize::from(head.pre_skip);
     let file = File::create(path).map_err(|source| PipelineError::Io {

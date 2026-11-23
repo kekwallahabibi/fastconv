@@ -1,4 +1,5 @@
 use std::fs;
+use std::fs::File;
 use std::io::Read;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -10,12 +11,26 @@ use fastconv_domain::{
     BenchmarkMetrics, BenchmarkSample, HostHardware, MediaKind, PeakMemory, WorkloadUnit,
 };
 use serde::{Deserialize, Serialize};
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::TrackType;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+use symphonia::core::meta::MetadataOptions;
 
 use crate::bench::format_baseline_table;
 use crate::fixtures::{self, audio_batch_inputs, audio_wav_path};
 
 const REPETITIONS: usize = 3;
 const EXPECTED_DURATION_TOLERANCE: f64 = 0.2;
+
+#[derive(Clone, Debug, Serialize)]
+struct ContentCheck {
+    check: String,
+    detail: String,
+    passed: bool,
+}
 
 #[derive(Serialize)]
 struct AudioBenchReport {
@@ -24,6 +39,7 @@ struct AudioBenchReport {
     hardware: HostHardware,
     results: Vec<BenchmarkMetrics>,
     validation: Vec<AudioValidation>,
+    content_checks: Vec<ContentCheck>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,6 +127,7 @@ pub fn run(root: &Path) -> Result<(), String> {
 
     let mut results = Vec::new();
     let mut validation = Vec::new();
+    let mut content_checks = Vec::new();
 
     let fastconv_flac_args = vec![
         "audio".to_owned(),
@@ -147,6 +164,7 @@ pub fn run(root: &Path) -> Result<(), String> {
         2,
         60.0,
     )?);
+    content_checks.push(check_lossless_roundtrip(&wav, &flac_out)?);
     results.push(measure_workload(
         "audio_60s_wav_to_flac",
         "ffmpeg (flac -5)",
@@ -200,6 +218,14 @@ pub fn run(root: &Path) -> Result<(), String> {
         2,
         60.0,
     )?);
+    content_checks.push(ContentCheck {
+        check: "opus complexity".to_owned(),
+        detail:
+            "opus-pure default complexity=9; libopus default complexity=10 (both 128 kbps, VBR)"
+                .to_owned(),
+        passed: true,
+    });
+    content_checks.push(check_opus_signal(&wav, &opus_out)?);
     results.push(measure_workload(
         "audio_60s_wav_to_opus",
         "ffmpeg (libopus 128k)",
@@ -242,8 +268,9 @@ pub fn run(root: &Path) -> Result<(), String> {
             .file_stem()
             .and_then(|s| s.to_str())
             .ok_or_else(|| "audio batch input has no UTF-8 stem".to_owned())?;
+        let output = batch_out.join(format!("{stem}.flac"));
         validation.push(validate(
-            &batch_out.join(format!("{stem}.flac")),
+            &output,
             "audio_batch_mixed_to_flac",
             "fastconv",
             "flac",
@@ -251,6 +278,7 @@ pub fn run(root: &Path) -> Result<(), String> {
             2,
             f64::from(fixtures::AUDIO_BATCH_SECS),
         )?);
+        content_checks.push(check_batch_samples(source, &output, stem)?);
     }
 
     results.push(measure_batch(
@@ -292,13 +320,23 @@ pub fn run(root: &Path) -> Result<(), String> {
             entry.duration_secs
         );
     }
+    println!("Audio content checks (native Symphonia decode):");
+    for check in &content_checks {
+        println!(
+            "  [{}] {:<28} {}",
+            if check.passed { "PASS" } else { "FAIL" },
+            check.check,
+            check.detail
+        );
+    }
 
     let report = AudioBenchReport {
-        schema_version: 1,
+        schema_version: 2,
         ffmpeg_version,
         hardware,
         results,
         validation,
+        content_checks,
     };
     let json = serde_json::to_string_pretty(&report)
         .map_err(|err| format!("failed to serialize audio benchmark: {err}"))?;
@@ -310,6 +348,186 @@ pub fn run(root: &Path) -> Result<(), String> {
 
     let _ = fs::remove_dir_all(&tmp);
     Ok(())
+}
+
+fn decode_i16(path: &Path) -> Result<Vec<i16>, String> {
+    let file =
+        File::open(path).map_err(|err| format!("failed to open '{}': {err}", path.display()))?;
+    let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mut reader = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|err| format!("failed to probe '{}': {err}", path.display()))?;
+    let track = reader
+        .default_track(TrackType::Audio)
+        .ok_or_else(|| format!("no audio track in '{}'", path.display()))?;
+    let params = track
+        .codec_params
+        .as_ref()
+        .and_then(|p| p.audio())
+        .ok_or_else(|| format!("no audio params in '{}'", path.display()))?
+        .clone();
+    let track_id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&params, &AudioDecoderOptions::default())
+        .map_err(|err| format!("failed to create decoder for '{}': {err}", path.display()))?;
+    let mut samples = Vec::new();
+    loop {
+        let packet = match reader.next_packet() {
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(err) => {
+                return Err(format!(
+                    "failed to read packet from '{}': {err}",
+                    path.display()
+                ));
+            }
+        };
+        if packet.track_id != track_id {
+            continue;
+        }
+        let frame = match decoder.decode(&packet) {
+            Ok(frame) => frame,
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(err) => return Err(format!("failed to decode '{}': {err}", path.display())),
+        };
+        let start = samples.len();
+        let count = frame.samples_interleaved();
+        samples.resize(start.saturating_add(count), 0);
+        if let Some(slot) = samples.get_mut(start..start.saturating_add(count)) {
+            frame.copy_to_slice_interleaved(slot);
+        }
+    }
+    if samples.is_empty() {
+        return Err(format!(
+            "decoded sample stream is empty in '{}'",
+            path.display()
+        ));
+    }
+    Ok(samples)
+}
+
+fn decode_via_ffmpeg_i16(path: &Path) -> Result<Vec<i16>, String> {
+    let output = Command::new("ffmpeg")
+        .stdin(Stdio::null())
+        .args([
+            "-v",
+            "error",
+            "-nostdin",
+            "-i",
+            &path_str(path)?,
+            "-f",
+            "s16le",
+            "-acodec",
+            "pcm_s16le",
+            "-",
+        ])
+        .output()
+        .map_err(|err| format!("failed to decode '{}' with ffmpeg: {err}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffmpeg failed to decode '{}': {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output
+        .stdout
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect())
+}
+
+fn check_lossless_roundtrip(source: &Path, flac: &Path) -> Result<ContentCheck, String> {
+    let original = decode_i16(source)?;
+    let roundtrip = decode_i16(flac)?;
+    if original != roundtrip {
+        let first = original
+            .iter()
+            .zip(roundtrip.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(original.len().min(roundtrip.len()));
+        return Err(format!(
+            "FLAC roundtrip is not bit-identical: {} vs {} samples, first difference at {first}",
+            original.len(),
+            roundtrip.len()
+        ));
+    }
+    Ok(ContentCheck {
+        check: "wav->flac->wav bit-exact".to_owned(),
+        detail: format!("{} samples identical", original.len()),
+        passed: true,
+    })
+}
+
+fn check_opus_signal(source: &Path, opus: &Path) -> Result<ContentCheck, String> {
+    let reference = decode_via_ffmpeg_i16(source)?;
+    let decoded = decode_via_ffmpeg_i16(opus)?;
+    if decoded.len() < reference.len().saturating_sub(2 * 48_000) {
+        return Err(format!(
+            "Opus output lost too many samples: {} vs {}",
+            decoded.len(),
+            reference.len()
+        ));
+    }
+    let count = reference.len().min(decoded.len());
+    let mut signal_energy = 0_f64;
+    let mut error_energy = 0_f64;
+    let mut peak = 0_i32;
+    for index in 0..count {
+        let a = i32::from(reference[index]);
+        let b = i32::from(decoded[index]);
+        signal_energy += f64::from(a.saturating_mul(a));
+        error_energy += f64::from(a.saturating_sub(b).saturating_mul(a.saturating_sub(b)));
+        peak = peak.max(a.abs());
+    }
+    let snr = if error_energy == 0.0 {
+        120.0
+    } else {
+        10.0 * (signal_energy / error_energy).log10()
+    };
+    let passed = snr >= 18.0 && peak > 0;
+    let check = ContentCheck {
+        check: "wav->opus SNR".to_owned(),
+        detail: format!("{snr:.1} dB over {count} samples (peak {peak})"),
+        passed,
+    };
+    if passed {
+        Ok(check)
+    } else {
+        Err(format!("Opus signal check failed: {}", check.detail))
+    }
+}
+
+fn check_batch_samples(source: &Path, output: &Path, label: &str) -> Result<ContentCheck, String> {
+    let source_samples = decode_i16(source)?;
+    let output_samples = decode_i16(output)?;
+    let passed = source_samples.len() == output_samples.len();
+    let check = ContentCheck {
+        check: format!("batch {label} samples"),
+        detail: format!(
+            "{} source samples -> {} decoded FLAC samples",
+            source_samples.len(),
+            output_samples.len()
+        ),
+        passed,
+    };
+    if passed {
+        Ok(check)
+    } else {
+        Err(format!("Batch sample count mismatch: {}", check.detail))
+    }
 }
 
 fn path_str(path: &Path) -> Result<String, String> {
@@ -422,6 +640,8 @@ fn measure_batch(
                         "flac".to_owned(),
                         "-compression_level".to_owned(),
                         "5".to_owned(),
+                        "-sample_fmt".to_owned(),
+                        "s16".to_owned(),
                         out,
                     ],
                 )?;

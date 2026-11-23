@@ -10,6 +10,7 @@ jpeg-encoder.workspace = true
 png.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+symphonia.workspace = true
 zenwebp.workspace = true
 zune-jpeg.workspace = true
 

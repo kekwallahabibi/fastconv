@@ -43,6 +43,9 @@ fn cmd_verify(root: &Path) -> Result<(), String> {
     println!("==> check no ffmpeg/ffprobe in crates/");
     check_no_ffmpeg_in_crates(&root.join("crates"))?;
 
+    println!("==> check licenses (no AGPL/GPL in default dependency tree)");
+    check_licenses(root)?;
+
     run_cargo_step(
         root,
         "cargo fmt --all -- --check",
@@ -322,6 +325,107 @@ fn char_literal_len(bytes: &[u8], i: usize) -> Option<usize> {
     }
 }
 
+fn check_licenses(root: &Path) -> Result<(), String> {
+    let output = Command::new(cargo_bin())
+        .current_dir(root)
+        .args(["metadata", "--format-version", "1"])
+        .output()
+        .map_err(|err| format!("failed to launch cargo metadata: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("failed to parse cargo metadata JSON: {err}"))?;
+
+    scan_licenses(&metadata)
+}
+
+fn scan_licenses(metadata: &serde_json::Value) -> Result<(), String> {
+    let workspace_members = metadata
+        .get("workspace_members")
+        .and_then(serde_json::Value::as_array)
+        .map_or_default(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<String>>()
+        });
+
+    let packages = metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "cargo metadata is missing 'packages'".to_owned())?;
+
+    let mut forbidden: Vec<(String, String)> = Vec::new();
+    let mut checked = 0_usize;
+
+    for package in packages {
+        let id = package
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if workspace_members.contains(id) {
+            continue;
+        }
+
+        let name = package
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(id)
+            .to_owned();
+
+        let license = package
+            .get("license")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+
+        if license.is_empty() {
+            continue;
+        }
+
+        checked += 1;
+        if forbidden_license(&license) {
+            forbidden.push((name, license));
+        }
+    }
+
+    if forbidden.is_empty() {
+        println!("checked {checked} dependencies: no AGPL/GPL (without exception) found");
+        Ok(())
+    } else {
+        let details = forbidden
+            .iter()
+            .map(|(name, license)| format!("{name} ({license})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!(
+            "forbidden (A)GPL license in default dependency tree: {details}"
+        ))
+    }
+}
+
+fn forbidden_license(license: &str) -> bool {
+    let lower = license.to_ascii_lowercase();
+    // LGPL is weak copyleft and not in scope of this check; strip it before
+    // testing for strong copyleft (GPL/AGPL) so "LGPL" alone is not flagged.
+    let normalized = lower.replace("lgpl", "");
+    let has_strong_copyleft = normalized.contains("gpl");
+    if !has_strong_copyleft {
+        return false;
+    }
+    // An explicit exception clause (e.g. "GPL-2.0 WITH Classpath-exception")
+    // lifts the ban.
+    let has_exception = lower.contains("with") || lower.contains("exception");
+    !has_exception
+}
+
 fn cmd_bench_status(root: &Path) {
     let png_count = (1..=IMAGE_BATCH_COUNT)
         .filter(|&idx| fixtures::is_non_empty_file(&image_path(root, idx)))
@@ -425,7 +529,10 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_no_ffmpeg_in_crates, find_forbidden_ffmpeg_reference, workspace_root};
+    use super::{
+        check_no_ffmpeg_in_crates, find_forbidden_ffmpeg_reference, forbidden_license,
+        scan_licenses, workspace_root,
+    };
 
     #[test]
     fn crates_contain_no_ffmpeg_or_ffprobe_references() -> Result<(), String> {
@@ -465,5 +572,35 @@ fn helper<'a>(s: &'a str) -> char { let _ = s; '\"' }
             find_forbidden_ffmpeg_reference(raw_multiline),
             Some((2, "ffprobe".to_owned()))
         );
+    }
+
+    #[test]
+    fn forbidden_license_flags_agpl_and_gpl_without_exception() {
+        assert!(forbidden_license(
+            "AGPL-3.0-only OR LicenseRef-Imazen-Commercial"
+        ));
+        assert!(forbidden_license("GPL-3.0-only"));
+        assert!(forbidden_license("GPL-2.0-only"));
+        assert!(!forbidden_license("MIT OR Apache-2.0"));
+        assert!(!forbidden_license("GPL-2.0 WITH Classpath-exception-2.0"));
+        assert!(!forbidden_license("LGPL-2.1-only"));
+        assert!(!forbidden_license("MPL-2.0"));
+    }
+
+    #[test]
+    fn scan_licenses_detects_jxl_encoder() -> Result<(), String> {
+        let json = r#"{
+            "workspace_members": [],
+            "packages": [
+                { "id": "jxl-encoder 0.1.0", "name": "jxl-encoder", "license": "AGPL-3.0" }
+            ]
+        }"#;
+        let metadata: serde_json::Value =
+            serde_json::from_str(json).map_err(|err| format!("valid JSON expected: {err}"))?;
+        let err = scan_licenses(&metadata)
+            .err()
+            .ok_or_else(|| "jxl-encoder must be flagged".to_owned())?;
+        assert!(err.contains("jxl-encoder"), "{err}");
+        Ok(())
     }
 }
