@@ -84,7 +84,7 @@ impl fmt::Display for ProbeError {
             Self::EmptyAudioDirectory(path) => {
                 write!(
                     f,
-                    "no supported audio files (WAV, FLAC, MP3, OGG, or Opus) found in source directory: {}",
+                    "no supported audio files (WAV, FLAC, MP3, OGG, Opus, AAC, M4A, ALAC, or AIFF) found in source directory: {}",
                     path.display()
                 )
             }

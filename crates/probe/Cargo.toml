@@ -9,6 +9,7 @@ containr.workspace = true
 opus-pure.workspace = true
 png.workspace = true
 pollster.workspace = true
+rusty_aac.workspace = true
 symphonia.workspace = true
 fastconv-domain.workspace = true
 jxl.workspace = true

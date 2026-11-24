@@ -8,6 +8,7 @@ use fastconv_domain::{
     AudioBatchItem, AudioBatchPlan, AudioExecutionMode, AudioInputFormat, AudioOutputFormat,
     AudioStreamInfo, DomainError, HardwareBackend, PathRole,
 };
+use symphonia::core::codecs::audio::{AudioDecoderOptions, well_known::CODEC_ID_ALAC};
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::formats::TrackType;
 use symphonia::core::formats::probe::Hint;
@@ -17,6 +18,7 @@ use symphonia::core::meta::MetadataOptions;
 use crate::ProbeError;
 
 const MAGIC_PREFIX_BYTES: usize = 4096;
+const SUPPORTED_AUDIO_TARGETS: &str = "flac, wav, opus, ogg, mp3, aac, m4a, alac, or aiff";
 
 /// Validated input metadata produced at the file-system boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,19 +35,70 @@ fn invalid_audio(path: &Path, reason: impl Into<String>) -> ProbeError {
     }
 }
 
+/// Returns the byte length of a leading `ID3v2` tag (header + payload + optional footer), if valid.
+fn id3v2_tag_len(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 10 || !bytes.starts_with(b"ID3") {
+        return None;
+    }
+    if bytes[3] == 0xFF || bytes[4] == 0xFF {
+        return None;
+    }
+    let size_bytes = &bytes[6..10];
+    if size_bytes.iter().any(|&b| b & 0x80 != 0) {
+        return None;
+    }
+    let payload = (usize::from(size_bytes[0]) << 21)
+        | (usize::from(size_bytes[1]) << 14)
+        | (usize::from(size_bytes[2]) << 7)
+        | usize::from(size_bytes[3]);
+    let footer = if bytes[5] & 0x10 != 0 { 10 } else { 0 };
+    10_usize.checked_add(payload)?.checked_add(footer)
+}
+
+/// True when `bytes` begins with a valid ADTS AAC frame header (syncword 0xFFF, layer 00).
+fn is_adts_sync(bytes: &[u8]) -> bool {
+    if bytes.len() < 7 || bytes[0] != 0xFF || (bytes[1] & 0xF6) != 0xF0 {
+        return false;
+    }
+    let sf_idx = (bytes[2] >> 2) & 0x0F;
+    if sf_idx >= 13 {
+        return false;
+    }
+    let frame_len = ((usize::from(bytes[3] & 0x03)) << 11)
+        | (usize::from(bytes[4]) << 3)
+        | (usize::from(bytes[5] >> 5));
+    frame_len >= 7
+}
+
+/// True when `bytes` begins with a valid MPEG Layer I/II/III frame sync (layer != 00).
+fn is_mp3_sync(bytes: &[u8]) -> bool {
+    bytes.len() >= 2
+        && bytes[0] == 0xFF
+        && (bytes[1] & 0xE0) == 0xE0
+        && (bytes[1] & 0x18) != 0x08
+        && (bytes[1] & 0x06) != 0x00
+}
+
 /// Detects the container from leading bytes only; file extensions are never trusted.
 #[must_use]
 pub fn detect_audio_magic(bytes: &[u8]) -> Option<AudioInputFormat> {
     if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
         return Some(AudioInputFormat::Wav);
     }
+    if bytes.len() >= 12
+        && &bytes[..4] == b"FORM"
+        && (&bytes[8..12] == b"AIFF" || &bytes[8..12] == b"AIFC")
+    {
+        return Some(AudioInputFormat::Aiff);
+    }
     if bytes.starts_with(b"fLaC") {
         return Some(AudioInputFormat::Flac);
     }
-    if bytes.starts_with(b"ID3")
-        || (bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] & 0xE0 == 0xE0)
-    {
-        return Some(AudioInputFormat::Mp3);
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        let box_size = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if box_size == 0 || box_size >= 12 {
+            return Some(AudioInputFormat::M4a);
+        }
     }
     if bytes.starts_with(b"OggS")
         && let Some(identification) = ogg_identification_packet(bytes)
@@ -56,6 +109,20 @@ pub fn detect_audio_magic(bytes: &[u8]) -> Option<AudioInputFormat> {
         if identification.starts_with(b"\x01vorbis") {
             return Some(AudioInputFormat::Vorbis);
         }
+    }
+    if let Some(tag_len) = id3v2_tag_len(bytes) {
+        if let Some(after_tag) = bytes.get(tag_len..)
+            && is_adts_sync(after_tag)
+        {
+            return Some(AudioInputFormat::Aac);
+        }
+        return Some(AudioInputFormat::Mp3);
+    }
+    if is_adts_sync(bytes) {
+        return Some(AudioInputFormat::Aac);
+    }
+    if is_mp3_sync(bytes) {
+        return Some(AudioInputFormat::Mp3);
     }
     None
 }
@@ -111,11 +178,53 @@ fn probe_opus(path: &Path, file: File) -> Result<AudioStreamInfo, ProbeError> {
         .map_err(|err| invalid_audio(path, err.to_string()))
 }
 
+fn probe_adts_aac(path: &Path, mut file: File) -> Result<AudioStreamInfo, ProbeError> {
+    let prefix = read_magic_prefix(&mut file, path)?;
+    let offset = if prefix.starts_with(b"ID3") {
+        let tag_len = id3v2_tag_len(&prefix)
+            .ok_or_else(|| invalid_audio(path, "invalid ID3v2 tag before AAC frame"))?;
+        u64::try_from(tag_len).map_err(|_| invalid_audio(path, "ID3v2 tag length out of range"))?
+    } else {
+        0
+    };
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut header_buf = [0_u8; 7];
+    file.read_exact(&mut header_buf)
+        .map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let header = rusty_aac::parse_adts(&header_buf)
+        .map_err(|err| invalid_audio(path, format!("invalid ADTS AAC header: {err}")))?;
+    if header.channels == 0 {
+        return Err(invalid_audio(path, "AAC channel count must not be zero"));
+    }
+    if header.sample_rate == 0 {
+        return Err(invalid_audio(path, "AAC sample rate must not be zero"));
+    }
+    if header.frame_length < header.header_len {
+        return Err(invalid_audio(
+            path,
+            "AAC frame length is shorter than its header",
+        ));
+    }
+    let channels = NonZeroU16::new(header.channels)
+        .ok_or_else(|| invalid_audio(path, "AAC channel count must not be zero"))?;
+    let sample_rate = NonZeroU32::new(header.sample_rate)
+        .ok_or_else(|| invalid_audio(path, "AAC sample rate must not be zero"))?;
+    AudioStreamInfo::new(channels, sample_rate, None, None)
+        .map_err(|err| invalid_audio(path, err.to_string()))
+}
+
 fn probe_symphonia(
     path: &Path,
     format: AudioInputFormat,
     file: File,
-) -> Result<AudioStreamInfo, ProbeError> {
+) -> Result<(AudioInputFormat, AudioStreamInfo), ProbeError> {
     let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
     let mut hint = Hint::new();
     hint.with_extension(format.extension());
@@ -135,6 +244,14 @@ fn probe_symphonia(
         .as_ref()
         .and_then(|p| p.audio())
         .ok_or_else(|| invalid_audio(path, "audio track has no codec parameters"))?;
+    symphonia::default::get_codecs()
+        .make_audio_decoder(params, &AudioDecoderOptions::default())
+        .map_err(|err| invalid_audio(path, format!("unsupported audio codec: {err}")))?;
+    let detected_format = if format == AudioInputFormat::M4a && params.codec == CODEC_ID_ALAC {
+        AudioInputFormat::Alac
+    } else {
+        format
+    };
     let channels = params
         .channels
         .as_ref()
@@ -147,8 +264,9 @@ fn probe_symphonia(
     let bits_per_sample = params
         .bits_per_sample
         .and_then(|bits| NonZeroU16::new(u16::try_from(bits).unwrap_or(u16::MAX)));
-    AudioStreamInfo::new(channels, sample_rate, bits_per_sample, track.num_frames)
-        .map_err(|err| invalid_audio(path, err.to_string()))
+    let stream = AudioStreamInfo::new(channels, sample_rate, bits_per_sample, track.num_frames)
+        .map_err(|err| invalid_audio(path, err.to_string()))?;
+    Ok((detected_format, stream))
 }
 
 /// Probes one file: detects its container by magic bytes and validates stream metadata.
@@ -178,16 +296,54 @@ pub fn probe_audio(path: &Path) -> Result<ProbedAudio, ProbeError> {
             path: path.to_path_buf(),
             source,
         })?;
-    let format = detect_audio_magic(&prefix).ok_or_else(|| {
+    let mut format = detect_audio_magic(&prefix).ok_or_else(|| {
         invalid_audio(
             path,
-            "unrecognized audio magic bytes (expected WAV, FLAC, MP3, Ogg Vorbis, or Ogg Opus)",
+            "unrecognized audio magic bytes (expected WAV, FLAC, MP3, Ogg Vorbis, Ogg Opus, AAC, M4A, ALAC, or AIFF)",
         )
     })?;
-    let stream = if format == AudioInputFormat::Opus {
-        probe_opus(path, file)?
-    } else {
-        probe_symphonia(path, format, file)?
+
+    // Large ID3v2 tags (e.g. cover art) push the ADTS frame past the prefix.
+    if prefix.starts_with(b"ID3")
+        && let Some(tag_len) = id3v2_tag_len(&prefix)
+        && tag_len > MAGIC_PREFIX_BYTES
+    {
+        let offset = u64::try_from(tag_len)
+            .map_err(|_| invalid_audio(path, "ID3v2 tag length out of range"))?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|source| ProbeError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let mut after_tag = [0_u8; 16];
+        let mut filled = 0_usize;
+        while filled < after_tag.len() {
+            match file.read(&mut after_tag[filled..]) {
+                Ok(0) => break,
+                Ok(count) => filled += count,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(source) => {
+                    return Err(ProbeError::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    });
+                }
+            }
+        }
+        if is_adts_sync(&after_tag[..filled]) {
+            format = AudioInputFormat::Aac;
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|source| ProbeError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
+
+    let (format, stream) = match format {
+        AudioInputFormat::Opus => (format, probe_opus(path, file)?),
+        AudioInputFormat::Aac => (format, probe_adts_aac(path, file)?),
+        _ => probe_symphonia(path, format, file)?,
     };
 
     Ok(ProbedAudio {
@@ -220,22 +376,23 @@ fn resolve_single_target(
     let ext = target.extension().and_then(|e| e.to_str()).ok_or_else(|| {
         ProbeError::UnsupportedTargetFormat {
             path: target.to_path_buf(),
-            expected: "flac, wav, or opus",
+            expected: SUPPORTED_AUDIO_TARGETS,
         }
     })?;
     let inferred = AudioOutputFormat::from_extension(ext).ok_or_else(|| {
         ProbeError::UnsupportedTargetFormat {
             path: target.to_path_buf(),
-            expected: "flac, wav, or opus",
+            expected: SUPPORTED_AUDIO_TARGETS,
         }
     })?;
-    if let Some(explicit) = to
-        && explicit != inferred
-    {
-        return Err(ProbeError::UnsupportedTargetFormat {
-            path: target.to_path_buf(),
-            expected: explicit.extension(),
-        });
+    if let Some(explicit) = to {
+        if !explicit.accepts_extension(ext) {
+            return Err(ProbeError::UnsupportedTargetFormat {
+                path: target.to_path_buf(),
+                expected: explicit.extension(),
+            });
+        }
+        return Ok((target.to_path_buf(), explicit));
     }
     Ok((target.to_path_buf(), inferred))
 }
@@ -280,7 +437,19 @@ fn prepare_directory_batch(
         let has_audio_extension = path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
             matches!(
                 e.to_ascii_lowercase().as_str(),
-                "wav" | "wave" | "flac" | "mp3" | "ogg" | "oga" | "opus"
+                "wav"
+                    | "wave"
+                    | "flac"
+                    | "mp3"
+                    | "ogg"
+                    | "oga"
+                    | "opus"
+                    | "aac"
+                    | "m4a"
+                    | "alac"
+                    | "aiff"
+                    | "aif"
+                    | "aifc"
             )
         });
         if path.is_file() && !is_hidden && has_audio_extension {
@@ -428,7 +597,7 @@ mod tests {
             Some(AudioInputFormat::Flac)
         );
         assert_eq!(
-            detect_audio_magic(b"ID3\x04\x00\x00"),
+            detect_audio_magic(b"ID3\x04\x00\x00\x00\x00\x00\x00"),
             Some(AudioInputFormat::Mp3)
         );
         assert_eq!(
@@ -541,6 +710,102 @@ mod tests {
                 DomainError::UnsupportedAudioPipeline { .. }
             ))
         ));
+        Ok(())
+    }
+
+    fn id3_prefixed(payload: &[u8]) -> Vec<u8> {
+        // 10-byte ID3v2.4 header with a 10-byte synchsafe size, then 10 bytes of tag payload.
+        let mut bytes = b"ID3\x04\x00\x00\x00\x00\x00\x0A".to_vec();
+        bytes.extend_from_slice(&[0_u8; 10]);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    #[test]
+    fn detects_new_audio_magic_formats() {
+        assert_eq!(
+            detect_audio_magic(b"FORM\x00\x00\x00\x00AIFF"),
+            Some(AudioInputFormat::Aiff)
+        );
+        assert_eq!(
+            detect_audio_magic(b"FORM\x00\x00\x00\x00AIFC"),
+            Some(AudioInputFormat::Aiff)
+        );
+        assert_eq!(
+            detect_audio_magic(b"\x00\x00\x00\x18ftypM4A "),
+            Some(AudioInputFormat::M4a)
+        );
+        let adts = [0xFF, 0xF1, 0x4C, 0x80, 0x02, 0x00, 0xFC];
+        let mp3 = [0xFF, 0xFB, 0x90, 0x64];
+        assert_eq!(detect_audio_magic(&adts), Some(AudioInputFormat::Aac));
+        assert_eq!(
+            detect_audio_magic(&id3_prefixed(&adts)),
+            Some(AudioInputFormat::Aac)
+        );
+        assert_eq!(
+            detect_audio_magic(&id3_prefixed(&mp3)),
+            Some(AudioInputFormat::Mp3)
+        );
+        assert_eq!(detect_audio_magic(&mp3), Some(AudioInputFormat::Mp3));
+    }
+
+    #[test]
+    fn resolves_new_target_formats_and_explicit_alac() {
+        let source = Path::new("track.wav");
+        for (name, expected) in [
+            ("out.ogg", AudioOutputFormat::Ogg),
+            ("out.mp3", AudioOutputFormat::Mp3),
+            ("out.aac", AudioOutputFormat::Aac),
+            ("out.m4a", AudioOutputFormat::M4a),
+            ("out.aiff", AudioOutputFormat::Aiff),
+            ("out.alac", AudioOutputFormat::Alac),
+        ] {
+            let (file, format) = resolve_single_target(source, Path::new(name), None)
+                .unwrap_or_else(|_| (PathBuf::new(), AudioOutputFormat::Wav));
+            assert_eq!(file, PathBuf::from(name), "{name}");
+            assert_eq!(format, expected, "{name}");
+        }
+
+        let (file, format) =
+            resolve_single_target(source, Path::new("out.m4a"), Some(AudioOutputFormat::Alac))
+                .unwrap_or_else(|_| (PathBuf::new(), AudioOutputFormat::Wav));
+        assert_eq!(file, PathBuf::from("out.m4a"));
+        assert_eq!(format, AudioOutputFormat::Alac);
+
+        assert!(
+            resolve_single_target(source, Path::new("out.flac"), Some(AudioOutputFormat::Alac))
+                .is_err()
+        );
+
+        let (dir_target, format) =
+            resolve_single_target(source, Path::new("dist/"), Some(AudioOutputFormat::Alac))
+                .unwrap_or_else(|_| (PathBuf::new(), AudioOutputFormat::Wav));
+        assert_eq!(dir_target, PathBuf::from("dist/track.m4a"));
+        assert_eq!(format, AudioOutputFormat::Alac);
+    }
+
+    #[test]
+    fn probes_minimal_adts_aac_frame() -> Result<(), String> {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dir = manifest
+            .join("target")
+            .join(format!("fastconv-audio-adts-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let path = dir.join("tone.aac");
+        let header = rusty_aac::AdtsHeader {
+            object_type: 2,
+            sample_rate: 44_100,
+            channels: 2,
+            frame_length: 7,
+            header_len: 7,
+        };
+        let frame = rusty_aac::write_adts_header(&header);
+        fs::write(&path, &frame).map_err(|err| err.to_string())?;
+        let probed = probe_audio(&path).map_err(|err| err.to_string())?;
+        assert_eq!(probed.format, AudioInputFormat::Aac);
+        assert_eq!(probed.stream.channels().get(), 2);
+        assert_eq!(probed.stream.sample_rate().get(), 44_100);
+        let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 }
