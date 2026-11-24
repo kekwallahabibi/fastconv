@@ -1026,22 +1026,17 @@ fn probe_ts(
                 pmt_section.clear();
                 pmt_needed = None;
                 if let Some(section) = ts_section_start(&packet) {
-                    // A TS payload is padded with 0xFF. Until the 3-byte
-                    // section header is complete, retain only bytes before the
-                    // padding run; the declared length then bounds assembly.
-                    let mut usable = section.len();
-                    while usable > 0 && section[usable - 1] == 0xFF {
-                        usable -= 1;
-                    }
-                    let header = usable.min(3);
-                    pmt_section.extend_from_slice(&section[..header]);
-                    pmt_needed =
-                        ts_section_length(&pmt_section).and_then(|len| 3_usize.checked_add(len));
-                    if let Some(needed) = pmt_needed {
-                        let extra = needed
-                            .saturating_sub(header)
-                            .min(section.len().saturating_sub(header));
-                        pmt_section.extend_from_slice(&section[header..header + extra]);
+                    if section.len() < 3 {
+                        // The header is split; continuation packets complete it.
+                        pmt_section.extend_from_slice(section);
+                    } else if let Some(len) = ts_section_length(section)
+                        && let Some(needed) = 3_usize.checked_add(len)
+                    {
+                        // Never strip trailing 0xFF: it may be the low byte of
+                        // a legitimate section length rather than TS stuffing.
+                        let take = needed.min(section.len());
+                        pmt_section.extend_from_slice(&section[..take]);
+                        pmt_needed = Some(needed);
                     }
                 }
             } else if !pmt_section.is_empty() {
@@ -1965,7 +1960,21 @@ mod tests {
     fn ts_packet(pid: u16, pusi: bool, payload: &[u8]) -> Vec<u8> {
         let high = u8::try_from(pid >> 8).unwrap_or(0) & 0x1F;
         let low = u8::try_from(pid & 0x00FF).unwrap_or(0);
-        let mut packet = vec![0x47, high | if pusi { 0x40 } else { 0 }, low, 0x10];
+        let short = payload.len() < 184;
+        let mut packet = vec![
+            0x47,
+            high | if pusi { 0x40 } else { 0 },
+            low,
+            if short { 0x30 } else { 0x10 },
+        ];
+        if short {
+            // Fill the remainder with a real adaptation field so no 0xFF
+            // stuffing is mistaken for part of a PSI section.
+            let af_len = 183_usize.saturating_sub(payload.len());
+            packet.push(u8::try_from(af_len).unwrap_or(0));
+            packet.push(0x00);
+            packet.resize(188_usize.saturating_sub(payload.len()), 0xFF);
+        }
         packet.extend_from_slice(payload);
         packet.resize(188, 0xFF);
         packet
@@ -2086,6 +2095,40 @@ mod tests {
         std::fs::remove_file(&path)?;
         assert_eq!(probed.streams.len(), 1);
         assert_eq!(probed.streams[0].codec(), VideoCodec::Aac);
+        Ok(())
+    }
+
+    #[test]
+    fn ts_pmt_header_ending_in_ff_is_not_trimmed() -> Result<(), Box<dyn std::error::Error>> {
+        let mut association_body = vec![0x00, 0x01, 0xC1, 0x00, 0x00];
+        association_body.extend_from_slice(&[0x00, 0x01, 0xF0, 0x00]);
+        let mut program_body = vec![0x00, 0x01, 0xC1, 0x00, 0x00, 0xF0, 0x00, 0xF0, 0x00];
+        for index in 0..45_u16 {
+            program_body.extend_from_slice(&ts_es(0x1B, 0x0200 + index, &[]));
+        }
+        program_body.extend_from_slice(&ts_es(0x1B, 0x02FF, &[0xAA]));
+        program_body.extend_from_slice(&ts_es(0x06, 0x0112, &ts_desc(0x05, b"Opus")));
+        assert_eq!(program_body.len(), 251);
+        let pmt = ts_section(0x02, &program_body);
+        assert_eq!(&pmt[..3], &[0x02, 0x80, 0xFF]);
+        assert_eq!(pmt.len(), 258);
+
+        let mut pat = vec![0x00];
+        pat.extend_from_slice(&ts_section(0x00, &association_body));
+        let mut bytes = ts_packet(0, true, &pat);
+        // The PUSI carries exactly the 3-byte header, whose last byte is the
+        // low byte of section_length (255) and must survive reassembly.
+        let mut first = vec![0x00];
+        first.extend_from_slice(&pmt[..3]);
+        bytes.extend_from_slice(&ts_packet(0x1000, true, &first));
+        for part in pmt[3..].chunks(184) {
+            bytes.extend_from_slice(&ts_packet(0x1000, false, part));
+        }
+        let path = temp_file("ts-pmt-header-ff", &bytes)?;
+        let probed = probe_video(&path)?;
+        std::fs::remove_file(&path)?;
+        assert_eq!(probed.streams.len(), 47);
+        assert_eq!(probed.streams[46].codec(), VideoCodec::Opus);
         Ok(())
     }
 

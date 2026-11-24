@@ -478,22 +478,17 @@ pub(crate) fn demux_ts(path: &Path) -> Result<DemuxedMedia, PipelineError> {
                 pmt_section.clear();
                 pmt_needed = None;
                 if let Some(section) = section_start(&parsed) {
-                    // TS padding is 0xFF. Until the 3-byte section header is
-                    // complete, retain only bytes before the padding run; the
-                    // declared length then bounds the rest of the assembly.
-                    let mut usable = section.len();
-                    while usable > 0 && section[usable - 1] == 0xFF {
-                        usable -= 1;
-                    }
-                    let header = usable.min(3);
-                    pmt_section.extend_from_slice(&section[..header]);
-                    pmt_needed =
-                        section_length(&pmt_section).and_then(|len| 3_usize.checked_add(len));
-                    if let Some(needed) = pmt_needed {
-                        let extra = needed
-                            .saturating_sub(header)
-                            .min(section.len().saturating_sub(header));
-                        pmt_section.extend_from_slice(&section[header..header + extra]);
+                    if section.len() < 3 {
+                        // The header is split; continuation packets complete it.
+                        pmt_section.extend_from_slice(section);
+                    } else if let Some(len) = section_length(section)
+                        && let Some(needed) = 3_usize.checked_add(len)
+                    {
+                        // Never strip trailing 0xFF: it may be the low byte of
+                        // a legitimate section length rather than TS stuffing.
+                        let take = needed.min(section.len());
+                        pmt_section.extend_from_slice(&section[..take]);
+                        pmt_needed = Some(needed);
                     }
                 }
             } else if !pmt_section.is_empty() {
@@ -661,11 +656,18 @@ pub(crate) fn demux_ts(path: &Path) -> Result<DemuxedMedia, PipelineError> {
                 }
             }
             VideoCodec::Opus => {
-                let step = 20_000;
                 let mut frame_pts = pts_us;
                 for frame in unwrap_ts_opus(&data) {
-                    push(media, track, frame_pts, frame_pts, frame, true);
-                    frame_pts = frame_pts.saturating_add(step);
+                    // Opus packets carry 2.5-120 ms of audio; the TOC gives the
+                    // coded duration instead of assuming a fixed 20 ms frame.
+                    let duration = crate::video_bitstream::opus_packet_samples_48k(&frame)
+                        .and_then(|samples| {
+                            u64::try_from(rescale_ticks(i64::from(samples), 1, 48_000)).ok()
+                        })
+                        .filter(|&value| value > 0)
+                        .unwrap_or(20_000);
+                    push_with_duration(media, track, frame_pts, frame_pts, duration, frame, true);
+                    frame_pts = frame_pts.saturating_add(i64::try_from(duration).unwrap_or(20_000));
                 }
             }
             VideoCodec::Mp3 => {
@@ -774,11 +776,23 @@ fn push(
     data: Vec<u8>,
     keyframe: bool,
 ) {
+    push_with_duration(media, track, pts, dts, 1, data, keyframe);
+}
+
+fn push_with_duration(
+    media: &mut ContainerMedia,
+    track: usize,
+    pts: i64,
+    dts: i64,
+    duration: u64,
+    data: Vec<u8>,
+    keyframe: bool,
+) {
     media.packets.push(ContainerPacket {
         track,
         pts,
         dts,
-        duration: 1,
+        duration,
         keyframe,
         data,
     });
@@ -805,12 +819,20 @@ fn fix_durations(media: &mut ContainerMedia) {
             media.packets[a].duration = u64::try_from(delta).unwrap_or(1);
         }
         if let Some(&last) = indexes.last() {
-            let duration = indexes.iter().rev().nth(1).map_or(1, |&prev| {
-                media.packets[last]
-                    .pts
-                    .saturating_sub(media.packets[prev].pts)
+            let duration = if indexes.len() == 1 {
+                // A lone packet has no presentation-order neighbour; keep the
+                // duration its demuxer already derived from the codec TOC.
+                i64::try_from(media.packets[last].duration)
+                    .unwrap_or(1)
                     .max(1)
-            });
+            } else {
+                indexes.iter().rev().nth(1).map_or(1, |&prev| {
+                    media.packets[last]
+                        .pts
+                        .saturating_sub(media.packets[prev].pts)
+                        .max(1)
+                })
+            };
             media.packets[last].duration = u64::try_from(duration).unwrap_or(1);
         }
     }
@@ -975,8 +997,15 @@ fn ts_packet(
     packet[0] = 0x47;
     packet[1] = (if pusi { 0x40 } else { 0x00 }) | (u8::try_from(pid >> 8).unwrap_or(0) & 0x1F);
     packet[2] = u8::try_from(pid & 0xFF).unwrap_or(0);
-    packet[3] = *cc & 0x0F;
-    *cc = cc.wrapping_add(1) & 0x0F;
+    if payload.is_empty() {
+        // Adaptation-field-only packets do not carry a payload: re-use the
+        // counter of the preceding payload packet so the following one can
+        // continue with the same value it would have had without the PCR.
+        packet[3] = cc.wrapping_sub(1) & 0x0F;
+    } else {
+        packet[3] = *cc & 0x0F;
+        *cc = cc.wrapping_add(1) & 0x0F;
+    }
     // A short payload always needs an adaptation field to fill the 188-byte
     // packet; build it before writing the payload.
     let adaptation = adaptation.or_else(|| {
@@ -1103,7 +1132,40 @@ pub(crate) fn mux_ts(
     let start_90k = to_90k(min_dts.saturating_add(shift));
     let mut next_pcr_90k = start_90k;
 
-    for packet in &media.packets {
+    // Callers may hand us packets grouped by track. Merge the per-track decode
+    // queues so PCRs are scheduled in DTS order and always precede the PES
+    // packets that reference them.
+    let mut queues: Vec<Vec<usize>> = vec![Vec::new(); media.tracks.len()];
+    for (index, packet) in media.packets.iter().enumerate() {
+        if packet.track < queues.len() {
+            queues[packet.track].push(index);
+        }
+    }
+    let mut cursors = vec![0_usize; queues.len()];
+    let mut order = Vec::with_capacity(media.packets.len());
+    loop {
+        let mut best: Option<(i64, usize, usize)> = None;
+        for (track, queue) in queues.iter().enumerate() {
+            if let Some(&index) = queue.get(cursors[track]) {
+                let dts = media.packets[index].dts;
+                if best
+                    .is_none_or(|(best_dts, best_track, _)| (dts, track) < (best_dts, best_track))
+                {
+                    best = Some((dts, track, index));
+                }
+            }
+        }
+        match best {
+            Some((_, track, index)) => {
+                cursors[track] += 1;
+                order.push(index);
+            }
+            None => break,
+        }
+    }
+
+    for &index in &order {
+        let packet = &media.packets[index];
         let track = &media.tracks[packet.track];
         let is_video = track.codec.is_video();
         let pid = pids[packet.track];
@@ -2023,6 +2085,237 @@ mod tests {
         std::fs::remove_file(&path)?;
         let video: Vec<_> = out.packets.iter().filter(|p| p.track == 0).collect();
         assert_eq!(video.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adaptation_only_packets_reuse_the_preceding_continuity_counter() {
+        let mut out = Vec::new();
+        let mut cc = 0_u8;
+        ts_packet(&mut out, 0x0100, false, &[0xAA], None, &mut cc);
+        ts_packet(
+            &mut out,
+            0x0100,
+            false,
+            &[],
+            Some(Adaptation {
+                flags: 0x10,
+                pcr_base: Some(42),
+                stuffing: TS_SIZE - 12,
+            }),
+            &mut cc,
+        );
+        ts_packet(&mut out, 0x0100, false, &[0xBB], None, &mut cc);
+        let counters: Vec<u8> = out.chunks(TS_SIZE).map(|packet| packet[3] & 0x0F).collect();
+        assert_eq!(counters, vec![0, 0, 1]);
+
+        // The same rule applies when the payload counter wraps at 15.
+        let mut out = Vec::new();
+        let mut cc = 15_u8;
+        ts_packet(&mut out, 0x0100, false, &[0xAA], None, &mut cc);
+        ts_packet(&mut out, 0x0100, false, &[], None, &mut cc);
+        ts_packet(&mut out, 0x0100, false, &[0xBB], None, &mut cc);
+        let counters: Vec<u8> = out.chunks(TS_SIZE).map(|packet| packet[3] & 0x0F).collect();
+        assert_eq!(counters, vec![15, 15, 0]);
+    }
+
+    /// Returns `(pid, PES stamp, most recent PCR)` for every PES start in the
+    /// byte stream, so tests can verify PCR ordering without demuxing.
+    fn pes_stamps_and_pcrs(bytes: &[u8]) -> Vec<(u16, u64, u64)> {
+        let mut out = Vec::new();
+        let mut latest_pcr = None;
+        for packet in bytes.chunks(TS_SIZE) {
+            let pid = (u16::from(packet[1] & 0x1F) << 8) | u16::from(packet[2]);
+            let afc = (packet[3] >> 4) & 0x03;
+            let mut idx = 4_usize;
+            if afc & 0x02 != 0 {
+                let len = usize::from(packet[4]);
+                if idx.saturating_add(1).saturating_add(len) > packet.len() {
+                    continue;
+                }
+                if len >= 7 && packet[5] & 0x10 != 0 && packet[10] & 0x7E == 0x7E {
+                    let value = (u64::from(packet[6]) << 25)
+                        | (u64::from(packet[7]) << 17)
+                        | (u64::from(packet[8]) << 9)
+                        | (u64::from(packet[9]) << 1)
+                        | u64::from(packet[10] >> 7);
+                    latest_pcr = Some(value);
+                }
+                idx += 1 + len;
+            }
+            if afc & 0x01 == 0 || idx >= packet.len() {
+                continue;
+            }
+            let payload = &packet[idx..];
+            if pid != 0x0100 && pid != 0x0101 {
+                continue;
+            }
+            if packet[1] & 0x40 == 0 || payload.get(..3) != Some([0_u8, 0, 1].as_slice()) {
+                continue;
+            }
+            let stamp = if payload.get(7).is_some_and(|&flags| flags & 0xC0 == 0xC0) {
+                decode_timestamp(payload, 14, 1)
+            } else {
+                decode_timestamp(payload, 9, 2)
+            };
+            if let (Some(stamp), Some(pcr)) = (stamp, latest_pcr) {
+                out.push((pid, stamp, pcr));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn pcrs_precede_pes_packets_from_every_track_in_decode_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let media = ContainerMedia {
+            tracks: vec![
+                ContainerTrack {
+                    codec: VideoCodec::H264,
+                    width: Some(320),
+                    height: Some(240),
+                    channels: None,
+                    sample_rate: None,
+                    config: h264_config(),
+                    timescale: US_TIMESCALE,
+                },
+                ContainerTrack {
+                    codec: VideoCodec::Aac,
+                    width: None,
+                    height: None,
+                    channels: Some(2),
+                    sample_rate: Some(48_000),
+                    config: vec![0x12, 0x10],
+                    timescale: US_TIMESCALE,
+                },
+            ],
+            // All video packets precede all audio packets in the input.
+            packets: (0..50)
+                .map(|index| ContainerPacket {
+                    track: 0,
+                    pts: i64::from(index) * 20_000,
+                    dts: i64::from(index) * 20_000,
+                    duration: 20_000,
+                    keyframe: true,
+                    data: vec![0, 0, 0, 2, 0x65, 0x88],
+                })
+                .chain((0..50).map(|index| ContainerPacket {
+                    track: 1,
+                    pts: i64::from(index) * 20_000,
+                    dts: i64::from(index) * 20_000,
+                    duration: 20_000,
+                    keyframe: true,
+                    data: vec![0xAA; 8],
+                }))
+                .collect(),
+        };
+        let path = temp_path("interleaved-pcr");
+        let file = File::create(&path)?;
+        mux_ts(&file, &path, &media)?;
+        drop(file);
+        let bytes = std::fs::read(&path)?;
+        std::fs::remove_file(&path)?;
+
+        let pcrs = pcr_values(&bytes);
+        assert!(pcrs.len() > 2, "only {} PCRs emitted", pcrs.len());
+        for pair in pcrs.windows(2) {
+            let gap = pair[1].1.saturating_sub(pair[0].1);
+            assert!(gap > 0 && gap <= PCR_INTERVAL_90K, "PCR gap {gap} ticks");
+        }
+
+        let stamps = pes_stamps_and_pcrs(&bytes);
+        assert_eq!(stamps.len(), 100);
+        assert_eq!(
+            stamps.iter().filter(|(pid, _, _)| *pid == 0x0100).count(),
+            50
+        );
+        assert_eq!(
+            stamps.iter().filter(|(pid, _, _)| *pid == 0x0101).count(),
+            50
+        );
+        for (pid, stamp, pcr) in stamps {
+            assert!(
+                stamp >= pcr,
+                "PID {pid:#06x} stamp {stamp} precedes PCR {pcr}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ts_pmt_header_ending_in_ff_is_not_trimmed() -> Result<(), Box<dyn std::error::Error>> {
+        let mut body = vec![0x00, 0x01, 0xC1, 0x00, 0x00, 0xF0, 0x00, 0xF0, 0x00];
+        for index in 0..45_u16 {
+            let pid = 0x0200 + index;
+            body.extend_from_slice(&[
+                0x1B,
+                u8::try_from(pid >> 8).unwrap_or(0) | 0xE0,
+                u8::try_from(pid & 0xFF).unwrap_or(0),
+                0xF0,
+                0x00,
+            ]);
+        }
+        body.extend_from_slice(&[0x1B, 0xE2, 0xFF, 0xF0, 0x01, 0xAA]);
+        body.extend_from_slice(&[
+            0x06, 0xE1, 0x12, 0xF0, 0x06, 0x05, 0x04, b'O', b'p', b'u', b's',
+        ]);
+        assert_eq!(body.len(), 251);
+        let mut pmt = vec![0x02, 0x80, 0xFF];
+        pmt.extend_from_slice(&body);
+        pmt.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(pmt.len(), 258);
+
+        let mut bytes = Vec::new();
+        let mut cc = 0_u8;
+        for packet in psi_packets(0, &build_pat(), &mut cc)? {
+            bytes.extend_from_slice(&packet);
+        }
+        // The PUSI carries only the pointer and the 3-byte header; the final
+        // header byte is 0xFF and must not be mistaken for stuffing.
+        ts_packet(
+            &mut bytes,
+            PMT_PID,
+            true,
+            &[0, 0x02, 0x80, 0xFF],
+            None,
+            &mut cc,
+        );
+        for part in pmt[3..].chunks(184) {
+            ts_packet(&mut bytes, PMT_PID, false, part, None, &mut cc);
+        }
+        let path = temp_path("pmt-header-ff");
+        std::fs::write(&path, &bytes)?;
+        let out = demux_ts(&path)?;
+        std::fs::remove_file(&path)?;
+        assert_eq!(out.tracks.len(), 47);
+        assert_eq!(out.tracks[46].codec, VideoCodec::Opus);
+        Ok(())
+    }
+
+    #[test]
+    fn ts_single_opus_packet_keeps_the_coded_duration() -> Result<(), Box<dyn std::error::Error>> {
+        let media = ContainerMedia {
+            tracks: vec![ContainerTrack {
+                codec: VideoCodec::Opus,
+                width: None,
+                height: None,
+                channels: Some(2),
+                sample_rate: Some(48_000),
+                config: default_opus_head(2, 0),
+                timescale: US_TIMESCALE,
+            }],
+            packets: vec![ContainerPacket {
+                track: 0,
+                pts: 0,
+                dts: 0,
+                duration: 1,
+                keyframe: true,
+                data: vec![0xFC; 20],
+            }],
+        };
+        let out = round_trip("opus-single-duration", &media)?;
+        assert_eq!(out.packets.len(), 1);
+        assert_eq!(out.packets[0].duration, 20_000);
         Ok(())
     }
 }

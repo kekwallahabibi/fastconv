@@ -485,28 +485,27 @@ pub(crate) fn hevc_dimensions_from_annex_b(data: &[u8]) -> Option<(u16, u16)> {
     let _constraints_high = bits.read(32)?;
     let _constraints_low = bits.read(16)?;
     let _level = bits.read(8)?;
-    // All presence flags precede all payloads in profile_tier_level; reading a
-    // payload after each flag pair would consume the next pair's flags.
+    // ITU-T H.265 §7.3.3 profile_tier_level(1, maxNumSubLayersMinus1): all
+    // presence flags come first, then the reserved bits, then one pass over
+    // the sublayers for their profile and level payloads in sublayer order.
     let mut sub_layers = Vec::with_capacity(usize::try_from(max_sub_layers_minus1).unwrap_or(0));
     for _ in 0..max_sub_layers_minus1 {
         sub_layers.push((bits.read(1)?, bits.read(1)?));
     }
-    for (profile_present, _) in &sub_layers {
-        if *profile_present == 1 {
+    if max_sub_layers_minus1 > 0 {
+        for _ in max_sub_layers_minus1..8 {
+            let _reserved = bits.read(2)?;
+        }
+    }
+    for (sub_layer_profile_present_flag, sub_layer_level_present_flag) in &sub_layers {
+        if *sub_layer_profile_present_flag == 1 {
             let _sub_profile = bits.read(8)?;
             let _sub_compat = bits.read(32)?;
             let _sub_constraints_high = bits.read(32)?;
             let _sub_constraints_low = bits.read(16)?;
         }
-    }
-    for (_, level_present) in &sub_layers {
-        if *level_present == 1 {
+        if *sub_layer_level_present_flag == 1 {
             let _sub_level_idc = bits.read(8)?;
-        }
-    }
-    if max_sub_layers_minus1 > 0 {
-        for _ in max_sub_layers_minus1..8 {
-            let _reserved = bits.read(2)?;
         }
     }
     let _sps_id = bits.ue()?;
@@ -630,6 +629,16 @@ impl<'a> BitReader<'a> {
         Some(value)
     }
 
+    /// `read` pads past the end with zeros; color configuration must instead
+    /// fail when a header is truncated so no synthetic metadata is derived.
+    fn read_checked(&mut self, count: usize) -> Option<u32> {
+        let end = self.bit.checked_add(count)?;
+        if end > self.bytes.len().saturating_mul(8) {
+            return None;
+        }
+        self.read(count)
+    }
+
     fn skip_uvlc(&mut self) -> Option<()> {
         let mut zeros = 0_usize;
         while self.read(1)? == 0 {
@@ -750,42 +759,102 @@ pub(crate) fn is_av1_keyframe(obu_data: &[u8]) -> bool {
     })
 }
 
-/// Derives the mandatory profile and bit depth from a VP9 keyframe header.
-/// Inter frames inherit these from an earlier keyframe and cannot establish
-/// them on their own.
-pub(crate) fn vp9_profile_and_depth_from_keyframe(frame: &[u8]) -> Option<(u8, u8)> {
-    // frame_marker(2), profile(2), [reserved(1) for profile 3],
-    // show_existing_frame(1), frame_type(1), show_frame(1),
-    // error_resilient_mode(1), the three-byte sync code and, for profiles >= 2,
-    // ten_or_twelve_bit. BitReader pads past the end with zeros, so require the
-    // full header up front.
-    if frame.len() < 5 {
-        return None;
-    }
+/// Color configuration derived from a VP9 keyframe header (VP9 §6.2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Vp9KeyframeColor {
+    pub(crate) profile: u8,
+    pub(crate) bit_depth: u8,
+    pub(crate) chroma_subsampling: u8,
+    pub(crate) full_range: bool,
+    pub(crate) colour_primaries: u8,
+    pub(crate) transfer: u8,
+    pub(crate) matrix: u8,
+}
+
+/// Derives the mandatory `color_config()` from a VP9 keyframe header. Inter
+/// frames inherit these values from an earlier keyframe and cannot establish
+/// them on their own. Every read is checked against the byte length so a
+/// truncated header never yields zero-padded metadata.
+pub(crate) fn vp9_color_from_keyframe(frame: &[u8]) -> Option<Vp9KeyframeColor> {
     let mut bits = BitReader::new(frame);
-    if bits.read(2)? != 2 {
+    if bits.read_checked(2)? != 2 {
         return None;
     }
     // profile_low_bit precedes profile_high_bit in the VP9 header.
-    let profile = bits.read(1)? | (bits.read(1)? << 1);
-    if profile == 3 && bits.read(1)? != 0 {
+    let profile = bits.read_checked(1)? | (bits.read_checked(1)? << 1);
+    if profile == 3 && bits.read_checked(1)? != 0 {
         return None;
     }
     // show_existing_frame carries no color config; only key frames do.
-    if bits.read(1)? != 0 || bits.read(1)? != 0 {
+    if bits.read_checked(1)? != 0 || bits.read_checked(1)? != 0 {
         return None;
     }
-    let _show_frame = bits.read(1)?;
-    let _error_resilient_mode = bits.read(1)?;
-    if bits.read(24)? != 0x0049_8342 {
+    let _show_frame = bits.read_checked(1)?;
+    let _error_resilient_mode = bits.read_checked(1)?;
+    if bits.read_checked(24)? != 0x0049_8342 {
         return None;
     }
     let bit_depth = if profile >= 2 {
-        if bits.read(1)? == 1 { 12 } else { 10 }
+        if bits.read_checked(1)? == 1 { 12 } else { 10 }
     } else {
         8
     };
-    Some((u8::try_from(profile).ok()?, bit_depth))
+    let color_space = bits.read_checked(3)?;
+    let (chroma_subsampling, full_range, colour_primaries, transfer, matrix) = match color_space {
+        // CS_RGB exists only for profiles 1 and 3 and implies 4:4:4 full range
+        // with sRGB primaries and identity matrix.
+        7 => {
+            if profile == 0 || profile == 2 {
+                return None;
+            }
+            if bits.read_checked(1)? != 0 {
+                return None;
+            }
+            (3, true, 1, 13, 0)
+        }
+        0..=5 => {
+            let full_range = bits.read_checked(1)? == 1;
+            let chroma_subsampling = if profile == 1 || profile == 3 {
+                let subsampling_x = bits.read_checked(1)?;
+                let subsampling_y = bits.read_checked(1)?;
+                if bits.read_checked(1)? != 0 {
+                    return None;
+                }
+                match (subsampling_x, subsampling_y) {
+                    (0, 0) => 3,
+                    (1, 0) => 2,
+                    _ => return None,
+                }
+            } else {
+                0
+            };
+            let primaries = match color_space {
+                0 => (2, 2, 2),
+                1 | 3 => (6, 6, 6),
+                2 => (1, 1, 1),
+                4 => (7, 7, 7),
+                5 => (9, if bit_depth == 12 { 15 } else { 14 }, 9),
+                _ => return None,
+            };
+            (
+                chroma_subsampling,
+                full_range,
+                primaries.0,
+                primaries.1,
+                primaries.2,
+            )
+        }
+        _ => return None,
+    };
+    Some(Vp9KeyframeColor {
+        profile: u8::try_from(profile).ok()?,
+        bit_depth,
+        chroma_subsampling,
+        full_range,
+        colour_primaries,
+        transfer,
+        matrix,
+    })
 }
 
 // ---- AAC -----------------------------------------------------------------
@@ -984,6 +1053,54 @@ pub(crate) fn unwrap_ts_opus(pes_payload: &[u8]) -> Vec<Vec<u8>> {
         idx = end;
     }
     out
+}
+
+/// Decodes the coded duration of an Opus packet from its RFC 6716 TOC byte.
+///
+/// Returns the number of 48 kHz samples, rejecting malformed packets and
+/// durations above the 120 ms (5760 samples) packet cap.
+pub(crate) fn opus_packet_samples_48k(packet: &[u8]) -> Option<u32> {
+    let toc = *packet.first()?;
+    let config = toc >> 3;
+    let frame_samples: u32 = match config {
+        0..=11 => match config % 4 {
+            0 => 480,
+            1 => 960,
+            2 => 1920,
+            _ => 2880,
+        },
+        12..=15 => {
+            if config % 2 == 0 {
+                480
+            } else {
+                960
+            }
+        }
+        16..=31 => match config % 4 {
+            0 => 120,
+            1 => 240,
+            2 => 480,
+            _ => 960,
+        },
+        _ => return None,
+    };
+    let frame_count = match toc & 0x03 {
+        0 => 1,
+        1 | 2 => 2,
+        _ => {
+            let n = u32::from(*packet.get(1)? & 0x3F);
+            if n == 0 {
+                return None;
+            }
+            n
+        }
+    };
+    let total = frame_samples.checked_mul(frame_count)?;
+    if total == 0 || total > 5760 {
+        None
+    } else {
+        Some(total)
+    }
 }
 
 // ---- MP4 sample entry builders ------------------------------------------
@@ -1262,6 +1379,32 @@ mod tests {
     }
 
     #[test]
+    fn opus_packet_duration_follows_rfc_6716_toc() {
+        // CELT 2.5 ms (config 16), one frame.
+        assert_eq!(opus_packet_samples_48k(&[0x80]), Some(120));
+        // CELT 10 ms (config 30): 0xF0 and 0xF4 are both one frame, while
+        // frame-count code 1 (0xF5) carries two.
+        assert_eq!(opus_packet_samples_48k(&[0xF0]), Some(480));
+        assert_eq!(opus_packet_samples_48k(&[0xF4]), Some(480));
+        assert_eq!(opus_packet_samples_48k(&[0xF5]), Some(960));
+        // CELT 20 ms (config 31), one frame (0xFC).
+        assert_eq!(opus_packet_samples_48k(&[0xFC]), Some(960));
+        // SILK 40 ms (config 2): one frame (0x14) and two via code 1 (0x15).
+        assert_eq!(opus_packet_samples_48k(&[0x14]), Some(1920));
+        assert_eq!(opus_packet_samples_48k(&[0x15]), Some(3840));
+        // Hybrid 10 ms (config 12) and 20 ms (config 13).
+        assert_eq!(opus_packet_samples_48k(&[0x60]), Some(480));
+        assert_eq!(opus_packet_samples_48k(&[0x68]), Some(960));
+        // Code 3 reads an explicit frame count from the second TOC byte.
+        assert_eq!(opus_packet_samples_48k(&[0xF3, 0x03]), Some(1440));
+        assert_eq!(opus_packet_samples_48k(&[0xF3, 0x00]), None);
+        // Malformed or over-long packets are rejected.
+        assert_eq!(opus_packet_samples_48k(&[]), None);
+        assert_eq!(opus_packet_samples_48k(&[0xF3]), None);
+        assert_eq!(opus_packet_samples_48k(&[0xFF, 0x0C]), None);
+    }
+
+    #[test]
     fn mp4_sample_entries_are_well_formed() -> Result<(), String> {
         let esds = build_aac_esds(&[0x12, 0x10]);
         assert_eq!(&esds[..4], &[0, 0, 0, 0]);
@@ -1514,8 +1657,12 @@ mod tests {
         assert_eq!(h264_dimensions_from_annex_b(&annex_b), Some((1920, 1080)));
     }
 
-    #[test]
-    fn hevc_sps_reads_all_sublayer_flags_before_payloads() {
+    fn hevc_sps_with_sublayers(
+        sub0: (u32, u32),
+        sub1: (u32, u32),
+        sub0_payload: fn(&mut BitWriter),
+        sub1_payload: fn(&mut BitWriter),
+    ) -> Vec<u8> {
         let mut bits = BitWriter::new();
         bits.write(0, 4); // sps_video_parameter_set_id
         bits.write(2, 3); // sps_max_sub_layers_minus1 = 2
@@ -1524,17 +1671,15 @@ mod tests {
         bits.write(0, 32); // compatibility flags
         bits.write(0, 48); // constraint flags
         bits.write(120, 8); // general level
-        // Presence flags: sublayer 0 has a profile payload, sublayer 1 a level.
-        bits.write(1, 1);
-        bits.write(0, 1);
-        bits.write(0, 1);
-        bits.write(1, 1);
-        bits.write(2, 8); // sublayer 0 profile (8 + 32 + 32 + 16 = 88 bits)
-        bits.write(0, 32);
-        bits.write(0, 32);
-        bits.write(0, 16);
-        bits.write(123, 8); // sublayer 1 level
-        bits.write(0, 12); // reserved flags for sublayers 2..8
+        // All presence flags, then reserved_zero_2bits for sublayers 2..8,
+        // then the payloads in sublayer order (H.265 §7.3.3).
+        bits.write(sub0.0, 1);
+        bits.write(sub0.1, 1);
+        bits.write(sub1.0, 1);
+        bits.write(sub1.1, 1);
+        bits.write(0, 12);
+        sub0_payload(&mut bits);
+        sub1_payload(&mut bits);
         bits.ue(0); // sps_id
         bits.ue(1); // chroma_format_idc = 4:2:0
         bits.ue(1920);
@@ -1542,37 +1687,153 @@ mod tests {
         bits.write(0, 1); // no conformance window
         let mut annex_b = vec![0, 0, 0, 1, 0x42, 0x01];
         annex_b.extend_from_slice(&bits.bytes);
+        annex_b
+    }
+
+    #[test]
+    fn hevc_sps_reads_all_sublayer_flags_before_payloads() {
+        let profile_payload = |bits: &mut BitWriter| {
+            bits.write(2, 8); // sub_layer_profile_idc
+            bits.write(0, 32); // compatibility flags
+            bits.write(0, 32); // constraint flags high
+            bits.write(0, 16); // constraint flags low: 88 bits in total
+        };
+        let level_payload = |bits: &mut BitWriter| bits.write(123, 8);
+
+        // Sublayer 0 has a profile payload, sublayer 1 a level payload.
+        let annex_b = hevc_sps_with_sublayers((1, 0), (0, 1), profile_payload, level_payload);
+        assert_eq!(hevc_dimensions_from_annex_b(&annex_b), Some((1920, 1080)));
+
+        // Sublayer 0 has a level payload and sublayer 1 a profile payload.
+        // Splitting payloads into all-profiles-then-all-levels loops (or
+        // reading reserved bits after them) misparses this stream.
+        let annex_b = hevc_sps_with_sublayers((0, 1), (1, 0), level_payload, profile_payload);
         assert_eq!(hevc_dimensions_from_annex_b(&annex_b), Some((1920, 1080)));
     }
 
     #[test]
-    fn vp9_keyframe_yields_profile_and_bit_depth() {
-        // marker=2, profile=2, show_existing=0, key frame, show_frame=1.
+    fn vp9_keyframe_yields_color_config() {
+        // marker=2, profile=2, show_existing=0, key frame, show_frame=1,
+        // sync code, then ten_or_twelve_bit=0, CS_UNSPECIFIED, full_range=0.
         let frame = [0x92, 0x49, 0x83, 0x42, 0x00];
-        assert_eq!(vp9_profile_and_depth_from_keyframe(&frame), Some((2, 10)));
-        let mut twelve_bit = frame;
-        twelve_bit[4] = 0x80; // ten_or_twelve_bit
         assert_eq!(
-            vp9_profile_and_depth_from_keyframe(&twelve_bit),
-            Some((2, 12))
+            vp9_color_from_keyframe(&frame),
+            Some(Vp9KeyframeColor {
+                profile: 2,
+                bit_depth: 10,
+                chroma_subsampling: 0,
+                full_range: false,
+                colour_primaries: 2,
+                transfer: 2,
+                matrix: 2,
+            })
+        );
+        let mut twelve_bit = frame;
+        twelve_bit[4] = 0x80; // ten_or_twelve_bit and CS_UNSPECIFIED
+        assert_eq!(
+            vp9_color_from_keyframe(&twelve_bit),
+            Some(Vp9KeyframeColor {
+                bit_depth: 12,
+                ..Vp9KeyframeColor {
+                    profile: 2,
+                    bit_depth: 10,
+                    chroma_subsampling: 0,
+                    full_range: false,
+                    colour_primaries: 2,
+                    transfer: 2,
+                    matrix: 2,
+                }
+            })
         );
         assert_eq!(
-            vp9_profile_and_depth_from_keyframe(&[0x82, 0x49, 0x83, 0x42, 0x00]),
-            Some((0, 8))
+            vp9_color_from_keyframe(&[0x82, 0x49, 0x83, 0x42, 0x00]),
+            Some(Vp9KeyframeColor {
+                profile: 0,
+                bit_depth: 8,
+                chroma_subsampling: 0,
+                full_range: false,
+                colour_primaries: 2,
+                transfer: 2,
+                matrix: 2,
+            })
         );
         // Inter frames, show-existing frames and bad sync codes establish nothing.
         assert_eq!(
-            vp9_profile_and_depth_from_keyframe(&[0x96, 0x49, 0x83, 0x42, 0x00]),
+            vp9_color_from_keyframe(&[0x96, 0x49, 0x83, 0x42, 0x00]),
             None
         );
         assert_eq!(
-            vp9_profile_and_depth_from_keyframe(&[0x9A, 0x49, 0x83, 0x42, 0x00]),
+            vp9_color_from_keyframe(&[0x9A, 0x49, 0x83, 0x42, 0x00]),
             None
         );
         assert_eq!(
-            vp9_profile_and_depth_from_keyframe(&[0x92, 0x00, 0x00, 0x00, 0x00]),
+            vp9_color_from_keyframe(&[0x92, 0x00, 0x00, 0x00, 0x00]),
             None
         );
-        assert_eq!(vp9_profile_and_depth_from_keyframe(&[0x92]), None);
+        assert_eq!(vp9_color_from_keyframe(&[0x92]), None);
+    }
+
+    #[test]
+    fn vp9_keyframe_color_config_rgb_and_422() {
+        // Profile 1, CS_RGB, reserved_zero=0: 4:4:4 full-range sRGB.
+        assert_eq!(
+            vp9_color_from_keyframe(&[0xA2, 0x49, 0x83, 0x42, 0xE0]),
+            Some(Vp9KeyframeColor {
+                profile: 1,
+                bit_depth: 8,
+                chroma_subsampling: 3,
+                full_range: true,
+                colour_primaries: 1,
+                transfer: 13,
+                matrix: 0,
+            })
+        );
+        // Profile 1, BT.709 with subsampling_x=1, subsampling_y=0: 4:2:2.
+        assert_eq!(
+            vp9_color_from_keyframe(&[0xA2, 0x49, 0x83, 0x42, 0x48]),
+            Some(Vp9KeyframeColor {
+                profile: 1,
+                bit_depth: 8,
+                chroma_subsampling: 2,
+                full_range: false,
+                colour_primaries: 1,
+                transfer: 1,
+                matrix: 1,
+            })
+        );
+        // Profile 2, 12-bit BT.2020 has transfer characteristic 15.
+        assert_eq!(
+            vp9_color_from_keyframe(&[0x92, 0x49, 0x83, 0x42, 0xD0]),
+            Some(Vp9KeyframeColor {
+                profile: 2,
+                bit_depth: 12,
+                chroma_subsampling: 0,
+                full_range: false,
+                colour_primaries: 9,
+                transfer: 15,
+                matrix: 9,
+            })
+        );
+    }
+
+    #[test]
+    fn vp9_keyframe_rejects_invalid_color_config() {
+        // CS_RGB is only legal for profiles 1 and 3.
+        assert_eq!(
+            vp9_color_from_keyframe(&[0x82, 0x49, 0x83, 0x42, 0xE0]),
+            None
+        );
+        // (0, 1) subsampling is not one of the allowed chroma layouts.
+        assert_eq!(
+            vp9_color_from_keyframe(&[0xA2, 0x49, 0x83, 0x42, 0x44]),
+            None
+        );
+        // color_space 6 is reserved.
+        assert_eq!(
+            vp9_color_from_keyframe(&[0xA2, 0x49, 0x83, 0x42, 0xC0]),
+            None
+        );
+        // Truncated color_config must not read zero-padding as metadata.
+        assert_eq!(vp9_color_from_keyframe(&[0xA2, 0x49, 0x83, 0x42]), None);
     }
 }

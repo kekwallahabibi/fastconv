@@ -137,18 +137,31 @@ struct AvStream {
     channels: Option<u16>,
     sample_rate: Option<u32>,
     config: Vec<u8>,
-    /// Duration of one AVI sample (`dwScale`/`dwRate`) in microseconds.
-    duration_us: u64,
+    /// `dwScale`/`dwRate` are kept as a rational: truncating to whole
+    /// microseconds per sample would drift over long streams.
+    scale: u64,
+    rate: u64,
     /// `dwSampleSize`: zero means one sample per chunk, otherwise the fixed
     /// byte size of a sample and a chunk may carry several of them.
     sample_size: u32,
-    next_pts: u64,
+    samples_emitted: u64,
     packets: usize,
 }
 
 impl AvStream {
-    fn chunk_duration_us(&self, chunk_bytes: usize) -> u64 {
-        let samples = if self.sample_size == 0 {
+    /// Cumulative timestamp at AVI sample `n`, rounded half-up from the
+    /// `dwScale`/`dwRate` time base.
+    fn timestamp_us(&self, samples: u64) -> u64 {
+        let rate = u128::from(self.rate).max(1);
+        let numerator = u128::from(samples)
+            .saturating_mul(u128::from(self.scale))
+            .saturating_mul(1_000_000)
+            .saturating_add(rate / 2);
+        u64::try_from(numerator / rate).unwrap_or(u64::MAX)
+    }
+
+    fn chunk_samples(&self, chunk_bytes: usize) -> u64 {
+        if self.sample_size == 0 {
             1
         } else {
             u64::try_from(chunk_bytes)
@@ -156,8 +169,17 @@ impl AvStream {
                 .and_then(|bytes| bytes.checked_div(u64::from(self.sample_size)))
                 .unwrap_or(0)
                 .max(1)
-        };
-        samples.saturating_mul(self.duration_us).max(1)
+        }
+    }
+
+    /// Advances this stream by one chunk and returns its `(pts, duration)`.
+    fn advance(&mut self, chunk_bytes: usize) -> (u64, u64) {
+        let chunk_samples = self.chunk_samples(chunk_bytes);
+        let start_us = self.timestamp_us(self.samples_emitted);
+        let end_us = self.timestamp_us(self.samples_emitted.saturating_add(chunk_samples));
+        self.samples_emitted = self.samples_emitted.saturating_add(chunk_samples);
+        self.packets += 1;
+        (start_us, end_us.saturating_sub(start_us).max(1))
     }
 }
 
@@ -235,12 +257,12 @@ fn parse_header(
                 .or((avih_height > 0).then_some(avih_height))
                 .and_then(|v| u16::try_from(v).ok());
             let config = format.get(40..).unwrap_or(&[]).to_vec();
-            let duration_us = if micro_sec_per_frame > 0 {
-                u64::from(micro_sec_per_frame)
+            let (scale, rate) = if micro_sec_per_frame > 0 {
+                (u64::from(micro_sec_per_frame), 1_000_000_u64)
             } else if scale > 0 && rate > 0 {
-                u64::from(scale).saturating_mul(1_000_000) / u64::from(rate)
+                (u64::from(scale), u64::from(rate))
             } else {
-                33_333
+                (33_333_u64, 1_000_000_u64)
             };
             ordinal_map[original_index] = Some(streams.len());
             streams.push(AvStream {
@@ -250,9 +272,10 @@ fn parse_header(
                 channels: None,
                 sample_rate: None,
                 config,
-                duration_us: duration_us.max(1),
+                scale,
+                rate,
                 sample_size: 0,
-                next_pts: 0,
+                samples_emitted: 0,
                 packets: 0,
             });
         } else {
@@ -273,10 +296,10 @@ fn parse_header(
             // `dwScale`/`dwRate` describe one AVI sample, not one codec frame.
             // For fixed-size samples the chunk byte count decides how many of
             // them a chunk holds; for VBR there is exactly one per chunk.
-            let duration_us = if scale > 0 && rate > 0 {
-                u64::from(scale).saturating_mul(1_000_000) / u64::from(rate)
+            let (scale, rate) = if scale > 0 && rate > 0 {
+                (u64::from(scale), u64::from(rate))
             } else {
-                1
+                (1_u64, 1_000_000_u64)
             };
             ordinal_map[original_index] = Some(streams.len());
             streams.push(AvStream {
@@ -286,9 +309,10 @@ fn parse_header(
                 channels,
                 sample_rate,
                 config,
-                duration_us: duration_us.max(1),
+                scale,
+                rate,
                 sample_size,
-                next_pts: 0,
+                samples_emitted: 0,
                 packets: 0,
             });
         }
@@ -489,18 +513,35 @@ pub(crate) fn demux_avi(path: &Path) -> Result<DemuxedMedia, PipelineError> {
                 } else {
                     vec![(payload.to_vec(), Vec::new())]
                 };
-                for (frame, asc) in frames {
+                if frames.is_empty() {
+                    continue;
+                }
+                // The AVI clock counts the original chunk bytes, not the ADTS
+                // headers stripped below. Advance it once for the whole chunk.
+                let (chunk_pts, total_duration) = streams[number].advance(payload.len());
+                let count = frames.len();
+                for (index, (frame, asc)) in frames.into_iter().enumerate() {
                     if streams[number].config.is_empty() && !asc.is_empty() {
                         streams[number].config = asc;
                     }
-                    push_packet(
-                        &mut media,
-                        &mut streams,
-                        number,
-                        frame.len(),
-                        frame,
-                        keyframe,
-                    );
+                    let (pts, duration) = if count == 1 {
+                        (chunk_pts, total_duration)
+                    } else {
+                        let n = u128::try_from(count).unwrap_or(1);
+                        let seg_start = u128::from(total_duration)
+                            .saturating_mul(u128::try_from(index).unwrap_or(0))
+                            / n;
+                        let seg_end = u128::from(total_duration)
+                            .saturating_mul(u128::try_from(index.saturating_add(1)).unwrap_or(0))
+                            / n;
+                        let seg_start = u64::try_from(seg_start).unwrap_or(u64::MAX);
+                        let seg_end = u64::try_from(seg_end).unwrap_or(u64::MAX);
+                        (
+                            chunk_pts.saturating_add(seg_start),
+                            seg_end.saturating_sub(seg_start).max(1),
+                        )
+                    };
+                    push_timed_packet(&mut media, number, pts, duration, frame, keyframe);
                 }
             }
             _ => {}
@@ -512,19 +553,16 @@ pub(crate) fn demux_avi(path: &Path) -> Result<DemuxedMedia, PipelineError> {
     Ok(media)
 }
 
-fn push_packet(
+fn push_timed_packet(
     media: &mut ContainerMedia,
-    streams: &mut [AvStream],
     number: usize,
-    chunk_bytes: usize,
+    pts: u64,
+    duration: u64,
     data: Vec<u8>,
     sync: bool,
 ) {
-    let stream = &mut streams[number];
-    let pts = i64::try_from(stream.next_pts).unwrap_or(i64::MAX);
-    let duration = stream.chunk_duration_us(chunk_bytes).min(i64::MAX as u64);
-    stream.next_pts = stream.next_pts.saturating_add(duration);
-    stream.packets += 1;
+    let pts = i64::try_from(pts).unwrap_or(i64::MAX);
+    let duration = duration.min(i64::MAX as u64);
     media.packets.push(ContainerPacket {
         track: number,
         pts,
@@ -533,6 +571,18 @@ fn push_packet(
         keyframe: sync,
         data,
     });
+}
+
+fn push_packet(
+    media: &mut ContainerMedia,
+    streams: &mut [AvStream],
+    number: usize,
+    chunk_bytes: usize,
+    data: Vec<u8>,
+    sync: bool,
+) {
+    let (pts, duration) = streams[number].advance(chunk_bytes);
+    push_timed_packet(media, number, pts, duration, data, sync);
 }
 
 fn video_fourcc(codec: VideoCodec) -> [u8; 4] {
@@ -762,17 +812,31 @@ fn opus_samples_per_packet(
         let scaled = u128::from(packet.duration)
             .saturating_mul(u128::from(rate))
             .saturating_add(500_000);
-        let samples = u32::try_from(scaled / 1_000_000)
-            .map_err(|_| avi_error(path, "Opus packet duration exceeds the AVI scale"))?;
+        let mut samples = u32::try_from(scaled / 1_000_000).unwrap_or(0);
+        let mut from_toc = false;
+        // Demuxers that cannot read an Opus TOC leave a 1 µs placeholder. Use
+        // the coded duration from the packet itself rather than rejecting it.
+        if samples == 0
+            && let Some(s48) = crate::video_bitstream::opus_packet_samples_48k(&packet.data)
+        {
+            let fallback = u128::from(s48)
+                .saturating_mul(u128::from(rate))
+                .saturating_add(24_000)
+                / 48_000;
+            samples = u32::try_from(fallback).unwrap_or(0);
+            from_toc = samples > 0;
+        }
         if samples == 0 {
             return Err(avi_error(path, "Opus packet duration has no AVI sample"));
         }
-        let nominal = u128::from(samples) * 1_000_000 / u128::from(rate);
-        if u128::from(packet.duration).abs_diff(nominal) > 1 {
-            return Err(avi_error(
-                path,
-                "Opus packet duration is not representable by the AVI scale",
-            ));
+        if !from_toc {
+            let nominal = u128::from(samples) * 1_000_000 / u128::from(rate);
+            if u128::from(packet.duration).abs_diff(nominal) > 1 {
+                return Err(avi_error(
+                    path,
+                    "Opus packet duration is not representable by the AVI scale",
+                ));
+            }
         }
         if count.is_some_and(|expected| expected != samples) {
             return Err(avi_error(path, "Opus packet durations are not constant"));
@@ -1389,7 +1453,8 @@ mod tests {
                     dts: i64::from(index) * 10_000,
                     duration: 10_000,
                     keyframe: true,
-                    data: vec![0xFC, u8::try_from(index).unwrap_or(0)],
+                    // 0xF0 is a 10 ms CELT TOC; 0xFC would declare 20 ms.
+                    data: vec![0xF0, u8::try_from(index).unwrap_or(0)],
                 })
                 .collect(),
         };
@@ -1420,6 +1485,166 @@ mod tests {
         let mut variable = media;
         variable.packets[1].duration = 20_000;
         let path = temp_path("opus-variable");
+        let file = File::create(&path)?;
+        assert!(mux_avi(&file, &path, &variable).is_err());
+        drop(file);
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    /// Builds a minimal AVI with one audio stream and caller-supplied chunks so
+    /// tests can exercise `dwSampleSize` layouts the muxer itself never writes.
+    fn avi_with_raw_audio_chunks(
+        label: &str,
+        scale: u32,
+        rate: u32,
+        sample_size: u32,
+        chunks: &[Vec<u8>],
+    ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+        let mut avih = vec![0_u8; 56];
+        avih[24..28].copy_from_slice(&1_u32.to_le_bytes());
+        let mut strh = vec![0_u8; 56];
+        strh[..4].copy_from_slice(b"auds");
+        strh[20..24].copy_from_slice(&scale.to_le_bytes());
+        strh[24..28].copy_from_slice(&rate.to_le_bytes());
+        strh[32..36].copy_from_slice(&u32::try_from(chunks.len())?.to_le_bytes());
+        strh[44..48].copy_from_slice(&sample_size.to_le_bytes());
+        let mut wave_format = vec![0_u8; 40];
+        wave_format[..2].copy_from_slice(&0x00FF_u16.to_le_bytes());
+        wave_format[2..4].copy_from_slice(&2_u16.to_le_bytes());
+        wave_format[4..8].copy_from_slice(&48_000_u32.to_le_bytes());
+        let hdrl = riff_list(
+            *b"hdrl",
+            &[
+                riff_chunk(*b"avih", &avih),
+                riff_list(
+                    *b"strl",
+                    &[
+                        riff_chunk(*b"strh", &strh),
+                        riff_chunk(*b"strf", &wave_format),
+                    ],
+                ),
+            ],
+        );
+        let mut movi = b"movi".to_vec();
+        for chunk in chunks {
+            movi.extend_from_slice(&riff_chunk(*b"00wb", chunk));
+        }
+        let mut body = b"AVI ".to_vec();
+        body.extend_from_slice(&hdrl);
+        body.extend_from_slice(&riff_chunk(*b"LIST", &movi));
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&u32::try_from(body.len())?.to_le_bytes());
+        bytes.extend_from_slice(&body);
+        let path = temp_path(label);
+        std::fs::write(&path, &bytes)?;
+        Ok(path)
+    }
+
+    #[test]
+    fn avi_rational_scale_avoids_cumulative_truncation() -> Result<(), Box<dyn std::error::Error>> {
+        // 160 chunks of 100 one-byte samples at dwScale=1/dwRate=16000 is
+        // exactly one second (62.5 µs per sample).
+        let chunks: Vec<Vec<u8>> = std::iter::repeat_n(vec![0xAA; 100], 160).collect();
+        let path = avi_with_raw_audio_chunks("rational-scale", 1, 16_000, 1, &chunks)?;
+        let out = demux_avi(&path)?;
+        std::fs::remove_file(&path)?;
+        assert_eq!(out.packets.len(), 160);
+        let total: u64 = out.packets.iter().map(|packet| packet.duration).sum();
+        assert_eq!(total, 1_000_000, "truncated timeline {total} µs");
+        assert_eq!(
+            out.packets[159].pts + i64::try_from(out.packets[159].duration)?,
+            1_000_000
+        );
+
+        // With dwSampleSize=0 every chunk is a single AVI sample: 62.5 µs
+        // rounds half-up to 63 µs, and the next chunk starts there.
+        let path = avi_with_raw_audio_chunks("single-sample", 1, 16_000, 0, &chunks[..2])?;
+        let out = demux_avi(&path)?;
+        std::fs::remove_file(&path)?;
+        assert_eq!(out.packets.len(), 2);
+        assert_eq!(out.packets[0].duration, 63);
+        assert_eq!(out.packets[1].pts, 63);
+        Ok(())
+    }
+
+    #[test]
+    fn avi_aac_chunk_timing_uses_original_adts_bytes() -> Result<(), Box<dyn std::error::Error>> {
+        let asc = [0x12, 0x10];
+        let frame =
+            crate::video_bitstream::wrap_adts(&asc, &[0xAA; 100]).map_err(std::io::Error::other)?;
+        assert_eq!(frame.len(), 107);
+        let mut first_chunk = frame.clone();
+        first_chunk.extend_from_slice(&frame);
+        assert_eq!(first_chunk.len(), 214);
+        let path =
+            avi_with_raw_audio_chunks("aac-original-chunk", 1, 16_000, 1, &[first_chunk, frame])?;
+        let out = demux_avi(&path)?;
+        std::fs::remove_file(&path)?;
+        assert_eq!(out.packets.len(), 3);
+        assert_eq!(out.packets[0].pts, 0);
+        assert_eq!(out.packets[1].pts, 6_687);
+        assert_eq!(out.packets[0].duration + out.packets[1].duration, 13_375);
+        // The second AVI chunk starts after the full 214-byte chunk, not the
+        // 200 header-stripped bytes of its two ADTS frames.
+        assert_eq!(out.packets[2].pts, 13_375);
+        Ok(())
+    }
+
+    #[test]
+    fn avi_single_opus_packet_with_placeholder_duration_uses_toc()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let media = ContainerMedia {
+            tracks: vec![ContainerTrack {
+                codec: VideoCodec::Opus,
+                width: None,
+                height: None,
+                channels: Some(2),
+                sample_rate: Some(48_000),
+                config: default_opus_head(2, 0),
+                timescale: US_TIMESCALE,
+            }],
+            packets: vec![ContainerPacket {
+                track: 0,
+                pts: 0,
+                dts: 0,
+                duration: 1,
+                keyframe: true,
+                data: vec![0xFC; 20],
+            }],
+        };
+        let path = temp_path("opus-toc-fallback");
+        let file = File::create(&path)?;
+        mux_avi(&file, &path, &media)?;
+        drop(file);
+        let bytes = std::fs::read(&path)?;
+        let strh = bytes
+            .windows(4)
+            .position(|window| window == b"strh".as_slice())
+            .ok_or("strh")?
+            + 8;
+        assert_eq!(
+            le_u32(bytes.get(strh + 20..strh + 24).ok_or("scale")?),
+            Some(960)
+        );
+        assert_eq!(
+            le_u32(bytes.get(strh + 24..strh + 28).ok_or("rate")?),
+            Some(48_000)
+        );
+        let out = demux_avi(&path)?;
+        std::fs::remove_file(&path)?;
+        assert_eq!(out.packets.len(), 1);
+        assert_eq!(out.packets[0].duration, 20_000);
+
+        let mut variable = media;
+        variable.packets.push(ContainerPacket {
+            track: 0,
+            pts: 20_000,
+            dts: 20_000,
+            duration: 10_000,
+            keyframe: true,
+            data: vec![0xF0; 20],
+        });
         let file = File::create(&path)?;
         assert!(mux_avi(&file, &path, &variable).is_err());
         drop(file);

@@ -196,6 +196,22 @@ fn stream_copy_supports(item: &VideoRemuxItem) -> bool {
     })
 }
 
+/// Codecs the canonical `demux_video` -> `mux_video` route can actually
+/// preserve. Codecs outside this set are supported by the container format but
+/// silently dropped by `mkv_codec`, so they must be rejected before demuxing.
+fn canonical_remux_supports(codec: VideoCodec) -> bool {
+    matches!(
+        codec,
+        VideoCodec::H264
+            | VideoCodec::Hevc
+            | VideoCodec::Av1
+            | VideoCodec::Vp9
+            | VideoCodec::Aac
+            | VideoCodec::Opus
+            | VideoCodec::Mp3
+    )
+}
+
 /// Fails before any path is taken when an MKV source carries attachments that
 /// the target container cannot represent.
 fn reject_mkv_attachments(source: &Path, target: &Path) -> Result<(), PipelineError> {
@@ -243,6 +259,17 @@ fn remux_file(item: &VideoRemuxItem, target: &File) -> Result<(), PipelineError>
         }
     }
     if !direct {
+        for stream in item.streams() {
+            if !canonical_remux_supports(stream.codec()) {
+                return Err(remux_failed(
+                    item.target(),
+                    format!(
+                        "{} stream cannot be preserved on the canonical remux route; refusing to drop track",
+                        stream.codec()
+                    ),
+                ));
+            }
+        }
         let media = demux_video(source, item.input_format())?;
         return mux_video(target, item.target(), output, &media);
     }
@@ -1711,6 +1738,132 @@ mod container_tests {
         let demuxer = containr::mkv::Demuxer::open(reader)?;
         assert_eq!(demuxer.attachments().len(), 1);
         assert_eq!(demuxer.attachments()[0].name, "note.txt");
+        std::fs::remove_file(source)?;
+        std::fs::remove_file(target)?;
+        Ok(())
+    }
+
+    fn write_mkv_with_subtitle(
+        path: &Path,
+        media: &ContainerMedia,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base = temp_path("mkv-subtitle-base", "mkv");
+        write_container(&base, VideoContainerFormat::Mkv, media)?;
+        let reader = WindowedFileReader::open(&base)?;
+        let mut input = containr::mkv::Demuxer::open(reader)?;
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(&file);
+        let options = containr::mkv::MkvOptions {
+            doc_type: DocType::Matroska,
+            timestamp_scale: crate::video_container::MKV_TICK_NS,
+            ..containr::mkv::MkvOptions::default()
+        };
+        let mut output = containr::mkv::Muxer::new(&mut writer, options)?;
+        let mut plans = Vec::new();
+        for track in input.tracks() {
+            let packets = read_packets(input.track_packets(track.id)?, &base)?;
+            let plan = containr::mkv::StreamCopy::plan(track, &packets)?;
+            let id = output.add_track(plan.spec.clone())?;
+            plans.push((track.id, plan, id));
+        }
+        let timebase = containr::Timebase::from_nanoseconds(u32::try_from(
+            crate::video_container::MKV_TICK_NS,
+        )?);
+        let mut spec =
+            containr::mkv::TrackSpec::new(containr::TrackKind::Subtitle, "S_TEXT/UTF8", timebase);
+        spec.matroska.language = "eng".to_owned();
+        let subtitle_id = output.add_track(spec)?;
+        let mut buf = Vec::new();
+        for packet in input.packets() {
+            let packet = packet?;
+            let Some((_, plan, id)) = plans
+                .iter()
+                .find(|(track_id, _, _)| *track_id == packet.track_id)
+            else {
+                continue;
+            };
+            input.read_packet_into(&packet, &mut buf)?;
+            if let Some(block) = plan.packet(&packet, &buf)? {
+                output.write_packet(*id, &block)?;
+            }
+        }
+        output.write_packet(
+            subtitle_id,
+            &containr::mkv::PacketIn {
+                data: b"Hello",
+                pts: 0,
+                duration: Some(1_000_000),
+                sync: true,
+                discardable: false,
+                discard_padding: None,
+            },
+        )?;
+        output.finish()?;
+        writer.flush()?;
+        drop(writer);
+        std::fs::remove_file(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mkv_canonical_route_rejects_subtitle_instead_of_dropping_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = temp_path("mkv-subtitle-source", "mkv");
+        let target = temp_path("mkv-subtitle-target", "mkv");
+        write_mkv_with_subtitle(&source, &h264_mp3_media())?;
+
+        // Probe sees the subtitle track; the canonical route must reject it
+        // before demux_video silently drops S_TEXT/UTF8.
+        let mut stream_infos = streams(&demux_video(&source, VideoContainerFormat::Mkv)?);
+        stream_infos.push(VideoStreamInfo::new(
+            VideoCodec::TimedText,
+            fastconv_domain::VideoStreamKind::Subtitle,
+            None,
+            None,
+            None,
+            None,
+            1,
+            US_TIMESCALE,
+            None,
+            Some("eng".to_owned()),
+        ));
+        let plan = VideoRemuxPlan::new(
+            vec![VideoRemuxItem::new(
+                source.clone(),
+                target.clone(),
+                VideoContainerFormat::Mkv,
+                VideoContainerFormat::Mkv,
+                stream_infos,
+            )],
+            NonZeroUsize::MIN,
+        )
+        .map_err(|err| remux_failed(&target, err.to_string()))?;
+        let result = execute_video_batch(&plan);
+        assert!(matches!(result, Err(PipelineError::RemuxFailed { .. })));
+        assert!(!target.exists(), "no target published after rejection");
+        std::fs::remove_file(source)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mkv_direct_copy_preserves_subtitle() -> Result<(), Box<dyn std::error::Error>> {
+        let source = temp_path("mkv-subtitle-direct", "mkv");
+        let target = temp_path("mkv-subtitle-direct-out", "mkv");
+        write_mkv_with_subtitle(&source, &h264_aac_media())?;
+        remux(
+            &source,
+            &target,
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Mkv,
+        )?;
+        let reader = WindowedFileReader::open(&target)?;
+        let demuxer = containr::mkv::Demuxer::open(reader)?;
+        assert!(
+            demuxer
+                .tracks()
+                .iter()
+                .any(|track| track.codec_id() == Some("S_TEXT/UTF8"))
+        );
         std::fs::remove_file(source)?;
         std::fs::remove_file(target)?;
         Ok(())

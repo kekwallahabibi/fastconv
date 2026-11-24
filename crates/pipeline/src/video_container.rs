@@ -22,7 +22,7 @@ use crate::video_bitstream::{
     annex_b_to_avcc, annex_b_to_hvcc, avcc_to_annex_b, build_aac_esds, build_mp3_mp4a_sample_entry,
     build_vp09_sample_entry, dops_to_opus_head, extract_av1c_from_obu, extract_avcc_from_annex_b,
     extract_hvcc_from_annex_b, hvcc_to_annex_b, is_av1_keyframe, is_h264_keyframe_annex_b,
-    is_hevc_keyframe_annex_b, opus_head_to_dops, vp9_profile_and_depth_from_keyframe,
+    is_hevc_keyframe_annex_b, opus_head_to_dops, vp9_color_from_keyframe,
 };
 
 /// Canonical timestamp unit: exact microseconds, i.e. one tick is 1 µs and
@@ -788,10 +788,34 @@ fn mp4_decode_origins(media: &ContainerMedia) -> Vec<Option<i64>> {
     origins
 }
 
+/// Earliest presentation time per track, clamped to that track's first DTS.
+/// A reordered B-frame may present before the first packet in decode order;
+/// using the smaller of the two as the presentation base keeps every rebased
+/// PTS non-negative.
+fn mp4_presentation_bases(media: &ContainerMedia, origins: &[Option<i64>]) -> Vec<Option<i64>> {
+    let mut earliest_pts: Vec<Option<i64>> = vec![None; media.tracks.len()];
+    for packet in &media.packets {
+        earliest_pts[packet.track] =
+            Some(earliest_pts[packet.track].map_or(packet.pts, |min| min.min(packet.pts)));
+    }
+    origins
+        .iter()
+        .zip(earliest_pts)
+        .map(|(origin, earliest)| {
+            origin.and_then(|first_dts| earliest.map(|earliest| first_dts.min(earliest)))
+        })
+        .collect()
+}
+
 /// `(decode, presentation)` timestamps in decode order. DTS is made strictly
-/// increasing while PTS is rebased directly from the original PTS, so forcing
-/// a later DTS cannot move a frame's presentation time.
-fn mp4_rebased_timestamps(media: &ContainerMedia, origins: &[Option<i64>]) -> Vec<(i64, i64)> {
+/// increasing from the first decode timestamp while PTS is rebased from the
+/// presentation base, so forcing a later DTS cannot push a frame's PTS below
+/// zero or move its presentation time relative to the other tracks.
+fn mp4_rebased_timestamps(
+    media: &ContainerMedia,
+    origins: &[Option<i64>],
+    pts_bases: &[Option<i64>],
+) -> Vec<(i64, i64)> {
     let mut previous: Vec<Option<i64>> = vec![None; media.tracks.len()];
     media
         .packets
@@ -806,7 +830,8 @@ fn mp4_rebased_timestamps(media: &ContainerMedia, origins: &[Option<i64>]) -> Ve
                     .max(prev.saturating_add(1)),
             };
             previous[packet.track] = Some(dts);
-            (dts, packet.pts.saturating_sub(origin))
+            let pts_base = pts_bases[packet.track].unwrap_or(origin);
+            (dts, packet.pts.saturating_sub(pts_base))
         })
         .collect()
 }
@@ -852,20 +877,25 @@ fn mux_mp4_into<W: Read + Write + Seek>(
                     vpcc
                 } else {
                     let track_index = track_index(media, track);
-                    let (profile, bit_depth) = media
+                    let color = media
                         .packets
                         .iter()
                         .filter(|packet| packet.track == track_index && packet.keyframe)
-                        .find_map(|packet| vp9_profile_and_depth_from_keyframe(&packet.data))
+                        .find_map(|packet| vp9_color_from_keyframe(&packet.data))
                         .ok_or_else(|| {
                             container_error(
                                 target_path,
-                                "VP9 profile and bit depth cannot be derived from CodecPrivate or keyframe",
+                                "VP9 color config cannot be derived from CodecPrivate or keyframe",
                             )
                         })?;
                     let features = Vp9Features {
-                        profile: Some(profile),
-                        bit_depth: Some(bit_depth),
+                        profile: Some(color.profile),
+                        bit_depth: Some(color.bit_depth),
+                        chroma_subsampling: Some(color.chroma_subsampling),
+                        full_range: Some(color.full_range),
+                        colour_primaries: Some(color.colour_primaries),
+                        transfer: Some(color.transfer),
+                        matrix: Some(color.matrix),
                         ..Vp9Features::default()
                     };
                     vp9_features_to_vpcc(&features).ok_or_else(|| {
@@ -921,14 +951,15 @@ fn mux_mp4_into<W: Read + Write + Seek>(
         );
     }
     // containr's MP4 muxer requires each track's first decode timestamp to be
-    // zero and every following one to be strictly greater. Rebase each track
-    // on the DTS of its first packet in decode order (MPEG-TS starts at the PCR
-    // offset), keep presentation times on that rebased timeline, and derive the
-    // composition offsets from them. A track that starts later on the common
-    // timeline keeps that delay through an edit list.
-    let origins = mp4_decode_origins(media);
-    let timeline_origin = origins.iter().flatten().copied().min().unwrap_or(0);
-    let timestamps = mp4_rebased_timestamps(media, &origins);
+    // zero and every following one to be strictly greater. Rebase each track's
+    // DTS on its first packet in decode order (MPEG-TS starts at the PCR
+    // offset) and its PTS on the earliest presentation time, so a reordered
+    // B-frame never produces a negative presentation time. The edit list
+    // restores each track's delay relative to the common timeline.
+    let dts_origins = mp4_decode_origins(media);
+    let pts_bases = mp4_presentation_bases(media, &dts_origins);
+    let timeline_origin = pts_bases.iter().flatten().copied().min().unwrap_or(0);
+    let timestamps = mp4_rebased_timestamps(media, &dts_origins, &pts_bases);
     let mut last_packet_for_track = vec![None; media.tracks.len()];
     for (index, packet) in media.packets.iter().enumerate() {
         last_packet_for_track[packet.track] = Some(index);
@@ -957,10 +988,10 @@ fn mux_mp4_into<W: Read + Write + Seek>(
             .map_err(|err| containr_error(target_path, &err))?;
     }
     for (index, id) in ids.iter().enumerate() {
-        let Some(origin) = origins[index] else {
+        let Some(pts_base) = pts_bases[index] else {
             continue;
         };
-        let delay = origin.saturating_sub(timeline_origin);
+        let delay = pts_base.saturating_sub(timeline_origin);
         let Ok(delay) = u64::try_from(delay) else {
             return Err(container_error(
                 target_path,
@@ -1290,9 +1321,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn vp9_without_codec_private_derives_profile_and_depth() -> Result<(), String> {
-        let media = vp9_media(Vec::new(), vec![0x92, 0x49, 0x83, 0x42, 0x00]);
+    fn vp9_muxed_vpcc(keyframe: &[u8]) -> Result<Vec<u8>, String> {
+        let media = vp9_media(Vec::new(), keyframe.to_vec());
         let mut output = Cursor::new(Vec::new());
         let options = MuxOptions {
             brand: Brand::Isom,
@@ -1306,26 +1336,54 @@ mod tests {
             .windows(4)
             .position(|window| window == b"vpcC")
             .ok_or("missing vpcC box")?;
-        assert_eq!(bytes[vpcc_offset + 8], 2, "profile from keyframe");
-        assert_eq!(bytes[vpcc_offset + 10], 0xA0, "10-bit from keyframe");
+        // Four bytes of version/flags precede the record in the box body.
+        Ok(bytes[vpcc_offset + 4..].to_vec())
+    }
+
+    #[test]
+    fn vp9_without_codec_private_derives_color_from_keyframe() -> Result<(), String> {
+        let vpcc = vp9_muxed_vpcc(&[0x92, 0x49, 0x83, 0x42, 0x00])?;
+        assert_eq!(vpcc[4], 2, "profile from keyframe");
+        assert_eq!(vpcc[6], 0xA0, "10-bit 4:2:0 limited range");
+        assert_eq!(&vpcc[7..10], &[2, 2, 2], "unspecified color primaries");
         Ok(())
     }
 
     #[test]
-    fn vp9_without_derivable_profile_fails_before_sample_entry() {
-        let media = vp9_media(Vec::new(), vec![0x82, 0x31, 0x01]);
-        let mut output = Cursor::new(Vec::new());
-        let options = MuxOptions {
-            brand: Brand::Isom,
-            faststart: true,
-            ..MuxOptions::default()
-        };
-        let result = mux_mp4_into(&mut output, Path::new("vp9.mp4"), &media, options);
-        assert!(matches!(result, Err(PipelineError::RemuxFailed { .. })));
-        assert!(
-            !output.get_ref().windows(4).any(|w| w == b"vp09"),
-            "no VP9 sample entry was written"
-        );
+    fn vp9_keyframe_rgb_and_422_color_reach_vpcc() -> Result<(), String> {
+        let rgb = vp9_muxed_vpcc(&[0xA2, 0x49, 0x83, 0x42, 0xE0])?;
+        assert_eq!(rgb[4], 1, "profile 1");
+        assert_eq!(rgb[6], 0x87, "8-bit 4:4:4 full range");
+        assert_eq!(&rgb[7..10], &[1, 13, 0], "sRGB primaries, identity matrix");
+
+        let four_two_two = vp9_muxed_vpcc(&[0xA2, 0x49, 0x83, 0x42, 0x48])?;
+        assert_eq!(four_two_two[6], 0x84, "8-bit 4:2:2 limited range");
+        assert_eq!(&four_two_two[7..10], &[1, 1, 1], "BT.709 matrix");
+        Ok(())
+    }
+
+    #[test]
+    fn vp9_without_derivable_color_fails_before_sample_entry() {
+        for keyframe in [
+            vec![0x82, 0x31, 0x01],
+            vec![0x82, 0x49, 0x83, 0x42, 0xE0], // CS_RGB in profile 0
+            vec![0xA2, 0x49, 0x83, 0x42, 0x44], // (0, 1) subsampling
+            vec![0xA2, 0x49, 0x83, 0x42],       // truncated color_config
+        ] {
+            let media = vp9_media(Vec::new(), keyframe);
+            let mut output = Cursor::new(Vec::new());
+            let options = MuxOptions {
+                brand: Brand::Isom,
+                faststart: true,
+                ..MuxOptions::default()
+            };
+            let result = mux_mp4_into(&mut output, Path::new("vp9.mp4"), &media, options);
+            assert!(matches!(result, Err(PipelineError::RemuxFailed { .. })));
+            assert!(
+                !output.get_ref().windows(4).any(|w| w == b"vp09"),
+                "no VP9 sample entry was written"
+            );
+        }
     }
 
     #[test]
@@ -1352,13 +1410,117 @@ mod tests {
         };
         let origins = mp4_decode_origins(&media);
         assert_eq!(origins, vec![Some(100_000)]);
-        let timestamps = mp4_rebased_timestamps(&media, &origins);
+        let pts_bases = mp4_presentation_bases(&media, &origins);
+        assert_eq!(pts_bases, vec![Some(50_000)]);
+        let timestamps = mp4_rebased_timestamps(&media, &origins, &pts_bases);
         assert_eq!(
             timestamps,
-            vec![(0, 0), (100_000, 100_000), (100_001, -50_000)]
+            vec![(0, 50_000), (100_000, 150_000), (100_001, 0)]
         );
-        // Presentation deltas are exactly the original ones, even though the
-        // third packet's DTS had to be pushed past the second's.
+        // Presentation deltas stay exact and no frame gets a negative PTS.
         assert_eq!(timestamps[2].1 - timestamps[1].1, -150_000);
+        assert!(timestamps.iter().all(|&(_, pts)| pts >= 0));
+    }
+
+    #[test]
+    fn mp4_delayed_track_edit_list_preserves_early_b_frames() -> Result<(), String> {
+        let video = |pts: i64| ContainerPacket {
+            track: 1,
+            pts,
+            dts: pts,
+            duration: 33_333,
+            keyframe: pts == 100_000,
+            data: vec![0, 0, 0, 2, 0x65, 0x88],
+        };
+        let media = ContainerMedia {
+            tracks: vec![
+                ContainerTrack {
+                    codec: VideoCodec::Aac,
+                    width: None,
+                    height: None,
+                    channels: Some(2),
+                    sample_rate: Some(48_000),
+                    config: vec![0x11, 0x90],
+                    timescale: US_TIMESCALE,
+                },
+                ContainerTrack {
+                    codec: VideoCodec::H264,
+                    width: Some(320),
+                    height: Some(240),
+                    channels: None,
+                    sample_rate: None,
+                    config: extract_avcc_from_annex_b(&[
+                        0, 0, 1, 0x67, 0x42, 0x00, 0x1E, 0, 0, 1, 0x68, 0xCE,
+                    ])
+                    .unwrap_or_default(),
+                    timescale: US_TIMESCALE,
+                },
+            ],
+            packets: vec![
+                ContainerPacket {
+                    track: 0,
+                    pts: 0,
+                    dts: 0,
+                    duration: 21_000,
+                    keyframe: true,
+                    data: vec![0xAA; 8],
+                },
+                video(100_000),
+                video(200_000),
+                video(50_000),
+            ],
+        };
+        let origins = mp4_decode_origins(&media);
+        assert_eq!(origins, vec![Some(0), Some(100_000)]);
+        let pts_bases = mp4_presentation_bases(&media, &origins);
+        assert_eq!(pts_bases, vec![Some(0), Some(50_000)]);
+        let timeline_origin = pts_bases.iter().flatten().copied().min().unwrap_or(0);
+        assert_eq!(timeline_origin, 0);
+        assert_eq!(
+            pts_bases[1].unwrap_or(0).saturating_sub(timeline_origin),
+            50_000
+        );
+        let timestamps = mp4_rebased_timestamps(&media, &origins, &pts_bases);
+        assert_eq!(timestamps[0], (0, 0));
+        assert_eq!(timestamps[1], (0, 50_000));
+        assert_eq!(timestamps[2], (100_000, 150_000));
+        assert_eq!(timestamps[3], (100_001, 0));
+        assert!(timestamps.iter().all(|&(_, pts)| pts >= 0));
+
+        let mut output = Cursor::new(Vec::new());
+        let options = MuxOptions {
+            brand: Brand::Isom,
+            faststart: true,
+            movie_timescale: US_TIMESCALE,
+            ..MuxOptions::default()
+        };
+        mux_mp4_into(&mut output, Path::new("delayed.mp4"), &media, options)
+            .map_err(|err| err.to_string())?;
+        let bytes = output.into_inner();
+        let elst_offset = bytes
+            .windows(4)
+            .position(|window| window == b"elst")
+            .ok_or("missing elst box")?;
+        // Full-box version and flags, then entry_count, then the first entry.
+        let version = bytes[elst_offset + 4];
+        let entries = u32::from_be_bytes([
+            bytes[elst_offset + 8],
+            bytes[elst_offset + 9],
+            bytes[elst_offset + 10],
+            bytes[elst_offset + 11],
+        ]);
+        assert_eq!(version, 0);
+        assert_eq!(entries, 2);
+        let empty_duration = u32::from_be_bytes([
+            bytes[elst_offset + 12],
+            bytes[elst_offset + 13],
+            bytes[elst_offset + 14],
+            bytes[elst_offset + 15],
+        ]);
+        assert_eq!(
+            empty_duration, 50_000,
+            "video track's early B-frame plays at movie time 50 ms"
+        );
+        Ok(())
     }
 }
