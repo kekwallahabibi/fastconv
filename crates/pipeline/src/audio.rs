@@ -8,8 +8,8 @@ use std::num::{NonZeroU64, NonZeroUsize};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -619,10 +619,75 @@ impl Source for BorrowedI32FlacSource<'_> {
     }
 }
 
+/// Keeps flacenc's parallel feeder running after a source read failure so its
+/// workers are always stopped and joined; the failure is reported afterwards.
+struct EofTolerantFlacSource<S> {
+    inner: S,
+    failed: Arc<AtomicBool>,
+    remaining: usize,
+}
+
+impl<S: Source> EofTolerantFlacSource<S> {
+    fn new(inner: S, failed: Arc<AtomicBool>) -> Self {
+        let remaining = inner.len_hint().unwrap_or(0);
+        Self {
+            inner,
+            failed,
+            remaining,
+        }
+    }
+}
+
+impl<S: Source> Source for EofTolerantFlacSource<S> {
+    fn channels(&self) -> usize {
+        self.inner.channels()
+    }
+
+    fn bits_per_sample(&self) -> usize {
+        self.inner.bits_per_sample()
+    }
+
+    fn sample_rate(&self) -> usize {
+        self.inner.sample_rate()
+    }
+
+    fn len_hint(&self) -> Option<usize> {
+        self.inner.len_hint()
+    }
+
+    fn read_samples<F: Fill>(
+        &mut self,
+        block_size: usize,
+        dest: &mut F,
+    ) -> Result<usize, SourceError> {
+        if let Ok(frames) = self.inner.read_samples(block_size, dest) {
+            self.remaining = self.remaining.saturating_sub(frames);
+            Ok(frames)
+        } else {
+            // Never propagate the error into flacenc's feeder: it would skip
+            // request_stop() and leave all encoder workers blocked forever.
+            self.failed.store(true, Ordering::Relaxed);
+            let frames = self.remaining.min(block_size);
+            self.remaining -= frames;
+            if frames > 0 {
+                let zeros = vec![
+                    0_u8;
+                    frames
+                        .saturating_mul(self.channels())
+                        .saturating_mul(self.bits_per_sample() / 8)
+                ];
+                dest.fill_le_bytes(&zeros, self.bits_per_sample() / 8)?;
+            }
+            Ok(frames)
+        }
+    }
+}
+
 fn encode_flac_from_source<S: Source>(
     path: &Path,
     source: S,
     batch_workers: usize,
+    source_failed: Option<&AtomicBool>,
 ) -> Result<(), PipelineError> {
     let pcm_bytes = source
         .len_hint()
@@ -672,6 +737,12 @@ fn encode_flac_from_source<S: Source>(
             path: path.to_path_buf(),
             reason: format!("FLAC bitstream write failed: {err}"),
         })?;
+    if source_failed.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err(PipelineError::DecodeFailed {
+            path: path.to_path_buf(),
+            reason: "WAV source ended before all declared PCM samples were read".to_owned(),
+        });
+    }
     fs::write(path, sink.as_slice()).map_err(|source| PipelineError::Io {
         path: path.to_path_buf(),
         source,
@@ -693,7 +764,7 @@ fn encode_flac(
         bits,
         rate: usize_from(rate),
     };
-    encode_flac_from_source(path, source, batch_workers)
+    encode_flac_from_source(path, source, batch_workers, None)
 }
 
 fn encode_wav(
@@ -1169,7 +1240,9 @@ fn convert_pcm_wav_to_flac(
             total_samples,
             remaining_bytes,
         };
-        encode_flac_from_source(temp, source, batch_workers)
+        let failed = Arc::new(AtomicBool::new(false));
+        let source = EofTolerantFlacSource::new(source, Arc::clone(&failed));
+        encode_flac_from_source(temp, source, batch_workers, Some(&failed))
     })
 }
 
