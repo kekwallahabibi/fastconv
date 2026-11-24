@@ -669,7 +669,11 @@ pub fn execute_video_batch(plan: &VideoRemuxPlan) -> Result<VideoRemuxReport, Pi
     // A single item does not benefit from a scoped worker: it avoids a thread
     // spawn and keeps the I/O window and packet buffer on the calling stack.
     if plan.items().len() == 1 {
-        remux_with_staging(&plan.items()[0], 0)?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            remux_with_staging(&plan.items()[0], 0)
+        }))
+        .map_err(|_| PipelineError::WorkerPanicked)?;
+        result?;
     } else {
         thread::scope(|scope| -> Result<(), PipelineError> {
             let mut handles = Vec::with_capacity(workers);

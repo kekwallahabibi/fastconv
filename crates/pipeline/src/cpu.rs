@@ -254,17 +254,20 @@ pub(crate) fn execute_cpu_image_batch(
     // state across all worker threads. Keep lightweight formats on the full
     // worker set, and cap JXL/AVIF image concurrency (8/6) while assigning
     // remaining logical cores to per-encoder internal threading.
-    let requested_workers = plan.effective_workers().get();
+    let effective_workers = plan.effective_workers().get();
+    // Inner threading draws from the configured budget, not the item-capped
+    // worker count, so a small batch of heavy images still uses idle cores.
+    let configured_workers = plan.worker_threads().get();
     let (worker_count, inner_threads) = match encoder {
         CpuImageEncoder::Jxl(_) => {
-            let count = requested_workers.min(items.len()).clamp(1, 8);
-            (count, (requested_workers / count).max(1))
+            let count = configured_workers.min(items.len()).clamp(1, 8);
+            (count, (configured_workers / count).max(1))
         }
         CpuImageEncoder::Avif { .. } => {
-            let count = requested_workers.min(items.len()).clamp(1, 6);
-            (count, (requested_workers / count).max(1))
+            let count = configured_workers.min(items.len()).clamp(1, 6);
+            (count, (configured_workers / count).max(1))
         }
-        _ => (requested_workers, 1),
+        _ => (effective_workers, 1),
     };
     let worker_threads = NonZeroUsize::new(worker_count).unwrap_or(NonZeroUsize::MIN);
     let files_converted = NonZeroUsize::new(items.len())

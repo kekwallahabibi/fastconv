@@ -19,20 +19,18 @@ use rav1e::prelude::{
 use crate::PipelineError;
 use crate::decode::{DecodedFrameMeta, DecodedPixelFormat};
 
-/// Linear 1..=100 quality to AV1 quantizer (Q=100 -> 0, Q=90 -> ~64, Q=80 ->
-/// ~108, Q=50 -> ~150, Q=10 -> ~230), clamped to 0..=255.
+/// 1..=100 quality to AV1 quantizer. Matches ravif 0.13's transfer curve so
+/// high-quality settings keep the same encoder quality as the previous backend.
 fn quality_to_quantizer(quality: u8) -> usize {
-    let q = f64::from(quality.clamp(1, 100));
-    let quantizer = if q >= 100.0 {
-        0.0
-    } else if q >= 80.0 {
-        108.0 - (q - 80.0) * 2.2
-    } else if q >= 50.0 {
-        150.0 - (q - 50.0) * 1.4
+    let q = f64::from(quality.clamp(1, 100)) / 100.0;
+    let x = if q >= 0.82 {
+        (1.0 - q) * 2.6
+    } else if q > 0.25 {
+        q.mul_add(-0.5, 0.875)
     } else {
-        208.0 - (q - 10.0) * 1.45
+        1.0 - q
     };
-    let clamped = quantizer.round().clamp(0.0, 255.0);
+    let clamped = (x * 255.0).round().clamp(0.0, 255.0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let result = clamped as usize;
     result
@@ -192,6 +190,7 @@ fn fill_yuv420(
             } else {
                 4
             };
+            let has_alpha = format == DecodedPixelFormat::Rgba8;
             for (y, row) in y_plane_ref.rows_iter_mut().take(height).enumerate() {
                 let row_offset = y * width * bpp;
                 for (x, dst) in row.iter_mut().take(width).enumerate() {
@@ -219,18 +218,35 @@ fn fill_yuv420(
                     let mut r_sum = 0_i32;
                     let mut g_sum = 0_i32;
                     let mut b_sum = 0_i32;
+                    let mut a_sum = 0_i32;
                     for idx in [
                         row0 + x0 * bpp,
                         row0 + x1 * bpp,
                         row1 + x0 * bpp,
                         row1 + x1 * bpp,
                     ] {
-                        r_sum += i32::from(pixels[idx]);
-                        g_sum += i32::from(pixels[idx + 1]);
-                        b_sum += i32::from(pixels[idx + 2]);
+                        // Fully transparent pixels carry invisible RGB that must not
+                        // shift the chroma shared with opaque neighbours in this block.
+                        let alpha = if has_alpha {
+                            i32::from(pixels[idx + 3])
+                        } else {
+                            255
+                        };
+                        r_sum += i32::from(pixels[idx]) * alpha;
+                        g_sum += i32::from(pixels[idx + 1]) * alpha;
+                        b_sum += i32::from(pixels[idx + 2]) * alpha;
+                        a_sum += alpha;
                     }
-                    let (cb, cr) =
-                        chroma_bt601((r_sum + 2) >> 2, (g_sum + 2) >> 2, (b_sum + 2) >> 2);
+                    let (cb, cr) = if a_sum == 0 {
+                        (128, 128)
+                    } else {
+                        let half = a_sum / 2;
+                        chroma_bt601(
+                            (r_sum + half) / a_sum,
+                            (g_sum + half) / a_sum,
+                            (b_sum + half) / a_sum,
+                        )
+                    };
                     u_row[cx] = cb;
                     v_row[cx] = cr;
                 }
@@ -374,6 +390,21 @@ mod tests {
     use super::*;
     use fastconv_domain::ImageQuality;
 
+    fn first_chroma(frame: &Frame<u8>, plane: usize) -> Option<u8> {
+        frame
+            .planes
+            .get(plane)
+            .and_then(|p| p.rows_iter().next())
+            .and_then(|row| row.first().copied())
+    }
+
+    fn missing_chroma() -> PipelineError {
+        PipelineError::EncodeFailed {
+            path: Path::new("test.avif").to_path_buf(),
+            reason: "missing chroma sample in test frame".to_owned(),
+        }
+    }
+
     fn meta(format: DecodedPixelFormat, width: u32, height: u32) -> DecodedFrameMeta {
         DecodedFrameMeta {
             width,
@@ -459,8 +490,55 @@ mod tests {
     }
 
     #[test]
+    fn transparent_pixels_do_not_shift_shared_chroma() -> Result<(), PipelineError> {
+        // rav1e requires at least 16x16; the pattern lives in the first 2x2 block.
+        const SIDE: usize = 16;
+        let cfg = EncoderConfig {
+            width: SIDE,
+            height: SIDE,
+            bit_depth: 8,
+            chroma_sampling: ChromaSampling::Cs420,
+            ..Default::default()
+        };
+        let ctx = Config::new()
+            .with_encoder_config(cfg)
+            .with_threads(1)
+            .new_context::<u8>()
+            .map_err(|err| PipelineError::EncodeFailed {
+                path: Path::new("test.avif").to_path_buf(),
+                reason: format!("failed to create AV1 encoder context: {err}"),
+            })?;
+        let mut frame = ctx.new_frame();
+
+        // One opaque red pixel and three transparent blue pixels: hidden RGB
+        // must not pull the 4:2:0 chroma away from the visible red pixel.
+        let mut pixels = vec![0_u8; SIDE * SIDE * 4];
+        pixels[..16].copy_from_slice(&[255, 0, 0, 255, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0]);
+        fill_yuv420(&mut frame, &pixels, SIDE, SIDE, DecodedPixelFormat::Rgba8);
+        let cb = first_chroma(&frame, 1).ok_or_else(missing_chroma)?;
+        let cr = first_chroma(&frame, 2).ok_or_else(missing_chroma)?;
+        assert_eq!((cb, cr), chroma_bt601(255, 0, 0));
+
+        // An all-transparent block has no visible colour: neutral chroma.
+        let transparent = vec![0_u8; SIDE * SIDE * 4];
+        fill_yuv420(
+            &mut frame,
+            &transparent,
+            SIDE,
+            SIDE,
+            DecodedPixelFormat::Rgba8,
+        );
+        let cb = first_chroma(&frame, 1).ok_or_else(missing_chroma)?;
+        let cr = first_chroma(&frame, 2).ok_or_else(missing_chroma)?;
+        assert_eq!((cb, cr), (128, 128));
+        Ok(())
+    }
+
+    #[test]
     fn quality_curve_is_monotonic() {
         assert_eq!(quality_to_quantizer(100), 0);
+        assert_eq!(quality_to_quantizer(99), 7);
+        assert_eq!(quality_to_quantizer(90), 66);
         assert!(quality_to_quantizer(90) < quality_to_quantizer(80));
         assert!(quality_to_quantizer(80) < quality_to_quantizer(50));
         assert!(quality_to_quantizer(50) < quality_to_quantizer(10));

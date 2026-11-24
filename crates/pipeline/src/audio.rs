@@ -5,6 +5,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -243,11 +244,11 @@ fn decode_symphonia(
     if direct_i16 {
         if buf.samples_i16.capacity() < reserve {
             buf.samples_i16
-                .reserve(reserve.saturating_sub(buf.samples_i16.capacity()));
+                .reserve(reserve.saturating_sub(buf.samples_i16.len()));
         }
     } else if buf.samples_f32.capacity() < reserve {
         buf.samples_f32
-            .reserve(reserve.saturating_sub(buf.samples_f32.capacity()));
+            .reserve(reserve.saturating_sub(buf.samples_f32.len()));
     }
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(&params, &AudioDecoderOptions::default())
@@ -423,6 +424,7 @@ fn try_open_pcm_wav(path: &Path) -> Result<Option<PcmWavStream>, PipelineError> 
     if le_u32(&head, 4) == u32::MAX {
         return Ok(None);
     }
+    let riff_end = u64::from(le_u32(&head, 4)).saturating_add(8).min(file_len);
 
     let mut pos = 12_u64;
     let mut fmt: Option<(usize, u32, usize, usize)> = None;
@@ -430,12 +432,15 @@ fn try_open_pcm_wav(path: &Path) -> Result<Option<PcmWavStream>, PipelineError> 
     let mut header = [0_u8; 8];
     let mut payload = vec![0_u8; 4096];
 
-    while pos.saturating_add(8) <= file_len {
+    while pos.saturating_add(8) <= riff_end {
         if file.seek(SeekFrom::Start(pos)).is_err() || file.read_exact(&mut header).is_err() {
             return Ok(None);
         }
         let size = u64::from(le_u32(&header, 4));
         if size == u64::from(u32::MAX) {
+            return Ok(None);
+        }
+        if pos.saturating_add(8).saturating_add(size) > riff_end {
             return Ok(None);
         }
         let padded = size.saturating_add(size & 1);
@@ -487,7 +492,7 @@ fn try_open_pcm_wav(path: &Path) -> Result<Option<PcmWavStream>, PipelineError> 
     };
     let align = u64::try_from(block_align).unwrap_or(u64::MAX);
     if data_bytes == 0
-        || data_offset.saturating_add(data_bytes) > file_len
+        || data_offset.saturating_add(data_bytes) > riff_end
         || data_bytes % align != 0
     {
         return Ok(None);
@@ -551,7 +556,11 @@ impl Source for LeBytesFlacSource {
         let mut filled = 0_usize;
         while filled < wanted {
             match self.reader.read(&mut self.read_buf[filled..wanted]) {
-                Ok(0) => break,
+                Ok(0) => {
+                    return Err(SourceError::from_io_error(io::Error::from(
+                        io::ErrorKind::UnexpectedEof,
+                    )));
+                }
                 Ok(count) => filled += count,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                 Err(err) => return Err(SourceError::from_io_error(err)),
@@ -818,7 +827,7 @@ fn resample_to_opus_rate(
     }
     if buf.resampled_f32.capacity() < interleaved_reserve {
         buf.resampled_f32
-            .reserve(interleaved_reserve.saturating_sub(buf.resampled_f32.capacity()));
+            .reserve(interleaved_reserve.saturating_sub(buf.resampled_f32.len()));
     }
 
     let mut calls = 0_usize;
@@ -837,7 +846,9 @@ fn resample_to_opus_rate(
             if let Some(dst) = chunk.get_mut(channel) {
                 let copied = if let Some(src) = planar_in.get(channel) {
                     let available = src.len().saturating_sub(offset).min(take).min(dst.len());
-                    dst[..available].copy_from_slice(&src[offset..offset + available]);
+                    if available > 0 {
+                        dst[..available].copy_from_slice(&src[offset..offset + available]);
+                    }
                     available
                 } else {
                     0
@@ -1035,12 +1046,11 @@ fn create_staging_file(target: &Path) -> Result<PathBuf, PipelineError> {
             ".fastconv-audio-{}-{sequence}.tmp",
             std::process::id()
         ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&staging)
-        {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&staging) {
             Ok(_) => return Ok(staging),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
             Err(source) => {
