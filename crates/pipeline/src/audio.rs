@@ -5,6 +5,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -279,16 +280,28 @@ fn decode_symphonia(
             }
         };
         let count = audio_frame.samples_interleaved();
+        let start = if direct_i16 {
+            buf.samples_i16.len()
+        } else {
+            buf.samples_f32.len()
+        };
+        let end = start.saturating_add(count);
+        if end > max_samples {
+            return Err(PipelineError::DecodeFailed {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "decoded PCM exceeds the {MAX_PCM_BYTES_PER_FILE}-byte per-file limit"
+                ),
+            });
+        }
         if direct_i16 {
-            let start = buf.samples_i16.len();
-            buf.samples_i16.resize(start.saturating_add(count), 0);
-            if let Some(slot) = buf.samples_i16.get_mut(start..start.saturating_add(count)) {
+            buf.samples_i16.resize(end, 0);
+            if let Some(slot) = buf.samples_i16.get_mut(start..end) {
                 audio_frame.copy_to_slice_interleaved::<i16, _>(slot);
             }
         } else {
-            let start = buf.samples_f32.len();
-            buf.samples_f32.resize(start.saturating_add(count), 0.0);
-            if let Some(slot) = buf.samples_f32.get_mut(start..start.saturating_add(count)) {
+            buf.samples_f32.resize(end, 0.0);
+            if let Some(slot) = buf.samples_f32.get_mut(start..end) {
                 audio_frame.copy_to_slice_interleaved(slot);
             }
         }
@@ -1025,6 +1038,7 @@ fn create_staging_file(target: &Path) -> Result<PathBuf, PipelineError> {
         match OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&staging)
         {
             Ok(_) => return Ok(staging),
