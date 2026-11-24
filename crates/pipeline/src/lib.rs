@@ -1,11 +1,13 @@
 #![cfg_attr(not(feature = "nvenc"), forbid(unsafe_code))]
 
+mod aiff;
 pub mod audio;
 mod avif;
 mod bmp;
 pub mod cpu;
 mod decode;
 pub mod gpu;
+mod m4a;
 mod qoi;
 pub mod remux;
 

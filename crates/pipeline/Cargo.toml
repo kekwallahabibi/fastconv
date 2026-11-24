@@ -9,6 +9,7 @@ default = []
 nvenc = ["dep:cudarc", "dep:nvidia-video-codec-sdk"]
 
 [dependencies]
+alac-encoder.workspace = true
 cudarc = { workspace = true, optional = true }
 fastconv-domain.workspace = true
 containr.workspace = true
@@ -21,11 +22,14 @@ nvidia-video-codec-sdk = { workspace = true, optional = true }
 opus-pure.workspace = true
 png.workspace = true
 rubato.workspace = true
+rusty_aac.workspace = true
+rusty_mp3.workspace = true
 symphonia.workspace = true
 avif-serialize.workspace = true
 flate2.workspace = true
 rav1e.workspace = true
 tiff.workspace = true
+vorbis-enc.workspace = true
 zenwebp.workspace = true
 zune-jpeg.workspace = true
 

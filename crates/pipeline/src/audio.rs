@@ -4,7 +4,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -166,6 +166,137 @@ fn decode_opus(path: &Path, buf: &mut AudioWorkerBuffer) -> Result<(u32, usize),
     Ok((OPUS_RATE, channels))
 }
 
+/// Returns the byte offset of the first ADTS frame, skipping a leading `ID3v2` tag.
+fn skip_id3v2(path: &Path, data: &[u8]) -> Result<usize, PipelineError> {
+    if !data.starts_with(b"ID3") {
+        return Ok(0);
+    }
+    let fail = |reason: String| PipelineError::DecodeFailed {
+        path: path.to_path_buf(),
+        reason,
+    };
+    if data.len() < 10 || data[3] == 0xFF || data[4] == 0xFF {
+        return Err(fail("invalid ID3v2 tag before AAC frame".to_owned()));
+    }
+    if data[6..10].iter().any(|&byte| byte & 0x80 != 0) {
+        return Err(fail(
+            "invalid ID3v2 synchsafe size before AAC frame".to_owned(),
+        ));
+    }
+    let payload = (usize::from(data[6]) << 21)
+        | (usize::from(data[7]) << 14)
+        | (usize::from(data[8]) << 7)
+        | usize::from(data[9]);
+    let footer = if data[5] & 0x10 != 0 { 10 } else { 0 };
+    let pos = 10_usize.saturating_add(payload).saturating_add(footer);
+    if pos > data.len() {
+        return Err(fail("ID3v2 tag extends past end of AAC file".to_owned()));
+    }
+    Ok(pos)
+}
+
+fn decode_adts_aac(
+    path: &Path,
+    buf: &mut AudioWorkerBuffer,
+) -> Result<(u32, usize), PipelineError> {
+    // Reject oversized input before `fs::read` so a malicious/oversized file cannot spike RAM
+    // ahead of the incremental PCM limit enforced in the decode loop below.
+    let file_len = fs::metadata(path)
+        .map_err(|source| PipelineError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if file_len > MAX_PCM_BYTES_PER_FILE {
+        return Err(PipelineError::DecodeFailed {
+            path: path.to_path_buf(),
+            reason: format!(
+                "AAC input of {file_len} bytes exceeds the {MAX_PCM_BYTES_PER_FILE}-byte per-file limit"
+            ),
+        });
+    }
+    let data = fs::read(path).map_err(|source| PipelineError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut pos = skip_id3v2(path, &data)?;
+    let mut decoder = rusty_aac::AacDecoder::new();
+    let mut header_rate = 0_u32;
+    let mut header_channels = 0_usize;
+    let mut decoded_rate = 0_u32;
+    let mut decoded_channels = 0_usize;
+    while pos < data.len() {
+        let header =
+            rusty_aac::parse_adts(&data[pos..]).map_err(|err| PipelineError::DecodeFailed {
+                path: path.to_path_buf(),
+                reason: format!("invalid ADTS frame at byte {pos}: {err}"),
+            })?;
+        if header.frame_length < header.header_len {
+            return Err(PipelineError::DecodeFailed {
+                path: path.to_path_buf(),
+                reason: format!("ADTS frame at byte {pos} has an invalid length"),
+            });
+        }
+        let end = pos.saturating_add(header.frame_length);
+        if end > data.len() {
+            return Err(PipelineError::DecodeFailed {
+                path: path.to_path_buf(),
+                reason: format!("ADTS frame at byte {pos} extends past end of file"),
+            });
+        }
+        if header_rate == 0 {
+            header_rate = header.sample_rate;
+            header_channels = usize::from(header.channels);
+        }
+        let frame =
+            decoder
+                .decode(&data[pos..end], None)
+                .map_err(|err| PipelineError::DecodeFailed {
+                    path: path.to_path_buf(),
+                    reason: format!("failed to decode ADTS frame at byte {pos}: {err}"),
+                })?;
+        if decoded_rate == 0 && frame.sample_rate != 0 {
+            decoded_rate = frame.sample_rate;
+            decoded_channels = usize::from(frame.channels);
+        }
+        let pcm_bytes = u64::try_from(buf.samples_f32.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(4)
+            .saturating_add(
+                u64::try_from(frame.samples.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(4),
+            );
+        if pcm_bytes > MAX_PCM_BYTES_PER_FILE {
+            return Err(PipelineError::DecodeFailed {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "decoded PCM exceeds the {MAX_PCM_BYTES_PER_FILE}-byte per-file limit"
+                ),
+            });
+        }
+        buf.samples_f32.extend_from_slice(&frame.samples);
+        pos = end;
+    }
+    let rate = if decoded_rate != 0 {
+        decoded_rate
+    } else {
+        header_rate
+    };
+    let channels = if decoded_channels != 0 {
+        decoded_channels
+    } else {
+        header_channels
+    };
+    if rate == 0 || channels == 0 {
+        return Err(PipelineError::DecodeFailed {
+            path: path.to_path_buf(),
+            reason: "ADTS stream has no decodable audio frames".to_owned(),
+        });
+    }
+    Ok((rate, channels))
+}
+
 // The decode loop and buffer reservation must stay together to keep the direct-i16
 // decision and its borrow of `buf` in one place.
 #[allow(clippy::too_many_lines)]
@@ -232,8 +363,13 @@ fn decode_symphonia(
                 | symphonia::core::audio::sample::SampleFormat::F64,
         )
     );
-    let direct_i16 = matches!(target, AudioOutputFormat::Wav | AudioOutputFormat::Flac)
-        && bits == 16
+    let direct_i16 = matches!(
+        target,
+        AudioOutputFormat::Wav
+            | AudioOutputFormat::Flac
+            | AudioOutputFormat::Aiff
+            | AudioOutputFormat::Alac
+    ) && bits == 16
         && integer_pcm;
     let sample_bytes = if direct_i16 { 2_u64 } else { 4_u64 };
     let max_samples = usize::try_from(MAX_PCM_BYTES_PER_FILE / sample_bytes).unwrap_or(usize::MAX);
@@ -316,11 +452,16 @@ fn decode_audio(
     buf: &mut AudioWorkerBuffer,
 ) -> Result<(u32, usize, usize), PipelineError> {
     buf.reset();
-    let (rate, channels, source_bits) = if item.input_format() == AudioInputFormat::Opus {
-        let (rate, channels) = decode_opus(item.source(), buf)?;
-        (rate, channels, 16)
-    } else {
-        decode_symphonia(item.source(), item.input_format(), target, buf)?
+    let (rate, channels, source_bits) = match item.input_format() {
+        AudioInputFormat::Opus => {
+            let (rate, channels) = decode_opus(item.source(), buf)?;
+            (rate, channels, 16)
+        }
+        AudioInputFormat::Aac => {
+            let (rate, channels) = decode_adts_aac(item.source(), buf)?;
+            (rate, channels, 16)
+        }
+        _ => decode_symphonia(item.source(), item.input_format(), target, buf)?,
     };
 
     if channels == 0 {
@@ -340,11 +481,12 @@ fn quantize_for(target: AudioOutputFormat, bits: usize, buf: &mut AudioWorkerBuf
     buf.samples_i16.clear();
     buf.samples_i32.clear();
     match (target, bits) {
-        (AudioOutputFormat::Opus, _) | (AudioOutputFormat::Wav, 16 | 0) => {
+        (AudioOutputFormat::Wav | AudioOutputFormat::Aiff, 16 | 0)
+        | (AudioOutputFormat::Alac, 8 | 16 | 0) => {
             buf.samples_i16
                 .extend(buf.samples_f32.iter().copied().map(quantize_i16));
         }
-        (AudioOutputFormat::Wav, 8) => {
+        (AudioOutputFormat::Wav | AudioOutputFormat::Aiff, 8) => {
             buf.samples_i16.extend(
                 buf.samples_f32
                     .iter()
@@ -352,7 +494,7 @@ fn quantize_for(target: AudioOutputFormat, bits: usize, buf: &mut AudioWorkerBuf
                     .map(|s| i16::from(quantize_i8(s))),
             );
         }
-        (AudioOutputFormat::Wav | AudioOutputFormat::Flac, 24) => {
+        (AudioOutputFormat::Wav | AudioOutputFormat::Aiff | AudioOutputFormat::Flac, 24) => {
             buf.samples_i32
                 .extend(buf.samples_f32.iter().copied().map(quantize_i24));
         }
@@ -372,7 +514,7 @@ fn quantize_for(target: AudioOutputFormat, bits: usize, buf: &mut AudioWorkerBuf
                     .map(|s| i32::from(quantize_i16(s))),
             );
         }
-        // Unsupported depths are rejected before quantization; keep the match exhaustive.
+        // Lossy targets keep their f32 samples; unsupported depths are rejected before this call.
         _ => {}
     }
     // Only one PCM representation is needed after quantization; release the float copy so peak
@@ -836,22 +978,22 @@ fn encode_wav(
 
 // The resampler state, chunk buffer and output accumulation form one linear pipeline.
 #[allow(clippy::too_many_lines)]
-fn resample_to_opus_rate(
-    rate: u32,
+fn resample_f32(
+    from_rate: u32,
+    to_rate: u32,
     channels: usize,
     buf: &mut AudioWorkerBuffer,
+    label: &str,
 ) -> Result<(), PipelineError> {
-    if rate == OPUS_RATE {
-        // Opus consumes f32 interleaved at 48 kHz; keep the decoded buffer in place.
+    if from_rate == to_rate {
+        // The encoder already consumes f32 interleaved at this rate.
         return Ok(());
     }
     let input = std::mem::take(&mut buf.samples_f32);
-    if channels > 2 {
-        return Err(PipelineError::EncodeFailed {
-            path: Path::new("opus-resampler").to_path_buf(),
-            reason: format!("Opus supports at most 2 channels, got {channels}"),
-        });
-    }
+    let fail = |reason: String| PipelineError::EncodeFailed {
+        path: Path::new(label).to_path_buf(),
+        reason,
+    };
 
     let mut planar_in = Vec::with_capacity(channels);
     let mut planar_out = Vec::with_capacity(channels);
@@ -867,22 +1009,23 @@ fn resample_to_opus_rate(
     }
 
     let mut resampler = FftFixedInOut::<f32>::new(
-        usize_from(rate),
-        usize_from(OPUS_RATE),
+        usize_from(from_rate),
+        usize_from(to_rate),
         RESAMPLE_CHUNK,
         channels,
     )
-    .map_err(|err| PipelineError::EncodeFailed {
-        path: Path::new("opus-resampler").to_path_buf(),
-        reason: format!("failed to create resampler from {rate} Hz to 48000 Hz: {err}"),
+    .map_err(|err| {
+        fail(format!(
+            "failed to create resampler from {from_rate} Hz to {to_rate} Hz: {err}"
+        ))
     })?;
     let chunk_in = resampler.input_frames_next();
     let chunk_out = resampler.output_frames_next().max(1);
     let mut out_chunk = resampler.output_buffer_allocate(true);
     let input_frames = input.len() / channels;
     let expected_u64 = (u64::try_from(input_frames).unwrap_or(u64::MAX))
-        .saturating_mul(u64::from(OPUS_RATE))
-        / u64::from(rate);
+        .saturating_mul(u64::from(to_rate))
+        / u64::from(from_rate);
     let expected = usize::try_from(expected_u64).unwrap_or(usize::MAX);
     let delay = resampler.output_delay();
     let needed = expected.saturating_add(delay);
@@ -931,10 +1074,7 @@ fn resample_to_opus_rate(
         }
         let (_, produced) = resampler
             .process_into_buffer(&chunk, &mut out_chunk, None)
-            .map_err(|err| PipelineError::EncodeFailed {
-                path: Path::new("opus-resampler").to_path_buf(),
-                reason: format!("resampling failed: {err}"),
-            })?;
+            .map_err(|err| fail(format!("resampling failed: {err}")))?;
         for channel in 0..channels {
             if let (Some(dst), Some(src)) = (planar_out.get_mut(channel), out_chunk.get(channel)) {
                 dst.extend_from_slice(&src[..produced.min(src.len())]);
@@ -974,7 +1114,7 @@ fn encode_opus(
             reason: format!("Opus output supports mono/stereo only, got {channels} channels"),
         });
     }
-    resample_to_opus_rate(rate, channels, buf)?;
+    resample_f32(rate, OPUS_RATE, channels, buf, "opus-resampler")?;
     let total_frames = buf.samples_f32.len() / channels;
     if total_frames == 0 {
         return Err(PipelineError::EmptyOutput(path.to_path_buf()));
@@ -1102,6 +1242,318 @@ fn encode_opus(
     })
 }
 
+const AAC_BITRATE_BPS: u32 = 128_000;
+const MP3_BITRATE_KBPS: u32 = 192;
+const MP3_RATES: [u32; 9] = [
+    8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000,
+];
+const OGG_MAX_RATE: u32 = 192_000;
+const OGG_CHUNK_FRAMES: usize = 4096;
+
+fn aac_rate(rate: u32) -> u32 {
+    if rusty_aac::sf_index_for_rate(rate).is_some() {
+        rate
+    } else {
+        OPUS_RATE
+    }
+}
+
+fn check_channels(
+    path: &Path,
+    channels: usize,
+    min: usize,
+    max: usize,
+    codec: &str,
+) -> Result<(), PipelineError> {
+    if (min..=max).contains(&channels) {
+        Ok(())
+    } else {
+        Err(PipelineError::EncodeFailed {
+            path: path.to_path_buf(),
+            reason: format!("{codec} output supports {min}-{max} channels, got {channels}"),
+        })
+    }
+}
+
+fn encode_aac(
+    path: &Path,
+    rate: u32,
+    channels: usize,
+    buf: &mut AudioWorkerBuffer,
+) -> Result<(), PipelineError> {
+    check_channels(path, channels, 1, 6, "AAC")?;
+    let target_rate = aac_rate(rate);
+    resample_f32(rate, target_rate, channels, buf, "aac-resampler")?;
+    if buf.samples_f32.is_empty() {
+        return Err(PipelineError::EmptyOutput(path.to_path_buf()));
+    }
+    let ch_u16 = u16::try_from(channels).unwrap_or(u16::MAX);
+    let mut encoder = rusty_aac::AacEncoder::new(rusty_aac::AacEncoderConfig {
+        bitrate_bps: AAC_BITRATE_BPS,
+        ..rusty_aac::AacEncoderConfig::default()
+    });
+    encoder
+        .push_pcm(&buf.samples_f32, ch_u16, target_rate)
+        .map_err(|err| PipelineError::EncodeFailed {
+            path: path.to_path_buf(),
+            reason: format!("AAC encoding failed: {err}"),
+        })?;
+    encoder.finish();
+    let file = File::create(path).map_err(|source| PipelineError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut writer = BufWriter::with_capacity(OPUS_WRITE_BUF_BYTES, file);
+    loop {
+        match encoder.next_packet() {
+            Ok(packet) => {
+                let header = rusty_aac::write_adts_header(&rusty_aac::AdtsHeader {
+                    object_type: 2,
+                    sample_rate: target_rate,
+                    channels: ch_u16,
+                    frame_length: 7_usize.saturating_add(packet.data.len()),
+                    header_len: 7,
+                });
+                writer
+                    .write_all(&header)
+                    .map_err(|source| PipelineError::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+                writer
+                    .write_all(&packet.data)
+                    .map_err(|source| PipelineError::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+            }
+            Err(rusty_aac::Error::Eof | rusty_aac::Error::Again) => break,
+            Err(err) => {
+                return Err(PipelineError::EncodeFailed {
+                    path: path.to_path_buf(),
+                    reason: format!("failed to drain AAC packets: {err}"),
+                });
+            }
+        }
+    }
+    writer.flush().map_err(|source| PipelineError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn encode_m4a(
+    path: &Path,
+    rate: u32,
+    channels: usize,
+    buf: &mut AudioWorkerBuffer,
+) -> Result<(), PipelineError> {
+    check_channels(path, channels, 1, 6, "M4A/AAC")?;
+    let target_rate = aac_rate(rate);
+    resample_f32(rate, target_rate, channels, buf, "m4a-resampler")?;
+    if buf.samples_f32.is_empty() {
+        return Err(PipelineError::EmptyOutput(path.to_path_buf()));
+    }
+    let ch_u16 = u16::try_from(channels).unwrap_or(u16::MAX);
+    let total_input_frames = u64::try_from(buf.samples_f32.len() / channels).unwrap_or(u64::MAX);
+    let mut encoder = rusty_aac::AacEncoder::new(rusty_aac::AacEncoderConfig {
+        bitrate_bps: AAC_BITRATE_BPS,
+        ..rusty_aac::AacEncoderConfig::default()
+    });
+    encoder
+        .push_pcm(&buf.samples_f32, ch_u16, target_rate)
+        .map_err(|err| PipelineError::EncodeFailed {
+            path: path.to_path_buf(),
+            reason: format!("AAC encoding failed: {err}"),
+        })?;
+    encoder.finish();
+    let mut packets: Vec<(Vec<u8>, u32)> = Vec::new();
+    loop {
+        match encoder.next_packet() {
+            Ok(packet) => packets.push((packet.data, packet.duration)),
+            Err(rusty_aac::Error::Eof | rusty_aac::Error::Again) => break,
+            Err(err) => {
+                return Err(PipelineError::EncodeFailed {
+                    path: path.to_path_buf(),
+                    reason: format!("failed to drain AAC packets: {err}"),
+                });
+            }
+        }
+    }
+    let priming = encoder.priming_samples();
+    crate::m4a::write_m4a_aac(
+        path,
+        target_rate,
+        ch_u16,
+        AAC_BITRATE_BPS,
+        total_input_frames,
+        priming,
+        &packets,
+    )
+}
+
+fn encode_mp3(
+    path: &Path,
+    rate: u32,
+    channels: usize,
+    buf: &mut AudioWorkerBuffer,
+) -> Result<(), PipelineError> {
+    check_channels(path, channels, 1, 2, "MP3")?;
+    let target_rate = if MP3_RATES.contains(&rate) {
+        rate
+    } else {
+        OPUS_RATE
+    };
+    resample_f32(rate, target_rate, channels, buf, "mp3-resampler")?;
+    if buf.samples_f32.is_empty() {
+        return Err(PipelineError::EmptyOutput(path.to_path_buf()));
+    }
+    let ch_u16 = u16::try_from(channels).unwrap_or(u16::MAX);
+    let mut encoder = rusty_mp3::Mp3Encoder::new(rusty_mp3::Mp3EncoderConfig {
+        bitrate_kbps: MP3_BITRATE_KBPS,
+        vbr_quality: None,
+    });
+    encoder
+        .push_pcm_f32(&buf.samples_f32, ch_u16, target_rate)
+        .map_err(|err| PipelineError::EncodeFailed {
+            path: path.to_path_buf(),
+            reason: format!("MP3 encoding failed: {err}"),
+        })?;
+    encoder.finish();
+    let file = File::create(path).map_err(|source| PipelineError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut writer = BufWriter::with_capacity(OPUS_WRITE_BUF_BYTES, file);
+    loop {
+        match encoder.next_packet() {
+            Ok(packet) => writer
+                .write_all(&packet)
+                .map_err(|source| PipelineError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?,
+            Err(rusty_mp3::Error::Eof | rusty_mp3::Error::Again) => break,
+            Err(err) => {
+                return Err(PipelineError::EncodeFailed {
+                    path: path.to_path_buf(),
+                    reason: format!("failed to drain MP3 packets: {err}"),
+                });
+            }
+        }
+    }
+    writer.flush().map_err(|source| PipelineError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn encode_ogg(
+    path: &Path,
+    rate: u32,
+    channels: usize,
+    buf: &mut AudioWorkerBuffer,
+) -> Result<(), PipelineError> {
+    check_channels(path, channels, 1, usize::from(u8::MAX), "Ogg Vorbis")?;
+    if rate == 0 {
+        return Err(PipelineError::EncodeFailed {
+            path: path.to_path_buf(),
+            reason: "Ogg Vorbis requires a positive sample rate".to_owned(),
+        });
+    }
+    let target_rate = if rate <= OGG_MAX_RATE {
+        rate
+    } else {
+        OPUS_RATE
+    };
+    resample_f32(rate, target_rate, channels, buf, "ogg-resampler")?;
+    if buf.samples_f32.is_empty() {
+        return Err(PipelineError::EmptyOutput(path.to_path_buf()));
+    }
+    let rate_nz = NonZeroU32::new(target_rate).ok_or_else(|| PipelineError::EncodeFailed {
+        path: path.to_path_buf(),
+        reason: "Ogg Vorbis sample rate must be non-zero".to_owned(),
+    })?;
+    let ch_nz = NonZeroU8::new(u8::try_from(channels).unwrap_or(u8::MAX)).ok_or_else(|| {
+        PipelineError::EncodeFailed {
+            path: path.to_path_buf(),
+            reason: "Ogg Vorbis channel count must be non-zero".to_owned(),
+        }
+    })?;
+    let file = File::create(path).map_err(|source| PipelineError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let writer = BufWriter::with_capacity(64 * 1024, file);
+    let mut encoder = vorbis_enc::EncoderBuilder::new(rate_nz, ch_nz, writer)
+        .bitrate_management_strategy(vorbis_enc::BitrateManagementStrategy::QualityVbr {
+            target_quality: 0.4,
+        })
+        .build()
+        .map_err(|err| PipelineError::EncodeFailed {
+            path: path.to_path_buf(),
+            reason: format!("failed to create Ogg Vorbis encoder: {err}"),
+        })?;
+    let total_frames = buf.samples_f32.len() / channels;
+    let mut planes: Vec<Vec<f32>> = vec![Vec::with_capacity(OGG_CHUNK_FRAMES); channels];
+    for start in (0..total_frames).step_by(OGG_CHUNK_FRAMES) {
+        let frames = OGG_CHUNK_FRAMES.min(total_frames.saturating_sub(start));
+        for plane in &mut planes {
+            plane.clear();
+        }
+        for frame in 0..frames {
+            let base = (start.saturating_add(frame)).saturating_mul(channels);
+            for (channel, plane) in planes.iter_mut().enumerate() {
+                if let Some(&value) = buf.samples_f32.get(base.saturating_add(channel)) {
+                    plane.push(value);
+                }
+            }
+        }
+        encoder
+            .encode_audio_block(planes.iter())
+            .map_err(|err| PipelineError::EncodeFailed {
+                path: path.to_path_buf(),
+                reason: format!("Ogg Vorbis encoding failed: {err}"),
+            })?;
+    }
+    let mut writer = encoder
+        .finish()
+        .map_err(|err| PipelineError::EncodeFailed {
+            path: path.to_path_buf(),
+            reason: format!("failed to finalize Ogg Vorbis stream: {err}"),
+        })?;
+    writer.flush().map_err(|source| PipelineError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn encode_alac(
+    path: &Path,
+    rate: u32,
+    channels: usize,
+    buf: &AudioWorkerBuffer,
+) -> Result<(), PipelineError> {
+    crate::m4a::encode_alac_m4a(path, rate, channels, &buf.samples_i16)
+}
+
+fn encode_aiff(
+    path: &Path,
+    rate: u32,
+    channels: usize,
+    bits: usize,
+    buf: &AudioWorkerBuffer,
+) -> Result<(), PipelineError> {
+    crate::aiff::encode_aiff(
+        path,
+        rate,
+        channels,
+        bits,
+        &buf.samples_i16,
+        &buf.samples_i32,
+    )
+}
+
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Reserves a unique, exclusively created staging file in the target directory so concurrent
@@ -1180,7 +1632,21 @@ fn encode_audio(
     buf: &mut AudioWorkerBuffer,
     batch_workers: usize,
 ) -> Result<u64, PipelineError> {
-    let bits = if mode.output_format() == AudioOutputFormat::Opus {
+    let output = mode.output_format();
+    if output == AudioOutputFormat::Alac && bits == 24 {
+        return Err(PipelineError::EncodeFailed {
+            path: item.source().to_path_buf(),
+            reason: "ALAC encoder currently supports 8/16-bit PCM only (24-bit would require lossy truncation)".to_owned(),
+        });
+    }
+    let bits = if matches!(
+        output,
+        AudioOutputFormat::Opus
+            | AudioOutputFormat::Ogg
+            | AudioOutputFormat::Mp3
+            | AudioOutputFormat::Aac
+            | AudioOutputFormat::M4a
+    ) {
         16
     } else {
         match bits {
@@ -1195,21 +1661,33 @@ fn encode_audio(
         }
     };
     // A direct i16 decode leaves samples_i16 populated; promote to i32 for FLAC
-    // or pass the i16 buffer through to the bulk WAV writer.
+    // or pass the i16 buffer through to the 16-bit WAV/AIFF/ALAC writers.
     let direct_i16 = !buf.samples_i16.is_empty() && buf.samples_f32.is_empty();
     if direct_i16 {
-        if mode.output_format() == AudioOutputFormat::Flac {
+        if output == AudioOutputFormat::Flac {
             buf.samples_i32.clear();
             buf.samples_i32
                 .extend(buf.samples_i16.iter().copied().map(i32::from));
         }
-    } else if mode.output_format() != AudioOutputFormat::Opus {
-        quantize_for(mode.output_format(), bits, buf);
+    } else if matches!(
+        output,
+        AudioOutputFormat::Wav
+            | AudioOutputFormat::Flac
+            | AudioOutputFormat::Alac
+            | AudioOutputFormat::Aiff
+    ) {
+        quantize_for(output, bits, buf);
     }
-    encode_staged(item, |temp| match mode.output_format() {
+    encode_staged(item, |temp| match output {
         AudioOutputFormat::Wav => encode_wav(temp, rate, channels, bits, buf),
         AudioOutputFormat::Flac => encode_flac(temp, rate, channels, bits, buf, batch_workers),
         AudioOutputFormat::Opus => encode_opus(temp, rate, channels, buf, batch_workers),
+        AudioOutputFormat::Ogg => encode_ogg(temp, rate, channels, buf),
+        AudioOutputFormat::Mp3 => encode_mp3(temp, rate, channels, buf),
+        AudioOutputFormat::Aac => encode_aac(temp, rate, channels, buf),
+        AudioOutputFormat::M4a => encode_m4a(temp, rate, channels, buf),
+        AudioOutputFormat::Alac => encode_alac(temp, rate, channels, buf),
+        AudioOutputFormat::Aiff => encode_aiff(temp, rate, channels, bits, buf),
     })
 }
 
@@ -1886,5 +2364,208 @@ mod tests {
         assert_eq!(decoded.len(), samples.len());
         let _ = fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    fn deep_tone(samples: usize, channels: usize) -> Vec<i32> {
+        (0..samples.saturating_mul(channels))
+            .map(|i| {
+                let value = i64::try_from(i).unwrap_or(0).saturating_mul(7919) % 4_000_000;
+                i32::try_from(value.saturating_sub(2_000_000)).unwrap_or(0)
+            })
+            .collect()
+    }
+
+    fn write_wav24(
+        path: &Path,
+        samples: &[i32],
+        rate: u32,
+        channels: u16,
+    ) -> Result<(), PipelineError> {
+        let mut data = Vec::with_capacity(samples.len().saturating_mul(3));
+        for &sample in samples {
+            let bytes = sample.to_le_bytes();
+            data.extend_from_slice(&bytes[..3]);
+        }
+        write_raw_wav(path, &wav_bytes(&fmt_pcm(channels, rate, 24), &data, &[]))
+    }
+
+    #[test]
+    fn roundtrips_wav_aiff_wav_16bit_and_24bit_bit_identically() -> Result<(), PipelineError> {
+        let dir = temp_dir("wav-aiff-wav");
+        let samples16 = tone(12_000, 2);
+        let wav16 = dir.join("in16.wav");
+        let aiff16 = dir.join("mid16.aiff");
+        let back16 = dir.join("out16.wav");
+        write_wav(&wav16, &samples16, 48_000, 2);
+        execute_audio_batch(&plan(
+            vec![item(
+                wav16,
+                aiff16.clone(),
+                AudioInputFormat::Wav,
+                2,
+                48_000,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuAiff,
+        ))?;
+        execute_audio_batch(&plan(
+            vec![item(
+                aiff16,
+                back16.clone(),
+                AudioInputFormat::Aiff,
+                2,
+                48_000,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuWav,
+        ))?;
+        assert_eq!(read_wav(&back16), samples16);
+
+        let samples24 = deep_tone(12_000, 2);
+        let wav24 = dir.join("in24.wav");
+        let aiff24 = dir.join("mid24.aiff");
+        let back24 = dir.join("out24.wav");
+        write_wav24(&wav24, &samples24, 48_000, 2)?;
+        execute_audio_batch(&plan(
+            vec![item_bits(
+                wav24,
+                aiff24.clone(),
+                AudioInputFormat::Wav,
+                2,
+                48_000,
+                24,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuAiff,
+        ))?;
+        execute_audio_batch(&plan(
+            vec![item_bits(
+                aiff24,
+                back24.clone(),
+                AudioInputFormat::Aiff,
+                2,
+                48_000,
+                24,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuWav,
+        ))?;
+        assert_eq!(read_wav_i32(&back24), samples24);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrips_wav_alac_wav_bit_identically() -> Result<(), PipelineError> {
+        let dir = temp_dir("wav-alac-wav");
+        let samples = tone(12_000, 2);
+        let wav = dir.join("in.wav");
+        let m4a = dir.join("mid.m4a");
+        let back = dir.join("out.wav");
+        write_wav(&wav, &samples, 48_000, 2);
+        execute_audio_batch(&plan(
+            vec![item(
+                wav.clone(),
+                m4a.clone(),
+                AudioInputFormat::Wav,
+                2,
+                48_000,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuAlac,
+        ))?;
+        execute_audio_batch(&plan(
+            vec![item(m4a, back.clone(), AudioInputFormat::Alac, 2, 48_000)],
+            fastconv_domain::AudioExecutionMode::CpuWav,
+        ))?;
+        assert_eq!(read_wav(&back), samples);
+
+        let wav24 = dir.join("in24.wav");
+        let m4a24 = dir.join("reject.m4a");
+        write_wav24(&wav24, &deep_tone(4_096, 1), 48_000, 1)?;
+        let result = execute_audio_batch(&plan(
+            vec![item_bits(
+                wav24,
+                m4a24,
+                AudioInputFormat::Wav,
+                1,
+                48_000,
+                24,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuAlac,
+        ));
+        assert!(
+            matches!(result, Err(PipelineError::EncodeFailed { .. })),
+            "24-bit ALAC must fail instead of truncating silently"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    fn assert_lossy_roundtrip(
+        label: &str,
+        extension: &str,
+        mode: fastconv_domain::AudioExecutionMode,
+        decoded_format: AudioInputFormat,
+    ) -> Result<(), PipelineError> {
+        let dir = temp_dir(label);
+        let wav = dir.join("in.wav");
+        let encoded = dir.join(format!("out.{extension}"));
+        let back = dir.join("back.wav");
+        write_wav(&wav, &tone(16_000, 2), 48_000, 2);
+        execute_audio_batch(&plan(
+            vec![item(wav, encoded.clone(), AudioInputFormat::Wav, 2, 48_000)],
+            mode,
+        ))?;
+        execute_audio_batch(&plan(
+            vec![item(encoded, back.clone(), decoded_format, 2, 48_000)],
+            fastconv_domain::AudioExecutionMode::CpuWav,
+        ))?;
+        assert!(!read_wav(&back).is_empty(), "decoded WAV must not be empty");
+        let spec = hound::WavReader::open(&back)
+            .map_err(|err| PipelineError::DecodeFailed {
+                path: back.clone(),
+                reason: format!("failed to reopen decoded WAV: {err}"),
+            })?
+            .spec();
+        assert_eq!(spec.sample_rate, 48_000);
+        assert_eq!(spec.channels, 2);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrips_wav_aac_wav() -> Result<(), PipelineError> {
+        assert_lossy_roundtrip(
+            "wav-aac-wav",
+            "aac",
+            fastconv_domain::AudioExecutionMode::CpuAac,
+            AudioInputFormat::Aac,
+        )
+    }
+
+    #[test]
+    fn roundtrips_wav_m4a_wav() -> Result<(), PipelineError> {
+        assert_lossy_roundtrip(
+            "wav-m4a-wav",
+            "m4a",
+            fastconv_domain::AudioExecutionMode::CpuM4a,
+            AudioInputFormat::M4a,
+        )
+    }
+
+    #[test]
+    fn roundtrips_wav_mp3_wav() -> Result<(), PipelineError> {
+        assert_lossy_roundtrip(
+            "wav-mp3-wav",
+            "mp3",
+            fastconv_domain::AudioExecutionMode::CpuMp3,
+            AudioInputFormat::Mp3,
+        )
+    }
+
+    #[test]
+    fn roundtrips_wav_ogg_wav() -> Result<(), PipelineError> {
+        assert_lossy_roundtrip(
+            "wav-ogg-wav",
+            "ogg",
+            fastconv_domain::AudioExecutionMode::CpuOgg,
+            AudioInputFormat::Vorbis,
+        )
     }
 }
