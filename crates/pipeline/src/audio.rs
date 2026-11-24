@@ -53,7 +53,6 @@ pub struct AudioWorkerBuffer {
     samples_i16: Vec<i16>,
     samples_i32: Vec<i32>,
     resampled_f32: Vec<f32>,
-    opus_block: Vec<i16>,
     packet: Vec<u8>,
 }
 
@@ -71,10 +70,6 @@ impl AudioWorkerBuffer {
             samples_i16: Vec::with_capacity(OPUS_RATE as usize * 2),
             samples_i32: Vec::with_capacity(OPUS_RATE as usize * 2),
             resampled_f32: Vec::new(),
-            opus_block: vec![
-                0_i16;
-                usize::try_from(OPUS_RATE / (1000 / OPUS_FRAME_MS)).unwrap_or(960) * 2
-            ],
             packet: vec![0_u8; MAX_PACKET_BYTES],
         }
     }
@@ -226,7 +221,7 @@ fn decode_symphonia(
     }
     let track_id = track.id;
     let total_samples = track.num_frames;
-    // Symphonia left-aligns 16-bit integer samples when converting to f32 (i16 << 16),
+    // Symphonia left-aligns 16-bit integer samples when converting to i32 (i16 << 16),
     // so a direct i16 copy is both faster and bit-exact for lossless targets.
     let integer_pcm = !matches!(
         params.sample_format,
@@ -238,9 +233,12 @@ fn decode_symphonia(
     let direct_i16 = matches!(target, AudioOutputFormat::Wav | AudioOutputFormat::Flac)
         && bits == 16
         && integer_pcm;
+    let sample_bytes = if direct_i16 { 2_u64 } else { 4_u64 };
+    let max_samples = usize::try_from(MAX_PCM_BYTES_PER_FILE / sample_bytes).unwrap_or(usize::MAX);
     let reserve = total_samples
         .map_or(0, |frames| usize::try_from(frames).unwrap_or(usize::MAX))
-        .saturating_mul(channels);
+        .saturating_mul(channels)
+        .min(max_samples);
     if direct_i16 {
         if buf.samples_i16.capacity() < reserve {
             buf.samples_i16
@@ -642,7 +640,10 @@ fn encode_flac_from_source<S: Source>(
             path: path.to_path_buf(),
             reason: format!("FLAC stream-info update failed: {err}"),
         })?;
-    let mut sink = ByteSink::with_capacity(pcm_bytes.saturating_mul(8).max(4096));
+    let max_sink_bytes = usize::try_from(MAX_PCM_BYTES_PER_FILE).unwrap_or(usize::MAX);
+    let estimated_bytes =
+        ((pcm_bytes / 10).saturating_mul(6).saturating_add(65_536)).min(max_sink_bytes);
+    let mut sink = ByteSink::with_capacity(estimated_bytes.saturating_mul(8).max(4096));
     stream
         .write(&mut sink)
         .map_err(|err| PipelineError::EncodeFailed {
@@ -796,13 +797,15 @@ fn resample_to_opus_rate(
         .div_ceil(chunk_in)
         .saturating_add(needed.div_ceil(chunk_out))
         .saturating_add(4);
-    let reserve = needed.saturating_add(4).saturating_mul(channels);
+    let max_f32_samples = usize::try_from(MAX_PCM_BYTES_PER_FILE / 4).unwrap_or(usize::MAX);
+    let plane_reserve = needed.saturating_add(4).min(max_f32_samples);
+    let interleaved_reserve = plane_reserve.saturating_mul(channels).min(max_f32_samples);
     for plane in &mut planar_out {
-        plane.reserve(reserve);
+        plane.reserve(plane_reserve);
     }
-    if buf.resampled_f32.capacity() < reserve {
+    if buf.resampled_f32.capacity() < interleaved_reserve {
         buf.resampled_f32
-            .reserve(reserve.saturating_sub(buf.resampled_f32.capacity()));
+            .reserve(interleaved_reserve.saturating_sub(buf.resampled_f32.capacity()));
     }
 
     let mut calls = 0_usize;
@@ -819,15 +822,15 @@ fn resample_to_opus_rate(
         }
         for channel in 0..channels {
             if let Some(dst) = chunk.get_mut(channel) {
-                dst.fill(0.0);
-                if let Some(src) = planar_in.get(channel) {
-                    for frame in 0..take {
-                        if let (Some(value), Some(slot)) =
-                            (src.get(offset + frame), dst.get_mut(frame))
-                        {
-                            *slot = *value;
-                        }
-                    }
+                let copied = if let Some(src) = planar_in.get(channel) {
+                    let available = src.len().saturating_sub(offset).min(take).min(dst.len());
+                    dst[..available].copy_from_slice(&src[offset..offset + available]);
+                    available
+                } else {
+                    0
+                };
+                if copied < dst.len() {
+                    dst[copied..].fill(0.0);
                 }
             }
         }
@@ -978,15 +981,14 @@ fn encode_opus(
     } else {
         for index in 0..packet_count {
             let start = index.saturating_mul(per_frame);
-            let end = start.saturating_add(per_frame).min(buf.samples_f32.len());
-            buf.opus_block.fill(0_i16);
-            // Serial fallback uses the existing i16 encoder path on quantized samples.
-            let mut block = vec![0_f32; per_frame];
-            if let Some(slot) = block.get_mut(..end.saturating_sub(start)) {
-                slot.copy_from_slice(&buf.samples_f32[start..end]);
-            }
+            let Some(block) = buf.samples_f32.get(start..start + per_frame) else {
+                return Err(PipelineError::EncodeFailed {
+                    path: path.to_path_buf(),
+                    reason: format!("Opus PCM buffer shorter than expected packet {index}"),
+                });
+            };
             let written = encoder
-                .encode(&block, frame, &mut buf.packet)
+                .encode(block, frame, &mut buf.packet)
                 .map_err(|err| PipelineError::EncodeFailed {
                     path: path.to_path_buf(),
                     reason: format!("Opus encoding failed: {err}"),

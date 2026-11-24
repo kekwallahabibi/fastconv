@@ -761,7 +761,7 @@ mod tests {
         reader.seek(SeekFrom::Start(0))?;
         for pos in [SeekFrom::Current(-1), SeekFrom::End(-11)] {
             match reader.seek(pos) {
-                Ok(result) => assert!(result == 0, "unexpected seek result: {result}"),
+                Ok(result) => return Err(format!("unexpected seek result: {result}").into()),
                 Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
             }
         }
