@@ -169,6 +169,9 @@ fn decode_opus(path: &Path, buf: &mut AudioWorkerBuffer) -> Result<(u32, usize),
     Ok((OPUS_RATE, channels))
 }
 
+// The decode loop and buffer reservation must stay together to keep the direct-i16
+// decision and its borrow of `buf` in one place.
+#[allow(clippy::too_many_lines)]
 fn decode_symphonia(
     path: &Path,
     format: AudioInputFormat,
@@ -227,8 +230,10 @@ fn decode_symphonia(
     // so a direct i16 copy is both faster and bit-exact for lossless targets.
     let integer_pcm = !matches!(
         params.sample_format,
-        Some(symphonia::core::audio::sample::SampleFormat::F32)
-            | Some(symphonia::core::audio::sample::SampleFormat::F64)
+        Some(
+            symphonia::core::audio::sample::SampleFormat::F32
+                | symphonia::core::audio::sample::SampleFormat::F64,
+        )
     );
     let direct_i16 = matches!(target, AudioOutputFormat::Wav | AudioOutputFormat::Flac)
         && bits == 16
@@ -238,10 +243,12 @@ fn decode_symphonia(
         .saturating_mul(channels);
     if direct_i16 {
         if buf.samples_i16.capacity() < reserve {
-            buf.samples_i16.reserve(reserve.saturating_sub(buf.samples_i16.capacity()));
+            buf.samples_i16
+                .reserve(reserve.saturating_sub(buf.samples_i16.capacity()));
         }
     } else if buf.samples_f32.capacity() < reserve {
-        buf.samples_f32.reserve(reserve.saturating_sub(buf.samples_f32.capacity()));
+        buf.samples_f32
+            .reserve(reserve.saturating_sub(buf.samples_f32.capacity()));
     }
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(&params, &AudioDecoderOptions::default())
@@ -361,10 +368,8 @@ fn quantize_for(target: AudioOutputFormat, bits: usize, buf: &mut AudioWorkerBuf
     buf.samples_f32.clear();
 }
 
-
 const WAVE_FORMAT_PCM_GUID: [u8; 16] = [
-    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B,
-    0x71,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
 ];
 
 fn le_u16(bytes: &[u8], at: usize) -> u16 {
@@ -522,8 +527,8 @@ impl Source for LeBytesFlacSource {
         block_size: usize,
         dest: &mut F,
     ) -> Result<usize, SourceError> {
-        let available = usize::try_from(self.remaining_bytes).unwrap_or(usize::MAX)
-            / self.frame_bytes.max(1);
+        let available =
+            usize::try_from(self.remaining_bytes).unwrap_or(usize::MAX) / self.frame_bytes.max(1);
         let frames = block_size.min(available);
         if frames == 0 {
             return Ok(0);
@@ -668,8 +673,6 @@ fn encode_flac(
     encode_flac_from_source(path, source, batch_workers)
 }
 
-
-
 fn encode_wav(
     path: &Path,
     rate: u32,
@@ -737,6 +740,8 @@ fn encode_wav(
         })
 }
 
+// The resampler state, chunk buffer and output accumulation form one linear pipeline.
+#[allow(clippy::too_many_lines)]
 fn resample_to_opus_rate(
     rate: u32,
     channels: usize,
@@ -796,7 +801,8 @@ fn resample_to_opus_rate(
         plane.reserve(reserve);
     }
     if buf.resampled_f32.capacity() < reserve {
-        buf.resampled_f32.reserve(reserve.saturating_sub(buf.resampled_f32.capacity()));
+        buf.resampled_f32
+            .reserve(reserve.saturating_sub(buf.resampled_f32.capacity()));
     }
 
     let mut calls = 0_usize;
@@ -816,7 +822,9 @@ fn resample_to_opus_rate(
                 dst.fill(0.0);
                 if let Some(src) = planar_in.get(channel) {
                     for frame in 0..take {
-                        if let (Some(value), Some(slot)) = (src.get(offset + frame), dst.get_mut(frame)) {
+                        if let (Some(value), Some(slot)) =
+                            (src.get(offset + frame), dst.get_mut(frame))
+                        {
                             *slot = *value;
                         }
                     }
@@ -853,6 +861,8 @@ fn resample_to_opus_rate(
     Ok(())
 }
 
+// Frame sizing, parallel/serial dispatch and Ogg writing share one encoder lifetime.
+#[allow(clippy::too_many_lines)]
 fn encode_opus(
     path: &Path,
     rate: u32,
@@ -897,14 +907,11 @@ fn encode_opus(
         path: path.to_path_buf(),
         source,
     })?;
-    let mut writer = OggOpusWriter::new(
-        BufWriter::with_capacity(OPUS_WRITE_BUF_BYTES, file),
-        head,
-    )
-    .map_err(|err| PipelineError::EncodeFailed {
-        path: path.to_path_buf(),
-        reason: format!("failed to create Ogg Opus writer: {err}"),
-    })?;
+    let mut writer = OggOpusWriter::new(BufWriter::with_capacity(OPUS_WRITE_BUF_BYTES, file), head)
+        .map_err(|err| PipelineError::EncodeFailed {
+            path: path.to_path_buf(),
+            reason: format!("failed to create Ogg Opus writer: {err}"),
+        })?;
 
     let available = std::thread::available_parallelism()
         .map_or(1, NonZeroUsize::get)
@@ -936,10 +943,12 @@ fn encode_opus(
                     reason: format!("failed to write final Opus packet: {err}"),
                 })?;
         } else {
-            writer.write_packet(packet).map_err(|err| PipelineError::EncodeFailed {
-                path: path.to_path_buf(),
-                reason: format!("failed to write Opus packet: {err}"),
-            })?;
+            writer
+                .write_packet(packet)
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: path.to_path_buf(),
+                    reason: format!("failed to write Opus packet: {err}"),
+                })?;
         }
         Ok(())
     };
@@ -986,12 +995,10 @@ fn encode_opus(
         }
     }
 
-    let mut buf_writer = writer
-        .finish()
-        .map_err(|err| PipelineError::EncodeFailed {
-            path: path.to_path_buf(),
-            reason: format!("failed to finalize Ogg Opus stream: {err}"),
-        })?;
+    let mut buf_writer = writer.finish().map_err(|err| PipelineError::EncodeFailed {
+        path: path.to_path_buf(),
+        reason: format!("failed to finalize Ogg Opus stream: {err}"),
+    })?;
     buf_writer.flush().map_err(|source| PipelineError::Io {
         path: path.to_path_buf(),
         source,
@@ -1036,7 +1043,6 @@ fn create_staging_file(target: &Path) -> Result<PathBuf, PipelineError> {
         ),
     })
 }
-
 
 fn encode_staged(
     item: &AudioBatchItem,
@@ -1109,7 +1115,6 @@ fn encode_audio(
         AudioOutputFormat::Opus => encode_opus(temp, rate, channels, buf, batch_workers),
     })
 }
-
 
 fn convert_pcm_wav_to_flac(
     item: &AudioBatchItem,
@@ -1548,16 +1553,21 @@ mod tests {
             chunks.push(0);
         }
         let mut bytes = b"RIFF".to_vec();
-        bytes.extend_from_slice(&u32::try_from(chunks.len().saturating_add(4)).unwrap_or(0).to_le_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(chunks.len().saturating_add(4))
+                .unwrap_or(0)
+                .to_le_bytes(),
+        );
         bytes.extend_from_slice(b"WAVE");
         bytes.extend_from_slice(&chunks);
         bytes
     }
 
-    fn write_raw_wav(path: &Path, bytes: &[u8]) {
-        if let Err(err) = fs::write(path, bytes) {
-            assert!(false, "failed to write test WAV: {err}");
-        }
+    fn write_raw_wav(path: &Path, bytes: &[u8]) -> Result<(), PipelineError> {
+        fs::write(path, bytes).map_err(|source| PipelineError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
     }
 
     fn read_wav_i32(path: &Path) -> Vec<i32> {
@@ -1604,15 +1614,35 @@ mod tests {
         }
         // A JUNK chunk with an odd body length exercises RIFF even-byte padding.
         let junk = b"JNK";
-        write_raw_wav(&wav, &wav_bytes(&fmt_pcm(2, 48_000, 16), &data, &[(*b"JUNK", junk)]));
-        assert!(try_open_pcm_wav(&wav)?.is_some(), "16-bit PCM must use the direct source");
+        write_raw_wav(
+            &wav,
+            &wav_bytes(&fmt_pcm(2, 48_000, 16), &data, &[(*b"JUNK", junk)]),
+        )?;
+        assert!(
+            try_open_pcm_wav(&wav)?.is_some(),
+            "16-bit PCM must use the direct source"
+        );
 
         execute_audio_batch(&plan(
-            vec![item_bits(wav, flac.clone(), AudioInputFormat::Wav, 2, 48_000, 16)],
+            vec![item_bits(
+                wav,
+                flac.clone(),
+                AudioInputFormat::Wav,
+                2,
+                48_000,
+                16,
+            )],
             fastconv_domain::AudioExecutionMode::CpuFlac,
         ))?;
         execute_audio_batch(&plan(
-            vec![item_bits(flac, back.clone(), AudioInputFormat::Flac, 2, 48_000, 16)],
+            vec![item_bits(
+                flac,
+                back.clone(),
+                AudioInputFormat::Flac,
+                2,
+                48_000,
+                16,
+            )],
             fastconv_domain::AudioExecutionMode::CpuWav,
         ))?;
         assert_eq!(read_wav(&back), samples);
@@ -1627,25 +1657,39 @@ mod tests {
         let flac = dir.join("out.flac");
         let back = dir.join("back.wav");
         let samples: Vec<i32> = (0..8_000_i32)
-            .map(|i| {
-                let magnitude = (i.saturating_mul(7919) % 4_000_000) - 2_000_000;
-                magnitude
-            })
+            .map(|i| (i.saturating_mul(7919) % 4_000_000) - 2_000_000)
             .collect();
         let mut data = Vec::with_capacity(samples.len() * 3);
         for sample in &samples {
             let bytes = sample.to_le_bytes();
             data.extend_from_slice(&bytes[..3]);
         }
-        write_raw_wav(&wav, &wav_bytes(&fmt_pcm(1, 44_100, 24), &data, &[]));
-        assert!(try_open_pcm_wav(&wav)?.is_some(), "24-bit PCM must use the direct source");
+        write_raw_wav(&wav, &wav_bytes(&fmt_pcm(1, 44_100, 24), &data, &[]))?;
+        assert!(
+            try_open_pcm_wav(&wav)?.is_some(),
+            "24-bit PCM must use the direct source"
+        );
 
         execute_audio_batch(&plan(
-            vec![item_bits(wav, flac.clone(), AudioInputFormat::Wav, 1, 44_100, 24)],
+            vec![item_bits(
+                wav,
+                flac.clone(),
+                AudioInputFormat::Wav,
+                1,
+                44_100,
+                24,
+            )],
             fastconv_domain::AudioExecutionMode::CpuFlac,
         ))?;
         execute_audio_batch(&plan(
-            vec![item_bits(flac, back.clone(), AudioInputFormat::Flac, 1, 44_100, 24)],
+            vec![item_bits(
+                flac,
+                back.clone(),
+                AudioInputFormat::Flac,
+                1,
+                44_100,
+                24,
+            )],
             fastconv_domain::AudioExecutionMode::CpuWav,
         ))?;
         assert_eq!(read_wav_i32(&back), samples);
@@ -1662,25 +1706,43 @@ mod tests {
         // WAV 8-bit is unsigned (0..=255); FLAC 8-bit is signed. The direct
         // source must reject this file so Symphonia performs the conversion.
         let unsigned: [u8; 8] = [0, 1, 64, 127, 128, 192, 254, 255];
-        write_raw_wav(&wav, &wav_bytes(&fmt_pcm(1, 8_000, 8), &unsigned, &[]));
-        assert!(try_open_pcm_wav(&wav)?.is_none(), "8-bit WAV must fall back to Symphonia");
+        write_raw_wav(&wav, &wav_bytes(&fmt_pcm(1, 8_000, 8), &unsigned, &[]))?;
+        assert!(
+            try_open_pcm_wav(&wav)?.is_none(),
+            "8-bit WAV must fall back to Symphonia"
+        );
 
         execute_audio_batch(&plan(
-            vec![item_bits(wav, flac.clone(), AudioInputFormat::Wav, 1, 8_000, 8)],
+            vec![item_bits(
+                wav,
+                flac.clone(),
+                AudioInputFormat::Wav,
+                1,
+                8_000,
+                8,
+            )],
             fastconv_domain::AudioExecutionMode::CpuFlac,
         ))?;
         execute_audio_batch(&plan(
-            vec![item_bits(flac, back.clone(), AudioInputFormat::Flac, 1, 8_000, 8)],
+            vec![item_bits(
+                flac,
+                back.clone(),
+                AudioInputFormat::Flac,
+                1,
+                8_000,
+                8,
+            )],
             fastconv_domain::AudioExecutionMode::CpuWav,
         ))?;
-        let Ok(mut reader) = hound::WavReader::open(&back) else {
-            assert!(false, "failed to reopen 8-bit WAV");
-            return Ok(());
-        };
+        let mut reader =
+            hound::WavReader::open(&back).map_err(|err| PipelineError::DecodeFailed {
+                path: back.clone(),
+                reason: format!("failed to reopen 8-bit WAV: {err}"),
+            })?;
         let decoded: Vec<u8> = reader
             .samples::<i8>()
             .filter_map(Result::ok)
-            .map(|sample| sample.wrapping_add(i8::MIN) as u8)
+            .map(|sample| sample.wrapping_add(i8::MIN).cast_unsigned())
             .collect();
         assert_eq!(decoded, unsigned);
         let _ = fs::remove_dir_all(&dir);
@@ -1694,8 +1756,11 @@ mod tests {
         // audio_format 3 == IEEE float.
         let mut fmt = fmt_pcm(1, 48_000, 32);
         fmt[..2].copy_from_slice(&3_u16.to_le_bytes());
-        write_raw_wav(&wav, &wav_bytes(&fmt, &[0_u8; 32], &[]));
-        assert!(try_open_pcm_wav(&wav)?.is_none(), "float WAV must fall back to Symphonia");
+        write_raw_wav(&wav, &wav_bytes(&fmt, &[0_u8; 32], &[]))?;
+        assert!(
+            try_open_pcm_wav(&wav)?.is_none(),
+            "float WAV must fall back to Symphonia"
+        );
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
@@ -1723,5 +1788,4 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
-
 }

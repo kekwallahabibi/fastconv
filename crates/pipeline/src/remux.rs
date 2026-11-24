@@ -114,14 +114,18 @@ impl Read for WindowedFileReader {
         {
             let count = out.len().min(self.buf_valid - rel_usize);
             out[..count].copy_from_slice(&self.buf[rel_usize..rel_usize + count]);
-            self.pos = self.pos.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+            self.pos = self
+                .pos
+                .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
             return Ok(count);
         }
 
         if out.len() >= self.buf.len() {
             self.file.seek(SeekFrom::Start(self.pos))?;
             let count = self.file.read(out)?;
-            self.pos = self.pos.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+            self.pos = self
+                .pos
+                .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
             return Ok(count);
         }
 
@@ -142,7 +146,9 @@ impl Read for WindowedFileReader {
         }
         let count = out.len().min(filled);
         out[..count].copy_from_slice(&self.buf[..count]);
-        self.pos = self.pos.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        self.pos = self
+            .pos
+            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
         Ok(count)
     }
 }
@@ -319,12 +325,10 @@ fn mp4_to_mkv(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
     output
         .finish()
         .map_err(|err| container_err(target_path, &err))?;
-    writer
-        .flush()
-        .map_err(|source| PipelineError::Io {
-            path: target_path.to_path_buf(),
-            source,
-        })?;
+    writer.flush().map_err(|source| PipelineError::Io {
+        path: target_path.to_path_buf(),
+        source,
+    })?;
     Ok(())
 }
 
@@ -435,7 +439,9 @@ fn mkv_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
     let source_len = input_size(source);
     if source_len <= IN_MEMORY_MP4_FASTSTART_LIMIT {
         let mut mem = io::Cursor::new(Vec::with_capacity(
-            usize::try_from(source_len).unwrap_or(0).saturating_add(256 * 1024),
+            usize::try_from(source_len)
+                .unwrap_or(0)
+                .saturating_add(256 * 1024),
         ));
         mux_mkv_to_mp4(source, &mut mem, target_path)?;
         let mut writer: &File = target;
@@ -523,7 +529,9 @@ fn mp4_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
     let source_len = input_size(source);
     if source_len <= IN_MEMORY_MP4_FASTSTART_LIMIT {
         let mut mem = io::Cursor::new(Vec::with_capacity(
-            usize::try_from(source_len).unwrap_or(0).saturating_add(256 * 1024),
+            usize::try_from(source_len)
+                .unwrap_or(0)
+                .saturating_add(256 * 1024),
         ));
         mux_mp4_to_mp4(source, &mut mem, target_path)?;
         let mut writer: &File = target;
@@ -630,12 +638,10 @@ fn mkv_to_mkv(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
     output
         .finish()
         .map_err(|err| container_err(target_path, &err))?;
-    writer
-        .flush()
-        .map_err(|source| PipelineError::Io {
-            path: target_path.to_path_buf(),
-            source,
-        })?;
+    writer.flush().map_err(|source| PipelineError::Io {
+        path: target_path.to_path_buf(),
+        source,
+    })?;
     Ok(())
 }
 
@@ -755,7 +761,7 @@ mod tests {
         reader.seek(SeekFrom::Start(0))?;
         for pos in [SeekFrom::Current(-1), SeekFrom::End(-11)] {
             match reader.seek(pos) {
-                Ok(result) => assert!(false, "unexpected seek result: {result}"),
+                Ok(result) => assert!(result == 0, "unexpected seek result: {result}"),
                 Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
             }
         }

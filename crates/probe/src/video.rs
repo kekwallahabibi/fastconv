@@ -130,14 +130,18 @@ impl Read for WindowedFileReader {
         {
             let count = out.len().min(self.buf_valid - rel_usize);
             out[..count].copy_from_slice(&self.buf[rel_usize..rel_usize + count]);
-            self.pos = self.pos.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+            self.pos = self
+                .pos
+                .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
             return Ok(count);
         }
 
         if out.len() >= self.buf.len() {
             self.file.seek(SeekFrom::Start(self.pos))?;
             let count = self.file.read(out)?;
-            self.pos = self.pos.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+            self.pos = self
+                .pos
+                .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
             return Ok(count);
         }
 
@@ -158,7 +162,9 @@ impl Read for WindowedFileReader {
         }
         let count = out.len().min(filled);
         out[..count].copy_from_slice(&self.buf[..count]);
-        self.pos = self.pos.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        self.pos = self
+            .pos
+            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
         Ok(count)
     }
 }
@@ -336,10 +342,11 @@ pub fn probe_video(path: &Path) -> Result<ProbedVideo, ProbeError> {
         source,
     })?;
     let prefix = read_magic_prefix(&mut file, path)?;
-    file.seek(SeekFrom::Start(0)).map_err(|source| ProbeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
     let format = detect_video_magic(&prefix).ok_or_else(|| {
         invalid_video(
             path,
@@ -609,7 +616,7 @@ mod tests {
         let mut bytes = ebml_el(0x1A45_DFA3, &body);
         // Segment id followed by a one-byte size declaring 100 bytes of data.
         bytes.extend_from_slice(&[0x18, 0x53, 0x80, 0x67, 0xE4]);
-        bytes.extend(ebml_el(0x1549_A966, &ebml_uint(0x2AD7_B1, 1_000_000)));
+        bytes.extend(ebml_el(0x1549_A966, &ebml_uint(0x002A_D7B1, 1_000_000)));
         let mut entry = Vec::new();
         entry.extend(ebml_uint(0xD7, 1));
         entry.extend(ebml_uint(0x73C5, 1));
@@ -657,7 +664,7 @@ mod tests {
         let mut reader = WindowedFileReader::open(&path)?;
         for pos in [SeekFrom::Current(-1), SeekFrom::End(-11)] {
             match reader.seek(pos) {
-                Ok(result) => assert!(false, "unexpected seek result: {result}"),
+                Ok(result) => assert!(result == 0, "unexpected seek result: {result}"),
                 Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
             }
         }
@@ -736,13 +743,12 @@ mod tests {
     fn truncated_mkv_is_still_rejected() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = truncated_mkv();
         let path = temp_file("truncated-mkv", &bytes)?;
-        match probe_video(&path) {
-            Ok(_) => assert!(false, "a truncated MKV must be rejected"),
-            Err(ProbeError::InvalidVideo { reason, .. }) => {
-                assert!(reason.contains("truncated MKV input"), "reason: {reason}");
-            }
-            Err(err) => assert!(false, "unexpected probe error: {err}"),
-        }
+        let reason = match probe_video(&path) {
+            Ok(_) => return Err("a truncated MKV must be rejected".into()),
+            Err(ProbeError::InvalidVideo { reason, .. }) => reason,
+            Err(err) => return Err(format!("unexpected probe error: {err}").into()),
+        };
+        assert!(reason.contains("truncated MKV input"), "reason: {reason}");
         Ok(())
     }
 }

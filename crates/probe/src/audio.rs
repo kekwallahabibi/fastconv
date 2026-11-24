@@ -173,10 +173,11 @@ pub fn probe_audio(path: &Path) -> Result<ProbedAudio, ProbeError> {
         source,
     })?;
     let prefix = read_magic_prefix(&mut file, path)?;
-    file.seek(SeekFrom::Start(0)).map_err(|source| ProbeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
     let format = detect_audio_magic(&prefix).ok_or_else(|| {
         invalid_audio(
             path,
