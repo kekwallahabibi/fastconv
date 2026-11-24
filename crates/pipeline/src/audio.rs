@@ -1291,13 +1291,30 @@ fn check_channels(
     }
 }
 
+/// MPEG `channel_configuration` 4 is C/L/R/rear-C, which cannot carry WAV quad
+/// (FL/FR/BL/BR): `rusty_aac` maps input 2 to the centre element and input 3 to
+/// the rear-centre element, so those samples would be rendered by wrong speakers.
+/// The 3/5/6-channel configurations do preserve WAV speaker order.
+fn check_aac_channels(path: &Path, channels: usize, codec: &str) -> Result<(), PipelineError> {
+    check_channels(path, channels, 1, 6, codec)?;
+    if channels == 4 {
+        return Err(PipelineError::EncodeFailed {
+            path: path.to_path_buf(),
+            reason: format!(
+                "{codec} cannot represent 4-channel WAV quad (FL, FR, BL, BR): MPEG channel_configuration 4 is C, L, R, rear-C and would put the back channels on the centre and rear-centre speakers"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn encode_aac(
     path: &Path,
     rate: u32,
     channels: usize,
     buf: &mut AudioWorkerBuffer,
 ) -> Result<(), PipelineError> {
-    check_channels(path, channels, 1, 6, "AAC")?;
+    check_aac_channels(path, channels, "AAC")?;
     let target_rate = aac_rate(rate);
     resample_f32(rate, target_rate, channels, buf, "aac-resampler")?;
     if buf.samples_f32.is_empty() {
@@ -1364,7 +1381,7 @@ fn encode_m4a(
     channels: usize,
     buf: &mut AudioWorkerBuffer,
 ) -> Result<(), PipelineError> {
-    check_channels(path, channels, 1, 6, "M4A/AAC")?;
+    check_aac_channels(path, channels, "M4A/AAC")?;
     let target_rate = aac_rate(rate);
     resample_f32(rate, target_rate, channels, buf, "m4a-resampler")?;
     if buf.samples_f32.is_empty() {
@@ -1465,14 +1482,17 @@ fn encode_mp3(
 }
 
 /// Returns the source index feeding each Vorbis I plane (FL, FC, FR, BL, BR, LFE).
-/// WAV/PCM 5.1 carries FL, FR, FC, LFE, BL, BR; the orders only agree up to four
-/// channels. Expressed source-to-plane, the 6-channel permutation is `[0, 2, 1, 5, 3, 4]`.
+/// WAV/PCM 5.1 carries FL, FR, FC, LFE, BL, BR; the plane order differs from
+/// three channels onward. Four channels are ambiguous (WAV quad FL/FR/BL/BR vs.
+/// FL/FR/FC/LFE), so they are rejected instead of being silently mislabeled.
+/// Expressed source-to-plane, the 6-channel permutation is `[0, 2, 1, 5, 3, 4]`.
 fn vorbis_plane_sources(channels: usize) -> Option<&'static [usize]> {
     match channels {
         1 => Some(&[0]),
         2 => Some(&[0, 1]),
         3 => Some(&[0, 2, 1]),
-        4 => Some(&[0, 1, 2, 3]),
+        // 4 is deliberately absent: quad (FL/FR/BL/BR) and FL/FR/FC/LFE are
+        // indistinguishable from the channel count alone.
         5 => Some(&[0, 2, 1, 3, 4]),
         6 => Some(&[0, 2, 1, 4, 5, 3]),
         _ => None,
@@ -1490,7 +1510,7 @@ fn encode_ogg(
         vorbis_plane_sources(channels).ok_or_else(|| PipelineError::EncodeFailed {
             path: path.to_path_buf(),
             reason: format!(
-                "Ogg Vorbis cannot safely map {channels} channels: speaker layout is ambiguous above 6 channels"
+                "Ogg Vorbis cannot safely map {channels} channels: 4-channel layouts are ambiguous (quad FL/FR/BL/BR vs. FL/FR/FC/LFE) and layouts above 6 channels are unsupported"
             ),
         })?;
     if rate == 0 {
@@ -1788,15 +1808,13 @@ fn convert_item(
 
 fn estimate_pcm_bytes(item: &AudioBatchItem) -> u64 {
     let stream = item.stream();
+    let Some(frames) = stream.total_samples() else {
+        // A compressed file size is not a PCM frame count: probed AAC streams, for
+        // example, expose no decoded length. Reserve the full per-file allowance so
+        // unknown-length inputs cannot over-subscribe the batch memory budget.
+        return MAX_PCM_BYTES_PER_FILE;
+    };
     let channels = u64::from(stream.channels().get()).max(1);
-    let bits = stream
-        .bits_per_sample()
-        .map_or(16, |value| u64::from(value.get()))
-        .max(8);
-    let frames = stream.total_samples().unwrap_or_else(|| {
-        let file_bytes = fs::metadata(item.source()).map_or(0, |meta| meta.len());
-        file_bytes / channels / (bits / 8).max(1)
-    });
     frames.saturating_mul(channels).saturating_mul(4)
 }
 
@@ -1987,6 +2005,29 @@ mod tests {
         .unwrap_or_else(|_| unreachable!())
     }
 
+    fn item_frames(
+        source: PathBuf,
+        target: PathBuf,
+        format: AudioInputFormat,
+        channels: u16,
+        rate: u32,
+        total_samples: u64,
+    ) -> AudioBatchItem {
+        AudioBatchItem::new(
+            source,
+            target,
+            format,
+            fastconv_domain::AudioStreamInfo::new(
+                NonZeroU16::new(channels).unwrap_or(NonZeroU16::MIN),
+                NonZeroU32::new(rate).unwrap_or(NonZeroU32::MIN),
+                NonZeroU16::new(16),
+                Some(total_samples),
+            )
+            .unwrap_or_else(|_| unreachable!()),
+        )
+        .unwrap_or_else(|_| unreachable!())
+    }
+
     fn plan(
         items: Vec<AudioBatchItem>,
         mode: fastconv_domain::AudioExecutionMode,
@@ -2075,17 +2116,34 @@ mod tests {
             fastconv_domain::AudioExecutionMode::CpuOpus,
         ))?;
 
+        // Known frame counts keep the estimated PCM well below the budget, so all
+        // three requested workers are available for this parallelism check.
         let mixed = AudioBatchPlan::new(
             vec![
-                item(
+                item_frames(
                     wav.clone(),
                     out.join("a.wav"),
                     AudioInputFormat::Wav,
                     2,
                     48_000,
+                    8_000,
                 ),
-                item(flac, out.join("b.wav"), AudioInputFormat::Flac, 2, 48_000),
-                item(opus, out.join("c.wav"), AudioInputFormat::Opus, 2, 48_000),
+                item_frames(
+                    flac,
+                    out.join("b.wav"),
+                    AudioInputFormat::Flac,
+                    2,
+                    48_000,
+                    8_000,
+                ),
+                item_frames(
+                    opus,
+                    out.join("c.wav"),
+                    AudioInputFormat::Opus,
+                    2,
+                    48_000,
+                    8_000,
+                ),
             ],
             fastconv_domain::AudioExecutionMode::CpuWav,
             NonZeroUsize::new(3).unwrap_or(NonZeroUsize::MIN),
@@ -2099,6 +2157,28 @@ mod tests {
         assert_ne!(read_wav(&out.join("c.wav")).len(), 0);
         let _ = fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    #[test]
+    fn unknown_stream_length_caps_batch_workers() {
+        let items: Vec<_> = (0..8)
+            .map(|index| {
+                item(
+                    PathBuf::from(format!("/nonexistent/in-{index}.aac")),
+                    PathBuf::from(format!("/nonexistent/out-{index}.wav")),
+                    AudioInputFormat::Aac,
+                    2,
+                    48_000,
+                )
+            })
+            .collect();
+        assert_eq!(estimate_pcm_bytes(&items[0]), MAX_PCM_BYTES_PER_FILE);
+        let workers = resolve_worker_count(&items, 8).unwrap_or(0);
+        assert_eq!(
+            workers,
+            usize::try_from(MAX_PCM_BYTES_PER_BATCH / MAX_PCM_BYTES_PER_FILE).unwrap_or(usize::MAX),
+            "unknown decoded lengths must reserve the full per-file budget"
+        );
     }
 
     #[test]
@@ -2587,6 +2667,58 @@ mod tests {
         )
     }
 
+    fn assert_four_channel_rejected(
+        label: &str,
+        extension: &str,
+        mode: fastconv_domain::AudioExecutionMode,
+        expected_reason: &str,
+    ) {
+        let dir = temp_dir(label);
+        let wav = dir.join("in.wav");
+        let out = dir.join(format!("out.{extension}"));
+        write_wav(&wav, &tone(1_024, 4), 48_000, 4);
+        let result = execute_audio_batch(&plan(
+            vec![item(wav, out, AudioInputFormat::Wav, 4, 48_000)],
+            mode,
+        ));
+        let reason = match result {
+            Err(PipelineError::EncodeFailed { reason, .. }) => reason,
+            Err(other) => format!("unexpected error: {other:?}"),
+            Ok(_) => "4-channel conversion unexpectedly succeeded".to_owned(),
+        };
+        assert!(
+            reason.contains(expected_reason),
+            "4-channel {extension} must be rejected with a clear reason, got: {reason}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_four_channel_aac_and_m4a() {
+        assert_four_channel_rejected(
+            "quad-aac",
+            "aac",
+            fastconv_domain::AudioExecutionMode::CpuAac,
+            "quad",
+        );
+        assert_four_channel_rejected(
+            "quad-m4a",
+            "m4a",
+            fastconv_domain::AudioExecutionMode::CpuM4a,
+            "quad",
+        );
+    }
+
+    #[test]
+    fn rejects_four_channel_ogg() {
+        assert_four_channel_rejected(
+            "quad-ogg",
+            "ogg",
+            fastconv_domain::AudioExecutionMode::CpuOgg,
+            "ambiguous",
+        );
+    }
+
     #[test]
     fn roundtrips_wav_mp3_wav() -> Result<(), PipelineError> {
         assert_lossy_roundtrip(
@@ -2609,11 +2741,12 @@ mod tests {
 
     #[test]
     fn vorbis_plane_sources_map_pcm_layouts() {
-        let identity: &[&[usize]] = &[&[0], &[0, 1], &[0, 1, 2, 3]];
-        for (channels, expected) in [1_usize, 2, 4].iter().zip(identity) {
+        let identity: &[&[usize]] = &[&[0], &[0, 1]];
+        for (channels, expected) in [1_usize, 2].iter().zip(identity) {
             assert_eq!(vorbis_plane_sources(*channels), Some(*expected));
         }
         assert_eq!(vorbis_plane_sources(3), Some(&[0, 2, 1][..]));
+        assert_eq!(vorbis_plane_sources(4), None, "quad layout is ambiguous");
         assert_eq!(vorbis_plane_sources(5), Some(&[0, 2, 1, 3, 4][..]));
         assert_eq!(vorbis_plane_sources(6), Some(&[0, 2, 1, 4, 5, 3][..]));
         assert_eq!(vorbis_plane_sources(0), None);
@@ -2633,6 +2766,12 @@ mod tests {
     #[test]
     fn ogg_rejects_channel_counts_without_a_known_layout() {
         let mut buf = AudioWorkerBuffer::new();
+        buf.samples_f32 = vec![0.0; 4];
+        let result = encode_ogg(Path::new("reject4.ogg"), 48_000, 4, &mut buf);
+        assert!(
+            matches!(result, Err(PipelineError::EncodeFailed { .. })),
+            "ambiguous 4-channel layout must be rejected instead of mislabeled"
+        );
         buf.samples_f32 = vec![0.0; 7];
         let result = encode_ogg(Path::new("reject.ogg"), 48_000, 7, &mut buf);
         assert!(
