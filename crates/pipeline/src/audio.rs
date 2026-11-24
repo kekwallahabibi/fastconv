@@ -195,30 +195,34 @@ fn skip_id3v2(path: &Path, data: &[u8]) -> Result<usize, PipelineError> {
     Ok(pos)
 }
 
+// The bounded read, per-frame format checks and PCM limit must stay in one pass.
+#[allow(clippy::too_many_lines)]
 fn decode_adts_aac(
     path: &Path,
     buf: &mut AudioWorkerBuffer,
 ) -> Result<(u32, usize), PipelineError> {
-    // Reject oversized input before `fs::read` so a malicious/oversized file cannot spike RAM
-    // ahead of the incremental PCM limit enforced in the decode loop below.
-    let file_len = fs::metadata(path)
+    // Read at most one byte past the PCM limit so an oversized file cannot spike RAM
+    // before the incremental PCM check in the decode loop below.
+    let limit = MAX_PCM_BYTES_PER_FILE.saturating_add(1);
+    let mut limited = File::open(path)
         .map_err(|source| PipelineError::Io {
             path: path.to_path_buf(),
             source,
         })?
-        .len();
-    if file_len > MAX_PCM_BYTES_PER_FILE {
+        .take(limit);
+    let mut data = Vec::new();
+    limited
+        .read_to_end(&mut data)
+        .map_err(|source| PipelineError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if u64::try_from(data.len()).unwrap_or(u64::MAX) > MAX_PCM_BYTES_PER_FILE {
         return Err(PipelineError::DecodeFailed {
             path: path.to_path_buf(),
-            reason: format!(
-                "AAC input of {file_len} bytes exceeds the {MAX_PCM_BYTES_PER_FILE}-byte per-file limit"
-            ),
+            reason: format!("AAC input exceeds the {MAX_PCM_BYTES_PER_FILE}-byte per-file limit"),
         });
     }
-    let data = fs::read(path).map_err(|source| PipelineError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
     let mut pos = skip_id3v2(path, &data)?;
     let mut decoder = rusty_aac::AacDecoder::new();
     let mut header_rate = 0_u32;
@@ -258,6 +262,18 @@ fn decode_adts_aac(
         if decoded_rate == 0 && frame.sample_rate != 0 {
             decoded_rate = frame.sample_rate;
             decoded_channels = usize::from(frame.channels);
+        } else if frame.sample_rate != 0
+            && (frame.sample_rate != decoded_rate
+                || usize::from(frame.channels) != decoded_channels)
+        {
+            return Err(PipelineError::DecodeFailed {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "ADTS frame at byte {pos} changes format from {decoded_rate} Hz/{decoded_channels} channels to {} Hz/{} channels",
+                    frame.sample_rate,
+                    usize::from(frame.channels)
+                ),
+            });
         }
         let pcm_bytes = u64::try_from(buf.samples_f32.len())
             .unwrap_or(u64::MAX)
@@ -1448,6 +1464,21 @@ fn encode_mp3(
     })
 }
 
+/// Returns the source index feeding each Vorbis I plane (FL, FC, FR, BL, BR, LFE).
+/// WAV/PCM 5.1 carries FL, FR, FC, LFE, BL, BR; the orders only agree up to four
+/// channels. Expressed source-to-plane, the 6-channel permutation is `[0, 2, 1, 5, 3, 4]`.
+fn vorbis_plane_sources(channels: usize) -> Option<&'static [usize]> {
+    match channels {
+        1 => Some(&[0]),
+        2 => Some(&[0, 1]),
+        3 => Some(&[0, 2, 1]),
+        4 => Some(&[0, 1, 2, 3]),
+        5 => Some(&[0, 2, 1, 3, 4]),
+        6 => Some(&[0, 2, 1, 4, 5, 3]),
+        _ => None,
+    }
+}
+
 fn encode_ogg(
     path: &Path,
     rate: u32,
@@ -1455,6 +1486,13 @@ fn encode_ogg(
     buf: &mut AudioWorkerBuffer,
 ) -> Result<(), PipelineError> {
     check_channels(path, channels, 1, usize::from(u8::MAX), "Ogg Vorbis")?;
+    let channel_order =
+        vorbis_plane_sources(channels).ok_or_else(|| PipelineError::EncodeFailed {
+            path: path.to_path_buf(),
+            reason: format!(
+                "Ogg Vorbis cannot safely map {channels} channels: speaker layout is ambiguous above 6 channels"
+            ),
+        })?;
     if rate == 0 {
         return Err(PipelineError::EncodeFailed {
             path: path.to_path_buf(),
@@ -1503,8 +1541,8 @@ fn encode_ogg(
         }
         for frame in 0..frames {
             let base = (start.saturating_add(frame)).saturating_mul(channels);
-            for (channel, plane) in planes.iter_mut().enumerate() {
-                if let Some(&value) = buf.samples_f32.get(base.saturating_add(channel)) {
+            for (plane, &source) in planes.iter_mut().zip(channel_order) {
+                if let Some(&value) = buf.samples_f32.get(base.saturating_add(source)) {
                     plane.push(value);
                 }
             }
@@ -2567,5 +2605,129 @@ mod tests {
             fastconv_domain::AudioExecutionMode::CpuOgg,
             AudioInputFormat::Vorbis,
         )
+    }
+
+    #[test]
+    fn vorbis_plane_sources_map_pcm_layouts() {
+        let identity: &[&[usize]] = &[&[0], &[0, 1], &[0, 1, 2, 3]];
+        for (channels, expected) in [1_usize, 2, 4].iter().zip(identity) {
+            assert_eq!(vorbis_plane_sources(*channels), Some(*expected));
+        }
+        assert_eq!(vorbis_plane_sources(3), Some(&[0, 2, 1][..]));
+        assert_eq!(vorbis_plane_sources(5), Some(&[0, 2, 1, 3, 4][..]));
+        assert_eq!(vorbis_plane_sources(6), Some(&[0, 2, 1, 4, 5, 3][..]));
+        assert_eq!(vorbis_plane_sources(0), None);
+        assert_eq!(vorbis_plane_sources(7), None);
+
+        // Inverting the plane-to-source mapping yields the documented
+        // source-to-plane permutation, including the non-involutive 5.1 case.
+        let mut source_to_plane = vec![0_usize; 6];
+        for (plane, &source) in vorbis_plane_sources(6).unwrap_or(&[]).iter().enumerate() {
+            if let Some(slot) = source_to_plane.get_mut(source) {
+                *slot = plane;
+            }
+        }
+        assert_eq!(source_to_plane, [0, 2, 1, 5, 3, 4]);
+    }
+
+    #[test]
+    fn ogg_rejects_channel_counts_without_a_known_layout() {
+        let mut buf = AudioWorkerBuffer::new();
+        buf.samples_f32 = vec![0.0; 7];
+        let result = encode_ogg(Path::new("reject.ogg"), 48_000, 7, &mut buf);
+        assert!(
+            matches!(result, Err(PipelineError::EncodeFailed { .. })),
+            "more than 6 channels must be rejected instead of mislabeled"
+        );
+    }
+
+    #[test]
+    fn roundtrips_wav_6ch_ogg_with_vorbis_channel_order() -> Result<(), PipelineError> {
+        const CHANNELS: usize = 6;
+        let dir = temp_dir("ogg-6ch-order");
+        let wav = dir.join("in.wav");
+        let ogg = dir.join("out.ogg");
+        let back = dir.join("back.wav");
+        let frames = 8_192_usize;
+        // Integer-cycle sines stay orthogonal over the block, so a dot product still
+        // identifies each source channel after lossy Vorbis coding (DC levels bleed).
+        let bins = [40_u16, 80, 120, 160, 200, 240];
+        let frames_f32 = f32::from(u16::try_from(frames).unwrap_or(u16::MAX));
+        let two_pi = 2.0_f32 * std::f32::consts::PI;
+        let steps: Vec<f32> = bins
+            .iter()
+            .map(|&bin| two_pi * f32::from(bin) / frames_f32)
+            .collect();
+        let mut references: Vec<Vec<f32>> =
+            (0..CHANNELS).map(|_| Vec::with_capacity(frames)).collect();
+        let mut phases = [0.0_f32; CHANNELS];
+        let mut samples = Vec::with_capacity(frames.saturating_mul(CHANNELS));
+        for _ in 0..frames {
+            for ((reference, phase), &step) in references.iter_mut().zip(&mut phases).zip(&steps) {
+                let sine = phase.sin();
+                reference.push(sine);
+                samples.push(i16::try_from(to_i32_saturating(sine * 12_000.0)).unwrap_or(0));
+                let next = *phase + step;
+                *phase = if next >= two_pi { next - two_pi } else { next };
+            }
+        }
+        let channels_u16 = u16::try_from(CHANNELS).unwrap_or(u16::MAX);
+        write_wav(&wav, &samples, 48_000, channels_u16);
+
+        execute_audio_batch(&plan(
+            vec![item(
+                wav,
+                ogg.clone(),
+                AudioInputFormat::Wav,
+                channels_u16,
+                48_000,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuOgg,
+        ))?;
+        execute_audio_batch(&plan(
+            vec![item(
+                ogg,
+                back.clone(),
+                AudioInputFormat::Vorbis,
+                channels_u16,
+                48_000,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuWav,
+        ))?;
+
+        let decoded = read_wav(&back);
+        assert_eq!(decoded.len(), samples.len());
+        // WAV 5.1 is FL, FR, FC, LFE, BL, BR; Vorbis writes FL, FC, FR, BL, BR, LFE.
+        // Symphonia's Vorbis decoder maps those planes back to WAV order, so a correct
+        // encoder permutation makes this round trip preserve the original placement.
+        for (plane, expected) in (0..CHANNELS).enumerate() {
+            let mut scores: Vec<(f64, usize)> = references
+                .iter()
+                .enumerate()
+                .map(|(source, reference)| {
+                    let score: f64 = decoded
+                        .iter()
+                        .skip(plane)
+                        .step_by(CHANNELS)
+                        .zip(reference)
+                        .map(|(&value, &sine)| f64::from(value) * f64::from(sine))
+                        .sum();
+                    (score.abs(), source)
+                })
+                .collect();
+            scores.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let (best, detected) = scores.first().copied().unwrap_or((0.0, 0));
+            let runner_up = scores.get(1).map_or(0.0, |&(score, _)| score);
+            assert_eq!(
+                detected, expected,
+                "Vorbis plane {plane} should carry source channel {expected}; scores {scores:?}"
+            );
+            assert!(
+                best > runner_up * 1.2,
+                "plane {plane} tone must dominate its competitors: {scores:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

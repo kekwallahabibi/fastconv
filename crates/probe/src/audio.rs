@@ -303,10 +303,11 @@ pub fn probe_audio(path: &Path) -> Result<ProbedAudio, ProbeError> {
         )
     })?;
 
-    // Large ID3v2 tags (e.g. cover art) push the ADTS frame past the prefix.
+    // Large ID3v2 tags (e.g. cover art) push the ADTS frame past the prefix, or leave
+    // fewer than 7 header bytes in it so `detect_audio_magic` cannot see the syncword.
     if prefix.starts_with(b"ID3")
         && let Some(tag_len) = id3v2_tag_len(&prefix)
-        && tag_len > MAGIC_PREFIX_BYTES
+        && tag_len.saturating_add(7) > prefix.len()
     {
         let offset = u64::try_from(tag_len)
             .map_err(|_| invalid_audio(path, "ID3v2 tag length out of range"))?;
@@ -805,6 +806,48 @@ mod tests {
         assert_eq!(probed.format, AudioInputFormat::Aac);
         assert_eq!(probed.stream.channels().get(), 2);
         assert_eq!(probed.stream.sample_rate().get(), 44_100);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    fn id3_tag_of_len(total_len: usize) -> Vec<u8> {
+        // 10-byte ID3v2.4 header whose payload size is a synchsafe integer.
+        let payload = total_len.saturating_sub(10);
+        let mut bytes = b"ID3\x04\x00\x00".to_vec();
+        for shift in [21, 14, 7, 0] {
+            let byte = (payload >> shift) & 0x7F;
+            bytes.push(u8::try_from(byte).unwrap_or(0));
+        }
+        bytes.resize(total_len, 0);
+        bytes
+    }
+
+    #[test]
+    fn probes_adts_after_id3_tag_at_prefix_boundary() -> Result<(), String> {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dir = manifest.join("target").join(format!(
+            "fastconv-audio-adts-boundary-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let header = rusty_aac::AdtsHeader {
+            object_type: 2,
+            sample_rate: 44_100,
+            channels: 2,
+            frame_length: 7,
+            header_len: 7,
+        };
+        let frame = rusty_aac::write_adts_header(&header);
+        // A 4090-byte tag leaves only 6 ADTS header bytes in the 4096-byte prefix;
+        // a 4096-byte tag leaves none. Both need the follow-up read after the tag.
+        for tag_len in [4090, 4096] {
+            let path = dir.join(format!("boundary-{tag_len}.aac"));
+            let mut bytes = id3_tag_of_len(tag_len);
+            bytes.extend_from_slice(&frame);
+            fs::write(&path, &bytes).map_err(|err| err.to_string())?;
+            let probed = probe_audio(&path).map_err(|err| err.to_string())?;
+            assert_eq!(probed.format, AudioInputFormat::Aac, "tag_len={tag_len}");
+        }
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
