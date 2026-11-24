@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -80,11 +80,7 @@ fn ogg_identification_packet(bytes: &[u8]) -> Option<&[u8]> {
     bytes.get(payload_start..payload_start + packet_len)
 }
 
-fn read_magic_prefix(path: &Path) -> Result<[u8; MAGIC_PREFIX_BYTES], ProbeError> {
-    let mut file = File::open(path).map_err(|source| ProbeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+fn read_magic_prefix(file: &mut File, path: &Path) -> Result<[u8; MAGIC_PREFIX_BYTES], ProbeError> {
     let mut prefix = [0_u8; MAGIC_PREFIX_BYTES];
     let mut filled = 0_usize;
     while filled < prefix.len() {
@@ -103,11 +99,7 @@ fn read_magic_prefix(path: &Path) -> Result<[u8; MAGIC_PREFIX_BYTES], ProbeError
     Ok(prefix)
 }
 
-fn probe_opus(path: &Path) -> Result<AudioStreamInfo, ProbeError> {
-    let file = File::open(path).map_err(|source| ProbeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+fn probe_opus(path: &Path, file: File) -> Result<AudioStreamInfo, ProbeError> {
     let reader = opus_pure::OggOpusReader::new(file)
         .map_err(|err| invalid_audio(path, format!("invalid Ogg Opus stream: {err}")))?;
     let head = reader.head();
@@ -119,11 +111,11 @@ fn probe_opus(path: &Path) -> Result<AudioStreamInfo, ProbeError> {
         .map_err(|err| invalid_audio(path, err.to_string()))
 }
 
-fn probe_symphonia(path: &Path, format: AudioInputFormat) -> Result<AudioStreamInfo, ProbeError> {
-    let file = File::open(path).map_err(|source| ProbeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+fn probe_symphonia(
+    path: &Path,
+    format: AudioInputFormat,
+    file: File,
+) -> Result<AudioStreamInfo, ProbeError> {
     let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
     let mut hint = Hint::new();
     hint.with_extension(format.extension());
@@ -176,7 +168,15 @@ pub fn probe_audio(path: &Path) -> Result<ProbedAudio, ProbeError> {
         return Err(invalid_audio(path, "audio file is empty"));
     }
 
-    let prefix = read_magic_prefix(path)?;
+    let mut file = File::open(path).map_err(|source| ProbeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let prefix = read_magic_prefix(&mut file, path)?;
+    file.seek(SeekFrom::Start(0)).map_err(|source| ProbeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let format = detect_audio_magic(&prefix).ok_or_else(|| {
         invalid_audio(
             path,
@@ -184,9 +184,9 @@ pub fn probe_audio(path: &Path) -> Result<ProbedAudio, ProbeError> {
         )
     })?;
     let stream = if format == AudioInputFormat::Opus {
-        probe_opus(path)?
+        probe_opus(path, file)?
     } else {
-        probe_symphonia(path, format)?
+        probe_symphonia(path, format, file)?
     };
 
     Ok(ProbedAudio {
