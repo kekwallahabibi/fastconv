@@ -255,7 +255,6 @@ pub(crate) fn h264_dimensions_from_annex_b(data: &[u8]) -> Option<(u16, u16)> {
     let _sps_id = bits.ue()?;
     let mut chroma_format = 1_u32;
     let mut separate_colour_plane = false;
-    let mut chroma_depth_minus8 = 0_u32;
     if matches!(
         profile,
         100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
@@ -265,15 +264,28 @@ pub(crate) fn h264_dimensions_from_annex_b(data: &[u8]) -> Option<(u16, u16)> {
             separate_colour_plane = bits.read(1)? == 1;
         }
         let _luma_depth_minus8 = bits.ue()?;
-        chroma_depth_minus8 = bits.ue()?;
+        let _chroma_depth_minus8 = bits.ue()?;
         let _transform_bypass = bits.read(1)?;
         if bits.read(1)? == 1 {
             let lists = if chroma_format == 3 { 12 } else { 8 };
             for index in 0..lists {
                 if bits.read(1)? == 1 {
                     let values = if index < 6 { 16 } else { 64 };
+                    // scaling_list(): a zero nextScale means the rest of the
+                    // list repeats lastScale and carries no delta_scale bits.
+                    let mut last_scale = 8_i32;
+                    let mut next_scale = 8_i32;
                     for _ in 0..values {
-                        let _delta = bits.se()?;
+                        if next_scale != 0 {
+                            let delta = bits.se()?;
+                            next_scale = last_scale.saturating_add(delta).rem_euclid(256);
+                        }
+                        let scale = if next_scale == 0 {
+                            last_scale
+                        } else {
+                            next_scale
+                        };
+                        last_scale = scale;
                     }
                 }
             }
@@ -315,13 +327,12 @@ pub(crate) fn h264_dimensions_from_annex_b(data: &[u8]) -> Option<(u16, u16)> {
     let sub_width = u32::from(matches!(chroma_array, 1 | 2)) + 1;
     let sub_height = u32::from(chroma_array == 1) + 1;
     let field_factor = 2_u32 - frame_mbs_only;
-    let crop_scale = 1_u32.checked_shl(chroma_depth_minus8)?;
-    let width = width_mbs.checked_add(1)?.checked_mul(16)?.checked_sub(
-        crop[0]
-            .checked_add(crop[1])?
-            .checked_mul(sub_width)?
-            .checked_mul(crop_scale)?,
-    )?;
+    // Crop offsets are expressed in chroma samples; bit depth does not scale
+    // the crop unit (only chroma format and field pairing do).
+    let width = width_mbs
+        .checked_add(1)?
+        .checked_mul(16)?
+        .checked_sub(crop[0].checked_add(crop[1])?.checked_mul(sub_width)?)?;
     let height = height_map_units
         .checked_add(1)?
         .checked_mul(16)?
@@ -330,8 +341,7 @@ pub(crate) fn h264_dimensions_from_annex_b(data: &[u8]) -> Option<(u16, u16)> {
             crop[2]
                 .checked_add(crop[3])?
                 .checked_mul(sub_height)?
-                .checked_mul(field_factor)?
-                .checked_mul(crop_scale)?,
+                .checked_mul(field_factor)?,
         )?;
     u16::try_from(width).ok().zip(u16::try_from(height).ok())
 }
@@ -426,12 +436,15 @@ pub(crate) fn extract_hvcc_from_annex_b(annex_b: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let first_sps = sps.first()?;
-    // The two-byte NAL header is not part of the RBSP. profile_tier_level
-    // starts after sps_video_parameter_set_id / max_sub_layers / nesting flag.
+    // The two-byte NAL header is not part of the RBSP. The first RBSP byte
+    // holds sps_video_parameter_set_id / max_sub_layers / nesting flag;
+    // profile_tier_level follows it and ends with general_level_idc.
     let rbsp = strip_emulation_prevention(first_sps.get(2..).unwrap_or(&[]));
     let mut profile_tier_level = [0_u8; 12];
-    let copied = rbsp.len().min(profile_tier_level.len());
-    profile_tier_level[..copied].copy_from_slice(&rbsp[..copied]);
+    if let Some(bytes) = rbsp.get(1..) {
+        let copied = bytes.len().min(profile_tier_level.len());
+        profile_tier_level[..copied].copy_from_slice(&bytes[..copied]);
+    }
     let mut out = Vec::with_capacity(23 + vps.len() * 8 + sps.len() * 8 + pps.len() * 8);
     out.push(1);
     out.extend_from_slice(&profile_tier_level);
@@ -472,17 +485,22 @@ pub(crate) fn hevc_dimensions_from_annex_b(data: &[u8]) -> Option<(u16, u16)> {
     let _constraints_high = bits.read(32)?;
     let _constraints_low = bits.read(16)?;
     let _level = bits.read(8)?;
+    // All presence flags precede all payloads in profile_tier_level; reading a
+    // payload after each flag pair would consume the next pair's flags.
+    let mut sub_layers = Vec::with_capacity(usize::try_from(max_sub_layers_minus1).unwrap_or(0));
     for _ in 0..max_sub_layers_minus1 {
-        let profile_present = bits.read(1)?;
-        let level_present = bits.read(1)?;
-        if profile_present == 1 {
+        sub_layers.push((bits.read(1)?, bits.read(1)?));
+    }
+    for (profile_present, _) in &sub_layers {
+        if *profile_present == 1 {
             let _sub_profile = bits.read(8)?;
             let _sub_compat = bits.read(32)?;
             let _sub_constraints_high = bits.read(32)?;
             let _sub_constraints_low = bits.read(16)?;
-            let _sub_level = bits.read(8)?;
         }
-        if level_present == 1 {
+    }
+    for (_, level_present) in &sub_layers {
+        if *level_present == 1 {
             let _sub_level_idc = bits.read(8)?;
         }
     }
@@ -730,6 +748,44 @@ pub(crate) fn is_av1_keyframe(obu_data: &[u8]) -> bool {
         }
         bits.read(2) == Some(0)
     })
+}
+
+/// Derives the mandatory profile and bit depth from a VP9 keyframe header.
+/// Inter frames inherit these from an earlier keyframe and cannot establish
+/// them on their own.
+pub(crate) fn vp9_profile_and_depth_from_keyframe(frame: &[u8]) -> Option<(u8, u8)> {
+    // frame_marker(2), profile(2), [reserved(1) for profile 3],
+    // show_existing_frame(1), frame_type(1), show_frame(1),
+    // error_resilient_mode(1), the three-byte sync code and, for profiles >= 2,
+    // ten_or_twelve_bit. BitReader pads past the end with zeros, so require the
+    // full header up front.
+    if frame.len() < 5 {
+        return None;
+    }
+    let mut bits = BitReader::new(frame);
+    if bits.read(2)? != 2 {
+        return None;
+    }
+    // profile_low_bit precedes profile_high_bit in the VP9 header.
+    let profile = bits.read(1)? | (bits.read(1)? << 1);
+    if profile == 3 && bits.read(1)? != 0 {
+        return None;
+    }
+    // show_existing_frame carries no color config; only key frames do.
+    if bits.read(1)? != 0 || bits.read(1)? != 0 {
+        return None;
+    }
+    let _show_frame = bits.read(1)?;
+    let _error_resilient_mode = bits.read(1)?;
+    if bits.read(24)? != 0x0049_8342 {
+        return None;
+    }
+    let bit_depth = if profile >= 2 {
+        if bits.read(1)? == 1 { 12 } else { 10 }
+    } else {
+        8
+    };
+    Some((u8::try_from(profile).ok()?, bit_depth))
 }
 
 // ---- AAC -----------------------------------------------------------------
@@ -1013,14 +1069,8 @@ pub(crate) fn build_mp3_mp4a_sample_entry(channels: u16, sample_rate: u32) -> Ve
     entry
 }
 
-pub(crate) fn build_vp09_sample_entry(
-    width: u16,
-    height: u16,
-    vpcc_body: Option<&[u8]>,
-) -> Vec<u8> {
-    let default_body = [1_u8, 0, 0, 0, 0, 10, 0x80, 1, 1, 1, 0, 0];
-    let body = vpcc_body.unwrap_or(&default_body);
-    let mut entry = Vec::with_capacity(8 + 78 + body.len() + 8);
+pub(crate) fn build_vp09_sample_entry(width: u16, height: u16, vpcc_body: &[u8]) -> Vec<u8> {
+    let mut entry = Vec::with_capacity(8 + 78 + vpcc_body.len() + 8);
     entry.extend_from_slice(&[0; 4]);
     entry.extend_from_slice(b"vp09");
     entry.extend_from_slice(&[0; 6]);
@@ -1035,7 +1085,7 @@ pub(crate) fn build_vp09_sample_entry(
     entry.extend_from_slice(&[0; 32]);
     entry.extend_from_slice(&0x0018_u16.to_be_bytes());
     entry.extend_from_slice(&0xFFFF_u16.to_be_bytes());
-    entry.extend_from_slice(&full_box(*b"vpcC", body));
+    entry.extend_from_slice(&full_box(*b"vpcC", vpcc_body));
     let size = u32::try_from(entry.len()).unwrap_or(u32::MAX);
     entry[..4].copy_from_slice(&size.to_be_bytes());
     entry
@@ -1226,7 +1276,7 @@ mod tests {
         );
         assert_eq!(usize::try_from(mp3_size).unwrap_or(0), mp3.len());
         assert_eq!(&mp3[24..26], &2_u16.to_be_bytes());
-        let vp9 = build_vp09_sample_entry(1280, 720, None);
+        let vp9 = build_vp09_sample_entry(1280, 720, &[1, 0, 0, 0, 2, 30, 0xA1, 1, 1, 1, 0, 0]);
         assert_eq!(&vp9[4..8], b"vp09");
         assert_eq!(&vp9[32..36], &[0x05, 0x00, 0x02, 0xD0]);
         assert_eq!(&vp9[36..40], &[0x00, 0x48, 0x00, 0x00]);
@@ -1269,19 +1319,30 @@ mod tests {
 
     #[test]
     fn hvcc_header_uses_emulation_prevention_free_profile_tier_level() -> Result<(), String> {
+        // SPS: header, one prefix byte, then a 12-byte profile_tier_level whose
+        // compatibility flags contain an emulation-prevention byte.
         let mut annex_b = vec![
-            0, 0, 1, 0x42, 0x01, 0x01, 0x00, 0x00, 0x03, 0xFF, 0xAA, 0xBB,
+            0, 0, 1, 0x42, 0x01, 0x01, 0x42, 0x00, 0x00, 0x03, 0xFF, 0xAA, 0x11, 0x22, 0x33, 0x44,
+            0x55, 0x66, 0x5A,
         ];
         annex_b.extend_from_slice(&[0, 0, 1, 0x40, 0x01, 0x01, 0x01]);
         annex_b.extend_from_slice(&[0, 0, 1, 0x44, 0x01, 0xC0]);
         let config = extract_hvcc_from_annex_b(&annex_b).ok_or("hvcC")?;
-        assert_eq!(&config[1..7], &[0x01, 0x00, 0x00, 0xFF, 0xAA, 0xBB]);
-        // The NALU arrays still carry the raw, unmodified SPS bytes.
-        assert!(
-            config
-                .windows(6)
-                .any(|w| w == [0x42, 0x01, 0x01, 0x00, 0x00, 0x03])
+        // config[0] is configurationVersion. The SPS prefix byte is skipped;
+        // profile and level are checked independently at their own offsets.
+        assert_eq!(config[1], 0x42, "general_profile_space/tier/idc");
+        assert_eq!(&config[2..6], &[0x00, 0x00, 0xFF, 0xAA]);
+        assert_eq!(config[12], 0x5A, "general_level_idc");
+        assert_eq!(
+            &config[13..23],
+            &[0xF0, 0x00, 0xFC, 0xFC, 0xF8, 0xF8, 0x00, 0x00, 0x03, 3]
         );
+        // The NALU arrays still carry the raw, unmodified SPS bytes.
+        assert!(config.windows(16).any(|w| w
+            == [
+                0x42, 0x01, 0x01, 0x42, 0x00, 0x00, 0x03, 0xFF, 0xAA, 0x11, 0x22, 0x33, 0x44, 0x55,
+                0x66, 0x5A
+            ]));
         Ok(())
     }
 
@@ -1325,6 +1386,18 @@ mod tests {
             let width = 32_u32.saturating_sub(code.leading_zeros()) as usize;
             self.write(0, width.saturating_sub(1));
             self.write(code, width);
+        }
+
+        fn se(&mut self, value: i32) {
+            let code = if value <= 0 {
+                value.checked_mul(-2).and_then(|v| u32::try_from(v).ok())
+            } else {
+                value
+                    .checked_mul(2)
+                    .and_then(|v| v.checked_sub(1))
+                    .and_then(|v| u32::try_from(v).ok())
+            };
+            self.ue(code.unwrap_or(0));
         }
     }
 
@@ -1373,5 +1446,133 @@ mod tests {
         let mut annex_b = vec![0, 0, 0, 1, 0x42, 0x01];
         annex_b.extend_from_slice(&bits.bytes);
         assert_eq!(hevc_dimensions_from_annex_b(&annex_b), Some((1920, 1084)));
+    }
+
+    #[test]
+    fn h264_scaling_list_stops_when_next_scale_reaches_zero() {
+        let mut bits = BitWriter::new();
+        bits.write(100, 8); // high profile
+        bits.write(0, 8);
+        bits.write(30, 8);
+        bits.ue(0); // sps_id
+        bits.ue(1); // chroma_format_idc = 4:2:0
+        bits.ue(0); // bit_depth_luma_minus8
+        bits.ue(0); // bit_depth_chroma_minus8
+        bits.write(0, 1); // qpprime_y_zero_transform_bypass_flag
+        bits.write(1, 1); // seq_scaling_matrix_present_flag
+        bits.write(1, 1); // seq_scaling_list_present_flag[0]
+        bits.se(-8); // first delta_scale: nextScale becomes 0
+        // The remaining 15 entries repeat lastScale and carry no bits.
+        for _ in 1..8 {
+            bits.write(0, 1); // other scaling lists absent
+        }
+        bits.ue(0); // log2_max_frame_num_minus4
+        bits.ue(0); // pic_order_cnt_type
+        bits.ue(0); // log2_max_pic_order_cnt_lsb_minus4
+        bits.ue(1); // max_num_ref_frames
+        bits.write(0, 1); // gaps_in_frame_num_value_allowed_flag
+        bits.ue(79); // 1280
+        bits.ue(44); // 720
+        bits.write(1, 1); // frame_mbs_only_flag
+        bits.write(0, 1); // direct_8x8_inference_flag
+        bits.write(0, 1); // frame_cropping_flag
+        bits.write(0, 1); // vui_parameters_present_flag
+        let mut annex_b = vec![0, 0, 0, 1, 0x67];
+        annex_b.extend_from_slice(&bits.bytes);
+        assert_eq!(h264_dimensions_from_annex_b(&annex_b), Some((1280, 720)));
+    }
+
+    #[test]
+    fn h264_10bit_crop_uses_chroma_units_only() {
+        let mut bits = BitWriter::new();
+        bits.write(100, 8); // high 10 profile
+        bits.write(0, 8);
+        bits.write(30, 8);
+        bits.ue(0); // sps_id
+        bits.ue(1); // chroma_format_idc = 4:2:0
+        bits.ue(2); // bit_depth_luma_minus8 = 10-bit
+        bits.ue(2); // bit_depth_chroma_minus8 = 10-bit
+        bits.write(0, 1); // transform bypass
+        bits.write(0, 1); // no scaling matrix
+        bits.ue(0);
+        bits.ue(0);
+        bits.ue(0);
+        bits.ue(1);
+        bits.write(0, 1);
+        bits.ue(119); // 1920
+        bits.ue(67); // 1088 coded lines
+        bits.write(1, 1); // frame_mbs_only_flag
+        bits.write(0, 1);
+        bits.write(1, 1); // frame_cropping_flag
+        bits.ue(0); // left
+        bits.ue(0); // right
+        bits.ue(0); // top
+        bits.ue(4); // bottom: 4 * SubHeightC(2) = 8 lines -> 1080
+        bits.write(0, 1); // vui
+        let mut annex_b = vec![0, 0, 0, 1, 0x67];
+        annex_b.extend_from_slice(&bits.bytes);
+        assert_eq!(h264_dimensions_from_annex_b(&annex_b), Some((1920, 1080)));
+    }
+
+    #[test]
+    fn hevc_sps_reads_all_sublayer_flags_before_payloads() {
+        let mut bits = BitWriter::new();
+        bits.write(0, 4); // sps_video_parameter_set_id
+        bits.write(2, 3); // sps_max_sub_layers_minus1 = 2
+        bits.write(1, 1); // temporal id nesting
+        bits.write(1, 8); // general profile
+        bits.write(0, 32); // compatibility flags
+        bits.write(0, 48); // constraint flags
+        bits.write(120, 8); // general level
+        // Presence flags: sublayer 0 has a profile payload, sublayer 1 a level.
+        bits.write(1, 1);
+        bits.write(0, 1);
+        bits.write(0, 1);
+        bits.write(1, 1);
+        bits.write(2, 8); // sublayer 0 profile (8 + 32 + 32 + 16 = 88 bits)
+        bits.write(0, 32);
+        bits.write(0, 32);
+        bits.write(0, 16);
+        bits.write(123, 8); // sublayer 1 level
+        bits.write(0, 12); // reserved flags for sublayers 2..8
+        bits.ue(0); // sps_id
+        bits.ue(1); // chroma_format_idc = 4:2:0
+        bits.ue(1920);
+        bits.ue(1080);
+        bits.write(0, 1); // no conformance window
+        let mut annex_b = vec![0, 0, 0, 1, 0x42, 0x01];
+        annex_b.extend_from_slice(&bits.bytes);
+        assert_eq!(hevc_dimensions_from_annex_b(&annex_b), Some((1920, 1080)));
+    }
+
+    #[test]
+    fn vp9_keyframe_yields_profile_and_bit_depth() {
+        // marker=2, profile=2, show_existing=0, key frame, show_frame=1.
+        let frame = [0x92, 0x49, 0x83, 0x42, 0x00];
+        assert_eq!(vp9_profile_and_depth_from_keyframe(&frame), Some((2, 10)));
+        let mut twelve_bit = frame;
+        twelve_bit[4] = 0x80; // ten_or_twelve_bit
+        assert_eq!(
+            vp9_profile_and_depth_from_keyframe(&twelve_bit),
+            Some((2, 12))
+        );
+        assert_eq!(
+            vp9_profile_and_depth_from_keyframe(&[0x82, 0x49, 0x83, 0x42, 0x00]),
+            Some((0, 8))
+        );
+        // Inter frames, show-existing frames and bad sync codes establish nothing.
+        assert_eq!(
+            vp9_profile_and_depth_from_keyframe(&[0x96, 0x49, 0x83, 0x42, 0x00]),
+            None
+        );
+        assert_eq!(
+            vp9_profile_and_depth_from_keyframe(&[0x9A, 0x49, 0x83, 0x42, 0x00]),
+            None
+        );
+        assert_eq!(
+            vp9_profile_and_depth_from_keyframe(&[0x92, 0x00, 0x00, 0x00, 0x00]),
+            None
+        );
+        assert_eq!(vp9_profile_and_depth_from_keyframe(&[0x92]), None);
     }
 }

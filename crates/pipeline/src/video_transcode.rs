@@ -10,7 +10,7 @@ use std::io::Cursor;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -943,6 +943,37 @@ fn transcode_file(
     ))
 }
 
+/// Worker admission under one lock: checking cancellation and claiming the
+/// next item are indivisible, so no worker can claim work after cancellation.
+#[derive(Default)]
+struct BatchAdmission {
+    next: usize,
+    cancelled: bool,
+    failure: Option<PipelineError>,
+}
+
+impl BatchAdmission {
+    fn claim(&mut self) -> Option<usize> {
+        if self.cancelled {
+            return None;
+        }
+        let index = self.next;
+        self.next = self.next.saturating_add(1);
+        Some(index)
+    }
+
+    fn stop(&mut self) {
+        self.cancelled = true;
+    }
+
+    fn fail(&mut self, err: PipelineError) {
+        if self.failure.is_none() {
+            self.failure = Some(err);
+        }
+        self.stop();
+    }
+}
+
 /// Executes a validated [`VideoTranscodePlan`] with bounded file-level
 /// parallelism. NVENC items run sequentially so GPU sessions do not contend.
 ///
@@ -971,10 +1002,8 @@ pub fn execute_video_transcode_batch(
     } else {
         plan.effective_workers().get().min(MAX_CPU_FILE_WORKERS)
     };
-    let next = AtomicUsize::new(0);
-    let abort = AtomicBool::new(false);
+    let admission = Mutex::new(BatchAdmission::default());
     let frames = AtomicU64::new(0);
-    let failure: Mutex<Option<PipelineError>> = Mutex::new(None);
     let device: Mutex<Option<String>> = Mutex::new(None);
     let tag = AtomicUsize::new(0);
 
@@ -991,18 +1020,13 @@ pub fn execute_video_transcode_batch(
             let mut handles = Vec::with_capacity(workers);
             let mut startup_error = None;
             for worker in 0..workers {
-                let (abort, next, frames, failure, device, tag) =
-                    (&abort, &next, &frames, &failure, &device, &tag);
+                let (admission, frames, device, tag) = (&admission, &frames, &device, &tag);
                 let worker = thread::Builder::new()
                     .name(format!("fastconv-video-{worker}"))
                     .spawn_scoped(scope, move || {
-                        loop {
-                            if abort.load(Ordering::Relaxed)
-                                || failure.lock().map_or(true, |guard| guard.is_some())
-                            {
-                                break;
-                            }
-                            let index = next.fetch_add(1, Ordering::Relaxed);
+                        while let Some(index) =
+                            admission.lock().ok().and_then(|mut guard| guard.claim())
+                        {
                             let Some(item) = items.get(index) else { break };
                             let my_tag = tag.fetch_add(1, Ordering::Relaxed);
                             match transcode_file(item, my_tag) {
@@ -1016,11 +1040,8 @@ pub fn execute_video_transcode_batch(
                                     }
                                 }
                                 Err(err) => {
-                                    abort.store(true, Ordering::Relaxed);
-                                    if let Ok(mut guard) = failure.lock()
-                                        && guard.is_none()
-                                    {
-                                        *guard = Some(err);
+                                    if let Ok(mut guard) = admission.lock() {
+                                        guard.fail(err);
                                     }
                                     break;
                                 }
@@ -1032,7 +1053,9 @@ pub fn execute_video_transcode_batch(
                     Err(err) => {
                         // Stop the workers already running from taking more
                         // items, then join all of them before propagating.
-                        abort.store(true, Ordering::Relaxed);
+                        if let Ok(mut guard) = admission.lock() {
+                            guard.stop();
+                        }
                         startup_error = Some(err);
                         break;
                     }
@@ -1047,10 +1070,10 @@ pub fn execute_video_transcode_batch(
             Ok(())
         })?;
     }
-    if let Some(err) = failure
+    let admission = admission
         .into_inner()
-        .map_err(|_| PipelineError::WorkerPanicked)?
-    {
+        .map_err(|_| PipelineError::WorkerPanicked)?;
+    if let Some(err) = admission.failure {
         return Err(err);
     }
 
@@ -1573,5 +1596,32 @@ mod tests {
             source,
         })?;
         Ok(())
+    }
+
+    #[test]
+    fn batch_admission_stops_claiming_after_worker_and_startup_failures() {
+        let mut admission = BatchAdmission::default();
+        assert_eq!(admission.claim(), Some(0));
+        assert_eq!(admission.claim(), Some(1));
+        let error = |reason: &str| PipelineError::RemuxFailed {
+            path: PathBuf::from("failed.mp4"),
+            reason: reason.to_owned(),
+        };
+        admission.fail(error("first"));
+        // A later failure must not overwrite the first, and neither failure
+        // may let another worker claim the next item.
+        admission.fail(error("second"));
+        assert_eq!(admission.claim(), None);
+        assert_eq!(admission.next, 2);
+        assert!(matches!(
+            admission.failure,
+            Some(PipelineError::RemuxFailed { ref reason, .. }) if reason == "first"
+        ));
+
+        let mut admission = BatchAdmission::default();
+        assert_eq!(admission.claim(), Some(0));
+        admission.stop(); // spawn failure, no worker error to report
+        assert_eq!(admission.claim(), None);
+        assert!(admission.failure.is_none());
     }
 }

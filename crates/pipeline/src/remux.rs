@@ -171,7 +171,7 @@ fn stream_copy_supports(item: &VideoRemuxItem) -> bool {
             VideoContainerFormat::Mp4 | VideoContainerFormat::Mov
         )
     };
-    let direct = (input == VideoContainerFormat::Mp4 && family(output))
+    let direct = (family(input) && family(output))
         || (matches!(
             input,
             VideoContainerFormat::Mkv | VideoContainerFormat::Webm
@@ -220,13 +220,14 @@ fn reject_mkv_attachments(source: &Path, target: &Path) -> Result<(), PipelineEr
 fn remux_file(item: &VideoRemuxItem, target: &File) -> Result<(), PipelineError> {
     let source = item.source();
     let output = item.output_format();
+    // Select the route first: only the canonical path loses attachments, and
+    // even a same-family conversion takes it when a codec disables stream copy.
+    let direct = stream_copy_supports(item);
     if matches!(
         item.input_format(),
         VideoContainerFormat::Mkv | VideoContainerFormat::Webm
-    ) && !matches!(
-        output,
-        VideoContainerFormat::Mkv | VideoContainerFormat::Webm
-    ) {
+    ) && !direct
+    {
         reject_mkv_attachments(source, item.target())?;
     }
     for stream in item.streams() {
@@ -241,7 +242,7 @@ fn remux_file(item: &VideoRemuxItem, target: &File) -> Result<(), PipelineError>
             ));
         }
     }
-    if !stream_copy_supports(item) {
+    if !direct {
         let media = demux_video(source, item.input_format())?;
         return mux_video(target, item.target(), output, &media);
     }
@@ -1072,7 +1073,7 @@ mod container_tests {
                     dts: 0,
                     duration: 33_333,
                     keyframe: true,
-                    data: vec![0x82, 0x31, 0x01],
+                    data: vec![0x92, 0x49, 0x83, 0x42, 0x00],
                 },
                 ContainerPacket {
                     track: 1,
@@ -1346,7 +1347,7 @@ mod container_tests {
                 dts: pts,
                 duration: 33_333,
                 keyframe: i == 0,
-                data: vec![0x82, 0x31, u8::try_from(i).unwrap_or(0)],
+                data: vec![0x92, 0x49, 0x83, 0x42, 0x00, u8::try_from(i).unwrap_or(0)],
             });
         }
         for i in 0..50_u32 {
@@ -1535,5 +1536,183 @@ mod container_tests {
             vec![stream(VideoCodec::H264)],
         );
         assert!(stream_copy_supports(&plain));
+    }
+
+    fn write_mov_with_chapter(
+        path: &Path,
+        media: &ContainerMedia,
+        title: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base = temp_path("mov-chapter-base", "mp4");
+        write_container(&base, VideoContainerFormat::Mp4, media)?;
+        let reader = WindowedFileReader::open(&base)?;
+        let mut input = containr::mp4::Demuxer::open(reader)?;
+        // Faststart reads mdat back through the same handle.
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        let options = containr::mp4::MuxOptions {
+            brand: Brand::QuickTime,
+            faststart: true,
+            ..containr::mp4::MuxOptions::default()
+        };
+        let mut output = containr::mp4::Muxer::new(&file, options)?;
+        let mut plans = Vec::new();
+        for track in input.tracks().iter().filter(|t| !t.chapter_track) {
+            let packets = read_packets(input.track_packets(track.id)?, &base)?;
+            let plan = containr::mp4::StreamCopy::plan(track, &packets, options.movie_timescale)?;
+            let id = output.add_track(plan.spec.clone())?;
+            plans.push((track.id, plan, id));
+        }
+        output.set_chapters(vec![containr::Chapter {
+            start: 0,
+            duration: Some(33_333),
+            timescale: US_TIMESCALE,
+            title: title.to_owned(),
+            source: containr::ChapterSource::Chpl,
+        }])?;
+        let mut buf = Vec::new();
+        for packet in input.packets() {
+            let packet = packet?;
+            let Some((_, plan, id)) = plans
+                .iter()
+                .find(|(track_id, _, _)| *track_id == packet.track_id)
+            else {
+                continue;
+            };
+            input.read_packet_into(&packet, &mut buf)?;
+            output.write_packet(*id, &plan.packet(&packet, &buf)?)?;
+        }
+        output.finish()?;
+        drop(file);
+        std::fs::remove_file(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mov_to_mp4_direct_copy_preserves_chapters() -> Result<(), Box<dyn std::error::Error>> {
+        let source = temp_path("chapter-mov", "mov");
+        let target = temp_path("chapter-mp4", "mp4");
+        write_mov_with_chapter(&source, &h264_aac_media(), "Intro")?;
+        remux(
+            &source,
+            &target,
+            VideoContainerFormat::Mov,
+            VideoContainerFormat::Mp4,
+        )?;
+        let reader = WindowedFileReader::open(&target)?;
+        let demuxer = containr::mp4::Demuxer::open(reader)?;
+        assert!(
+            demuxer
+                .chapters()
+                .iter()
+                .any(|chapter| chapter.title == "Intro"),
+            "chapters were dropped from the MOV -> MP4 remux"
+        );
+        std::fs::remove_file(source)?;
+        std::fs::remove_file(target)?;
+        Ok(())
+    }
+
+    fn h264_mp3_media() -> ContainerMedia {
+        let mut media = h264_aac_media();
+        media.tracks[1].codec = VideoCodec::Mp3;
+        media.tracks[1].config = Vec::new();
+        media
+    }
+
+    fn write_mkv_with_attachment(
+        path: &Path,
+        media: &ContainerMedia,
+        name: &str,
+        data: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base = temp_path("mkv-attachment-base", "mkv");
+        write_container(&base, VideoContainerFormat::Mkv, media)?;
+        let reader = WindowedFileReader::open(&base)?;
+        let mut input = containr::mkv::Demuxer::open(reader)?;
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(&file);
+        let options = containr::mkv::MkvOptions {
+            doc_type: DocType::Matroska,
+            timestamp_scale: crate::video_container::MKV_TICK_NS,
+            ..containr::mkv::MkvOptions::default()
+        };
+        let mut output = containr::mkv::Muxer::new(&mut writer, options)?;
+        let mut plans = Vec::new();
+        for track in input.tracks() {
+            let packets = read_packets(input.track_packets(track.id)?, &base)?;
+            let plan = containr::mkv::StreamCopy::plan(track, &packets)?;
+            let id = output.add_track(plan.spec.clone())?;
+            plans.push((track.id, plan, id));
+        }
+        output.attach(&containr::mkv::AttachmentIn {
+            name,
+            mime: "text/plain",
+            description: None,
+            uid: Some(7),
+            data,
+        })?;
+        let mut buf = Vec::new();
+        for packet in input.packets() {
+            let packet = packet?;
+            let Some((_, plan, id)) = plans
+                .iter()
+                .find(|(track_id, _, _)| *track_id == packet.track_id)
+            else {
+                continue;
+            };
+            input.read_packet_into(&packet, &mut buf)?;
+            if let Some(block) = plan.packet(&packet, &buf)? {
+                output.write_packet(*id, &block)?;
+            }
+        }
+        output.finish()?;
+        writer.flush()?;
+        drop(writer);
+        std::fs::remove_file(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mkv_to_mkv_with_mp3_rejects_attachments_before_muxing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = temp_path("mkv-mp3-attachment", "mkv");
+        let target = temp_path("mkv-mp3-attachment-out", "mkv");
+        write_mkv_with_attachment(&source, &h264_mp3_media(), "note.txt", b"keep me")?;
+        // MP3 disables stream copy, so even MKV -> MKV takes the canonical path.
+        let result = remux(
+            &source,
+            &target,
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Mkv,
+        );
+        assert!(matches!(result, Err(PipelineError::RemuxFailed { .. })));
+        assert!(!target.exists(), "no target was published after rejection");
+        std::fs::remove_file(source)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mkv_to_mkv_direct_copy_preserves_attachments() -> Result<(), Box<dyn std::error::Error>> {
+        let source = temp_path("mkv-attachment", "mkv");
+        let target = temp_path("mkv-attachment-out", "mkv");
+        write_mkv_with_attachment(&source, &h264_aac_media(), "note.txt", b"keep me")?;
+        remux(
+            &source,
+            &target,
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Mkv,
+        )?;
+        let reader = WindowedFileReader::open(&target)?;
+        let demuxer = containr::mkv::Demuxer::open(reader)?;
+        assert_eq!(demuxer.attachments().len(), 1);
+        assert_eq!(demuxer.attachments()[0].name, "note.txt");
+        std::fs::remove_file(source)?;
+        std::fs::remove_file(target)?;
+        Ok(())
     }
 }

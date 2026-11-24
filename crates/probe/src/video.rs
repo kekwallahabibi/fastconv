@@ -1024,19 +1024,44 @@ fn probe_ts(
         {
             if packet.pusi {
                 pmt_section.clear();
-                let section = ts_section_start(&packet);
-                pmt_needed = section.and_then(|section| {
-                    ts_section_length(section).and_then(|len| 3_usize.checked_add(len))
-                });
-                // A TS payload is padded with 0xFF; only the declared section bytes count.
-                if let (Some(section), Some(needed)) = (section, pmt_needed) {
-                    let take = needed.min(section.len());
-                    pmt_section.extend_from_slice(&section[..take]);
+                pmt_needed = None;
+                if let Some(section) = ts_section_start(&packet) {
+                    // A TS payload is padded with 0xFF. Until the 3-byte
+                    // section header is complete, retain only bytes before the
+                    // padding run; the declared length then bounds assembly.
+                    let mut usable = section.len();
+                    while usable > 0 && section[usable - 1] == 0xFF {
+                        usable -= 1;
+                    }
+                    let header = usable.min(3);
+                    pmt_section.extend_from_slice(&section[..header]);
+                    pmt_needed =
+                        ts_section_length(&pmt_section).and_then(|len| 3_usize.checked_add(len));
+                    if let Some(needed) = pmt_needed {
+                        let extra = needed
+                            .saturating_sub(header)
+                            .min(section.len().saturating_sub(header));
+                        pmt_section.extend_from_slice(&section[header..header + extra]);
+                    }
                 }
-            } else if let Some(needed) = pmt_needed {
-                let left = needed.saturating_sub(pmt_section.len());
-                let take = left.min(packet.payload.len());
-                pmt_section.extend_from_slice(&packet.payload[..take]);
+            } else if !pmt_section.is_empty() {
+                let mut consumed = 0_usize;
+                if pmt_needed.is_none() {
+                    let take = 3_usize
+                        .saturating_sub(pmt_section.len())
+                        .min(packet.payload.len());
+                    pmt_section.extend_from_slice(&packet.payload[..take]);
+                    consumed = take;
+                    pmt_needed =
+                        ts_section_length(&pmt_section).and_then(|len| 3_usize.checked_add(len));
+                }
+                if let Some(needed) = pmt_needed {
+                    let left = needed.saturating_sub(pmt_section.len());
+                    let take = left.min(packet.payload.len().saturating_sub(consumed));
+                    if take > 0 {
+                        pmt_section.extend_from_slice(&packet.payload[consumed..consumed + take]);
+                    }
+                }
             }
             if let Some(needed) = pmt_needed
                 && pmt_section.len() >= needed
@@ -1046,6 +1071,7 @@ fn probe_ts(
                     break;
                 }
                 pmt_needed = None;
+                pmt_section.clear();
             }
         }
     }
@@ -2039,6 +2065,27 @@ mod tests {
             probed.streams[5].channels().map(std::num::NonZero::get),
             Some(6)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ts_pmt_first_byte_alone_is_reassembled() -> Result<(), Box<dyn std::error::Error>> {
+        let mut association_body = vec![0x00, 0x01, 0xC1, 0x00, 0x00];
+        association_body.extend_from_slice(&[0x00, 0x01, 0xF0, 0x00]);
+        let mut program_body = vec![0x00, 0x01, 0xC1, 0x00, 0x00, 0xF0, 0x00, 0xF0, 0x00];
+        program_body.extend_from_slice(&ts_es(0x0F, 0x0110, &[]));
+        let pat = ts_section(0x00, &association_body);
+        let pmt = ts_section(0x02, &program_body);
+        let mut bytes = ts_packet(0, true, &[&[0_u8][..], pat.as_slice()].concat());
+        // Only the table id arrives with the PUSI; the section header is
+        // completed by the continuation packet.
+        bytes.extend_from_slice(&ts_packet(0x1000, true, &[0, pmt[0]]));
+        bytes.extend_from_slice(&ts_packet(0x1000, false, &pmt[1..]));
+        let path = temp_file("ts-pmt-first-byte", &bytes)?;
+        let probed = probe_video(&path)?;
+        std::fs::remove_file(&path)?;
+        assert_eq!(probed.streams.len(), 1);
+        assert_eq!(probed.streams[0].codec(), VideoCodec::Aac);
         Ok(())
     }
 
