@@ -5,13 +5,17 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::{DomainError, HardwareBackend};
+use crate::{DomainError, GpuBackend, HardwareBackend, PathRole};
 
-/// Video container formats supported for lossless remuxing.
+/// Video container formats supported for remuxing and transcoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum VideoContainerFormat {
     Mp4,
     Mkv,
+    Webm,
+    Mov,
+    Avi,
+    Ts,
 }
 
 impl VideoContainerFormat {
@@ -20,6 +24,10 @@ impl VideoContainerFormat {
         match self {
             Self::Mp4 => "mp4",
             Self::Mkv => "mkv",
+            Self::Webm => "webm",
+            Self::Mov => "mov",
+            Self::Avi => "avi",
+            Self::Ts => "ts",
         }
     }
 
@@ -28,15 +36,39 @@ impl VideoContainerFormat {
         match self {
             Self::Mp4 => "MP4",
             Self::Mkv => "MKV",
+            Self::Webm => "WebM",
+            Self::Mov => "MOV",
+            Self::Avi => "AVI",
+            Self::Ts => "TS",
         }
     }
 
     #[must_use]
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_ascii_lowercase().as_str() {
-            "mp4" | "m4v" | "mov" => Some(Self::Mp4),
-            "mkv" | "webm" => Some(Self::Mkv),
+            "mp4" | "m4v" => Some(Self::Mp4),
+            "mov" | "qt" => Some(Self::Mov),
+            "mkv" => Some(Self::Mkv),
+            "webm" => Some(Self::Webm),
+            "avi" => Some(Self::Avi),
+            "ts" | "m2ts" | "mts" => Some(Self::Ts),
             _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn default_video_codec(self) -> TargetVideoCodec {
+        match self {
+            Self::Webm => TargetVideoCodec::Vp9,
+            Self::Mp4 | Self::Mkv | Self::Mov | Self::Avi | Self::Ts => TargetVideoCodec::H264,
+        }
+    }
+
+    #[must_use]
+    pub const fn default_audio_codec(self) -> TargetAudioCodec {
+        match self {
+            Self::Webm => TargetAudioCodec::Opus,
+            Self::Mp4 | Self::Mkv | Self::Mov | Self::Avi | Self::Ts => TargetAudioCodec::Aac,
         }
     }
 }
@@ -56,6 +88,7 @@ pub enum VideoCodec {
     Vp9,
     Aac,
     Opus,
+    Mp3,
     Vorbis,
     TimedText,
     Unknown,
@@ -71,6 +104,7 @@ impl VideoCodec {
             Self::Vp9 => "VP9",
             Self::Aac => "AAC",
             Self::Opus => "Opus",
+            Self::Mp3 => "MP3",
             Self::Vorbis => "Vorbis",
             Self::TimedText => "Timed text",
             Self::Unknown => "unknown",
@@ -81,9 +115,16 @@ impl VideoCodec {
     #[must_use]
     pub const fn supported_in(self, container: VideoContainerFormat) -> bool {
         match container {
-            VideoContainerFormat::Mp4 => matches!(
+            VideoContainerFormat::Mp4 | VideoContainerFormat::Mov => matches!(
                 self,
-                Self::H264 | Self::Hevc | Self::Av1 | Self::Aac | Self::Opus | Self::TimedText
+                Self::H264
+                    | Self::Hevc
+                    | Self::Av1
+                    | Self::Vp9
+                    | Self::Aac
+                    | Self::Opus
+                    | Self::Mp3
+                    | Self::TimedText
             ),
             VideoContainerFormat::Mkv => matches!(
                 self,
@@ -93,16 +134,330 @@ impl VideoCodec {
                     | Self::Vp9
                     | Self::Aac
                     | Self::Opus
+                    | Self::Mp3
                     | Self::Vorbis
                     | Self::TimedText
             ),
+            VideoContainerFormat::Webm => {
+                matches!(self, Self::Vp9 | Self::Av1 | Self::Opus | Self::Vorbis)
+            }
+            VideoContainerFormat::Avi => matches!(
+                self,
+                Self::H264
+                    | Self::Hevc
+                    | Self::Av1
+                    | Self::Vp9
+                    | Self::Aac
+                    | Self::Opus
+                    | Self::Mp3
+            ),
+            // Standard MPEG-TS carries no VP9 bitstream mapping.
+            VideoContainerFormat::Ts => matches!(
+                self,
+                Self::H264 | Self::Hevc | Self::Av1 | Self::Aac | Self::Opus | Self::Mp3
+            ),
         }
+    }
+
+    #[must_use]
+    pub const fn is_video(self) -> bool {
+        matches!(self, Self::H264 | Self::Hevc | Self::Av1 | Self::Vp9)
+    }
+
+    #[must_use]
+    pub const fn is_audio(self) -> bool {
+        matches!(self, Self::Aac | Self::Opus | Self::Mp3 | Self::Vorbis)
     }
 }
 
 impl fmt::Display for VideoCodec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.label())
+    }
+}
+
+/// Video codec selected for re-encoding, distinct from probed bitstream codecs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum TargetVideoCodec {
+    H264,
+    Hevc,
+    Av1,
+    Vp9,
+}
+
+impl TargetVideoCodec {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::Hevc => "HEVC",
+            Self::Av1 => "AV1",
+            Self::Vp9 => "VP9",
+        }
+    }
+
+    #[must_use]
+    pub const fn as_video_codec(self) -> VideoCodec {
+        match self {
+            Self::H264 => VideoCodec::H264,
+            Self::Hevc => VideoCodec::Hevc,
+            Self::Av1 => VideoCodec::Av1,
+            Self::Vp9 => VideoCodec::Vp9,
+        }
+    }
+
+    #[must_use]
+    pub const fn supported_in(self, container: VideoContainerFormat) -> bool {
+        self.as_video_codec().supported_in(container)
+    }
+
+    #[must_use]
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "h264" | "avc" | "x264" => Some(Self::H264),
+            "hevc" | "h265" | "x265" => Some(Self::Hevc),
+            "av1" => Some(Self::Av1),
+            "vp9" => Some(Self::Vp9),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for TargetVideoCodec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Audio codec selected for re-encoding inside a video container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum TargetAudioCodec {
+    Aac,
+    Opus,
+    Mp3,
+}
+
+impl TargetAudioCodec {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Aac => "AAC",
+            Self::Opus => "Opus",
+            Self::Mp3 => "MP3",
+        }
+    }
+
+    #[must_use]
+    pub const fn as_video_codec(self) -> VideoCodec {
+        match self {
+            Self::Aac => VideoCodec::Aac,
+            Self::Opus => VideoCodec::Opus,
+            Self::Mp3 => VideoCodec::Mp3,
+        }
+    }
+
+    #[must_use]
+    pub const fn supported_in(self, container: VideoContainerFormat) -> bool {
+        self.as_video_codec().supported_in(container)
+    }
+
+    #[must_use]
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "aac" => Some(Self::Aac),
+            "opus" => Some(Self::Opus),
+            "mp3" => Some(Self::Mp3),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for TargetAudioCodec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Validated lossy video quality factor in `0..=100`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct VideoQuality(u8);
+
+impl VideoQuality {
+    pub const MAX: u8 = 100;
+    pub const DEFAULT: Self = Self(80);
+
+    /// Creates a validated [`VideoQuality`] in `0..=100`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidVideoQuality`] when `value > 100`.
+    pub const fn new(value: u8) -> Result<Self, DomainError> {
+        if value > Self::MAX {
+            return Err(DomainError::InvalidVideoQuality {
+                value,
+                max: Self::MAX,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl fmt::Display for VideoQuality {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Compile-time-legal video encoder choice: a codec/backend pair and its quality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum VideoEncodeMode {
+    CpuH264 { quality: VideoQuality },
+    CpuAv1 { quality: VideoQuality },
+    CpuVp9 { quality: VideoQuality },
+    NvencH264 { quality: VideoQuality },
+    NvencHevc { quality: VideoQuality },
+}
+
+impl VideoEncodeMode {
+    /// Resolves an encode mode without ever falling back to CPU silently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::UnsupportedVideoPipeline`] when the requested codec
+    /// has no encoder on the selected backend.
+    pub fn resolve(
+        codec: TargetVideoCodec,
+        quality: VideoQuality,
+        backend: HardwareBackend,
+    ) -> Result<Self, DomainError> {
+        match (codec, backend) {
+            (TargetVideoCodec::H264, HardwareBackend::Cpu) => Ok(Self::CpuH264 { quality }),
+            (TargetVideoCodec::Av1, HardwareBackend::Cpu) => Ok(Self::CpuAv1 { quality }),
+            (TargetVideoCodec::Vp9, HardwareBackend::Cpu) => Ok(Self::CpuVp9 { quality }),
+            (TargetVideoCodec::Hevc, HardwareBackend::Cpu) => {
+                Err(DomainError::UnsupportedVideoPipeline {
+                    codec: VideoCodec::Hevc,
+                    backend,
+                    reason:
+                        "HEVC (H.265) encoding requires hardware acceleration via --backend nvenc"
+                            .to_owned(),
+                })
+            }
+            (TargetVideoCodec::H264, HardwareBackend::Gpu(GpuBackend::Nvenc)) => {
+                Ok(Self::NvencH264 { quality })
+            }
+            (TargetVideoCodec::Hevc, HardwareBackend::Gpu(GpuBackend::Nvenc)) => {
+                Ok(Self::NvencHevc { quality })
+            }
+            (
+                TargetVideoCodec::Av1 | TargetVideoCodec::Vp9,
+                HardwareBackend::Gpu(GpuBackend::Nvenc),
+            ) => Err(DomainError::UnsupportedVideoPipeline {
+                codec: codec.as_video_codec(),
+                backend,
+                reason: "NVENC supports H.264 and HEVC encoding; use --backend cpu for AV1/VP9"
+                    .to_owned(),
+            }),
+            (_, HardwareBackend::Gpu(other)) => Err(DomainError::UnsupportedVideoPipeline {
+                codec: codec.as_video_codec(),
+                backend: HardwareBackend::Gpu(other),
+                reason: format!(
+                    "GPU backend '{other}' video encoding is not implemented; no silent CPU fallback"
+                ),
+            }),
+        }
+    }
+
+    #[must_use]
+    pub const fn codec(self) -> TargetVideoCodec {
+        match self {
+            Self::CpuH264 { .. } | Self::NvencH264 { .. } => TargetVideoCodec::H264,
+            Self::CpuAv1 { .. } => TargetVideoCodec::Av1,
+            Self::CpuVp9 { .. } => TargetVideoCodec::Vp9,
+            Self::NvencHevc { .. } => TargetVideoCodec::Hevc,
+        }
+    }
+
+    #[must_use]
+    pub const fn quality(self) -> VideoQuality {
+        match self {
+            Self::CpuH264 { quality }
+            | Self::CpuAv1 { quality }
+            | Self::CpuVp9 { quality }
+            | Self::NvencH264 { quality }
+            | Self::NvencHevc { quality } => quality,
+        }
+    }
+
+    #[must_use]
+    pub const fn backend(self) -> HardwareBackend {
+        match self {
+            Self::CpuH264 { .. } | Self::CpuAv1 { .. } | Self::CpuVp9 { .. } => {
+                HardwareBackend::Cpu
+            }
+            Self::NvencH264 { .. } | Self::NvencHevc { .. } => {
+                HardwareBackend::Gpu(GpuBackend::Nvenc)
+            }
+        }
+    }
+}
+
+impl fmt::Display for VideoEncodeMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} {} (quality {})",
+            self.backend(),
+            self.codec(),
+            self.quality()
+        )
+    }
+}
+
+/// Per-track decision for a video stream during transcoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum VideoTrackAction {
+    Copy,
+    Encode(VideoEncodeMode),
+}
+
+impl VideoTrackAction {
+    #[must_use]
+    pub const fn backend(self) -> HardwareBackend {
+        match self {
+            Self::Copy => HardwareBackend::Cpu,
+            Self::Encode(mode) => mode.backend(),
+        }
+    }
+}
+
+impl fmt::Display for VideoTrackAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Copy => f.write_str("copy"),
+            Self::Encode(mode) => write!(f, "encode {mode}"),
+        }
+    }
+}
+
+/// Per-track decision for an audio stream during video transcoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum AudioTrackAction {
+    Copy,
+    Encode(TargetAudioCodec),
+}
+
+impl fmt::Display for AudioTrackAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Copy => f.write_str("copy"),
+            Self::Encode(codec) => write!(f, "encode {codec}"),
+        }
     }
 }
 
@@ -425,6 +780,307 @@ impl VideoRemuxReport {
     }
 }
 
+/// A single transcode item with validated per-track actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoTranscodeItem {
+    source: PathBuf,
+    target: PathBuf,
+    input_format: VideoContainerFormat,
+    output_format: VideoContainerFormat,
+    streams: Vec<VideoStreamInfo>,
+    video_action: VideoTrackAction,
+    audio_action: AudioTrackAction,
+}
+
+impl VideoTranscodeItem {
+    /// Creates a transcode item after rejecting codec/container mismatches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::EmptyPath`] or [`DomainError::IdenticalSourceAndTarget`]
+    /// for invalid paths, and [`DomainError::UnsupportedVideoCodec`] when a copied or
+    /// encoded track cannot be carried by `output_format`.
+    pub fn new(
+        source: PathBuf,
+        target: PathBuf,
+        input_format: VideoContainerFormat,
+        output_format: VideoContainerFormat,
+        streams: Vec<VideoStreamInfo>,
+        video_action: VideoTrackAction,
+        audio_action: AudioTrackAction,
+    ) -> Result<Self, DomainError> {
+        if source.as_os_str().is_empty() {
+            return Err(DomainError::EmptyPath(PathRole::Source));
+        }
+        if target.as_os_str().is_empty() {
+            return Err(DomainError::EmptyPath(PathRole::Target));
+        }
+        if source == target {
+            return Err(DomainError::IdenticalSourceAndTarget(source));
+        }
+
+        match video_action {
+            VideoTrackAction::Copy => {
+                for stream in streams
+                    .iter()
+                    .filter(|s| s.kind() == VideoStreamKind::Video)
+                {
+                    if !stream.codec().supported_in(output_format) {
+                        return Err(DomainError::UnsupportedVideoCodec {
+                            codec: stream.codec(),
+                            container: output_format,
+                        });
+                    }
+                }
+            }
+            VideoTrackAction::Encode(mode) => {
+                if !mode.codec().supported_in(output_format) {
+                    return Err(DomainError::UnsupportedVideoCodec {
+                        codec: mode.codec().as_video_codec(),
+                        container: output_format,
+                    });
+                }
+            }
+        }
+
+        match audio_action {
+            AudioTrackAction::Copy => {
+                for stream in streams
+                    .iter()
+                    .filter(|s| s.kind() == VideoStreamKind::Audio)
+                {
+                    if !stream.codec().supported_in(output_format) {
+                        return Err(DomainError::UnsupportedVideoCodec {
+                            codec: stream.codec(),
+                            container: output_format,
+                        });
+                    }
+                }
+            }
+            AudioTrackAction::Encode(codec) => {
+                if !codec.supported_in(output_format) {
+                    return Err(DomainError::UnsupportedVideoCodec {
+                        codec: codec.as_video_codec(),
+                        container: output_format,
+                    });
+                }
+            }
+        }
+
+        Ok(Self {
+            source,
+            target,
+            input_format,
+            output_format,
+            streams,
+            video_action,
+            audio_action,
+        })
+    }
+
+    #[must_use]
+    pub fn source(&self) -> &Path {
+        &self.source
+    }
+
+    #[must_use]
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
+    #[must_use]
+    pub const fn input_format(&self) -> VideoContainerFormat {
+        self.input_format
+    }
+
+    #[must_use]
+    pub const fn output_format(&self) -> VideoContainerFormat {
+        self.output_format
+    }
+
+    #[must_use]
+    pub fn streams(&self) -> &[VideoStreamInfo] {
+        &self.streams
+    }
+
+    #[must_use]
+    pub const fn video_action(&self) -> VideoTrackAction {
+        self.video_action
+    }
+
+    #[must_use]
+    pub const fn audio_action(&self) -> AudioTrackAction {
+        self.audio_action
+    }
+}
+
+/// Validated batch plan for video transcoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoTranscodePlan {
+    items: Vec<VideoTranscodeItem>,
+    worker_threads: NonZeroUsize,
+}
+
+impl VideoTranscodePlan {
+    /// Creates a validated transcode batch plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::EmptyBatch`] if `items` is empty, or
+    /// [`DomainError::DuplicateTargetPath`] / [`DomainError::TargetOverwritesSource`].
+    pub fn new(
+        items: Vec<VideoTranscodeItem>,
+        worker_threads: NonZeroUsize,
+    ) -> Result<Self, DomainError> {
+        if items.is_empty() {
+            return Err(DomainError::EmptyBatch);
+        }
+        let mut targets = std::collections::HashSet::new();
+        let sources: std::collections::HashSet<PathBuf> =
+            items.iter().map(|i| i.source().to_path_buf()).collect();
+        for item in &items {
+            if !targets.insert(item.target().to_path_buf()) {
+                return Err(DomainError::DuplicateTargetPath(
+                    item.target().to_path_buf(),
+                ));
+            }
+            if sources.contains(item.target()) {
+                return Err(DomainError::TargetOverwritesSource(
+                    item.target().to_path_buf(),
+                ));
+            }
+        }
+        Ok(Self {
+            items,
+            worker_threads,
+        })
+    }
+
+    #[must_use]
+    pub fn items(&self) -> &[VideoTranscodeItem] {
+        &self.items
+    }
+
+    #[must_use]
+    pub const fn worker_threads(&self) -> NonZeroUsize {
+        self.worker_threads
+    }
+
+    #[must_use]
+    pub fn effective_workers(&self) -> NonZeroUsize {
+        let n = self.worker_threads.get().min(self.items.len()).max(1);
+        NonZeroUsize::new(n).unwrap_or(NonZeroUsize::MIN)
+    }
+
+    #[must_use]
+    pub fn output_format(&self) -> VideoContainerFormat {
+        self.items[0].output_format()
+    }
+
+    #[must_use]
+    pub fn backend(&self) -> HardwareBackend {
+        self.items[0].video_action().backend()
+    }
+}
+
+/// Report after a transcode batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VideoTranscodeReport {
+    files_converted: NonZeroUsize,
+    frames_processed: u64,
+    total_input_bytes: NonZeroU64,
+    total_output_bytes: NonZeroU64,
+    duration: Duration,
+    worker_threads_used: NonZeroUsize,
+    backend: HardwareBackend,
+    hardware_device: Option<String>,
+}
+
+impl VideoTranscodeReport {
+    // One argument per reported metric keeps the report construction explicit.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        files_converted: NonZeroUsize,
+        frames_processed: u64,
+        total_input_bytes: NonZeroU64,
+        total_output_bytes: NonZeroU64,
+        duration: Duration,
+        worker_threads_used: NonZeroUsize,
+        backend: HardwareBackend,
+        hardware_device: Option<String>,
+    ) -> Self {
+        Self {
+            files_converted,
+            frames_processed,
+            total_input_bytes,
+            total_output_bytes,
+            duration,
+            worker_threads_used,
+            backend,
+            hardware_device,
+        }
+    }
+
+    #[must_use]
+    pub const fn files_converted(&self) -> NonZeroUsize {
+        self.files_converted
+    }
+
+    #[must_use]
+    pub const fn frames_processed(&self) -> u64 {
+        self.frames_processed
+    }
+
+    #[must_use]
+    pub const fn total_input_bytes(&self) -> NonZeroU64 {
+        self.total_input_bytes
+    }
+
+    #[must_use]
+    pub const fn total_output_bytes(&self) -> NonZeroU64 {
+        self.total_output_bytes
+    }
+
+    #[must_use]
+    pub const fn duration(&self) -> Duration {
+        self.duration
+    }
+
+    #[must_use]
+    pub const fn worker_threads_used(&self) -> NonZeroUsize {
+        self.worker_threads_used
+    }
+
+    #[must_use]
+    pub const fn backend(&self) -> HardwareBackend {
+        self.backend
+    }
+
+    #[must_use]
+    pub fn hardware_device(&self) -> Option<&str> {
+        self.hardware_device.as_deref()
+    }
+
+    #[must_use]
+    pub fn megabytes_per_sec(&self) -> f64 {
+        let secs = self.duration.as_secs_f64();
+        if secs == 0.0 {
+            return 0.0;
+        }
+        (u64_to_f64(self.total_input_bytes.get()) / (1024.0 * 1024.0)) / secs
+    }
+
+    #[must_use]
+    pub fn fps(&self) -> f64 {
+        let secs = self.duration.as_secs_f64();
+        if secs == 0.0 {
+            return 0.0;
+        }
+        u64_to_f64(self.frames_processed) / secs
+    }
+}
+
 fn u64_to_f64(value: u64) -> f64 {
     let hi = u32::try_from(value >> 32).unwrap_or(u32::MAX);
     let lo = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
@@ -436,20 +1092,617 @@ mod tests {
     use super::*;
     use std::num::NonZeroUsize;
 
-    #[test]
-    fn codec_support_matrix() {
-        assert!(VideoCodec::H264.supported_in(VideoContainerFormat::Mp4));
-        assert!(VideoCodec::H264.supported_in(VideoContainerFormat::Mkv));
-        assert!(VideoCodec::Aac.supported_in(VideoContainerFormat::Mp4));
-        assert!(VideoCodec::Aac.supported_in(VideoContainerFormat::Mkv));
-        assert!(!VideoCodec::Vorbis.supported_in(VideoContainerFormat::Mp4));
-        // tx3g <-> S_TEXT/UTF8 is a pure container mapping in both directions.
-        assert!(VideoCodec::TimedText.supported_in(VideoContainerFormat::Mp4));
-        assert!(VideoCodec::TimedText.supported_in(VideoContainerFormat::Mkv));
+    fn stream(codec: VideoCodec, kind: VideoStreamKind) -> VideoStreamInfo {
+        VideoStreamInfo::new(codec, kind, None, None, None, None, 1, 1000, None, None)
+    }
+
+    fn item(
+        source: &str,
+        target: &str,
+        input: VideoContainerFormat,
+        output: VideoContainerFormat,
+        streams: Vec<VideoStreamInfo>,
+        video: VideoTrackAction,
+        audio: AudioTrackAction,
+    ) -> Result<VideoTranscodeItem, DomainError> {
+        VideoTranscodeItem::new(
+            PathBuf::from(source),
+            PathBuf::from(target),
+            input,
+            output,
+            streams,
+            video,
+            audio,
+        )
+    }
+
+    fn cpu_encode(codec: TargetVideoCodec) -> VideoTrackAction {
+        let quality = VideoQuality::DEFAULT;
+        VideoTrackAction::Encode(match codec {
+            TargetVideoCodec::H264 => VideoEncodeMode::CpuH264 { quality },
+            TargetVideoCodec::Av1 => VideoEncodeMode::CpuAv1 { quality },
+            TargetVideoCodec::Vp9 => VideoEncodeMode::CpuVp9 { quality },
+            TargetVideoCodec::Hevc => VideoEncodeMode::NvencHevc { quality },
+        })
     }
 
     #[test]
-    fn plan_rejects_empty_and_duplicates() {
+    fn codec_support_matrix() {
+        let all = [
+            VideoCodec::H264,
+            VideoCodec::Hevc,
+            VideoCodec::Av1,
+            VideoCodec::Vp9,
+            VideoCodec::Aac,
+            VideoCodec::Opus,
+            VideoCodec::Mp3,
+            VideoCodec::Vorbis,
+            VideoCodec::TimedText,
+        ];
+        let webm = [
+            VideoCodec::Vp9,
+            VideoCodec::Av1,
+            VideoCodec::Opus,
+            VideoCodec::Vorbis,
+        ];
+        let ts = [
+            VideoCodec::H264,
+            VideoCodec::Hevc,
+            VideoCodec::Av1,
+            VideoCodec::Aac,
+            VideoCodec::Opus,
+            VideoCodec::Mp3,
+        ];
+        let rich_audio = [
+            VideoCodec::H264,
+            VideoCodec::Hevc,
+            VideoCodec::Av1,
+            VideoCodec::Vp9,
+            VideoCodec::Aac,
+            VideoCodec::Opus,
+            VideoCodec::Mp3,
+        ];
+        let mp4 = [
+            VideoCodec::H264,
+            VideoCodec::Hevc,
+            VideoCodec::Av1,
+            VideoCodec::Vp9,
+            VideoCodec::Aac,
+            VideoCodec::Opus,
+            VideoCodec::Mp3,
+            VideoCodec::TimedText,
+        ];
+        let mkv = [
+            VideoCodec::H264,
+            VideoCodec::Hevc,
+            VideoCodec::Av1,
+            VideoCodec::Vp9,
+            VideoCodec::Aac,
+            VideoCodec::Opus,
+            VideoCodec::Mp3,
+            VideoCodec::Vorbis,
+            VideoCodec::TimedText,
+        ];
+
+        for codec in all {
+            assert_eq!(
+                codec.supported_in(VideoContainerFormat::Webm),
+                webm.contains(&codec)
+            );
+            assert_eq!(
+                codec.supported_in(VideoContainerFormat::Ts),
+                ts.contains(&codec)
+            );
+            assert_eq!(
+                codec.supported_in(VideoContainerFormat::Avi),
+                rich_audio.contains(&codec)
+            );
+            assert_eq!(
+                codec.supported_in(VideoContainerFormat::Mp4),
+                mp4.contains(&codec)
+            );
+            assert_eq!(
+                codec.supported_in(VideoContainerFormat::Mov),
+                mp4.contains(&codec)
+            );
+            assert_eq!(
+                codec.supported_in(VideoContainerFormat::Mkv),
+                mkv.contains(&codec)
+            );
+        }
+    }
+
+    #[test]
+    fn codec_support_specific_rules() {
+        // WebM is restricted to VP9/AV1 video and Opus/Vorbis audio.
+        for codec in [
+            VideoCodec::H264,
+            VideoCodec::Hevc,
+            VideoCodec::Aac,
+            VideoCodec::Mp3,
+        ] {
+            assert!(!codec.supported_in(VideoContainerFormat::Webm));
+        }
+        // MPEG-TS has no VP9 mapping.
+        assert!(!VideoCodec::Vp9.supported_in(VideoContainerFormat::Ts));
+        for container in [
+            VideoContainerFormat::Avi,
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mov,
+            VideoContainerFormat::Mkv,
+        ] {
+            for codec in [
+                VideoCodec::H264,
+                VideoCodec::Hevc,
+                VideoCodec::Av1,
+                VideoCodec::Vp9,
+                VideoCodec::Aac,
+                VideoCodec::Opus,
+                VideoCodec::Mp3,
+            ] {
+                assert!(codec.supported_in(container));
+            }
+        }
+        assert!(!VideoCodec::Vorbis.supported_in(VideoContainerFormat::Mp4));
+        assert!(!VideoCodec::TimedText.supported_in(VideoContainerFormat::Avi));
+        assert!(!VideoCodec::Unknown.supported_in(VideoContainerFormat::Mkv));
+        assert!(VideoCodec::H264.is_video());
+        assert!(VideoCodec::Hevc.is_video());
+        assert!(VideoCodec::Av1.is_video());
+        assert!(VideoCodec::Vp9.is_video());
+        assert!(VideoCodec::Aac.is_audio());
+        assert!(VideoCodec::Opus.is_audio());
+        assert!(VideoCodec::Mp3.is_audio());
+        assert!(VideoCodec::Vorbis.is_audio());
+        assert!(!VideoCodec::H264.is_audio());
+        assert!(!VideoCodec::Mp3.is_video());
+    }
+
+    #[test]
+    fn from_extension_maps_all_aliases() {
+        let cases = [
+            ("mp4", VideoContainerFormat::Mp4),
+            ("m4v", VideoContainerFormat::Mp4),
+            ("mov", VideoContainerFormat::Mov),
+            ("qt", VideoContainerFormat::Mov),
+            ("mkv", VideoContainerFormat::Mkv),
+            ("webm", VideoContainerFormat::Webm),
+            ("avi", VideoContainerFormat::Avi),
+            ("ts", VideoContainerFormat::Ts),
+            ("m2ts", VideoContainerFormat::Ts),
+            ("mts", VideoContainerFormat::Ts),
+            ("MP4", VideoContainerFormat::Mp4),
+            ("WEBM", VideoContainerFormat::Webm),
+        ];
+        for (ext, expected) in cases {
+            assert_eq!(
+                VideoContainerFormat::from_extension(ext),
+                Some(expected),
+                "extension {ext}"
+            );
+        }
+        assert_eq!(VideoContainerFormat::from_extension("gif"), None);
+    }
+
+    #[test]
+    fn container_defaults_and_codec_names() {
+        assert_eq!(VideoContainerFormat::Mp4.extension(), "mp4");
+        assert_eq!(VideoContainerFormat::Mkv.extension(), "mkv");
+        assert_eq!(VideoContainerFormat::Webm.extension(), "webm");
+        assert_eq!(VideoContainerFormat::Mov.extension(), "mov");
+        assert_eq!(VideoContainerFormat::Avi.extension(), "avi");
+        assert_eq!(VideoContainerFormat::Ts.extension(), "ts");
+        assert_eq!(VideoContainerFormat::Webm.label(), "WebM");
+        assert_eq!(VideoContainerFormat::Ts.label(), "TS");
+        assert_eq!(
+            VideoContainerFormat::Webm.default_video_codec(),
+            TargetVideoCodec::Vp9
+        );
+        assert_eq!(
+            VideoContainerFormat::Mp4.default_video_codec(),
+            TargetVideoCodec::H264
+        );
+        assert_eq!(
+            VideoContainerFormat::Webm.default_audio_codec(),
+            TargetAudioCodec::Opus
+        );
+        assert_eq!(
+            VideoContainerFormat::Mp4.default_audio_codec(),
+            TargetAudioCodec::Aac
+        );
+        assert_eq!(
+            TargetVideoCodec::from_name("x264"),
+            Some(TargetVideoCodec::H264)
+        );
+        assert_eq!(
+            TargetVideoCodec::from_name("HEVC"),
+            Some(TargetVideoCodec::Hevc)
+        );
+        assert_eq!(
+            TargetVideoCodec::from_name("h265"),
+            Some(TargetVideoCodec::Hevc)
+        );
+        assert_eq!(
+            TargetVideoCodec::from_name("av1"),
+            Some(TargetVideoCodec::Av1)
+        );
+        assert_eq!(
+            TargetVideoCodec::from_name("vp9"),
+            Some(TargetVideoCodec::Vp9)
+        );
+        assert_eq!(TargetVideoCodec::from_name("vp8"), None);
+        assert_eq!(
+            TargetAudioCodec::from_name("aac"),
+            Some(TargetAudioCodec::Aac)
+        );
+        assert_eq!(
+            TargetAudioCodec::from_name("opus"),
+            Some(TargetAudioCodec::Opus)
+        );
+        assert_eq!(
+            TargetAudioCodec::from_name("mp3"),
+            Some(TargetAudioCodec::Mp3)
+        );
+        assert_eq!(TargetAudioCodec::from_name("flac"), None);
+        assert!(TargetVideoCodec::Vp9.supported_in(VideoContainerFormat::Webm));
+        assert!(!TargetVideoCodec::H264.supported_in(VideoContainerFormat::Webm));
+        assert!(!TargetAudioCodec::Mp3.supported_in(VideoContainerFormat::Webm));
+    }
+
+    #[test]
+    fn encode_mode_resolve_accepts_supported_pairs() -> Result<(), DomainError> {
+        let q = VideoQuality::DEFAULT;
+        assert_eq!(
+            VideoEncodeMode::resolve(TargetVideoCodec::H264, q, HardwareBackend::Cpu)?,
+            VideoEncodeMode::CpuH264 { quality: q }
+        );
+        assert_eq!(
+            VideoEncodeMode::resolve(TargetVideoCodec::Av1, q, HardwareBackend::Cpu)?,
+            VideoEncodeMode::CpuAv1 { quality: q }
+        );
+        assert_eq!(
+            VideoEncodeMode::resolve(TargetVideoCodec::Vp9, q, HardwareBackend::Cpu)?,
+            VideoEncodeMode::CpuVp9 { quality: q }
+        );
+        let nvenc = HardwareBackend::Gpu(GpuBackend::Nvenc);
+        assert_eq!(
+            VideoEncodeMode::resolve(TargetVideoCodec::H264, q, nvenc)?,
+            VideoEncodeMode::NvencH264 { quality: q }
+        );
+        assert_eq!(
+            VideoEncodeMode::resolve(TargetVideoCodec::Hevc, q, nvenc)?,
+            VideoEncodeMode::NvencHevc { quality: q }
+        );
+        assert_eq!(
+            VideoEncodeMode::CpuH264 { quality: q }.codec(),
+            TargetVideoCodec::H264
+        );
+        assert_eq!(
+            VideoEncodeMode::NvencHevc { quality: q }.codec(),
+            TargetVideoCodec::Hevc
+        );
+        assert_eq!(VideoEncodeMode::CpuAv1 { quality: q }.quality(), q);
+        assert_eq!(
+            VideoEncodeMode::CpuVp9 { quality: q }.backend(),
+            HardwareBackend::Cpu
+        );
+        assert_eq!(VideoEncodeMode::NvencH264 { quality: q }.backend(), nvenc);
+        assert_eq!(VideoTrackAction::Copy.backend(), HardwareBackend::Cpu);
+        Ok(())
+    }
+
+    #[test]
+    fn encode_mode_resolve_rejects_unsupported_pairs_without_fallback() {
+        let q = VideoQuality::DEFAULT;
+        assert_eq!(
+            VideoEncodeMode::resolve(TargetVideoCodec::Hevc, q, HardwareBackend::Cpu),
+            Err(DomainError::UnsupportedVideoPipeline {
+                codec: VideoCodec::Hevc,
+                backend: HardwareBackend::Cpu,
+                reason: "HEVC (H.265) encoding requires hardware acceleration via --backend nvenc"
+                    .to_owned(),
+            })
+        );
+        for codec in [TargetVideoCodec::Av1, TargetVideoCodec::Vp9] {
+            assert_eq!(
+                VideoEncodeMode::resolve(codec, q, HardwareBackend::Gpu(GpuBackend::Nvenc)),
+                Err(DomainError::UnsupportedVideoPipeline {
+                    codec: codec.as_video_codec(),
+                    backend: HardwareBackend::Gpu(GpuBackend::Nvenc),
+                    reason: "NVENC supports H.264 and HEVC encoding; use --backend cpu for AV1/VP9"
+                        .to_owned(),
+                })
+            );
+        }
+        for gpu in [
+            GpuBackend::Vaapi,
+            GpuBackend::Vulkan,
+            GpuBackend::Qsv,
+            GpuBackend::Amf,
+            GpuBackend::VideoToolbox,
+        ] {
+            let backend = HardwareBackend::Gpu(gpu);
+            assert_eq!(
+                VideoEncodeMode::resolve(TargetVideoCodec::H264, q, backend),
+                Err(DomainError::UnsupportedVideoPipeline {
+                    codec: VideoCodec::H264,
+                    backend,
+                    reason: format!(
+                        "GPU backend '{gpu}' video encoding is not implemented; no silent CPU fallback"
+                    ),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn video_quality_rejects_out_of_range() {
+        assert_eq!(VideoQuality::MAX, 100);
+        assert_eq!(VideoQuality::DEFAULT.get(), 80);
+        assert_eq!(
+            VideoQuality::new(101),
+            Err(DomainError::InvalidVideoQuality {
+                value: 101,
+                max: 100
+            })
+        );
+        assert_eq!(VideoQuality::new(100).map(VideoQuality::get), Ok(100));
+    }
+
+    #[test]
+    fn transcode_item_rejects_webm_codec_mismatch() -> Result<(), DomainError> {
+        let webm = VideoContainerFormat::Webm;
+        let mp4 = VideoContainerFormat::Mp4;
+        assert_eq!(
+            item(
+                "in.mp4",
+                "out.webm",
+                mp4,
+                webm,
+                Vec::new(),
+                cpu_encode(TargetVideoCodec::H264),
+                AudioTrackAction::Encode(TargetAudioCodec::Opus)
+            ),
+            Err(DomainError::UnsupportedVideoCodec {
+                codec: VideoCodec::H264,
+                container: webm
+            })
+        );
+        assert_eq!(
+            item(
+                "in.mp4",
+                "out.webm",
+                mp4,
+                webm,
+                vec![stream(VideoCodec::H264, VideoStreamKind::Video)],
+                VideoTrackAction::Copy,
+                AudioTrackAction::Copy
+            ),
+            Err(DomainError::UnsupportedVideoCodec {
+                codec: VideoCodec::H264,
+                container: webm
+            })
+        );
+        assert_eq!(
+            item(
+                "in.mp4",
+                "out.webm",
+                mp4,
+                webm,
+                Vec::new(),
+                cpu_encode(TargetVideoCodec::Vp9),
+                AudioTrackAction::Encode(TargetAudioCodec::Aac)
+            ),
+            Err(DomainError::UnsupportedVideoCodec {
+                codec: VideoCodec::Aac,
+                container: webm
+            })
+        );
+        assert_eq!(
+            item(
+                "in.mkv",
+                "out.webm",
+                VideoContainerFormat::Mkv,
+                webm,
+                vec![stream(VideoCodec::Aac, VideoStreamKind::Audio)],
+                VideoTrackAction::Copy,
+                AudioTrackAction::Copy
+            ),
+            Err(DomainError::UnsupportedVideoCodec {
+                codec: VideoCodec::Aac,
+                container: webm
+            })
+        );
+
+        let valid = item(
+            "in.mkv",
+            "out.webm",
+            VideoContainerFormat::Mkv,
+            webm,
+            Vec::new(),
+            cpu_encode(TargetVideoCodec::Vp9),
+            AudioTrackAction::Encode(TargetAudioCodec::Opus),
+        )?;
+        assert_eq!(valid.output_format(), webm);
+        let copied = item(
+            "in.webm",
+            "out2.webm",
+            webm,
+            webm,
+            vec![
+                stream(VideoCodec::Vp9, VideoStreamKind::Video),
+                stream(VideoCodec::Opus, VideoStreamKind::Audio),
+            ],
+            VideoTrackAction::Copy,
+            AudioTrackAction::Copy,
+        )?;
+        assert_eq!(copied.streams().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn transcode_item_rejects_ts_vp9() -> Result<(), DomainError> {
+        let ts = VideoContainerFormat::Ts;
+        assert_eq!(
+            item(
+                "in.webm",
+                "out.ts",
+                VideoContainerFormat::Webm,
+                ts,
+                Vec::new(),
+                cpu_encode(TargetVideoCodec::Vp9),
+                AudioTrackAction::Encode(TargetAudioCodec::Opus)
+            ),
+            Err(DomainError::UnsupportedVideoCodec {
+                codec: VideoCodec::Vp9,
+                container: ts
+            })
+        );
+        assert_eq!(
+            item(
+                "in.webm",
+                "out.ts",
+                VideoContainerFormat::Webm,
+                ts,
+                vec![stream(VideoCodec::Vp9, VideoStreamKind::Video)],
+                VideoTrackAction::Copy,
+                AudioTrackAction::Copy
+            ),
+            Err(DomainError::UnsupportedVideoCodec {
+                codec: VideoCodec::Vp9,
+                container: ts
+            })
+        );
+        let valid = item(
+            "in.mp4",
+            "out.ts",
+            VideoContainerFormat::Mp4,
+            ts,
+            Vec::new(),
+            cpu_encode(TargetVideoCodec::H264),
+            AudioTrackAction::Encode(TargetAudioCodec::Mp3),
+        )?;
+        assert_eq!(valid.output_format(), ts);
+        Ok(())
+    }
+
+    #[test]
+    fn transcode_item_rejects_invalid_paths() {
+        let target = vec![
+            stream(VideoCodec::Vp9, VideoStreamKind::Video),
+            stream(VideoCodec::Opus, VideoStreamKind::Audio),
+        ];
+        assert_eq!(
+            item(
+                "",
+                "out.webm",
+                VideoContainerFormat::Webm,
+                VideoContainerFormat::Webm,
+                target.clone(),
+                VideoTrackAction::Copy,
+                AudioTrackAction::Copy
+            ),
+            Err(DomainError::EmptyPath(PathRole::Source))
+        );
+        assert_eq!(
+            item(
+                "in.webm",
+                "",
+                VideoContainerFormat::Webm,
+                VideoContainerFormat::Webm,
+                target.clone(),
+                VideoTrackAction::Copy,
+                AudioTrackAction::Copy
+            ),
+            Err(DomainError::EmptyPath(PathRole::Target))
+        );
+        assert_eq!(
+            item(
+                "in.webm",
+                "in.webm",
+                VideoContainerFormat::Webm,
+                VideoContainerFormat::Webm,
+                target,
+                VideoTrackAction::Copy,
+                AudioTrackAction::Copy
+            ),
+            Err(DomainError::IdenticalSourceAndTarget(PathBuf::from(
+                "in.webm"
+            )))
+        );
+    }
+
+    #[test]
+    fn transcode_plan_rejects_empty_duplicates_and_overwrites() -> Result<(), DomainError> {
+        let w = NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN);
+        assert!(matches!(
+            VideoTranscodePlan::new(Vec::new(), w),
+            Err(DomainError::EmptyBatch)
+        ));
+
+        let make = |source: &str, target: &str| {
+            item(
+                source,
+                target,
+                VideoContainerFormat::Mp4,
+                VideoContainerFormat::Webm,
+                Vec::new(),
+                cpu_encode(TargetVideoCodec::Vp9),
+                AudioTrackAction::Encode(TargetAudioCodec::Opus),
+            )
+        };
+        assert!(matches!(
+            VideoTranscodePlan::new(
+                vec![make("a.mp4", "out.webm")?, make("b.mp4", "out.webm")?],
+                w
+            ),
+            Err(DomainError::DuplicateTargetPath(_))
+        ));
+        assert!(matches!(
+            VideoTranscodePlan::new(vec![make("a.mp4", "b.mp4")?, make("b.mp4", "out.webm")?], w),
+            Err(DomainError::TargetOverwritesSource(_))
+        ));
+
+        let plan =
+            VideoTranscodePlan::new(vec![make("a.mp4", "a.webm")?, make("b.mp4", "b.webm")?], w)?;
+        assert_eq!(plan.items().len(), 2);
+        assert_eq!(plan.worker_threads(), w);
+        assert_eq!(plan.effective_workers().get(), 2);
+        assert_eq!(plan.output_format(), VideoContainerFormat::Webm);
+        assert_eq!(plan.backend(), HardwareBackend::Cpu);
+        Ok(())
+    }
+
+    #[test]
+    fn transcode_report_metrics() {
+        let w = NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN);
+        let input = NonZeroU64::new(2 * 1024 * 1024).unwrap_or(NonZeroU64::MIN);
+        let output = NonZeroU64::new(1024 * 1024).unwrap_or(NonZeroU64::MIN);
+        let files = NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN);
+        let report = VideoTranscodeReport::new(
+            files,
+            600,
+            input,
+            output,
+            Duration::from_secs(2),
+            w,
+            HardwareBackend::Gpu(GpuBackend::Nvenc),
+            Some("cuda:0".to_owned()),
+        );
+        assert_eq!(report.files_converted(), files);
+        assert_eq!(report.frames_processed(), 600);
+        assert_eq!(report.total_input_bytes(), input);
+        assert_eq!(report.total_output_bytes(), output);
+        assert_eq!(report.duration(), Duration::from_secs(2));
+        assert_eq!(report.worker_threads_used(), w);
+        assert_eq!(report.backend(), HardwareBackend::Gpu(GpuBackend::Nvenc));
+        assert_eq!(report.hardware_device(), Some("cuda:0"));
+        assert_eq!(report.megabytes_per_sec(), 1.0);
+        assert_eq!(report.fps(), 300.0);
+    }
+
+    #[test]
+    fn remux_plan_rejects_empty_and_duplicates() {
         let w = NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN);
         assert!(matches!(
             VideoRemuxPlan::new(Vec::new(), w),
