@@ -137,7 +137,10 @@ struct AvStream {
 // The linear RIFF walk is kept in one function: splitting it would require
 // passing five mutable accumulators through helpers without adding clarity.
 #[allow(clippy::too_many_lines)]
-fn parse_header(path: &Path, bytes: &[u8]) -> Result<Vec<AvStream>, PipelineError> {
+fn parse_header(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(Vec<AvStream>, Vec<Option<usize>>), PipelineError> {
     if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"AVI " {
         return Err(avi_error(path, "truncated RIFF/AVI header"));
     }
@@ -165,11 +168,13 @@ fn parse_header(path: &Path, bytes: &[u8]) -> Result<Vec<AvStream>, PipelineErro
     let avih_width = le_u32(avih.get(32..36).unwrap_or(&[])).unwrap_or(0);
     let avih_height = le_u32(avih.get(36..40).unwrap_or(&[])).unwrap_or(0);
     let mut streams = Vec::with_capacity(strls.len());
-    for strl in &strls {
+    let mut ordinal_map = vec![None; strls.len()];
+    for (original_index, strl) in strls.iter().enumerate() {
         let mut fcc_type = [0_u8; 4];
         let mut handler = None;
         let mut scale = 1_u32;
         let mut rate = 1_u32;
+        let mut sample_size = 0_u32;
         let mut strf = None;
         riff_chunks(strl, |kind, body, _| {
             if kind == *b"strh" && body.len() >= 36 {
@@ -177,6 +182,7 @@ fn parse_header(path: &Path, bytes: &[u8]) -> Result<Vec<AvStream>, PipelineErro
                 handler = upper_fourcc(body.get(4..8).unwrap_or(&[]));
                 scale = le_u32(body.get(20..24).unwrap_or(&[])).unwrap_or(1);
                 rate = le_u32(body.get(24..28).unwrap_or(&[])).unwrap_or(1);
+                sample_size = le_u32(body.get(44..48).unwrap_or(&[])).unwrap_or(0);
             } else if kind == *b"strf" {
                 strf = Some(body.to_vec());
             }
@@ -209,6 +215,7 @@ fn parse_header(path: &Path, bytes: &[u8]) -> Result<Vec<AvStream>, PipelineErro
             } else {
                 33_333
             };
+            ordinal_map[original_index] = Some(streams.len());
             streams.push(AvStream {
                 codec,
                 width,
@@ -241,13 +248,17 @@ fn parse_header(path: &Path, bytes: &[u8]) -> Result<Vec<AvStream>, PipelineErro
                 _ => 1024,
             };
             let duration_us = if scale > 0 && rate > 0 {
-                samples_per_packet
-                    .saturating_mul(u64::from(scale))
-                    .saturating_mul(1_000_000)
-                    / u64::from(rate)
+                let units = if sample_size == 0 {
+                    // One coded frame per chunk: dwScale already counts its samples.
+                    u64::from(scale)
+                } else {
+                    samples_per_packet.saturating_mul(u64::from(scale))
+                };
+                units.saturating_mul(1_000_000) / u64::from(rate)
             } else {
                 1
             };
+            ordinal_map[original_index] = Some(streams.len());
             streams.push(AvStream {
                 codec,
                 width: None,
@@ -264,13 +275,16 @@ fn parse_header(path: &Path, bytes: &[u8]) -> Result<Vec<AvStream>, PipelineErro
     if streams.is_empty() {
         return Err(avi_error(path, "AVI header has no usable streams"));
     }
-    Ok(streams)
+    Ok((streams, ordinal_map))
 }
 
 fn stream_number(id: [u8; 4]) -> Option<usize> {
-    let high = (id[0] as char).to_digit(16)?;
-    let low = (id[1] as char).to_digit(16)?;
-    usize::try_from(high * 16 + low).ok()
+    let high = id[0].checked_sub(b'0')?;
+    let low = id[1].checked_sub(b'0')?;
+    if high > 9 || low > 9 {
+        return None;
+    }
+    Some(usize::from(high) * 10 + usize::from(low))
 }
 
 fn is_annex_b(data: &[u8]) -> bool {
@@ -293,17 +307,19 @@ pub(crate) fn demux_avi(path: &Path) -> Result<DemuxedMedia, PipelineError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let mut streams = parse_header(path, &bytes)?;
+    let (mut streams, ordinal_map) = parse_header(path, &bytes)?;
     let mut movi: &[u8] = &[];
-    let mut keyframes = HashMap::new();
-    riff_chunks(&bytes[12..], |id, payload, _| {
+    let mut movi_abs_start = 0_usize;
+    let mut index_entries = Vec::new();
+    riff_chunks(&bytes[12..], |id, payload, offset| {
         if id == *b"LIST" && payload.len() >= 4 && &payload[..4] == b"movi" {
             movi = &payload[4..];
+            movi_abs_start = 12_usize.saturating_add(offset).saturating_add(12);
         } else if id == *b"idx1" {
             for entry in payload.as_chunks::<16>().0 {
                 let flags = le_u32(entry.get(4..8).unwrap_or(&[])).unwrap_or(0);
                 let offset = u64::from(le_u32(entry.get(8..12).unwrap_or(&[])).unwrap_or(0));
-                keyframes.insert(offset, flags & AVIIF_KEYFRAME != 0);
+                index_entries.push((offset, flags & AVIIF_KEYFRAME != 0));
             }
         }
     });
@@ -329,13 +345,34 @@ pub(crate) fn demux_avi(path: &Path) -> Result<DemuxedMedia, PipelineError> {
     riff_chunks(movi, |id, payload, offset| {
         chunk_list.push((id, payload, offset));
     });
+    // Index writers disagree on whether offsets start at the file, the movi
+    // list or the chunk header. Resolve each index entry against the real
+    // chunk positions once instead of assuming a single base.
+    let mut offset_map: HashMap<u64, u64> = HashMap::new();
+    for (_, _, offset) in &chunk_list {
+        let canonical = u64::try_from(*offset).unwrap_or(0);
+        let absolute = u64::try_from(movi_abs_start.saturating_add(*offset)).unwrap_or(u64::MAX);
+        for candidate in [
+            canonical,
+            canonical.saturating_sub(4),
+            absolute,
+            absolute.saturating_sub(4),
+        ] {
+            offset_map.entry(candidate).or_insert(canonical);
+        }
+    }
+    let mut keyframes = HashMap::new();
+    for (stored, is_keyframe) in index_entries {
+        if let Some(&canonical) = offset_map.get(&stored) {
+            keyframes.insert(canonical, is_keyframe);
+        }
+    }
     for (id, payload, offset) in chunk_list {
-        let Some(number) = stream_number(id) else {
+        let Some(number) =
+            stream_number(id).and_then(|original| ordinal_map.get(original).copied().flatten())
+        else {
             continue;
         };
-        if number >= streams.len() {
-            continue;
-        }
         let keyframe = keyframes
             .get(&u64::try_from(offset).unwrap_or(0))
             .copied()
@@ -532,11 +569,21 @@ pub(crate) fn mux_avi(
                 [0; 4]
             };
             let sr = track.sample_rate.unwrap_or(48_000);
-            // One scale unit is one sample, so the demuxer's
-            // `samples_per_packet * dwScale / dwRate` yields exact frame
-            // duration in microseconds.
+            // One coded frame per chunk: dwScale counts the samples in that
+            // frame and dwSampleSize stays zero, the standard AVI VBR layout.
+            let samples_per_packet: u32 = match track.codec {
+                VideoCodec::Opus => 960,
+                VideoCodec::Mp3 => {
+                    if sr >= 32_000 {
+                        1152
+                    } else {
+                        576
+                    }
+                }
+                _ => 1024,
+            };
             (
-                1,
+                samples_per_packet,
                 sr,
                 handler,
                 build_waveformatex(track.codec, track, target_path)?,
@@ -552,6 +599,8 @@ pub(crate) fn mux_avi(
         strh_body[20..24].copy_from_slice(&scale.to_le_bytes());
         strh_body[24..28].copy_from_slice(&rate.to_le_bytes());
         strh_body[32..36].copy_from_slice(&length.to_le_bytes());
+        // dwSampleSize = 0 marks one coded frame per chunk for every codec we write.
+        strh_body[44..48].copy_from_slice(&0_u32.to_le_bytes());
         strl_chunks.push(riff_list(
             *b"strl",
             &[
@@ -571,11 +620,13 @@ pub(crate) fn mux_avi(
     let mut index = Vec::new();
     for packet in &media.packets {
         let track = &media.tracks[packet.track];
-        let number = u8::try_from(packet.track).unwrap_or(u8::MAX);
-        let hex = b"0123456789ABCDEF";
+        if packet.track >= 100 {
+            return Err(avi_error(target_path, "AVI supports at most 100 streams"));
+        }
+        let number = u8::try_from(packet.track).unwrap_or(99);
         let mut id = [0_u8; 4];
-        id[0] = hex[usize::from(number >> 4)];
-        id[1] = hex[usize::from(number & 0x0F)];
+        id[0] = b'0' + number / 10;
+        id[1] = b'0' + number % 10;
         id[2..4].copy_from_slice(if track.codec.is_video() { b"dc" } else { b"wb" });
         let payload = if track.codec.is_video() {
             crate::video_container::video_payload_for_annex_b(track, packet)
@@ -895,6 +946,179 @@ mod tests {
         assert_eq!(out.tracks[0].codec, VideoCodec::Av1);
         assert_ne!(out.tracks[0].config.len(), 0);
         assert_eq!(out.packets[0].data, vec![0x0A, 0x02, 0x00, 0x0A]);
+        Ok(())
+    }
+
+    #[test]
+    fn avi_file_relative_idx1_offsets_preserve_later_vp9_keyframes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let media = ContainerMedia {
+            tracks: vec![ContainerTrack {
+                codec: VideoCodec::Vp9,
+                width: Some(320),
+                height: Some(240),
+                channels: None,
+                sample_rate: None,
+                config: Vec::new(),
+                timescale: US_TIMESCALE,
+            }],
+            packets: [true, false, true]
+                .into_iter()
+                .enumerate()
+                .map(|(index, keyframe)| ContainerPacket {
+                    track: 0,
+                    pts: i64::try_from(index).unwrap_or(0) * 33_333,
+                    dts: i64::try_from(index).unwrap_or(0) * 33_333,
+                    duration: 33_333,
+                    keyframe,
+                    data: vec![0x82, u8::try_from(index).unwrap_or(0)],
+                })
+                .collect(),
+        };
+        let path = temp_path("vp9-file-idx1");
+        let file = File::create(&path)?;
+        mux_avi(&file, &path, &media)?;
+        drop(file);
+        let mut bytes = std::fs::read(&path)?;
+        let movi_pos = bytes
+            .windows(4)
+            .position(|window| window == b"movi".as_slice())
+            .ok_or("movi list")?;
+        let base = movi_pos.saturating_add(4);
+        let idx_pos = bytes
+            .windows(4)
+            .position(|window| window == b"idx1".as_slice())
+            .ok_or("idx1 chunk")?;
+        let size = usize::try_from(
+            le_u32(bytes.get(idx_pos + 4..idx_pos + 8).ok_or("idx1 size")?).ok_or("idx1 size")?,
+        )?;
+        let start = idx_pos + 8;
+        for entry in bytes
+            .get_mut(start..start + size)
+            .ok_or("idx1 payload")?
+            .as_chunks_mut::<16>()
+            .0
+        {
+            let offset = le_u32(entry.get(8..12).ok_or("offset")?).ok_or("offset")?;
+            entry[8..12].copy_from_slice(&offset.wrapping_add(u32::try_from(base)?).to_le_bytes());
+        }
+        std::fs::write(&path, &bytes)?;
+        let out = demux_avi(&path)?;
+        std::fs::remove_file(&path)?;
+        let flags: Vec<bool> = out.packets.iter().map(|packet| packet.keyframe).collect();
+        assert_eq!(flags, vec![true, false, true]);
+        Ok(())
+    }
+
+    #[test]
+    fn avi_unsupported_strl_does_not_shift_stream_numbers() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut unsupported_header = vec![0_u8; 56];
+        unsupported_header[0..4].copy_from_slice(b"txts");
+        let unsupported = riff_list(
+            *b"strl",
+            &[
+                riff_chunk(*b"strh", &unsupported_header),
+                riff_chunk(*b"strf", &[0; 4]),
+            ],
+        );
+        let mut video_header = vec![0_u8; 56];
+        video_header[0..4].copy_from_slice(b"vids");
+        video_header[4..8].copy_from_slice(b"H264");
+        video_header[20..24].copy_from_slice(&33_333_u32.to_le_bytes());
+        video_header[24..28].copy_from_slice(&1_000_000_u32.to_le_bytes());
+        let mut format = vec![0_u8; 40];
+        format[4..8].copy_from_slice(&320_u32.to_le_bytes());
+        format[8..12].copy_from_slice(&240_u32.to_le_bytes());
+        format[16..20].copy_from_slice(b"H264");
+        let video = riff_list(
+            *b"strl",
+            &[
+                riff_chunk(*b"strh", &video_header),
+                riff_chunk(*b"strf", &format),
+            ],
+        );
+        let mut avih = vec![0_u8; 56];
+        avih[0..4].copy_from_slice(&33_333_u32.to_le_bytes());
+        avih[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        avih[24..28].copy_from_slice(&1_u32.to_le_bytes());
+        avih[32..36].copy_from_slice(&320_u32.to_le_bytes());
+        avih[36..40].copy_from_slice(&240_u32.to_le_bytes());
+        let hdrl = riff_list(*b"hdrl", &[riff_chunk(*b"avih", &avih), unsupported, video]);
+        let mut movi = b"movi".to_vec();
+        movi.extend_from_slice(&riff_chunk(*b"01dc", &[0, 0, 0, 2, 0x65, 0x88]));
+        let body = [
+            b"AVI ".as_slice(),
+            hdrl.as_slice(),
+            riff_chunk(*b"LIST", &movi).as_slice(),
+        ]
+        .concat();
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&u32::try_from(body.len())?.to_le_bytes());
+        bytes.extend_from_slice(&body);
+        let path = temp_path("strl-ordinal");
+        std::fs::write(&path, &bytes)?;
+        let out = demux_avi(&path)?;
+        std::fs::remove_file(&path)?;
+        assert_eq!(out.tracks.len(), 1);
+        assert_eq!(out.packets.len(), 1);
+        assert_eq!(out.packets[0].track, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn avi_audio_frame_duration_survives_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let media = ContainerMedia {
+            tracks: vec![ContainerTrack {
+                codec: VideoCodec::Aac,
+                width: None,
+                height: None,
+                channels: Some(2),
+                sample_rate: Some(48_000),
+                config: vec![0x12, 0x10],
+                timescale: US_TIMESCALE,
+            }],
+            packets: (0..47)
+                .map(|index| ContainerPacket {
+                    track: 0,
+                    pts: i64::from(index) * 21_333,
+                    dts: i64::from(index) * 21_333,
+                    duration: 21_333,
+                    keyframe: true,
+                    data: vec![0xAA; 8],
+                })
+                .collect(),
+        };
+        let out = round_trip("audio-duration", &media)?;
+        let total: u64 = out.packets.iter().map(|packet| packet.duration).sum();
+        assert!(
+            total.abs_diff(1_000_000) <= 5_000,
+            "total audio duration {total} µs"
+        );
+
+        let path = temp_path("audio-header");
+        let file = File::create(&path)?;
+        mux_avi(&file, &path, &media)?;
+        drop(file);
+        let bytes = std::fs::read(&path)?;
+        std::fs::remove_file(&path)?;
+        let strh = bytes
+            .windows(4)
+            .position(|window| window == b"strh".as_slice())
+            .ok_or("strh")?;
+        let body = strh + 8;
+        assert_eq!(
+            le_u32(bytes.get(body + 20..body + 24).ok_or("scale")?),
+            Some(1024)
+        );
+        assert_eq!(
+            le_u32(bytes.get(body + 24..body + 28).ok_or("rate")?),
+            Some(48_000)
+        );
+        assert_eq!(
+            le_u32(bytes.get(body + 44..body + 48).ok_or("sample size")?),
+            Some(0)
+        );
         Ok(())
     }
 }

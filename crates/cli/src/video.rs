@@ -150,8 +150,9 @@ pub(crate) enum VideoCommand {
 
 pub(crate) fn print_video_help() {
     println!(
-        "Usage: fastconv video <source> <target> [--to <mp4|mkv|webm|mov|avi|ts>] [--vcodec <h264|hevc|h265|av1|vp9|copy>] [--acodec <aac|opus|mp3|copy>] [--quality <0..=100>] [--threads <N>] [--backend <cpu|nvenc|vaapi|qsv|amf|videotoolbox|vulkan>]\n\n\
+        "Usage: fastconv video <source> <target> [--to <mp4|mkv|webm|mov|avi|ts>] [--vcodec <h264|hevc|h265|av1|vp9|copy>] [--acodec <aac|opus|mp3|copy>] [--quality <0..=100>] [--threads <N>] [--backend <cpu|nvenc>]\n\n\
          Transcode audio/video tracks while converting between MP4/MOV, MKV, WebM, AVI, and TS containers.\n\n\
+         Backends: cpu runs every codec and --vcodec copy; nvenc encodes H.264/HEVC only.\n\n\
          Arguments:\n  \
            <source>              Source video file or directory\n  \
            <target>              Target file or directory\n\n\
@@ -161,7 +162,7 @@ pub(crate) fn print_video_help() {
            --acodec <codec>      Audio codec: aac, opus, mp3, or copy\n  \
            --quality <0..=100>   Encoding quality (cannot be combined with --vcodec copy)\n  \
            --threads <N>         Number of parallel workers\n  \
-           --backend <name>      cpu (default), nvenc, vaapi, qsv, amf, videotoolbox, or vulkan\n  \
+           --backend <name>      cpu (default) or nvenc (H.264/HEVC encoding only)\n  \
            -h, --help            Print this help\n\n\
          Container aliases: m4v -> mp4, qt -> mov, m2ts/mts -> ts"
     );
@@ -322,9 +323,28 @@ pub(crate) fn run_video(args: &VideoArgs) -> Result<(), String> {
         None => report.backend().to_string(),
     };
     let first = plan.items().first();
-    let input_format = first.map_or("?", |item| item.input_format().extension());
+    let mut input_formats: Vec<&str> = plan
+        .items()
+        .iter()
+        .map(|item| item.input_format().extension())
+        .collect();
+    input_formats.sort_unstable();
+    input_formats.dedup();
+    let input_format = match input_formats.as_slice() {
+        [] => "?".to_owned(),
+        [only] => (*only).to_owned(),
+        many => format!("mixed({})", many.join(", ")),
+    };
     let video_action = first.map_or_else(|| "?".to_owned(), |item| item.video_action().to_string());
     let audio_action = first.map_or_else(|| "?".to_owned(), |item| item.audio_action().to_string());
+    // The sizes below are decimal MB, so throughput must use the same unit;
+    // the report's megabytes_per_sec() is MiB/s and would overstate the rate.
+    let secs = report.duration().as_secs_f64();
+    let mb_per_sec = if secs == 0.0 {
+        0.0
+    } else {
+        crate::u64_to_f64(report.total_input_bytes().get()) / 1_000_000.0 / secs
+    };
 
     println!(
         "converted {} video file(s) [{backend_desc} | {input_format} -> {} | video: {video_action} | audio: {audio_action} | {} frame(s) at {:.1} FPS | {} thread(s)]: {:.2} MB -> {:.2} MB in {:.1} ms ({:.2} MB/s)",
@@ -336,7 +356,7 @@ pub(crate) fn run_video(args: &VideoArgs) -> Result<(), String> {
         crate::u64_to_f64(report.total_input_bytes().get()) / 1_000_000.0,
         crate::u64_to_f64(report.total_output_bytes().get()) / 1_000_000.0,
         report.duration().as_secs_f64() * 1_000.0,
-        report.megabytes_per_sec(),
+        mb_per_sec,
     );
     Ok(())
 }

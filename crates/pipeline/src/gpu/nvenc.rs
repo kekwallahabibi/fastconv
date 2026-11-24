@@ -16,9 +16,9 @@ mod enabled {
     use nvidia_video_codec_sdk::{
         Bitstream, Buffer, EncodePictureParams, Encoder, EncoderInitParams, EncoderInput, Session,
         sys::nvEncodeAPI::{
-            NV_ENC_BUFFER_FORMAT, NV_ENC_CODEC_H264_GUID, NV_ENC_CODEC_HEVC_GUID, NV_ENC_CONFIG,
-            NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_TYPE, NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO,
-            NV_ENC_VUI_COLOR_PRIMARIES, NV_ENC_VUI_MATRIX_COEFFS,
+            GUID, NV_ENC_BUFFER_FORMAT, NV_ENC_CODEC_H264_GUID, NV_ENC_CODEC_HEVC_GUID,
+            NV_ENC_CONFIG, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_TYPE, NV_ENC_PRESET_P4_GUID,
+            NV_ENC_TUNING_INFO, NV_ENC_VUI_COLOR_PRIMARIES, NV_ENC_VUI_MATRIX_COEFFS,
             NV_ENC_VUI_TRANSFER_CHARACTERISTIC, NV_ENC_VUI_VIDEO_FORMAT,
         },
     };
@@ -910,25 +910,82 @@ mod enabled {
         (1_000_000_u64 / duration.max(1)).clamp(1, 240) as u32
     }
 
-    // NVENC exposes codec-specific config in a C union (`NV_ENC_CODEC_CONFIG`).
-    // The active member is chosen by the encode GUID used for the preset query.
-    #[allow(unsafe_code)]
-    fn configure_video_codec_config(cfg: &mut NV_ENC_CONFIG, h264: bool) {
-        if h264 {
-            // SAFETY: `cfg` came from `get_preset_config(NV_ENC_CODEC_H264_GUID, ...)`,
-            // so `encodeCodecConfig.h264Config` is the active union member.
-            let h264_cfg = unsafe { &mut cfg.encodeCodecConfig.h264Config };
-            h264_cfg.set_repeatSPSPPS(1);
-            h264_cfg.set_outputAUD(0);
-            h264_cfg.chromaFormatIDC = 1;
-        } else {
-            // SAFETY: `cfg` came from `get_preset_config(NV_ENC_CODEC_HEVC_GUID, ...)`,
-            // so `encodeCodecConfig.hevcConfig` is the active union member.
-            let hevc_cfg = unsafe { &mut cfg.encodeCodecConfig.hevcConfig };
-            hevc_cfg.set_repeatSPSPPS(1);
-            hevc_cfg.set_outputAUD(0);
-            hevc_cfg.set_chromaFormatIDC(1);
-            hevc_cfg.set_pixelBitDepthMinus8(0);
+    /// One value drives the encode GUID, the codec-config union member, and
+    /// the output codec, so a mismatched combination cannot be constructed.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum NvencVideoCodec {
+        H264,
+        Hevc,
+    }
+
+    impl NvencVideoCodec {
+        fn from_mode(mode: VideoEncodeMode) -> Result<(Self, VideoQuality), PipelineError> {
+            match mode {
+                VideoEncodeMode::NvencH264 { quality } => Ok((Self::H264, quality)),
+                VideoEncodeMode::NvencHevc { quality } => Ok((Self::Hevc, quality)),
+                other => Err(video_error(format!(
+                    "NVENC video encoding rejects mode {other}; only H.264 and HEVC are supported"
+                ))),
+            }
+        }
+
+        fn guid(self) -> GUID {
+            match self {
+                Self::H264 => NV_ENC_CODEC_H264_GUID,
+                Self::Hevc => NV_ENC_CODEC_HEVC_GUID,
+            }
+        }
+
+        fn output_codec(self) -> VideoCodec {
+            match self {
+                Self::H264 => VideoCodec::H264,
+                Self::Hevc => VideoCodec::Hevc,
+            }
+        }
+
+        /// NVENC exposes codec-specific config in a C union (`NV_ENC_CODEC_CONFIG`).
+        /// The preset was queried with `self.guid()`, so this selects its one
+        /// valid member.
+        #[allow(unsafe_code)]
+        fn configure_codec_config(self, cfg: &mut NV_ENC_CONFIG) {
+            match self {
+                Self::H264 => {
+                    // SAFETY: `cfg` came from `get_preset_config(NV_ENC_CODEC_H264_GUID, ...)`.
+                    let h264_cfg = unsafe { &mut cfg.encodeCodecConfig.h264Config };
+                    h264_cfg.set_repeatSPSPPS(1);
+                    h264_cfg.set_outputAUD(0);
+                    h264_cfg.chromaFormatIDC = 1;
+                }
+                Self::Hevc => {
+                    // SAFETY: `cfg` came from `get_preset_config(NV_ENC_CODEC_HEVC_GUID, ...)`.
+                    let hevc_cfg = unsafe { &mut cfg.encodeCodecConfig.hevcConfig };
+                    hevc_cfg.set_repeatSPSPPS(1);
+                    hevc_cfg.set_outputAUD(0);
+                    hevc_cfg.set_chromaFormatIDC(1);
+                    hevc_cfg.set_pixelBitDepthMinus8(0);
+                }
+            }
+        }
+
+        fn is_keyframe(self, data: &[u8]) -> bool {
+            match self {
+                Self::H264 => is_h264_keyframe_annex_b(data),
+                Self::Hevc => is_hevc_keyframe_annex_b(data),
+            }
+        }
+
+        fn extract_config(self, data: &[u8]) -> Option<Vec<u8>> {
+            match self {
+                Self::H264 => extract_avcc_from_annex_b(data),
+                Self::Hevc => extract_hvcc_from_annex_b(data),
+            }
+        }
+
+        fn to_sample(self, data: &[u8]) -> Vec<u8> {
+            match self {
+                Self::H264 => annex_b_to_avcc(data),
+                Self::Hevc => annex_b_to_hvcc(data),
+            }
         }
     }
 
@@ -1008,15 +1065,8 @@ mod enabled {
         mode: VideoEncodeMode,
         track_index: usize,
     ) -> Result<(EncodedVideoStream, String), PipelineError> {
-        let (guid, h264, quality) = match mode {
-            VideoEncodeMode::NvencH264 { quality } => (NV_ENC_CODEC_H264_GUID, true, quality),
-            VideoEncodeMode::NvencHevc { quality } => (NV_ENC_CODEC_HEVC_GUID, false, quality),
-            other => {
-                return Err(video_error(format!(
-                    "NVENC video encoding rejects mode {other}; only H.264 and HEVC are supported"
-                )));
-            }
-        };
+        let (codec, quality) = NvencVideoCodec::from_mode(mode)?;
+        let guid = codec.guid();
         let first = frames
             .first()
             .ok_or_else(|| video_error("no video frames to encode"))?;
@@ -1071,7 +1121,7 @@ mod enabled {
         preset_cfg.presetCfg.rcParams.constQP.qpIntra = qp;
         preset_cfg.presetCfg.rcParams.constQP.qpInterP = qp;
         preset_cfg.presetCfg.rcParams.constQP.qpInterB = qp;
-        configure_video_codec_config(&mut preset_cfg.presetCfg, h264);
+        codec.configure_codec_config(&mut preset_cfg.presetCfg);
 
         let mut init = EncoderInitParams::new(guid, width, height);
         init.preset_guid(NV_ENC_PRESET_P4_GUID)
@@ -1114,11 +1164,7 @@ mod enabled {
         }
 
         let mut track = ContainerTrack {
-            codec: if h264 {
-                VideoCodec::H264
-            } else {
-                VideoCodec::Hevc
-            },
+            codec: codec.output_codec(),
             width: u16::try_from(width).ok(),
             height: u16::try_from(height).ok(),
             channels: None,
@@ -1131,26 +1177,14 @@ mod enabled {
             if data.is_empty() {
                 return Err(video_error("NVENC produced an empty access unit"));
             }
-            let keyframe = if h264 {
-                is_h264_keyframe_annex_b(&data)
-            } else {
-                is_hevc_keyframe_annex_b(&data)
-            };
-            if track.config.is_empty() && keyframe {
-                let config = if h264 {
-                    extract_avcc_from_annex_b(&data)
-                } else {
-                    extract_hvcc_from_annex_b(&data)
-                };
-                if let Some(config) = config {
-                    track.config = config;
-                }
+            let keyframe = codec.is_keyframe(&data);
+            if track.config.is_empty()
+                && keyframe
+                && let Some(config) = codec.extract_config(&data)
+            {
+                track.config = config;
             }
-            let payload = if h264 {
-                annex_b_to_avcc(&data)
-            } else {
-                annex_b_to_hvcc(&data)
-            };
+            let payload = codec.to_sample(&data);
             let frame = frames.get(index).or_else(|| frames.last());
             let (pts, duration) = frame.map_or((0, 1_000_000 / u64::from(fps.max(1))), |frame| {
                 (frame.pts_us, frame.duration_us.max(1))

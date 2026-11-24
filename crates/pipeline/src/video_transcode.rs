@@ -10,13 +10,14 @@ use std::io::Cursor;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
 use fastconv_domain::{
-    AudioTrackAction, GpuBackend, HardwareBackend, TargetAudioCodec, VideoCodec, VideoEncodeMode,
-    VideoTrackAction, VideoTranscodeItem, VideoTranscodePlan, VideoTranscodeReport,
+    AudioTrackAction, GpuBackend, HardwareBackend, TargetAudioCodec, VideoCodec,
+    VideoContainerFormat, VideoEncodeMode, VideoTrackAction, VideoTranscodeItem,
+    VideoTranscodePlan, VideoTranscodeReport,
 };
 use opus_pure::{Application, MAX_PACKET_BYTES, OpusEncoder};
 use rubato::{FftFixedInOut, Resampler};
@@ -29,7 +30,7 @@ use symphonia::core::meta::MetadataOptions;
 
 use crate::PipelineError;
 use crate::video_bitstream::{default_opus_head, wrap_adts};
-use crate::video_codecs::{decode_video_track, encode_video_cpu};
+use crate::video_codecs::{Yuv420Frame, decode_video_track, encode_video_cpu};
 use crate::video_container::{
     ContainerPacket, ContainerTrack, US_TIMESCALE, demux_video, mux_video,
 };
@@ -46,6 +47,11 @@ const MP3_RATES: [u32; 9] = [
 /// CPU video encoding is memory hungry (especially AV1/VP9), so at most two
 /// files are transcoded in parallel regardless of the requested worker count.
 const MAX_CPU_FILE_WORKERS: usize = 2;
+/// Both CPU and NVENC encoders take the whole display-ordered frame slice:
+/// their reference state spans the clip, so a bounded streaming handoff would
+/// require new encoder APIs. Until then, cap retained decoded bytes per track
+/// so a hostile input fails explicitly instead of exhausting RAM.
+const MAX_DECODED_BYTES_PER_TRACK: u64 = 1_073_741_824;
 
 fn decode_error(path: &Path, reason: impl Into<String>) -> PipelineError {
     PipelineError::DecodeFailed {
@@ -97,6 +103,14 @@ fn resample_interleaved(
             format!("failed to create resampler from {from_rate} Hz to {to_rate} Hz: {err}"),
         )
     })?;
+    let input_frames = samples.len() / channels;
+    let expected = usize::try_from(
+        u64::try_from(input_frames)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::from(to_rate))
+            / u64::from(from_rate),
+    )
+    .unwrap_or(usize::MAX);
     let mut planar = Vec::with_capacity(channels);
     for channel in 0..channels {
         planar.push(
@@ -108,14 +122,55 @@ fn resample_interleaved(
                 .collect::<Vec<f32>>(),
         );
     }
-    let out = resampler
-        .process(&planar, None)
-        .map_err(|err| encode_error(Path::new("resampler"), format!("resampling failed: {err}")))?;
-    let delay = resampler.output_delay();
-    let frames = out.first().map_or(0, Vec::len);
-    let end = frames.saturating_sub(delay);
-    let mut interleaved = Vec::with_capacity(end.saturating_mul(channels));
-    for frame in delay..frames {
+    let block_frames = resampler.input_frames_next();
+    if block_frames == 0 {
+        return Err(encode_error(
+            Path::new("resampler"),
+            "resampler requires a non-zero input block size",
+        ));
+    }
+    let mut out: Vec<Vec<f32>> = Vec::with_capacity(channels);
+    for start in (0..input_frames).step_by(block_frames) {
+        let count = input_frames.saturating_sub(start).min(block_frames);
+        let mut block = Vec::with_capacity(channels);
+        for plane in &planar {
+            let mut padded = vec![0.0_f32; block_frames];
+            if let Some(source) = plane.get(start..start.saturating_add(count)) {
+                padded[..source.len()].copy_from_slice(source);
+            }
+            block.push(padded);
+        }
+        let processed = resampler.process(&block, None).map_err(|err| {
+            encode_error(Path::new("resampler"), format!("resampling failed: {err}"))
+        })?;
+        for (index, plane) in processed.into_iter().enumerate() {
+            if let Some(target) = out.get_mut(index) {
+                target.extend(plane);
+            } else {
+                out.push(plane);
+            }
+        }
+    }
+    // A single zero block pushes the FFT overlap tail out of the resampler;
+    // keeping those delayed frames is what makes the final block audible.
+    let drained = resampler
+        .process_partial::<Vec<f32>>(None, None)
+        .map_err(|err| {
+            encode_error(
+                Path::new("resampler"),
+                format!("resampler drain failed: {err}"),
+            )
+        })?;
+    for (index, plane) in drained.into_iter().enumerate() {
+        if let Some(target) = out.get_mut(index) {
+            target.extend(plane);
+        } else {
+            out.push(plane);
+        }
+    }
+    let frames = out.first().map_or(0, Vec::len).min(expected);
+    let mut interleaved = Vec::with_capacity(frames.saturating_mul(channels));
+    for frame in 0..frames {
         for plane in &out {
             if let Some(&sample) = plane.get(frame) {
                 interleaved.push(sample);
@@ -148,13 +203,27 @@ pub(crate) fn decode_audio_track_pcm(
             )
             .map_err(|err| decode_error(path, format!("failed to create Opus decoder: {err}")))?;
             let mut pcm = Vec::new();
-            let mut block = vec![0.0_f32; OPUS_FRAME.saturating_mul(usize::from(channels))];
+            let mut block = Vec::new();
             for packet in ordered {
+                // Opus packets may hold 2.5-120 ms of audio, not just the
+                // 20 ms frame we choose when encoding. Size the output from
+                // this packet's TOC instead of over- or under-shadowing it.
+                let frames = opus_pure::packet::samples(
+                    &packet.data,
+                    i32::try_from(OPUS_RATE).unwrap_or(i32::MAX),
+                )
+                .map_err(|err| {
+                    decode_error(path, format!("invalid Opus packet duration: {err}"))
+                })?;
+                let needed = frames.saturating_mul(usize::from(channels));
+                if block.len() < needed {
+                    block.resize(needed, 0.0_f32);
+                }
                 let count = decoder
-                    .decode(&packet.data, OPUS_FRAME, &mut block)
+                    .decode(&packet.data, frames, &mut block[..needed])
                     .map_err(|err| decode_error(path, format!("Opus decode failed: {err}")))?;
                 pcm.extend_from_slice(
-                    &block[..count.saturating_mul(usize::from(channels)).min(block.len())],
+                    &block[..count.saturating_mul(usize::from(channels)).min(needed)],
                 );
             }
             let skip = pre_skip.saturating_mul(usize::from(channels));
@@ -385,7 +454,19 @@ fn encode_opus_track(
     let head = opus_pure::OpusHead::for_encoder(&encoder, OPUS_RATE);
     let pre_skip = head.pre_skip;
     let frame_samples = OPUS_FRAME.saturating_mul(usize::from(channels));
-    let frames = pcm.len().div_ceil(frame_samples).max(1);
+    let input_frames = pcm.len() / usize::from(channels);
+    // The encoder's lookahead is reported as OpusHead pre-skip, so those
+    // samples must be fed through the encoder as extra padded frames. Without
+    // them playback would end pre-skip samples too early.
+    let total_frames = input_frames.saturating_add(usize::from(pre_skip));
+    let frames = total_frames.div_ceil(OPUS_FRAME).max(1);
+    let final_frames = total_frames
+        .saturating_sub(frames.saturating_sub(1).saturating_mul(OPUS_FRAME))
+        .clamp(1, OPUS_FRAME);
+    let final_duration = u64::try_from(final_frames)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1_000_000)
+        / u64::from(OPUS_RATE);
     let mut packets = Vec::with_capacity(frames);
     let mut packet = vec![0_u8; MAX_PACKET_BYTES];
     for index in 0..frames {
@@ -407,7 +488,13 @@ fn encode_opus_track(
             track: 0,
             pts,
             dts: pts,
-            duration: 20_000,
+            // Tell the muxer the exact unplayed tail in the last packet: the
+            // total decoded duration then equals the source's input duration.
+            duration: if index + 1 == frames {
+                final_duration
+            } else {
+                20_000
+            },
             keyframe: true,
             data: packet[..count].to_vec(),
         });
@@ -520,6 +607,7 @@ struct StagingTarget {
     temp: PathBuf,
     target: PathBuf,
     file: Option<File>,
+    published: bool,
 }
 
 impl StagingTarget {
@@ -532,13 +620,12 @@ impl StagingTarget {
                 source,
             })?;
         }
-        let name = target.file_name().map_or_else(
-            || "transcode.mp4".to_owned(),
-            |n| n.to_string_lossy().into_owned(),
-        );
+        // The staging name deliberately ignores the destination basename:
+        // a long user-supplied name could otherwise overflow the filesystem's
+        // component limit. Only the parent directory and create_new matter.
         let serial = STAGING_SERIAL.fetch_add(1, Ordering::Relaxed);
         let temp = target.with_file_name(format!(
-            ".{name}.transcode-{}-{serial}-{tag}.tmp",
+            ".fastconv-{}-{serial}-{tag}.tmp",
             std::process::id()
         ));
         let mut options = OpenOptions::new();
@@ -556,6 +643,7 @@ impl StagingTarget {
             temp,
             target: target.to_path_buf(),
             file: Some(file),
+            published: false,
         })
     }
 
@@ -573,13 +661,15 @@ impl StagingTarget {
         fs::rename(&self.temp, &self.target).map_err(|source| PipelineError::Io {
             path: self.target.clone(),
             source,
-        })
+        })?;
+        self.published = true;
+        Ok(())
     }
 }
 
 impl Drop for StagingTarget {
     fn drop(&mut self) {
-        if self.file.is_some() {
+        if !self.published {
             let _ = fs::remove_file(&self.temp);
         }
     }
@@ -589,6 +679,88 @@ static STAGING_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 fn input_size(path: &Path) -> u64 {
     fs::metadata(path).map_or(0, |meta| meta.len())
+}
+
+fn enforce_decoded_budget(path: &Path, bytes: u64) -> Result<(), PipelineError> {
+    if bytes > MAX_DECODED_BYTES_PER_TRACK {
+        return Err(decode_error(
+            path,
+            format!(
+                "decoded track needs {bytes} bytes, exceeding the {MAX_DECODED_BYTES_PER_TRACK}-byte per-track budget"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn estimated_decoded_bytes(track: &ContainerTrack, packet_count: usize) -> u64 {
+    let width = u64::from(track.width.unwrap_or(0));
+    let height = u64::from(track.height.unwrap_or(0));
+    let bytes_per_frame = width.saturating_mul(height).saturating_mul(3) / 2_u64;
+    bytes_per_frame.saturating_mul(u64::try_from(packet_count).unwrap_or(u64::MAX))
+}
+
+fn decoded_bytes(frames: &[Yuv420Frame]) -> u64 {
+    frames.iter().fold(0_u64, |total, frame| {
+        total
+            .saturating_add(u64::try_from(frame.y.len()).unwrap_or(u64::MAX))
+            .saturating_add(u64::try_from(frame.u.len()).unwrap_or(u64::MAX))
+            .saturating_add(u64::try_from(frame.v.len()).unwrap_or(u64::MAX))
+    })
+}
+
+/// Moves packets that already carry source timestamps onto the one file-level
+/// origin shared by copied, encoded and NVENC tracks.
+fn rebase_source_packets(packets: &mut [ContainerPacket], origin: i64) {
+    let offset = origin.saturating_neg();
+    for packet in packets {
+        packet.pts = packet.pts.saturating_add(offset);
+        packet.dts = packet.dts.saturating_add(offset);
+    }
+}
+
+/// Moves packets whose timeline starts at zero relative to their source track
+/// (CPU video and decoded audio) onto that same file-level origin.
+fn rebase_encoded_packets(packets: &mut [ContainerPacket], track_origin: i64, origin: i64) {
+    let offset = track_origin.saturating_sub(origin);
+    for packet in packets {
+        packet.pts = packet.pts.saturating_add(offset);
+        packet.dts = packet.dts.saturating_add(offset);
+    }
+}
+
+/// The packet-copy path shared by video, audio and timed-text tracks.
+#[allow(clippy::too_many_arguments)]
+fn copy_track(
+    source_track: &ContainerTrack,
+    track_packets: Vec<ContainerPacket>,
+    new_index: usize,
+    rebase: Option<i64>,
+    format: VideoContainerFormat,
+    target: &Path,
+    tracks: &mut Vec<ContainerTrack>,
+    packets: &mut Vec<ContainerPacket>,
+) -> Result<(), PipelineError> {
+    if !source_track.codec.supported_in(format) {
+        return Err(PipelineError::RemuxFailed {
+            path: target.to_path_buf(),
+            reason: format!(
+                "codec {} cannot be carried by {}",
+                source_track.codec,
+                format.label()
+            ),
+        });
+    }
+    tracks.push(source_track.clone());
+    let mut copied = track_packets;
+    for packet in &mut copied {
+        packet.track = new_index;
+    }
+    if let Some(origin) = rebase {
+        rebase_source_packets(&mut copied, origin);
+    }
+    packets.extend(copied);
+    Ok(())
 }
 
 // Track-by-track dispatch keeps copy/encode decisions explicit per codec.
@@ -601,19 +773,22 @@ fn transcode_file(
     let target = item.target();
     let format = item.output_format();
     let media = demux_video(source, item.input_format())?;
-    // Freshly encoded tracks start at zero; copied tracks must be shifted by
-    // the same amount (e.g. a TS PCR offset) or their timestamps diverge.
-    let rebase_copied = media.tracks.iter().any(|track| {
+    // One file-level origin for every track: copied/NVENC packets carry source
+    // timestamps, while CPU-encoded video and decoded audio start at zero
+    // relative to their own source track. Rebasing both onto this origin keeps
+    // the input's inter-track spacing instead of zeroing each track separately.
+    let needs_rebase = media.tracks.iter().any(|track| {
         (track.codec.is_video() && matches!(item.video_action(), VideoTrackAction::Encode(_)))
             || (track.codec.is_audio()
                 && matches!(item.audio_action(), AudioTrackAction::Encode(_)))
     });
-    let source_min_dts = media
+    let origin = media
         .packets
         .iter()
         .map(|packet| packet.dts)
         .min()
         .unwrap_or(0);
+    let rebase = needs_rebase.then_some(origin);
     let mut tracks = Vec::with_capacity(media.tracks.len());
     let mut packets = Vec::new();
     let mut frames_processed = 0_u64;
@@ -626,32 +801,24 @@ fn transcode_file(
             .filter(|packet| packet.track == index)
             .cloned()
             .collect();
+        let track_origin = track_packets
+            .iter()
+            .map(|packet| packet.pts)
+            .min()
+            .unwrap_or(0);
         let new_index = tracks.len();
         match (source_track.codec.is_video(), source_track.codec.is_audio()) {
             (true, _) => match item.video_action() {
-                VideoTrackAction::Copy => {
-                    if !source_track.codec.supported_in(format) {
-                        return Err(PipelineError::RemuxFailed {
-                            path: target.to_path_buf(),
-                            reason: format!(
-                                "codec {} cannot be carried by {}",
-                                source_track.codec,
-                                format.label()
-                            ),
-                        });
-                    }
-                    // MPEG-TS carries no display geometry; the canonical muxer
-                    // supplies a safe default when dimensions are absent.
-                    tracks.push(source_track.clone());
-                    for mut packet in track_packets {
-                        packet.track = new_index;
-                        if rebase_copied {
-                            packet.pts = packet.pts.saturating_sub(source_min_dts);
-                            packet.dts = packet.dts.saturating_sub(source_min_dts);
-                        }
-                        packets.push(packet);
-                    }
-                }
+                VideoTrackAction::Copy => copy_track(
+                    source_track,
+                    track_packets,
+                    new_index,
+                    rebase,
+                    format,
+                    target,
+                    &mut tracks,
+                    &mut packets,
+                )?,
                 VideoTrackAction::Encode(mode) => {
                     if !mode.codec().supported_in(format) {
                         return Err(PipelineError::RemuxFailed {
@@ -663,10 +830,15 @@ fn transcode_file(
                             ),
                         });
                     }
+                    enforce_decoded_budget(
+                        source,
+                        estimated_decoded_bytes(source_track, track_packets.len()),
+                    )?;
                     let frames = decode_video_track(source, source_track, &track_packets)?;
+                    enforce_decoded_budget(source, decoded_bytes(&frames))?;
                     frames_processed = frames_processed
                         .saturating_add(u64::try_from(frames.len()).unwrap_or(u64::MAX));
-                    let stream = match mode {
+                    let mut stream = match mode {
                         VideoEncodeMode::CpuH264 { .. }
                         | VideoEncodeMode::CpuAv1 { .. }
                         | VideoEncodeMode::CpuVp9 { .. } => {
@@ -682,32 +854,34 @@ fn transcode_file(
                             stream
                         }
                     };
+                    if needs_rebase {
+                        match mode {
+                            VideoEncodeMode::CpuH264 { .. }
+                            | VideoEncodeMode::CpuAv1 { .. }
+                            | VideoEncodeMode::CpuVp9 { .. } => {
+                                rebase_encoded_packets(&mut stream.packets, track_origin, origin);
+                            }
+                            VideoEncodeMode::NvencH264 { .. }
+                            | VideoEncodeMode::NvencHevc { .. } => {
+                                rebase_source_packets(&mut stream.packets, origin);
+                            }
+                        }
+                    }
                     tracks.push(stream.track);
                     packets.extend(stream.packets);
                 }
             },
             (false, true) => match item.audio_action() {
-                AudioTrackAction::Copy => {
-                    if !source_track.codec.supported_in(format) {
-                        return Err(PipelineError::RemuxFailed {
-                            path: target.to_path_buf(),
-                            reason: format!(
-                                "codec {} cannot be carried by {}",
-                                source_track.codec,
-                                format.label()
-                            ),
-                        });
-                    }
-                    tracks.push(source_track.clone());
-                    for mut packet in track_packets {
-                        packet.track = new_index;
-                        if rebase_copied {
-                            packet.pts = packet.pts.saturating_sub(source_min_dts);
-                            packet.dts = packet.dts.saturating_sub(source_min_dts);
-                        }
-                        packets.push(packet);
-                    }
-                }
+                AudioTrackAction::Copy => copy_track(
+                    source_track,
+                    track_packets,
+                    new_index,
+                    rebase,
+                    format,
+                    target,
+                    &mut tracks,
+                    &mut packets,
+                )?,
                 AudioTrackAction::Encode(codec) => {
                     if !codec.supported_in(format) {
                         return Err(PipelineError::RemuxFailed {
@@ -722,6 +896,9 @@ fn transcode_file(
                         decode_audio_track_pcm(source, source_track, &track_packets)?;
                     let (mut track, mut encoded) =
                         encode_audio_track(source, &samples, rate, channels, codec)?;
+                    if needs_rebase {
+                        rebase_encoded_packets(&mut encoded, track_origin, origin);
+                    }
                     for packet in &mut encoded {
                         packet.track = new_index;
                     }
@@ -732,15 +909,18 @@ fn transcode_file(
                     packets.extend(encoded);
                 }
             },
-            (false, false) => {
-                return Err(PipelineError::RemuxFailed {
-                    path: target.to_path_buf(),
-                    reason: format!(
-                        "track {} with codec {} is neither video nor audio and cannot be transcoded",
-                        index, source_track.codec
-                    ),
-                });
-            }
+            // Timed text is copy-only. The domain already allows it in MOV/MP4
+            // and skips it in codec validation, so execution must not abort.
+            (false, false) => copy_track(
+                source_track,
+                track_packets,
+                new_index,
+                rebase,
+                format,
+                target,
+                &mut tracks,
+                &mut packets,
+            )?,
         }
     }
 
@@ -792,6 +972,7 @@ pub fn execute_video_transcode_batch(
         plan.effective_workers().get().min(MAX_CPU_FILE_WORKERS)
     };
     let next = AtomicUsize::new(0);
+    let abort = AtomicBool::new(false);
     let frames = AtomicU64::new(0);
     let failure: Mutex<Option<PipelineError>> = Mutex::new(None);
     let device: Mutex<Option<String>> = Mutex::new(None);
@@ -808,41 +989,60 @@ pub fn execute_video_transcode_batch(
     } else {
         thread::scope(|scope| -> Result<(), PipelineError> {
             let mut handles = Vec::with_capacity(workers);
-            for _ in 0..workers {
-                let (next, frames, failure, device, tag) =
-                    (&next, &frames, &failure, &device, &tag);
-                handles.push(scope.spawn(move || {
-                    loop {
-                        if failure.lock().map_or(true, |guard| guard.is_some()) {
-                            break;
-                        }
-                        let index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(item) = items.get(index) else { break };
-                        let my_tag = tag.fetch_add(1, Ordering::Relaxed);
-                        match transcode_file(item, my_tag) {
-                            Ok((processed, _in, _out, hw)) => {
-                                frames.fetch_add(processed, Ordering::Relaxed);
-                                if let Some(hw) = hw
-                                    && let Ok(mut guard) = device.lock()
-                                    && guard.is_none()
-                                {
-                                    *guard = Some(hw);
-                                }
-                            }
-                            Err(err) => {
-                                if let Ok(mut guard) = failure.lock()
-                                    && guard.is_none()
-                                {
-                                    *guard = Some(err);
-                                }
+            let mut startup_error = None;
+            for worker in 0..workers {
+                let (abort, next, frames, failure, device, tag) =
+                    (&abort, &next, &frames, &failure, &device, &tag);
+                let worker = thread::Builder::new()
+                    .name(format!("fastconv-video-{worker}"))
+                    .spawn_scoped(scope, move || {
+                        loop {
+                            if abort.load(Ordering::Relaxed)
+                                || failure.lock().map_or(true, |guard| guard.is_some())
+                            {
                                 break;
                             }
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(item) = items.get(index) else { break };
+                            let my_tag = tag.fetch_add(1, Ordering::Relaxed);
+                            match transcode_file(item, my_tag) {
+                                Ok((processed, _in, _out, hw)) => {
+                                    frames.fetch_add(processed, Ordering::Relaxed);
+                                    if let Some(hw) = hw
+                                        && let Ok(mut guard) = device.lock()
+                                        && guard.is_none()
+                                    {
+                                        *guard = Some(hw);
+                                    }
+                                }
+                                Err(err) => {
+                                    abort.store(true, Ordering::Relaxed);
+                                    if let Ok(mut guard) = failure.lock()
+                                        && guard.is_none()
+                                    {
+                                        *guard = Some(err);
+                                    }
+                                    break;
+                                }
+                            }
                         }
+                    });
+                match worker {
+                    Ok(handle) => handles.push(handle),
+                    Err(err) => {
+                        // Stop the workers already running from taking more
+                        // items, then join all of them before propagating.
+                        abort.store(true, Ordering::Relaxed);
+                        startup_error = Some(err);
+                        break;
                     }
-                }));
+                }
             }
             for handle in handles {
                 handle.join().map_err(|_| PipelineError::WorkerPanicked)?;
+            }
+            if let Some(err) = startup_error {
+                return Err(PipelineError::WorkerStartFailed(err));
             }
             Ok(())
         })?;
@@ -1208,6 +1408,166 @@ mod tests {
             VideoCodec::Av1,
             VideoCodec::Mp3,
         )?;
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn resamples_the_whole_track_in_blocks() -> Result<(), PipelineError> {
+        let samples = sine(8_000, 44_100, 2);
+        let out = resample_interleaved(&samples, 2, 44_100, 48_000)?;
+        let expected = 8_000_u64
+            .saturating_mul(48_000)
+            .saturating_div(44_100)
+            .saturating_mul(2);
+        assert_eq!(out.len(), usize::try_from(expected).unwrap_or(usize::MAX));
+        assert!(out.iter().any(|sample| sample.abs() > 0.01));
+        Ok(())
+    }
+
+    // Non-empty PCM assertion documents the successful decode roundtrip.
+    #[allow(clippy::assert_is_empty)]
+    #[test]
+    fn opus_tail_trims_to_the_input_duration() -> Result<(), PipelineError> {
+        let dir = temp_dir("opus-tail")?;
+        let samples = sine(1_000, 48_000, 2);
+        let (track, packets) =
+            encode_audio_track(&dir.join("x"), &samples, 48_000, 2, TargetAudioCodec::Opus)?;
+        assert!(
+            packets.len() >= 2,
+            "the encoder delay needs a padded packet"
+        );
+        let last = &packets[packets.len() - 1];
+        assert!(last.duration > 0 && last.duration <= 20_000);
+        assert_eq!(
+            last.pts,
+            20_000_i64 * i64::try_from(packets.len() - 1).unwrap_or(1)
+        );
+        let (decoded, _, _) = decode_audio_track_pcm(&dir.join("x"), &track, &packets)?;
+        assert!(!decoded.is_empty());
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn rebase_copied_and_encoded_tracks_on_one_timeline() {
+        let packet = |track: usize, start: i64, index: i64| ContainerPacket {
+            track,
+            pts: start.saturating_add(index.saturating_mul(20_000)),
+            dts: start.saturating_add(index.saturating_mul(20_000)),
+            duration: 20_000,
+            keyframe: index == 0,
+            data: Vec::new(),
+        };
+        let video_start = 1_000_000_i64;
+        let audio_start = 250_000_i64;
+        let mut audio = vec![packet(1, audio_start, 0), packet(1, audio_start, 1)];
+        let source_video = vec![packet(0, video_start, 0), packet(0, video_start, 1)];
+        let origin = audio
+            .iter()
+            .chain(source_video.iter())
+            .map(|p| p.dts)
+            .min()
+            .unwrap_or(0);
+        assert_eq!(origin, audio_start);
+
+        rebase_source_packets(&mut audio, origin);
+        let mut nvenc_video = source_video.clone();
+        rebase_source_packets(&mut nvenc_video, origin);
+        let mut cpu_video = vec![packet(0, 0, 0), packet(0, 0, 1)];
+        rebase_encoded_packets(&mut cpu_video, video_start, origin);
+
+        assert_eq!(audio[0].pts, 0);
+        assert_eq!(audio[0].dts, 0);
+        assert_eq!(nvenc_video[0].pts, 750_000);
+        assert_eq!(cpu_video[0].pts, 750_000);
+        assert_eq!(cpu_video[0].pts - audio[0].pts, 750_000);
+        assert_eq!(cpu_video[1].pts, nvenc_video[1].pts);
+    }
+
+    #[test]
+    fn copies_timed_text_with_the_packet_copy_path() -> Result<(), PipelineError> {
+        let dir = temp_dir("timed-text")?;
+        let target = dir.join("out.mov");
+        let track = ContainerTrack {
+            codec: VideoCodec::TimedText,
+            width: None,
+            height: None,
+            channels: None,
+            sample_rate: None,
+            config: Vec::new(),
+            timescale: US_TIMESCALE,
+        };
+        let packets = vec![ContainerPacket {
+            track: 0,
+            pts: 1_000_000,
+            dts: 1_000_000,
+            duration: 500_000,
+            keyframe: true,
+            data: b"hello".to_vec(),
+        }];
+        let mut tracks = Vec::new();
+        let mut out = Vec::new();
+        copy_track(
+            &track,
+            packets,
+            0,
+            None,
+            VideoContainerFormat::Mov,
+            &target,
+            &mut tracks,
+            &mut out,
+        )?;
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].codec, VideoCodec::TimedText);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].data, b"hello".to_vec());
+        assert_eq!(out[0].pts, 1_000_000);
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn staging_name_is_short_and_cleans_up_after_a_failed_commit() -> Result<(), PipelineError> {
+        let dir = temp_dir("staging")?;
+        let long_target = dir.join(format!("{}.mov", "a".repeat(255)));
+        let long_staging = StagingTarget::new(&long_target, 3)?;
+        let long_temp = long_staging.temp.clone();
+        let name = long_temp.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert!(long_temp.starts_with(&dir));
+        assert!(name.len() < 64);
+        drop(long_staging);
+        assert!(!long_temp.exists());
+
+        let target = dir.join("out.mov");
+        let staging = StagingTarget::new(&target, 4)?;
+        let temp = staging.temp.clone();
+        {
+            let _file = staging.file()?;
+        }
+        fs::create_dir(&target).map_err(|source| PipelineError::Io {
+            path: target.clone(),
+            source,
+        })?;
+        assert!(staging.commit().is_err());
+        assert!(!temp.exists());
+
+        fs::remove_dir(&target).map_err(|source| PipelineError::Io {
+            path: target.clone(),
+            source,
+        })?;
+        let staging = StagingTarget::new(&target, 5)?;
+        staging.commit()?;
+        assert!(target.is_file());
         fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
             path: dir.clone(),
             source,

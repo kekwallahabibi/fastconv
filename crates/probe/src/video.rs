@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::num::NonZeroUsize;
@@ -337,18 +337,19 @@ fn mpeg4_descriptor(bytes: &[u8], tag: u8) -> Option<&[u8]> {
     while idx < bytes.len() {
         let found = bytes[idx];
         idx += 1;
+        // MPEG-4 descriptor sizes are big-endian base-128: every byte but the
+        // last has the continuation bit set.
         let mut size = 0_usize;
-        let mut shift = 0_u32;
+        let mut parts = 0_u8;
         loop {
             let byte = *bytes.get(idx)?;
             idx += 1;
-            let part = usize::from(byte & 0x7F).checked_shl(shift)?;
-            size = size.checked_add(part)?;
-            shift += 7;
+            size = size.checked_shl(7)?.checked_add(usize::from(byte & 0x7F))?;
             if byte & 0x80 == 0 {
                 break;
             }
-            if shift > 28 {
+            parts += 1;
+            if parts >= 4 {
                 return None;
             }
         }
@@ -701,15 +702,13 @@ fn avi_stream_info(chunk: &[u8], avih: &AvihInfo) -> Option<VideoStreamInfo> {
     } else {
         None
     };
-    let timebase_num = if is_video && avih.micro_sec_per_frame > 0 {
-        1
+    let (timebase_num, timebase_den) = if scale > 0 && rate > 0 {
+        (u64::from(scale), u64::from(rate))
+    } else if avih.micro_sec_per_frame > 0 {
+        // Exact rational instead of truncating 1_000_000 / us_per_frame.
+        (u64::from(avih.micro_sec_per_frame), 1_000_000)
     } else {
-        scale.max(1)
-    };
-    let timebase_den = if is_video && avih.micro_sec_per_frame > 0 {
-        (1_000_000_u64 / u64::from(avih.micro_sec_per_frame)).max(1)
-    } else {
-        u64::from(rate.max(1))
+        (1, 1)
     };
     Some(VideoStreamInfo::new(
         codec,
@@ -722,7 +721,7 @@ fn avi_stream_info(chunk: &[u8], avih: &AvihInfo) -> Option<VideoStreamInfo> {
         height,
         channels,
         sample_rate,
-        timebase_num,
+        u32::try_from(timebase_num).unwrap_or(u32::MAX),
         u32::try_from(timebase_den).unwrap_or(u32::MAX),
         duration,
         None,
@@ -848,21 +847,24 @@ fn map_ts_stream(stream_type: u8, descriptors: &[u8]) -> TsStreamInfo {
         0x0F => TsStreamInfo::new(VideoCodec::Aac, VideoStreamKind::Audio),
         0x03 | 0x04 => TsStreamInfo::new(VideoCodec::Mp3, VideoStreamKind::Audio),
         0x06 => {
+            let opus_channels = ts_descriptor(descriptors, 0x7F)
+                .filter(|ext| ext.len() >= 2 && ext[0] == 0x80)
+                .map(|ext| u16::from(ext[1] & 0x0F).max(1));
             if let Some(reg) = ts_descriptor(descriptors, 0x05)
                 && reg.len() >= 4
             {
                 if &reg[..4] == b"Opus" {
-                    return TsStreamInfo::audio(VideoCodec::Opus, Some(48_000), Some(2));
+                    return TsStreamInfo::audio(
+                        VideoCodec::Opus,
+                        Some(48_000),
+                        Some(opus_channels.unwrap_or(2)),
+                    );
                 }
                 if &reg[..4] == b"AV01" {
                     return TsStreamInfo::new(VideoCodec::Av1, VideoStreamKind::Video);
                 }
             }
-            if let Some(ext) = ts_descriptor(descriptors, 0x7F)
-                && ext.len() >= 2
-                && ext[0] == 0x80
-            {
-                let channels = u16::from(ext[1] & 0x0F).max(1);
+            if let Some(channels) = opus_channels {
                 return TsStreamInfo::audio(VideoCodec::Opus, Some(48_000), Some(channels));
             }
             // The AV1 descriptor is unambiguous inside a private-data stream.
@@ -956,8 +958,13 @@ fn adts_facts(bytes: &[u8]) -> Option<(u32, u16)> {
         return None;
     }
     let rate = ADTS_SAMPLE_RATES[usize::from((bytes[2] >> 2) & 0x0F)];
-    let channels = (u16::from(bytes[2] & 0x01) << 2) | u16::from(bytes[3] >> 6);
-    (rate > 0 && channels > 0).then_some((rate, channels))
+    let config = ((bytes[2] & 0x01) << 2) | (bytes[3] >> 6);
+    let channels = match config {
+        1..=6 => Some(u16::from(config)),
+        7 => Some(8),
+        _ => None,
+    }?;
+    (rate > 0).then_some((rate, channels))
 }
 
 fn mp3_facts(bytes: &[u8]) -> Option<(u32, u16)> {
@@ -981,6 +988,9 @@ fn mp3_facts(bytes: &[u8]) -> Option<(u32, u16)> {
 }
 
 /// Parses MPEG-TS PAT/PMT tables and the first PES headers within a 2 MiB scan.
+// A single linear scan keeps the boundary validation and its five mutable
+// accumulators in one auditable pass; splitting would only thread state around.
+#[allow(clippy::too_many_lines)]
 fn probe_ts(
     path: &Path,
     file: &mut File,
@@ -992,6 +1002,8 @@ fn probe_ts(
     let offset = stride - 188;
 
     let mut pmt_pid = None;
+    let mut pmt_section: Vec<u8> = Vec::new();
+    let mut pmt_needed: Option<usize> = None;
     let mut streams: Vec<TsStream> = Vec::new();
     for chunk in bytes.chunks(stride) {
         if chunk.len() < stride {
@@ -1009,12 +1021,32 @@ fn probe_ts(
         }
         if let Some(pid) = pmt_pid
             && packet.pid == pid
-            && packet.pusi
-            && let Some(section) = ts_section_start(&packet)
-            && let Some(found) = parse_pmt(section)
         {
-            streams = found;
-            break;
+            if packet.pusi {
+                pmt_section.clear();
+                let section = ts_section_start(&packet);
+                pmt_needed = section.and_then(|section| {
+                    ts_section_length(section).and_then(|len| 3_usize.checked_add(len))
+                });
+                // A TS payload is padded with 0xFF; only the declared section bytes count.
+                if let (Some(section), Some(needed)) = (section, pmt_needed) {
+                    let take = needed.min(section.len());
+                    pmt_section.extend_from_slice(&section[..take]);
+                }
+            } else if let Some(needed) = pmt_needed {
+                let left = needed.saturating_sub(pmt_section.len());
+                let take = left.min(packet.payload.len());
+                pmt_section.extend_from_slice(&packet.payload[..take]);
+            }
+            if let Some(needed) = pmt_needed
+                && pmt_section.len() >= needed
+            {
+                if let Some(found) = parse_pmt(&pmt_section[..needed]) {
+                    streams = found;
+                    break;
+                }
+                pmt_needed = None;
+            }
         }
     }
     pmt_pid.ok_or_else(|| invalid_video(path, "MPEG-TS has no PAT"))?;
@@ -1149,17 +1181,20 @@ pub fn probe_video(path: &Path) -> Result<ProbedVideo, ProbeError> {
     })
 }
 
-/// Rejects targets that name the same file as the source through a different path spelling.
-fn reject_alias_collision(source: &Path, target: &Path) -> Result<(), ProbeError> {
-    let canonical_source = fs::canonicalize(source).map_err(|source_err| ProbeError::Io {
-        path: source.to_path_buf(),
-        source: source_err,
-    })?;
-    let canonical_target = if target.exists() {
-        fs::canonicalize(target).map_err(|err| ProbeError::Io {
+fn canonical_source(path: &Path) -> Result<PathBuf, ProbeError> {
+    fs::canonicalize(path).map_err(|source| ProbeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Resolves a target that may not exist yet through its canonical parent.
+fn canonical_target(target: &Path) -> Result<PathBuf, ProbeError> {
+    if target.exists() {
+        Ok(fs::canonicalize(target).map_err(|err| ProbeError::Io {
             path: target.to_path_buf(),
             source: err,
-        })?
+        })?)
     } else {
         let parent = target
             .parent()
@@ -1169,13 +1204,35 @@ fn reject_alias_collision(source: &Path, target: &Path) -> Result<(), ProbeError
             path: parent.to_path_buf(),
             source: err,
         })?;
-        match target.file_name() {
+        Ok(match target.file_name() {
             Some(name) => canonical_parent.join(name),
             None => canonical_parent,
-        }
-    };
-    if canonical_source == canonical_target {
+        })
+    }
+}
+
+/// Rejects targets that name the same file as the source through a different path spelling.
+fn reject_alias_collision(source: &Path, target: &Path) -> Result<(), ProbeError> {
+    if canonical_source(source)? == canonical_target(target)? {
         return Err(DomainError::IdenticalSourceAndTarget(source.to_path_buf()).into());
+    }
+    Ok(())
+}
+
+fn canonical_sources(paths: &[PathBuf]) -> Result<HashSet<PathBuf>, ProbeError> {
+    paths.iter().map(|path| canonical_source(path)).collect()
+}
+
+/// Rejects a batch target that resolves onto any source in the same batch.
+fn reject_batch_target_collision(
+    sources: &HashSet<PathBuf>,
+    target: &Path,
+) -> Result<(), ProbeError> {
+    if sources.contains(&canonical_target(target)?) {
+        return Err(ProbeError::InvalidVideo {
+            path: target.to_path_buf(),
+            reason: "target aliases another source in this batch".to_owned(),
+        });
     }
     Ok(())
 }
@@ -1255,6 +1312,7 @@ fn prepare_directory_batch(
     if sources.is_empty() {
         return Err(ProbeError::EmptyVideoDirectory(source_dir.to_path_buf()));
     }
+    let canonical_sources = canonical_sources(&sources)?;
 
     let mut items = Vec::with_capacity(sources.len());
     for source in sources {
@@ -1277,6 +1335,7 @@ fn prepare_directory_batch(
             }
         }
         reject_alias_collision(&source, &target)?;
+        reject_batch_target_collision(&canonical_sources, &target)?;
         items.push(VideoRemuxItem::new(
             source,
             target,
@@ -1373,8 +1432,9 @@ pub enum RequestedAudioCodec {
 ///
 /// Returns [`ProbeError`] for invalid paths, unsupported codec/container pairs, or
 /// encoder/backend combinations that have no implementation.
-// One argument per CLI input keeps the boundary mapping explicit and auditable.
-#[allow(clippy::too_many_arguments)]
+// One argument per CLI input keeps the boundary mapping explicit and auditable;
+// the directory walk likewise stays in one validation pass before planning.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn prepare_video_transcode_batch(
     source: &Path,
     target: &Path,
@@ -1426,6 +1486,7 @@ pub fn prepare_video_transcode_batch(
         if sources.is_empty() {
             return Err(ProbeError::EmptyVideoDirectory(source.to_path_buf()));
         }
+        let canonical_sources = canonical_sources(&sources)?;
         for file in sources {
             let stem = file
                 .file_stem()
@@ -1433,7 +1494,9 @@ pub fn prepare_video_transcode_batch(
             let mut name = stem.to_os_string();
             name.push(".");
             name.push(format.extension());
-            specs.push((file, target.join(name)));
+            let output = target.join(name);
+            reject_batch_target_collision(&canonical_sources, &output)?;
+            specs.push((file, output));
         }
         format
     } else if source_meta.is_file() {
@@ -1774,6 +1837,78 @@ mod tests {
     }
 
     #[test]
+    fn mpeg4_descriptor_accepts_expandable_big_endian_lengths() {
+        assert_eq!(
+            mpeg4_descriptor(&mpeg4_desc(0x05, b"abc"), 0x05),
+            Some(b"abc".as_slice())
+        );
+        let mut padded = vec![0x05, 0x80, 0x80, 0x80, 3];
+        padded.extend_from_slice(b"abc");
+        assert_eq!(mpeg4_descriptor(&padded, 0x05), Some(b"abc".as_slice()));
+        let mut too_long = vec![0x05, 0x80, 0x80, 0x80, 0x80, 3];
+        too_long.extend_from_slice(b"abc");
+        assert_eq!(mpeg4_descriptor(&too_long, 0x05), None);
+    }
+
+    #[test]
+    fn opus_registration_honours_extension_channel_count() {
+        let mut descriptors = ts_desc(0x05, b"Opus");
+        descriptors.extend_from_slice(&ts_desc(0x7F, &[0x80, 6]));
+        let info = map_ts_stream(0x06, &descriptors);
+        assert_eq!(info.codec, VideoCodec::Opus);
+        assert_eq!(info.channels, Some(6));
+        let fallback = map_ts_stream(0x06, &ts_desc(0x05, b"Opus"));
+        assert_eq!(fallback.channels, Some(2));
+    }
+
+    #[test]
+    fn adts_channel_config_follows_mpeg4_table() {
+        let header = |config: u8| {
+            [
+                0xFF,
+                0xF1,
+                0x40 | (4 << 2) | (config >> 2),
+                (config & 0x03) << 6,
+                0x00,
+            ]
+        };
+        assert_eq!(adts_facts(&header(2)), Some((44_100, 2)));
+        assert_eq!(adts_facts(&header(7)), Some((44_100, 8)));
+        assert_eq!(adts_facts(&header(0)), None);
+    }
+
+    #[test]
+    fn synthetic_ts_probe_assembles_multi_packet_pmt() -> Result<(), Box<dyn std::error::Error>> {
+        let mut association_body = vec![0x00, 0x01, 0xC1, 0x00, 0x00];
+        association_body.extend_from_slice(&[0x00, 0x01, 0xF0, 0x00]);
+        let mut program_map_body = vec![0x00, 0x01, 0xC1, 0x00, 0x00, 0xF0, 0x00, 0xF0, 0x00];
+        // Enough elementary streams to force the PMT section past one TS packet.
+        for index in 0..40_u16 {
+            program_map_body.extend_from_slice(&ts_es(0x1B, 0x0200 + index, &[]));
+        }
+        program_map_body.extend_from_slice(&ts_es(0x06, 0x0112, &ts_desc(0x05, b"Opus")));
+        let mut pat = vec![0x00];
+        pat.extend_from_slice(&ts_section(0x00, &association_body));
+        let pmt = ts_section(0x02, &program_map_body);
+        let split = 183;
+        let mut first = vec![0x00];
+        first.extend_from_slice(&pmt[..split]);
+        let mut bytes = ts_packet(0, true, &pat);
+        bytes.extend_from_slice(&ts_packet(0x1000, true, &first));
+        bytes.extend_from_slice(&ts_packet(0x1000, false, &pmt[split..]));
+        let path = temp_file("split-pmt-ts", &bytes)?;
+        let probed = probe_video(&path)?;
+        assert_eq!(probed.streams.len(), 41);
+        assert_eq!(probed.streams[0].codec(), VideoCodec::H264);
+        assert_eq!(probed.streams[40].codec(), VideoCodec::Opus);
+        assert_eq!(
+            probed.streams[40].channels().map(std::num::NonZero::get),
+            Some(2)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn esds_object_type_distinguishes_mp3_from_aac() {
         let build = |object_type: u8| {
             let decoder_config = mpeg4_desc(0x04, &[object_type, 0x15, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -1802,7 +1937,7 @@ mod tests {
     }
 
     fn ts_packet(pid: u16, pusi: bool, payload: &[u8]) -> Vec<u8> {
-        let high = 0xE0 | (u8::try_from(pid >> 8).unwrap_or(0) & 0x1F);
+        let high = u8::try_from(pid >> 8).unwrap_or(0) & 0x1F;
         let low = u8::try_from(pid & 0x00FF).unwrap_or(0);
         let mut packet = vec![0x47, high | if pusi { 0x40 } else { 0 }, low, 0x10];
         packet.extend_from_slice(payload);

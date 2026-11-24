@@ -5,11 +5,12 @@
 //! Every illegal state is rejected explicitly; there is no silent fallback
 //! between codecs or bit depths.
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
 use fastconv_domain::{VideoCodec, VideoEncodeMode, VideoQuality};
-use rav1d_safe::src::managed::{Decoder as Av1Decoder, Planes as Av1Planes};
+use rav1d_safe::src::managed::{Decoder as Av1Decoder, PixelLayout, Planes as Av1Planes};
 use rav1e::color::ChromaSampling;
 use rav1e::prelude::{Config, EncoderConfig, FrameType, Rational, SpeedSettings};
 use rusty_h264::{
@@ -250,6 +251,36 @@ fn hevc_frame(
     })
 }
 
+/// Maps a picture's presentation timestamp to the source packet that produced
+/// it. A reordered picture can surface while a different access unit is being
+/// pushed, so the current packet is not necessarily its source.
+fn hevc_pts_to_packet(packets: &[ContainerPacket]) -> HashMap<i64, usize> {
+    let mut mapping = HashMap::with_capacity(packets.len());
+    for (index, packet) in packets.iter().enumerate() {
+        mapping.entry(packet.pts).or_insert(index);
+    }
+    mapping
+}
+
+/// Uses the decoded picture's own timestamp when the decoder supplies one,
+/// falling back to the access unit being pushed (or the next expected
+/// presentation time while flushing) only when the picture has none.
+fn hevc_picture_pts(frame: &rusty_h265::Frame, fallback: i64) -> i64 {
+    frame.pts.unwrap_or(fallback)
+}
+
+fn hevc_picture_duration(
+    pts: i64,
+    packets: &[ContainerPacket],
+    mapping: &HashMap<i64, usize>,
+    fallback: u64,
+) -> u64 {
+    mapping
+        .get(&pts)
+        .and_then(|&index| packets.get(index))
+        .map_or(fallback, |packet| packet.duration)
+}
+
 fn av1_frame(
     frame: &rav1d_safe::src::managed::Frame,
     pts_us: i64,
@@ -262,6 +293,13 @@ fn av1_frame(
         return Err(decode_error(
             path,
             format!("AV1 decoded odd or zero dimensions: {width}x{height}"),
+        ));
+    }
+    let layout = frame.pixel_layout();
+    if layout != PixelLayout::I420 {
+        return Err(decode_error(
+            path,
+            format!("AV1 chroma layout {layout:?} is not 4:2:0"),
         ));
     }
     let (cw, ch) = (width / 2, height / 2);
@@ -441,6 +479,8 @@ pub(crate) fn decode_video_track(
         VideoCodec::Hevc => {
             let mut decoder = HevcDecoder::new();
             let mut frames = Vec::with_capacity(ordered.len());
+            let mapping = hevc_pts_to_packet(packets);
+            let fallback_dur = median_duration(packets);
             for packet in ordered {
                 let annex_b = hvcc_to_annex_b(&track.config, &packet.data, true)
                     .map_err(|reason| decode_error(path, reason))?;
@@ -450,7 +490,10 @@ pub(crate) fn decode_video_track(
                 loop {
                     match decoder.next_frame() {
                         Ok(frame) => {
-                            frames.push(hevc_frame(&frame, packet.pts, packet.duration, path)?);
+                            let pts = hevc_picture_pts(&frame, packet.pts);
+                            let duration =
+                                hevc_picture_duration(pts, packets, &mapping, fallback_dur);
+                            frames.push(hevc_frame(&frame, pts, duration, path)?);
                         }
                         Err(rusty_h265::Error::Again | rusty_h265::Error::Eof) => break,
                         Err(err) => {
@@ -460,7 +503,6 @@ pub(crate) fn decode_video_track(
                 }
             }
             decoder.flush();
-            let fallback_dur = median_duration(packets);
             loop {
                 match decoder.next_frame() {
                     Ok(frame) => {
@@ -468,7 +510,9 @@ pub(crate) fn decode_video_track(
                             last.pts_us
                                 .saturating_add(i64::try_from(last.duration_us).unwrap_or(1))
                         });
-                        frames.push(hevc_frame(&frame, fallback_pts, fallback_dur, path)?);
+                        let pts = hevc_picture_pts(&frame, fallback_pts);
+                        let duration = hevc_picture_duration(pts, packets, &mapping, fallback_dur);
+                        frames.push(hevc_frame(&frame, pts, duration, path)?);
                     }
                     Err(rusty_h265::Error::Again | rusty_h265::Error::Eof) => break,
                     Err(err) => {
@@ -1103,6 +1147,48 @@ mod tests {
         assert!(matches!(result, Err(PipelineError::EncodeFailed { .. })));
     }
 
+    #[test]
+    fn hevc_reordered_b_frame_uses_its_own_timestamp_and_duration() {
+        let packet = |pts: i64, duration: u64| ContainerPacket {
+            track: 0,
+            pts,
+            dts: pts,
+            duration,
+            keyframe: true,
+            data: Vec::new(),
+        };
+        // Decode order I (0 µs), P (80 ms), B (40 ms): the B picture is
+        // emitted while the P access unit is pushed, so packet.pts is wrong.
+        let packets = [
+            packet(0, 40_000),
+            packet(80_000, 40_000),
+            packet(40_000, 33_333),
+        ];
+        let mapping = hevc_pts_to_packet(&packets);
+        let mut frame = rusty_h265::Frame {
+            picture: std::sync::Arc::new(rusty_h265::Picture::new(16, 16, 1, 8, 8)),
+            poc: 2,
+            pts: Some(40_000),
+            width: 16,
+            height: 16,
+        };
+        let pts = hevc_picture_pts(&frame, 80_000);
+        assert_eq!(pts, 40_000);
+        assert_eq!(
+            hevc_picture_duration(pts, &packets, &mapping, 40_000),
+            33_333
+        );
+        // Only a picture without its own PTS falls back, and the same mapping
+        // supplies the duration during flush.
+        frame.pts = None;
+        let flushed = hevc_picture_pts(&frame, 120_000);
+        assert_eq!(flushed, 120_000);
+        assert_eq!(
+            hevc_picture_duration(flushed, &packets, &mapping, 40_000),
+            40_000
+        );
+    }
+
     #[cfg(not(feature = "nvenc"))]
     #[test]
     fn nvenc_video_fails_explicitly_without_feature() {
@@ -1131,6 +1217,11 @@ mod tests {
     #[cfg(feature = "nvenc")]
     #[test]
     fn roundtrips_nvenc_h264_and_hevc() -> Result<(), PipelineError> {
+        // The encode itself probes CUDA device 0. Skip only that expected
+        // no-device condition; a real device must still surface encode errors.
+        if cudarc::driver::CudaContext::new(0).is_err() {
+            return Ok(());
+        }
         let path = Path::new("nvenc-video.mp4");
         let frames = synthetic_frames(256, 144, 4);
         for (mode, codec) in [

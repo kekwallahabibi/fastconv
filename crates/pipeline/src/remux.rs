@@ -171,7 +171,7 @@ fn stream_copy_supports(item: &VideoRemuxItem) -> bool {
             VideoContainerFormat::Mp4 | VideoContainerFormat::Mov
         )
     };
-    let direct = (input == VideoContainerFormat::Mp4 && output == VideoContainerFormat::Mp4)
+    let direct = (input == VideoContainerFormat::Mp4 && family(output))
         || (matches!(
             input,
             VideoContainerFormat::Mkv | VideoContainerFormat::Webm
@@ -196,10 +196,39 @@ fn stream_copy_supports(item: &VideoRemuxItem) -> bool {
     })
 }
 
+/// Fails before any path is taken when an MKV source carries attachments that
+/// the target container cannot represent.
+fn reject_mkv_attachments(source: &Path, target: &Path) -> Result<(), PipelineError> {
+    let reader = WindowedFileReader::open(source).map_err(|err| PipelineError::Io {
+        path: source.to_path_buf(),
+        source: err,
+    })?;
+    let input = containr::mkv::Demuxer::open(reader).map_err(|err| container_err(source, &err))?;
+    if input.truncated() {
+        return Err(remux_failed(source, "truncated MKV input"));
+    }
+    if !input.attachments().is_empty() {
+        return Err(remux_failed(
+            target,
+            "MKV attachments have no representation in the target container; refusing to drop data",
+        ));
+    }
+    Ok(())
+}
+
 /// Remuxes a single file without re-encoding, rejecting unsupported codecs.
 fn remux_file(item: &VideoRemuxItem, target: &File) -> Result<(), PipelineError> {
     let source = item.source();
     let output = item.output_format();
+    if matches!(
+        item.input_format(),
+        VideoContainerFormat::Mkv | VideoContainerFormat::Webm
+    ) && !matches!(
+        output,
+        VideoContainerFormat::Mkv | VideoContainerFormat::Webm
+    ) {
+        reject_mkv_attachments(source, item.target())?;
+    }
     for stream in item.streams() {
         if !stream.codec().supported_in(output) {
             return Err(remux_failed(
