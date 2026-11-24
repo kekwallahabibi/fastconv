@@ -28,6 +28,9 @@ use crate::decode::{
     DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat, decode_image_into,
     precreate_target_directories,
 };
+use crate::gif::encode_gif_into;
+use crate::ico::encode_ico_into;
+use crate::pnm::encode_pnm_to_writer;
 use crate::qoi::encode_qoi_into;
 
 const STREAM_IO_BUF_BYTES: usize = 512 * 1024;
@@ -58,6 +61,9 @@ pub(crate) enum CpuImageEncoder {
         quality: ImageQuality,
         threads: usize,
     },
+    Gif,
+    Ico,
+    Pnm,
 }
 
 static STAGING_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -439,6 +445,25 @@ fn convert_single_item(
             )?;
             write_encoded_buffer(item.target(), &scratch.encoded_buf)?
         }
+        CpuImageEncoder::Gif => {
+            scratch.encoded_buf.clear();
+            encode_gif_into(
+                item.target(),
+                pixels,
+                decoded,
+                &mut scratch.aux_buf,
+                &mut scratch.encoded_buf,
+            )?;
+            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
+        }
+        CpuImageEncoder::Ico => {
+            scratch.encoded_buf.clear();
+            encode_ico_into(item.target(), pixels, decoded, &mut scratch.encoded_buf)?;
+            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
+        }
+        CpuImageEncoder::Pnm => {
+            encode_pnm_streaming(item.target(), pixels, decoded, &mut scratch.aux_buf)?
+        }
     };
 
     Ok((decoded.input_file_bytes, output_bytes))
@@ -541,6 +566,26 @@ fn encode_png_streaming(
         path: target.to_path_buf(),
         source: err.into_error(),
     })?;
+    staging.commit(target, file)?;
+    Ok(bytes)
+}
+
+fn encode_pnm_streaming(
+    target: &Path,
+    pixels: &[u8],
+    decoded: DecodedFrameMeta,
+    aux_buf: &mut Vec<u8>,
+) -> Result<u64, PipelineError> {
+    let (staging, file) = StagingFile::create_for(target)?;
+    let mut buf_writer = BufWriter::with_capacity(STREAM_IO_BUF_BYTES, file);
+    let bytes = encode_pnm_to_writer(target, pixels, decoded, aux_buf, &mut buf_writer)?;
+    let file = buf_writer.into_inner().map_err(|err| PipelineError::Io {
+        path: target.to_path_buf(),
+        source: err.into_error(),
+    })?;
+    if bytes == 0 {
+        return Err(PipelineError::EmptyOutput(target.to_path_buf()));
+    }
     staging.commit(target, file)?;
     Ok(bytes)
 }

@@ -6,8 +6,11 @@ mod avif;
 mod bmp;
 pub mod cpu;
 mod decode;
+mod gif;
 pub mod gpu;
+mod ico;
 mod m4a;
+mod pnm;
 mod qoi;
 pub mod remux;
 
@@ -145,6 +148,9 @@ pub fn execute_image_batch(plan: &ImageBatchPlan) -> Result<ImageConversionRepor
                 threads: 1,
             },
         ),
+        ImageExecutionMode::CpuGif => cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Gif),
+        ImageExecutionMode::CpuIco => cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Ico),
+        ImageExecutionMode::CpuPnm => cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Pnm),
         ImageExecutionMode::NvencHeic { quality } => gpu::nvenc::execute_heic_batch(plan, quality),
     }
 }
@@ -1086,6 +1092,261 @@ mod tests {
             execute_image_batch(&plan),
             Err(PipelineError::UnsupportedPixelFormat { .. })
         ));
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrips_png_avif_png_through_the_avif_decoder() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = create_temp_dir("avif-read")?;
+        let src = root.join("src.png");
+        let avif = root.join("stage/test.avif");
+        let out = root.join("out.png");
+        let pixels = make_rgb_gradient(64, 48);
+        write_test_png(&src, 64, 48, png::ColorType::Rgb, &pixels)?;
+
+        execute_image_batch(&ImageBatchPlan::new(
+            vec![jpeg_item(src, avif.clone(), ImageInputFormat::Png, 64, 48)?],
+            ImageExecutionMode::CpuAvif {
+                quality: ImageQuality::new(95)?,
+            },
+            NonZeroUsize::MIN,
+        )?)?;
+        let avif_bytes = fs::read(&avif)?;
+        assert_eq!(&avif_bytes[4..8], b"ftyp");
+
+        execute_image_batch(&ImageBatchPlan::new(
+            vec![jpeg_item(
+                avif,
+                out.clone(),
+                ImageInputFormat::Avif,
+                64,
+                48,
+            )?],
+            ImageExecutionMode::CpuPng,
+            NonZeroUsize::MIN,
+        )?)?;
+        let decoded = decode_test_png(&out)?;
+        assert_eq!(
+            (decoded.width, decoded.height, decoded.color_type),
+            (64, 48, png::ColorType::Rgb)
+        );
+        assert_eq!(decoded.pixels.len(), pixels.len());
+        assert!(
+            mean_abs_channel_diff(&decoded.pixels, &pixels)? < 12.0,
+            "AVIF roundtrip diverged too far from the source"
+        );
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrips_png_gif_png_opaque_and_transparent() -> Result<(), Box<dyn std::error::Error>> {
+        let root = create_temp_dir("gif-read")?;
+        let mut opaque = Vec::new();
+        let mut transparent = Vec::new();
+        for i in 0..53_u32 * 37 {
+            let color = u8::try_from((i % 8) * 31).unwrap_or(0);
+            opaque.extend_from_slice(&[color, 255 - color, color ^ 255]);
+            transparent.extend_from_slice(&[
+                color,
+                255 - color,
+                color,
+                if i % 4 == 0 { 0 } else { 255 },
+            ]);
+        }
+        let opaque_png = root.join("opaque.png");
+        let alpha_png = root.join("alpha.png");
+        write_test_png(&opaque_png, 53, 37, png::ColorType::Rgb, &opaque)?;
+        write_test_png(&alpha_png, 53, 37, png::ColorType::Rgba, &transparent)?;
+
+        for (name, src, input_color) in [
+            ("opaque", &opaque_png, png::ColorType::Rgb),
+            ("alpha", &alpha_png, png::ColorType::Rgba),
+        ] {
+            let gif = root.join(format!("stage/{name}.gif"));
+            let out = root.join(format!("{name}.png"));
+            execute_image_batch(&ImageBatchPlan::new(
+                vec![jpeg_item(
+                    src.clone(),
+                    gif.clone(),
+                    ImageInputFormat::Png,
+                    53,
+                    37,
+                )?],
+                ImageExecutionMode::CpuGif,
+                NonZeroUsize::MIN,
+            )?)?;
+            assert_eq!(&fs::read(&gif)?[..3], b"GIF");
+            execute_image_batch(&ImageBatchPlan::new(
+                vec![jpeg_item(gif, out.clone(), ImageInputFormat::Gif, 53, 37)?],
+                ImageExecutionMode::CpuPng,
+                NonZeroUsize::MIN,
+            )?)?;
+            let decoded = decode_test_png(&out)?;
+            assert_eq!(
+                (decoded.width, decoded.height, decoded.color_type),
+                (53, 37, input_color)
+            );
+            if input_color == png::ColorType::Rgb {
+                assert_eq!(decoded.pixels, opaque);
+            } else {
+                for (i, pixel) in decoded.pixels.as_chunks::<4>().0.iter().enumerate() {
+                    assert_eq!(pixel[3], if i % 4 == 0 { 0 } else { 255 });
+                    if pixel[3] == 255 {
+                        assert_eq!(pixel[..3], transparent[i * 4..i * 4 + 3]);
+                    }
+                }
+            }
+        }
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrips_png_ico_png_and_rejects_oversized_icons() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = create_temp_dir("ico-read")?;
+        let mut opaque = Vec::new();
+        let mut transparent = Vec::new();
+        for i in 0..32_u32 * 32 {
+            let color = u8::try_from((i % 8) * 31).unwrap_or(0);
+            opaque.extend_from_slice(&[color, 255 - color, color ^ 255]);
+            transparent.extend_from_slice(&[
+                color,
+                255 - color,
+                color,
+                if i % 5 == 0 { 0 } else { 255 },
+            ]);
+        }
+        let opaque_png = root.join("opaque.png");
+        let alpha_png = root.join("alpha.png");
+        write_test_png(&opaque_png, 32, 32, png::ColorType::Rgb, &opaque)?;
+        write_test_png(&alpha_png, 32, 32, png::ColorType::Rgba, &transparent)?;
+
+        for (name, src, input_color) in [
+            ("opaque", &opaque_png, png::ColorType::Rgb),
+            ("alpha", &alpha_png, png::ColorType::Rgba),
+        ] {
+            let ico = root.join(format!("stage/{name}.ico"));
+            let out = root.join(format!("{name}.png"));
+            execute_image_batch(&ImageBatchPlan::new(
+                vec![jpeg_item(
+                    src.clone(),
+                    ico.clone(),
+                    ImageInputFormat::Png,
+                    32,
+                    32,
+                )?],
+                ImageExecutionMode::CpuIco,
+                NonZeroUsize::MIN,
+            )?)?;
+            execute_image_batch(&ImageBatchPlan::new(
+                vec![jpeg_item(ico, out.clone(), ImageInputFormat::Ico, 32, 32)?],
+                ImageExecutionMode::CpuPng,
+                NonZeroUsize::MIN,
+            )?)?;
+            let decoded = decode_test_png(&out)?;
+            assert_eq!(
+                (decoded.width, decoded.height, decoded.color_type),
+                (32, 32, input_color)
+            );
+            assert_eq!(
+                decoded.pixels,
+                if input_color == png::ColorType::Rgb {
+                    opaque.clone()
+                } else {
+                    transparent.clone()
+                }
+            );
+        }
+
+        let big_png = root.join("big.png");
+        let big_pixels = vec![32_u8; 257 * 257 * 3];
+        write_test_png(&big_png, 257, 257, png::ColorType::Rgb, &big_pixels)?;
+        let oversized = ImageBatchPlan::new(
+            vec![jpeg_item(
+                big_png,
+                root.join("big.ico"),
+                ImageInputFormat::Png,
+                257,
+                257,
+            )?],
+            ImageExecutionMode::CpuIco,
+            NonZeroUsize::MIN,
+        )?;
+        assert!(matches!(
+            execute_image_batch(&oversized),
+            Err(PipelineError::EncodeFailed { .. })
+        ));
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrips_png_all_pnm_variants_losslessly() -> Result<(), Box<dyn std::error::Error>> {
+        let root = create_temp_dir("pnm-read")?;
+        let rgb = make_rgb_gradient(53, 37);
+        let luma: Vec<u8> = (0..53_u32 * 37)
+            .map(|i| u8::try_from((i * 11) % 256).unwrap_or(0))
+            .collect();
+        let rgba: Vec<u8> = rgb
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &[r, g, b])| [r, g, b, if i % 4 == 0 { 0 } else { 255 }])
+            .collect();
+
+        let rgb_png = root.join("rgb.png");
+        let luma_png = root.join("luma.png");
+        let alpha_png = root.join("rgba.png");
+        write_test_png(&rgb_png, 53, 37, png::ColorType::Rgb, &rgb)?;
+        write_test_png(&luma_png, 53, 37, png::ColorType::Grayscale, &luma)?;
+        write_test_png(&alpha_png, 53, 37, png::ColorType::Rgba, &rgba)?;
+
+        for (name, src, expected, color) in [
+            ("out.pnm", &rgb_png, rgb.as_slice(), png::ColorType::Rgb),
+            ("out.ppm", &rgb_png, rgb.as_slice(), png::ColorType::Rgb),
+            (
+                "out.pgm",
+                &luma_png,
+                luma.as_slice(),
+                png::ColorType::Grayscale,
+            ),
+            ("out.pam", &alpha_png, rgba.as_slice(), png::ColorType::Rgba),
+        ] {
+            let pnm = root.join(format!("stage/{name}"));
+            let out = root.join(format!("{name}.png"));
+            execute_image_batch(&ImageBatchPlan::new(
+                vec![jpeg_item(
+                    src.clone(),
+                    pnm.clone(),
+                    ImageInputFormat::Png,
+                    53,
+                    37,
+                )?],
+                ImageExecutionMode::CpuPnm,
+                NonZeroUsize::MIN,
+            )?)?;
+            execute_image_batch(&ImageBatchPlan::new(
+                vec![jpeg_item(pnm, out.clone(), ImageInputFormat::Pnm, 53, 37)?],
+                ImageExecutionMode::CpuPng,
+                NonZeroUsize::MIN,
+            )?)?;
+            let decoded = decode_test_png(&out)?;
+            assert_eq!(
+                (decoded.width, decoded.height, decoded.color_type),
+                (53, 37, color),
+                "{name} metadata"
+            );
+            assert_eq!(decoded.pixels, expected, "{name} pixels");
+        }
 
         fs::remove_dir_all(&root)?;
         Ok(())

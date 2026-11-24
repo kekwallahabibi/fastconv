@@ -60,6 +60,10 @@ pub enum ImageInputFormat {
     Qoi,
     Tiff,
     Jxl,
+    Avif,
+    Gif,
+    Ico,
+    Pnm,
 }
 
 impl ImageInputFormat {
@@ -73,6 +77,10 @@ impl ImageInputFormat {
             Self::Qoi => "qoi",
             Self::Tiff => "tiff",
             Self::Jxl => "jxl",
+            Self::Avif => "avif",
+            Self::Gif => "gif",
+            Self::Ico => "ico",
+            Self::Pnm => "pnm",
         }
     }
 }
@@ -95,6 +103,9 @@ pub enum ImageOutputFormat {
     Tiff,
     Jxl,
     Avif,
+    Gif,
+    Ico,
+    Pnm,
 }
 
 impl ImageOutputFormat {
@@ -110,6 +121,9 @@ impl ImageOutputFormat {
             Self::Tiff => "tiff",
             Self::Jxl => "jxl",
             Self::Avif => "avif",
+            Self::Gif => "gif",
+            Self::Ico => "ico",
+            Self::Pnm => "pnm",
         }
     }
 }
@@ -173,9 +187,9 @@ impl fmt::Display for ImageCompression {
 
 /// Compile-time-legal combination of output image format, codec mode, and hardware backend.
 ///
-/// Illegal pairings (e.g. NVENC + WebP/JPEG/PNG/BMP/QOI/TIFF/JXL/AVIF, Vulkan + images,
-/// CPU + HEIC, lossless + JPEG/HEIC/AVIF, lossy quality + PNG/BMP/QOI/TIFF, or
-/// hardware-absent video encoder backends) cannot be constructed.
+/// Illegal pairings (e.g. NVENC + WebP/JPEG/PNG/BMP/QOI/TIFF/JXL/AVIF/GIF/ICO/PNM,
+/// Vulkan + images, CPU + HEIC, lossless + JPEG/HEIC/AVIF/GIF, lossy quality +
+/// PNG/BMP/QOI/TIFF/ICO/PNM, or hardware-absent video encoder backends) cannot be constructed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum ImageExecutionMode {
     CpuWebp(ImageCompression),
@@ -186,6 +200,9 @@ pub enum ImageExecutionMode {
     CpuTiff,
     CpuJxl(ImageCompression),
     CpuAvif { quality: ImageQuality },
+    CpuGif,
+    CpuIco,
+    CpuPnm,
     NvencHeic { quality: ImageQuality },
 }
 
@@ -193,7 +210,8 @@ impl ImageExecutionMode {
     /// Resolves a CPU-only [`ImageExecutionMode`] for `format` without probing GPU hardware.
     ///
     /// When `compression` is `None`, selects the natural default for `format` (lossy quality 80
-    /// for WebP/JPEG/JXL/AVIF, lossless for PNG/BMP/QOI/TIFF).
+    /// for WebP/JPEG/JXL/AVIF, lossless for PNG/BMP/QOI/TIFF/ICO/PNM, and indexed 256-color
+    /// quantization for GIF).
     ///
     /// # Errors
     ///
@@ -246,6 +264,25 @@ impl ImageExecutionMode {
                             .to_owned(),
                 }),
             },
+            ImageOutputFormat::Gif => match compression {
+                None => Ok(Self::CpuGif),
+                Some(ImageCompression::Lossy { .. }) => Err(DomainError::UnsupportedImagePipeline {
+                    format,
+                    backend: HardwareBackend::Cpu,
+                    reason: "GIF uses fixed 256-color palette quantization and does not accept --quality; omit --quality".to_owned(),
+                }),
+                Some(ImageCompression::Lossless) => Err(DomainError::UnsupportedImagePipeline {
+                    format,
+                    backend: HardwareBackend::Cpu,
+                    reason: "GIF is limited to a 256-color palette and cannot guarantee lossless encoding for truecolor images; omit --lossless".to_owned(),
+                }),
+            },
+            ImageOutputFormat::Ico => {
+                resolve_lossless_only_cpu(format, "ICO", compression, Self::CpuIco)
+            }
+            ImageOutputFormat::Pnm => {
+                resolve_lossless_only_cpu(format, "PNM", compression, Self::CpuPnm)
+            }
             ImageOutputFormat::Heic => Err(DomainError::UnsupportedImagePipeline {
                 format,
                 backend: HardwareBackend::Cpu,
@@ -295,6 +332,15 @@ impl ImageExecutionMode {
             (ImageOutputFormat::Avif, HardwareBackend::Gpu(GpuBackend::Nvenc)) => Err(
                 nvenc_unsupported_image_error(format, "AV1/AVIF still images", ".avif", hardware),
             ),
+            (ImageOutputFormat::Gif, HardwareBackend::Gpu(GpuBackend::Nvenc)) => Err(
+                nvenc_unsupported_image_error(format, "GIF", ".gif", hardware),
+            ),
+            (ImageOutputFormat::Ico, HardwareBackend::Gpu(GpuBackend::Nvenc)) => Err(
+                nvenc_unsupported_image_error(format, "ICO", ".ico", hardware),
+            ),
+            (ImageOutputFormat::Pnm, HardwareBackend::Gpu(GpuBackend::Nvenc)) => Err(
+                nvenc_unsupported_image_error(format, "PNM", ".pnm", hardware),
+            ),
             (ImageOutputFormat::Heic, HardwareBackend::Gpu(GpuBackend::Nvenc)) => {
                 if !hardware.supports_video_encode(GpuBackend::Nvenc) {
                     return Err(DomainError::UnsupportedImagePipeline {
@@ -337,6 +383,9 @@ impl ImageExecutionMode {
             Self::CpuTiff => ImageOutputFormat::Tiff,
             Self::CpuJxl(_) => ImageOutputFormat::Jxl,
             Self::CpuAvif { .. } => ImageOutputFormat::Avif,
+            Self::CpuGif => ImageOutputFormat::Gif,
+            Self::CpuIco => ImageOutputFormat::Ico,
+            Self::CpuPnm => ImageOutputFormat::Pnm,
             Self::NvencHeic { .. } => ImageOutputFormat::Heic,
         }
     }
@@ -351,7 +400,10 @@ impl ImageExecutionMode {
             | Self::CpuQoi
             | Self::CpuTiff
             | Self::CpuJxl(_)
-            | Self::CpuAvif { .. } => HardwareBackend::Cpu,
+            | Self::CpuAvif { .. }
+            | Self::CpuGif
+            | Self::CpuIco
+            | Self::CpuPnm => HardwareBackend::Cpu,
             Self::NvencHeic { .. } => HardwareBackend::Gpu(GpuBackend::Nvenc),
         }
     }
@@ -368,6 +420,9 @@ impl fmt::Display for ImageExecutionMode {
             Self::CpuTiff => f.write_str("tiff lossless"),
             Self::CpuJxl(compression) => write!(f, "jxl {compression}"),
             Self::CpuAvif { quality } => write!(f, "avif av1 q={}", quality.get()),
+            Self::CpuGif => f.write_str("gif indexed"),
+            Self::CpuIco => f.write_str("ico lossless"),
+            Self::CpuPnm => f.write_str("pnm lossless"),
             Self::NvencHeic { quality } => {
                 write!(f, "heic hevc-intra q={}", quality.get())
             }
@@ -1242,6 +1297,235 @@ mod tests {
             ),
             Err(DomainError::EmptyPath(PathRole::Source))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn new_image_formats_report_extensions_and_display() {
+        for (format, ext) in [
+            (ImageInputFormat::Avif, "avif"),
+            (ImageInputFormat::Gif, "gif"),
+            (ImageInputFormat::Ico, "ico"),
+            (ImageInputFormat::Pnm, "pnm"),
+        ] {
+            assert_eq!(format.extension(), ext);
+            assert_eq!(format.to_string(), ext);
+        }
+
+        for (format, ext) in [
+            (ImageOutputFormat::Gif, "gif"),
+            (ImageOutputFormat::Ico, "ico"),
+            (ImageOutputFormat::Pnm, "pnm"),
+        ] {
+            assert_eq!(format.extension(), ext);
+            assert_eq!(format.to_string(), ext);
+        }
+    }
+
+    #[test]
+    fn resolves_gif_indexed_mode_and_rejects_incompatible_requests() -> Result<(), DomainError> {
+        let rtx = rtx_2060_hardware()?;
+        let cpu_only = cpu_only_hardware()?;
+        let lossy = Some(ImageCompression::Lossy {
+            quality: ImageQuality::DEFAULT,
+        });
+
+        assert_eq!(
+            ImageExecutionMode::resolve(
+                ImageOutputFormat::Gif,
+                None,
+                HardwareBackend::Cpu,
+                &cpu_only
+            )?,
+            ImageExecutionMode::CpuGif
+        );
+        assert_eq!(
+            ImageExecutionMode::CpuGif.output_format(),
+            ImageOutputFormat::Gif
+        );
+        assert_eq!(ImageExecutionMode::CpuGif.backend(), HardwareBackend::Cpu);
+        assert_eq!(ImageExecutionMode::CpuGif.to_string(), "gif indexed");
+
+        for (compression, needle) in [
+            (lossy, "--quality"),
+            (Some(ImageCompression::Lossless), "--lossless"),
+        ] {
+            let rejected = ImageExecutionMode::resolve(
+                ImageOutputFormat::Gif,
+                compression,
+                HardwareBackend::Cpu,
+                &cpu_only,
+            );
+            assert!(matches!(
+                rejected,
+                Err(DomainError::UnsupportedImagePipeline {
+                    format: ImageOutputFormat::Gif,
+                    backend: HardwareBackend::Cpu,
+                    ref reason,
+                }) if reason.contains(needle)
+            ));
+        }
+
+        let nvenc = ImageExecutionMode::resolve(
+            ImageOutputFormat::Gif,
+            None,
+            HardwareBackend::Gpu(GpuBackend::Nvenc),
+            &rtx,
+        );
+        assert!(matches!(
+            nvenc,
+            Err(DomainError::UnsupportedImagePipeline {
+                format: ImageOutputFormat::Gif,
+                backend: HardwareBackend::Gpu(GpuBackend::Nvenc),
+                ref reason,
+            }) if reason.contains("GIF") && reason.contains(".gif")
+        ));
+
+        let vulkan = ImageExecutionMode::resolve(
+            ImageOutputFormat::Gif,
+            None,
+            HardwareBackend::Gpu(GpuBackend::Vulkan),
+            &rtx,
+        );
+        assert!(matches!(
+            vulkan,
+            Err(DomainError::UnsupportedImagePipeline {
+                format: ImageOutputFormat::Gif,
+                backend: HardwareBackend::Gpu(GpuBackend::Vulkan),
+                ref reason,
+            }) if reason.contains("only exposes compute")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_ico_and_pnm_lossless_modes_and_rejects_incompatible_requests()
+    -> Result<(), DomainError> {
+        let rtx = rtx_2060_hardware()?;
+        let cpu_only = cpu_only_hardware()?;
+        let lossy = Some(ImageCompression::Lossy {
+            quality: ImageQuality::DEFAULT,
+        });
+
+        for (format, mode, label, ext, display) in [
+            (
+                ImageOutputFormat::Ico,
+                ImageExecutionMode::CpuIco,
+                "ICO",
+                ".ico",
+                "ico lossless",
+            ),
+            (
+                ImageOutputFormat::Pnm,
+                ImageExecutionMode::CpuPnm,
+                "PNM",
+                ".pnm",
+                "pnm lossless",
+            ),
+        ] {
+            assert_eq!(
+                ImageExecutionMode::resolve(format, None, HardwareBackend::Cpu, &cpu_only)?,
+                mode
+            );
+            assert_eq!(
+                ImageExecutionMode::resolve(
+                    format,
+                    Some(ImageCompression::Lossless),
+                    HardwareBackend::Cpu,
+                    &cpu_only
+                )?,
+                mode
+            );
+            assert_eq!(mode.output_format(), format);
+            assert_eq!(mode.backend(), HardwareBackend::Cpu);
+            assert_eq!(mode.to_string(), display);
+
+            let quality_rejected =
+                ImageExecutionMode::resolve(format, lossy, HardwareBackend::Cpu, &cpu_only);
+            assert!(matches!(
+                quality_rejected,
+                Err(DomainError::UnsupportedImagePipeline {
+                    format: rejected_format,
+                    backend: HardwareBackend::Cpu,
+                    ref reason,
+                }) if rejected_format == format && reason.contains("--quality")
+            ));
+
+            let nvenc = ImageExecutionMode::resolve(
+                format,
+                None,
+                HardwareBackend::Gpu(GpuBackend::Nvenc),
+                &rtx,
+            );
+            assert!(matches!(
+                nvenc,
+                Err(DomainError::UnsupportedImagePipeline {
+                    format: rejected_format,
+                    backend: HardwareBackend::Gpu(GpuBackend::Nvenc),
+                    ref reason,
+                }) if rejected_format == format && reason.contains(label) && reason.contains(ext)
+            ));
+
+            let vulkan = ImageExecutionMode::resolve(
+                format,
+                None,
+                HardwareBackend::Gpu(GpuBackend::Vulkan),
+                &rtx,
+            );
+            assert!(matches!(
+                vulkan,
+                Err(DomainError::UnsupportedImagePipeline {
+                    format: rejected_format,
+                    backend: HardwareBackend::Gpu(GpuBackend::Vulkan),
+                    ref reason,
+                }) if rejected_format == format && reason.contains("only exposes compute")
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn constructs_batch_with_new_image_input_formats() -> Result<(), DomainError> {
+        let dims = ImageDimensions::new(640, 480)?;
+        let valid_items = vec![
+            ImageBatchItem::new(
+                PathBuf::from("a.avif"),
+                PathBuf::from("out/a.gif"),
+                ImageInputFormat::Avif,
+                dims,
+            )?,
+            ImageBatchItem::new(
+                PathBuf::from("b.gif"),
+                PathBuf::from("out/b.gif"),
+                ImageInputFormat::Gif,
+                dims,
+            )?,
+            ImageBatchItem::new(
+                PathBuf::from("c.ico"),
+                PathBuf::from("out/c.gif"),
+                ImageInputFormat::Ico,
+                dims,
+            )?,
+            ImageBatchItem::new(
+                PathBuf::from("d.pnm"),
+                PathBuf::from("out/d.gif"),
+                ImageInputFormat::Pnm,
+                dims,
+            )?,
+        ];
+        let plan = ImageBatchPlan::new(
+            valid_items,
+            ImageExecutionMode::CpuGif,
+            NonZeroUsize::new(8).ok_or(DomainError::EmptyBatch)?,
+        )?;
+
+        assert_eq!(plan.items().len(), 4);
+        assert_eq!(plan.items()[0].input_format(), ImageInputFormat::Avif);
+        assert_eq!(plan.items()[1].input_format(), ImageInputFormat::Gif);
+        assert_eq!(plan.items()[2].input_format(), ImageInputFormat::Ico);
+        assert_eq!(plan.items()[3].input_format(), ImageInputFormat::Pnm);
+        assert_eq!(plan.output_format(), ImageOutputFormat::Gif);
+        assert_eq!(plan.backend(), HardwareBackend::Cpu);
         Ok(())
     }
 }

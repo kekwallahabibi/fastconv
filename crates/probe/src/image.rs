@@ -1,6 +1,6 @@
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read, Seek, SeekFrom};
-use std::num::NonZeroUsize;
+use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom};
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
 use fastconv_domain::{
@@ -27,11 +27,18 @@ const TIFF_LE_MAGIC: [u8; 4] = *b"II*\0";
 const TIFF_BE_MAGIC: [u8; 4] = *b"MM\0*";
 // 512 Mi samples = 512 MiB RGBA8; keeps a hostile JXL header from forcing huge allocations.
 const MAX_JXL_SAMPLES: usize = 512 * 1024 * 1024;
+const GIF87A_MAGIC: [u8; 6] = *b"GIF87a";
+const GIF89A_MAGIC: [u8; 6] = *b"GIF89a";
+const ICO_MAGIC: [u8; 4] = [0x00, 0x00, 0x01, 0x00];
+// 128 Mi pixels = 512 MiB RGBA8 budget, matching `MAX_QOI_PIXELS`.
+const MAX_STILL_IMAGE_PIXELS: u64 = 128 * 1024 * 1024;
+const MAX_GIF_DECODE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PNM_HEADER_BYTES: usize = 64 * 1024;
 const KNOWN_IMAGE_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "webp", "bmp", "qoi", "tif", "tiff", "jxl",
+    "png", "jpg", "jpeg", "webp", "bmp", "qoi", "tif", "tiff", "jxl", "avif", "gif", "ico", "pnm",
+    "pbm", "pgm", "ppm", "pam",
 ];
-const UNRECOGNIZED_MAGIC_REASON: &str =
-    "unrecognized image magic bytes (expected PNG, JPEG, WebP, BMP, QOI, TIFF, or JPEG XL)";
+const UNRECOGNIZED_MAGIC_REASON: &str = "unrecognized image magic bytes (expected PNG, JPEG, WebP, BMP, QOI, TIFF, JPEG XL, AVIF, GIF, ICO, or PNM)";
 
 /// Detected input container format and validated pixel dimensions from image headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +51,130 @@ fn is_known_bmp_dib_size(size: u32) -> bool {
     matches!(size, 12 | 40 | 52 | 56 | 108 | 124)
 }
 
-fn sniff_magic_format(header: &[u8], strict_bmp_dib: bool) -> Option<ImageInputFormat> {
+/// Only ISOBMFF files carrying an `avif`/`avis` brand are still/animated AVIF.
+/// MP4 (`isom`/`mp4*`/`avc1`), MOV (`qt  `) and HEIC (`heic`/`mif1`/`miaf`)
+/// deliberately fall through so videos never enter the image pipeline.
+fn is_avif_ftyp(header: &[u8]) -> bool {
+    if header.len() < 16 || &header[4..8] != b"ftyp" {
+        return false;
+    }
+    let box_size = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    let (brand_start, box_end) = if box_size == 1 {
+        if header.len() < 24 {
+            return false;
+        }
+        (16_usize, header.len())
+    } else if box_size == 0 {
+        (8_usize, header.len())
+    } else {
+        if box_size < 16 {
+            return false;
+        }
+        (
+            8_usize,
+            usize::try_from(box_size)
+                .unwrap_or(header.len())
+                .min(header.len()),
+        )
+    };
+    if matches!(
+        header.get(brand_start..brand_start + 4),
+        Some(b"avif" | b"avis")
+    ) {
+        return true;
+    }
+    let mut offset = brand_start + 8;
+    while offset + 4 <= box_end {
+        if matches!(header.get(offset..offset + 4), Some(b"avif" | b"avis")) {
+            return true;
+        }
+        offset += 4;
+    }
+    false
+}
+
+fn is_ico_header(header: &[u8], strict_ambiguous: bool) -> bool {
+    if !header.starts_with(&ICO_MAGIC) || header.len() < 6 {
+        return false;
+    }
+    if !strict_ambiguous {
+        return true;
+    }
+    if header.len() < 22 {
+        return false;
+    }
+    let count = u16::from_le_bytes([header[4], header[5]]);
+    if count < 1 || header[9] != 0 {
+        return false;
+    }
+    let data_size = u32::from_le_bytes([header[14], header[15], header[16], header[17]]);
+    if data_size == 0 {
+        return false;
+    }
+    let data_offset = u32::from_le_bytes([header[18], header[19], header[20], header[21]]);
+    let directory_end = 6_u64 + 16_u64 * u64::from(count);
+    u64::from(data_offset) >= directory_end
+}
+
+fn skip_pnm_whitespace_and_comments(buf: &[u8], pos: &mut usize) {
+    loop {
+        match buf.get(*pos) {
+            Some(b' ' | b'\t' | b'\r' | b'\n' | 0x0B | 0x0C) => *pos += 1,
+            Some(b'#') => {
+                while let Some(&byte) = buf.get(*pos) {
+                    *pos += 1;
+                    if byte == b'\n' {
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+}
+
+fn is_pnm_header(header: &[u8], strict_ambiguous: bool) -> bool {
+    if header.len() < 3 || header[0] != b'P' || !matches!(header[1], b'1'..=b'7') {
+        return false;
+    }
+    if header[1] == b'7' {
+        let rest = if header[2] == b'\n' {
+            &header[3..]
+        } else if header.len() >= 4 && header[2] == b'\r' && header[3] == b'\n' {
+            &header[4..]
+        } else {
+            return false;
+        };
+        if !strict_ambiguous {
+            return true;
+        }
+        let mut pos = 0_usize;
+        skip_pnm_whitespace_and_comments(rest, &mut pos);
+        return rest.get(pos..).is_some_and(|tail| {
+            [
+                b"WIDTH".as_slice(),
+                b"HEIGHT",
+                b"DEPTH",
+                b"MAXVAL",
+                b"TUPLTYPE",
+                b"ENDHDR",
+            ]
+            .iter()
+            .any(|key| tail.starts_with(key))
+        });
+    }
+    if !matches!(header[2], b' ' | b'\t' | b'\r' | b'\n' | b'#') {
+        return false;
+    }
+    if !strict_ambiguous {
+        return true;
+    }
+    let mut pos = 2_usize;
+    skip_pnm_whitespace_and_comments(header, &mut pos);
+    header.get(pos).is_some_and(u8::is_ascii_digit)
+}
+
+fn sniff_magic_format(header: &[u8], strict_ambiguous: bool) -> Option<ImageInputFormat> {
     if header.starts_with(&PNG_MAGIC) {
         Some(ImageInputFormat::Png)
     } else if header.starts_with(&JPEG_MAGIC) {
@@ -56,7 +186,7 @@ fn sniff_magic_format(header: &[u8], strict_bmp_dib: bool) -> Option<ImageInputF
     } else if header.starts_with(&QOI_MAGIC) {
         Some(ImageInputFormat::Qoi)
     } else if header.starts_with(&BMP_MAGIC) {
-        if !strict_bmp_dib {
+        if !strict_ambiguous {
             return Some(ImageInputFormat::Bmp);
         }
         let dib_bytes = header.get(14..18)?;
@@ -69,13 +199,21 @@ fn sniff_magic_format(header: &[u8], strict_bmp_dib: bool) -> Option<ImageInputF
         jxl::api::JxlSignature::Codestream | jxl::api::JxlSignature::Container
     ) {
         Some(ImageInputFormat::Jxl)
+    } else if is_avif_ftyp(header) {
+        Some(ImageInputFormat::Avif)
+    } else if header.starts_with(&GIF87A_MAGIC) || header.starts_with(&GIF89A_MAGIC) {
+        Some(ImageInputFormat::Gif)
+    } else if is_ico_header(header, strict_ambiguous) {
+        Some(ImageInputFormat::Ico)
+    } else if is_pnm_header(header, strict_ambiguous) {
+        Some(ImageInputFormat::Pnm)
     } else {
         None
     }
 }
 
-fn read_magic_prefix(file: &mut File, path: &Path) -> Result<([u8; 18], usize), ProbeError> {
-    let mut buf = [0_u8; 18];
+fn read_magic_prefix(file: &mut File, path: &Path) -> Result<([u8; 64], usize), ProbeError> {
+    let mut buf = [0_u8; 64];
     let mut filled = 0_usize;
     while filled < buf.len() {
         let slot = buf
@@ -709,6 +847,489 @@ fn probe_qoi(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError
     Ok(dims)
 }
 
+fn probe_avif(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+    let config = zenavif_parse::DecodeConfig::default()
+        .lenient(true)
+        .with_peak_memory_limit(512 * 1024 * 1024)
+        .with_total_megapixels_limit(128);
+    let mut reader = BufReader::new(file);
+    let parser = zenavif_parse::AvifParser::from_reader_with_config(
+        &mut reader,
+        &config,
+        &zenavif_parse::Unstoppable,
+    )
+    .map_err(|err| invalid_image(path, format!("invalid AVIF container: {err}")))?;
+    if parser.major_brand() == b"avis" || parser.animation_info().is_some() {
+        return Err(invalid_image(
+            path,
+            "animated AVIF is not supported by the still-image pipeline",
+        ));
+    }
+    let (width, height) = if let Some(grid) = parser.grid_config() {
+        (grid.output_width, grid.output_height)
+    } else {
+        let meta = parser
+            .primary_metadata()
+            .map_err(|err| invalid_image(path, format!("invalid AVIF primary item: {err}")))?;
+        (meta.max_frame_width.get(), meta.max_frame_height.get())
+    };
+    let pixel_count = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| invalid_image(path, "AVIF dimensions overflow pixel count"))?;
+    if pixel_count > MAX_STILL_IMAGE_PIXELS {
+        return Err(invalid_image(
+            path,
+            format!(
+                "AVIF pixel count ({pixel_count}) exceeds {MAX_STILL_IMAGE_PIXELS}-pixel limit"
+            ),
+        ));
+    }
+    Ok(ImageDimensions::new(width, height)?)
+}
+
+fn probe_gif(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+    let mut options = gif::DecodeOptions::new();
+    options.set_memory_limit(gif::MemoryLimit::Bytes(
+        NonZeroU64::new(MAX_GIF_DECODE_BYTES).unwrap_or(NonZeroU64::MIN),
+    ));
+    options.skip_frame_decoding(true);
+    let mut decoder = options
+        .read_info(BufReader::new(file))
+        .map_err(|err| invalid_image(path, format!("invalid GIF header: {err}")))?;
+    let width = u32::from(decoder.width());
+    let height = u32::from(decoder.height());
+    let dims = ImageDimensions::new(width, height)?;
+    let pixel_count = u64::from(width) * u64::from(height);
+    if pixel_count > MAX_STILL_IMAGE_PIXELS {
+        return Err(invalid_image(
+            path,
+            format!("GIF pixel count ({pixel_count}) exceeds {MAX_STILL_IMAGE_PIXELS}-pixel limit"),
+        ));
+    }
+    if decoder
+        .next_frame_info()
+        .map_err(|err| invalid_image(path, format!("invalid GIF frame: {err}")))?
+        .is_none()
+    {
+        return Err(invalid_image(path, "GIF contains no image frames"));
+    }
+    if decoder
+        .next_frame_info()
+        .map_err(|err| invalid_image(path, format!("invalid GIF frame: {err}")))?
+        .is_some()
+    {
+        return Err(invalid_image(
+            path,
+            "animated GIF is not supported by the still-image pipeline",
+        ));
+    }
+    Ok(dims)
+}
+
+fn probe_ico(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+    let icon_dir = ico::IconDir::read(BufReader::new(file))
+        .map_err(|err| invalid_image(path, format!("invalid ICO container: {err}")))?;
+    if icon_dir.resource_type() != ico::ResourceType::Icon {
+        return Err(invalid_image(
+            path,
+            "CUR cursor files are not supported (expected ICO icon resource)",
+        ));
+    }
+    let mut best: Option<&ico::IconDirEntry> = None;
+    for entry in icon_dir.entries() {
+        let score = (
+            u64::from(entry.width()).saturating_mul(u64::from(entry.height())),
+            entry.bits_per_pixel(),
+        );
+        let select = match best {
+            None => true,
+            Some(current) => {
+                let current_score = (
+                    u64::from(current.width()).saturating_mul(u64::from(current.height())),
+                    current.bits_per_pixel(),
+                );
+                score > current_score
+            }
+        };
+        if select {
+            best = Some(entry);
+        }
+    }
+    let entry =
+        best.ok_or_else(|| invalid_image(path, "ICO container contains no icon entries"))?;
+    if entry.data().is_empty() {
+        return Err(invalid_image(path, "ICO icon entry has no image data"));
+    }
+    if entry.is_png() {
+        let decoder = png::Decoder::new(Cursor::new(entry.data()));
+        let reader = decoder
+            .read_info()
+            .map_err(|err| invalid_image(path, format!("invalid embedded ICO PNG: {err}")))?;
+        let info = reader.info();
+        if info.width != entry.width() || info.height != entry.height() {
+            return Err(invalid_image(
+                path,
+                format!(
+                    "embedded ICO PNG is {}x{} but directory entry declares {}x{}",
+                    info.width,
+                    info.height,
+                    entry.width(),
+                    entry.height()
+                ),
+            ));
+        }
+    } else {
+        let data = entry.data();
+        if data.len() < 40 {
+            return Err(invalid_image(path, "truncated embedded ICO BMP DIB header"));
+        }
+        let dib_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        if dib_size != 40 {
+            return Err(invalid_image(
+                path,
+                format!("unsupported embedded ICO BMP DIB header size {dib_size} (expected 40)"),
+            ));
+        }
+    }
+    let pixel_count = u64::from(entry.width()).saturating_mul(u64::from(entry.height()));
+    if pixel_count > MAX_STILL_IMAGE_PIXELS {
+        return Err(invalid_image(
+            path,
+            format!("ICO pixel count ({pixel_count}) exceeds {MAX_STILL_IMAGE_PIXELS}-pixel limit"),
+        ));
+    }
+    Ok(ImageDimensions::new(entry.width(), entry.height())?)
+}
+
+fn parse_pnm_number(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let start = *pos;
+    let mut value = 0_u64;
+    while let Some(byte @ b'0'..=b'9') = buf.get(*pos) {
+        value = value
+            .checked_mul(10)?
+            .checked_add(u64::from(*byte - b'0'))?;
+        *pos += 1;
+    }
+    (*pos > start).then_some(value)
+}
+
+fn parse_pnm_maxval(buf: &[u8], pos: &mut usize, path: &Path) -> Result<u64, ProbeError> {
+    skip_pnm_whitespace_and_comments(buf, pos);
+    let maxval =
+        parse_pnm_number(buf, pos).ok_or_else(|| invalid_image(path, "missing PNM maxval"))?;
+    if !(1..=65535).contains(&maxval) {
+        return Err(invalid_image(
+            path,
+            format!("invalid PNM maxval {maxval} (expected 1..=65535)"),
+        ));
+    }
+    Ok(maxval)
+}
+
+/// Binary PNM headers terminate their final token with exactly one whitespace
+/// byte (or a `#` comment whose terminating `\n` serves as that byte); raster
+/// data begins immediately afterwards.
+fn consume_pnm_token_terminator(buf: &[u8], pos: &mut usize) -> bool {
+    match buf.get(*pos) {
+        Some(b'#') => {
+            let mut saw_newline = false;
+            while let Some(&byte) = buf.get(*pos) {
+                *pos += 1;
+                if byte == b'\n' {
+                    saw_newline = true;
+                    break;
+                }
+            }
+            saw_newline
+        }
+        Some(b' ' | b'\t' | b'\r' | b'\n' | 0x0B | 0x0C) => {
+            *pos += 1;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn pnm_dimensions(path: &Path, width: u64, height: u64) -> Result<ImageDimensions, ProbeError> {
+    let width = u32::try_from(width).map_err(|_| invalid_image(path, "PNM width is too large"))?;
+    let height =
+        u32::try_from(height).map_err(|_| invalid_image(path, "PNM height is too large"))?;
+    let pixel_count = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| invalid_image(path, "PNM dimensions overflow pixel count"))?;
+    if pixel_count > MAX_STILL_IMAGE_PIXELS {
+        return Err(invalid_image(
+            path,
+            format!("PNM pixel count ({pixel_count}) exceeds {MAX_STILL_IMAGE_PIXELS}-pixel limit"),
+        ));
+    }
+    Ok(ImageDimensions::new(width, height)?)
+}
+
+fn parse_exact_pnm_number(slice: &[u8]) -> Option<u64> {
+    let trimmed = slice.trim_ascii();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut pos = 0_usize;
+    let value = parse_pnm_number(trimmed, &mut pos)?;
+    (pos == trimmed.len()).then_some(value)
+}
+
+struct PamHeaderFields {
+    width: u64,
+    height: u64,
+    depth: u64,
+    maxval: u64,
+    raster_offset: usize,
+}
+
+fn parse_pam_header_fields(buf: &[u8], path: &Path) -> Result<PamHeaderFields, ProbeError> {
+    if !buf.starts_with(b"P7\n") && !buf.starts_with(b"P7\r\n") {
+        return Err(invalid_image(
+            path,
+            "invalid PAM header signature (expected P7\\n)",
+        ));
+    }
+    let mut pos = if buf.starts_with(b"P7\r\n") { 4 } else { 3 };
+    let mut width = None;
+    let mut height = None;
+    let mut depth = None;
+    let mut maxval = None;
+    let mut endhdr = false;
+
+    while pos < buf.len() {
+        let Some(eol_offset) = buf[pos..].iter().position(|&byte| byte == b'\n') else {
+            break;
+        };
+        let eol = pos + eol_offset;
+        let mut line = &buf[pos..eol];
+        pos = eol + 1;
+        if line.last() == Some(&b'\r') {
+            line = &line[..line.len() - 1];
+        }
+        if line.is_empty() || line.first() == Some(&b'#') {
+            continue;
+        }
+        let split = line
+            .iter()
+            .position(|byte| matches!(byte, b' ' | b'\t' | 0x0B | 0x0C))
+            .unwrap_or(line.len());
+        let key = &line[..split];
+        let rest = &line[split..];
+        match key {
+            b"WIDTH" => {
+                width = Some(
+                    parse_exact_pnm_number(rest)
+                        .ok_or_else(|| invalid_image(path, "invalid PAM WIDTH value"))?,
+                );
+            }
+            b"HEIGHT" => {
+                height = Some(
+                    parse_exact_pnm_number(rest)
+                        .ok_or_else(|| invalid_image(path, "invalid PAM HEIGHT value"))?,
+                );
+            }
+            b"DEPTH" => {
+                depth = Some(
+                    parse_exact_pnm_number(rest)
+                        .ok_or_else(|| invalid_image(path, "invalid PAM DEPTH value"))?,
+                );
+            }
+            b"MAXVAL" => {
+                maxval = Some(
+                    parse_exact_pnm_number(rest)
+                        .ok_or_else(|| invalid_image(path, "invalid PAM MAXVAL value"))?,
+                );
+            }
+            b"TUPLTYPE" => {}
+            b"ENDHDR" => {
+                if !rest.trim_ascii().is_empty() {
+                    return Err(invalid_image(
+                        path,
+                        "unexpected trailing tokens on PAM ENDHDR line",
+                    ));
+                }
+                endhdr = true;
+                break;
+            }
+            other => {
+                return Err(invalid_image(
+                    path,
+                    format!("unknown PAM header key: {}", String::from_utf8_lossy(other)),
+                ));
+            }
+        }
+    }
+    if !endhdr {
+        return Err(invalid_image(path, "PAM header is missing ENDHDR"));
+    }
+    Ok(PamHeaderFields {
+        width: width.ok_or_else(|| invalid_image(path, "PAM header is missing WIDTH"))?,
+        height: height.ok_or_else(|| invalid_image(path, "PAM header is missing HEIGHT"))?,
+        depth: depth.ok_or_else(|| invalid_image(path, "PAM header is missing DEPTH"))?,
+        maxval: maxval.ok_or_else(|| invalid_image(path, "PAM header is missing MAXVAL"))?,
+        raster_offset: pos,
+    })
+}
+
+fn probe_pam(buf: &[u8], file_len: u64, path: &Path) -> Result<ImageDimensions, ProbeError> {
+    let fields = parse_pam_header_fields(buf, path)?;
+    if !(1..=4).contains(&fields.depth) {
+        return Err(invalid_image(
+            path,
+            format!("invalid PAM DEPTH {} (expected 1..=4)", fields.depth),
+        ));
+    }
+    if !(1..=65535).contains(&fields.maxval) {
+        return Err(invalid_image(
+            path,
+            format!("invalid PAM MAXVAL {} (expected 1..=65535)", fields.maxval),
+        ));
+    }
+    let dims = pnm_dimensions(path, fields.width, fields.height)?;
+    let sample_bytes = if fields.maxval > 255 { 2_u64 } else { 1_u64 };
+    let pixel_count = u64::from(dims.width().get()) * u64::from(dims.height().get());
+    let raster_bytes = pixel_count
+        .checked_mul(fields.depth)
+        .and_then(|bytes| bytes.checked_mul(sample_bytes))
+        .ok_or_else(|| invalid_image(path, "PAM raster size overflow"))?;
+    let needed = u64::try_from(fields.raster_offset)
+        .map_err(|_| invalid_image(path, "PAM header size overflow"))?
+        .checked_add(raster_bytes)
+        .ok_or_else(|| invalid_image(path, "PAM total size overflow"))?;
+    if needed > file_len {
+        return Err(invalid_image(
+            path,
+            format!("truncated PAM raster (need {needed} bytes, file has {file_len})"),
+        ));
+    }
+    Ok(dims)
+}
+
+fn validate_pnm_raster(
+    header_len: usize,
+    raster_bytes: u64,
+    file_len: u64,
+    path: &Path,
+) -> Result<(), ProbeError> {
+    let header_len =
+        u64::try_from(header_len).map_err(|_| invalid_image(path, "PNM header size overflow"))?;
+    let needed = header_len
+        .checked_add(raster_bytes)
+        .ok_or_else(|| invalid_image(path, "PNM total size overflow"))?;
+    if needed > file_len {
+        return Err(invalid_image(
+            path,
+            format!("truncated PNM raster (need {needed} bytes, file has {file_len})"),
+        ));
+    }
+    Ok(())
+}
+
+fn probe_pnm_standard(
+    buf: &[u8],
+    file_len: u64,
+    path: &Path,
+    variant: u8,
+) -> Result<ImageDimensions, ProbeError> {
+    let mut pos = 2_usize;
+    skip_pnm_whitespace_and_comments(buf, &mut pos);
+    let width =
+        parse_pnm_number(buf, &mut pos).ok_or_else(|| invalid_image(path, "missing PNM width"))?;
+    skip_pnm_whitespace_and_comments(buf, &mut pos);
+    let height =
+        parse_pnm_number(buf, &mut pos).ok_or_else(|| invalid_image(path, "missing PNM height"))?;
+    let dims = pnm_dimensions(path, width, height)?;
+    let pixel_count = u64::from(dims.width().get()) * u64::from(dims.height().get());
+
+    let header_len = if matches!(variant, b'2' | b'3' | b'5' | b'6') {
+        let maxval = parse_pnm_maxval(buf, &mut pos, path)?;
+        if matches!(variant, b'5' | b'6') {
+            if !consume_pnm_token_terminator(buf, &mut pos) {
+                return Err(invalid_image(
+                    path,
+                    "binary PNM header is missing its single whitespace terminator",
+                ));
+            }
+            let sample_bytes = if maxval > 255 { 2_u64 } else { 1_u64 };
+            let raster_bytes = if variant == b'5' {
+                pixel_count.checked_mul(sample_bytes)
+            } else {
+                pixel_count
+                    .checked_mul(3)
+                    .and_then(|bytes| bytes.checked_mul(sample_bytes))
+            }
+            .ok_or_else(|| invalid_image(path, "PNM raster size overflow"))?;
+            validate_pnm_raster(pos, raster_bytes, file_len, path)?;
+        }
+        pos
+    } else {
+        if variant == b'4' {
+            if !consume_pnm_token_terminator(buf, &mut pos) {
+                return Err(invalid_image(
+                    path,
+                    "binary PNM header is missing its single whitespace terminator",
+                ));
+            }
+            // P4 packs each row independently to a full byte boundary.
+            let row_bytes = u64::from(dims.width().get()).div_ceil(8);
+            let raster_bytes = row_bytes
+                .checked_mul(u64::from(dims.height().get()))
+                .ok_or_else(|| invalid_image(path, "PBM raster size overflow"))?;
+            validate_pnm_raster(pos, raster_bytes, file_len, path)?;
+        }
+        if pos >= buf.len() {
+            return Err(invalid_image(path, "PNM header has no raster data"));
+        }
+        pos
+    };
+    if u64::try_from(header_len).map_err(|_| invalid_image(path, "PNM header size overflow"))?
+        >= file_len
+    {
+        return Err(invalid_image(
+            path,
+            "truncated PNM raster (no data after header)",
+        ));
+    }
+    Ok(dims)
+}
+
+fn probe_pnm(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+    let file_len = file
+        .metadata()
+        .map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    let cap = u64::try_from(MAX_PNM_HEADER_BYTES).unwrap_or(u64::MAX);
+    let mut buf = Vec::new();
+    {
+        let mut limited = (&mut *file).take(cap);
+        limited
+            .read_to_end(&mut buf)
+            .map_err(|source| ProbeError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
+    if buf.first() != Some(&b'P') {
+        return Err(invalid_image(path, "invalid PNM magic"));
+    }
+    let variant = *buf
+        .get(1)
+        .ok_or_else(|| invalid_image(path, "truncated PNM magic"))?;
+    match variant {
+        b'7' => probe_pam(&buf, file_len, path),
+        b'1'..=b'6' => probe_pnm_standard(&buf, file_len, path, variant),
+        other => Err(invalid_image(
+            path,
+            format!("unsupported PNM variant P{other}"),
+        )),
+    }
+}
+
 fn probe_opened_image(
     mut file: File,
     path: &Path,
@@ -752,6 +1373,10 @@ fn probe_opened_image(
         ImageInputFormat::Qoi => probe_qoi(&mut file, path)?,
         ImageInputFormat::Tiff => probe_tiff(file, path)?,
         ImageInputFormat::Jxl => probe_jxl(file, path)?,
+        ImageInputFormat::Avif => probe_avif(file, path)?,
+        ImageInputFormat::Gif => probe_gif(file, path)?,
+        ImageInputFormat::Ico => probe_ico(file, path)?,
+        ImageInputFormat::Pnm => probe_pnm(&mut file, path)?,
     };
 
     Ok(ProbedImage { format, dimensions })
@@ -1058,8 +1683,8 @@ fn probe_directory_entry(path: &Path) -> Result<Option<ProbedImage>, ProbeError>
     })?;
     let (prefix, len) = read_magic_prefix(&mut file, path)?;
     let header_slice = prefix.get(..len).unwrap_or(&prefix);
-    let has_bmp_ext = has_extension(path, "bmp");
-    if let Some(format) = sniff_magic_format(header_slice, !has_bmp_ext) {
+    let strict_ambiguous = !has_any_extension(path, KNOWN_IMAGE_EXTENSIONS);
+    if let Some(format) = sniff_magic_format(header_slice, strict_ambiguous) {
         return probe_opened_image(file, path, format).map(Some);
     }
 
@@ -1111,12 +1736,15 @@ fn resolve_single_target(
                 ImageOutputFormat::Tiff => ".tif or .tiff",
                 ImageOutputFormat::Jxl => ".jxl",
                 ImageOutputFormat::Avif => ".avif",
+                ImageOutputFormat::Gif => ".gif",
+                ImageOutputFormat::Ico => ".ico",
+                ImageOutputFormat::Pnm => ".pnm, .ppm, .pgm, .pbm, or .pam",
             },
         }),
         (None, Some(actual)) => Ok((target.to_path_buf(), actual)),
         (None, None) => Err(ProbeError::UnsupportedTargetFormat {
             path: target.to_path_buf(),
-            expected: ".webp, .heic, .jpg, .jpeg, .png, .bmp, .qoi, .tif, .tiff, .jxl, or .avif",
+            expected: ".webp, .heic, .jpg, .jpeg, .png, .bmp, .qoi, .tif, .tiff, .jxl, .avif, .gif, .ico, .pnm, .ppm, .pgm, .pbm, or .pam",
         }),
     }
 }
@@ -1140,6 +1768,12 @@ fn infer_format_from_extension(path: &Path) -> Option<ImageOutputFormat> {
         Some(ImageOutputFormat::Jxl)
     } else if has_extension(path, "avif") {
         Some(ImageOutputFormat::Avif)
+    } else if has_extension(path, "gif") {
+        Some(ImageOutputFormat::Gif)
+    } else if has_extension(path, "ico") {
+        Some(ImageOutputFormat::Ico)
+    } else if has_any_extension(path, &["pnm", "ppm", "pgm", "pbm", "pam"]) {
+        Some(ImageOutputFormat::Pnm)
     } else {
         None
     }
@@ -1341,6 +1975,174 @@ mod tests {
             remaining -= run;
         }
         bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+        fs::write(path, bytes).map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn in_memory_error(path: &Path, reason: impl Into<String>) -> ProbeError {
+        ProbeError::InvalidImage {
+            path: path.to_path_buf(),
+            reason: reason.into(),
+        }
+    }
+
+    fn make_tiny_png_bytes(width: u32, height: u32) -> Result<Vec<u8>, ProbeError> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder
+                .write_header()
+                .map_err(|err| in_memory_error(Path::new("memory.png"), err.to_string()))?;
+            let data_len = usize::try_from(width * height * 3).unwrap_or(0);
+            writer
+                .write_image_data(&vec![128_u8; data_len])
+                .map_err(|err| in_memory_error(Path::new("memory.png"), err.to_string()))?;
+        }
+        Ok(bytes)
+    }
+
+    fn write_tiny_avif(path: &Path, width: usize, height: usize) -> Result<(), ProbeError> {
+        use rav1e::prelude::{ChromaSampling, Config, EncoderConfig, EncoderStatus};
+
+        let mut enc = EncoderConfig::with_speed_preset(8);
+        enc.width = width;
+        enc.height = height;
+        enc.bit_depth = 8;
+        enc.chroma_sampling = ChromaSampling::Cs420;
+        enc.still_picture = true;
+        enc.low_latency = true;
+        enc.bitrate = 0;
+        enc.quantizer = 60;
+        let cfg = Config::new().with_encoder_config(enc).with_threads(1);
+        let mut ctx = cfg.new_context::<u8>().map_err(|err| {
+            in_memory_error(path, format!("failed to create AV1 encoder context: {err}"))
+        })?;
+        let mut frame = ctx.new_frame();
+        for plane in &mut frame.planes {
+            for row in plane.rows_iter_mut() {
+                row.fill(128);
+            }
+        }
+        ctx.send_frame(frame)
+            .map_err(|err| in_memory_error(path, format!("failed to send AV1 frame: {err}")))?;
+        ctx.flush();
+        let mut av1 = Vec::new();
+        loop {
+            match ctx.receive_packet() {
+                Ok(packet) => {
+                    if av1.is_empty() {
+                        av1 = packet.data;
+                    }
+                }
+                Err(EncoderStatus::Encoded) => {}
+                Err(EncoderStatus::NeedMoreData | EncoderStatus::LimitReached) => break,
+                Err(err) => {
+                    return Err(in_memory_error(
+                        path,
+                        format!("failed to receive AV1 packet: {err}"),
+                    ));
+                }
+            }
+        }
+        let width = u32::try_from(width)
+            .map_err(|_| in_memory_error(path, "AVIF test width is too large"))?;
+        let height = u32::try_from(height)
+            .map_err(|_| in_memory_error(path, "AVIF test height is too large"))?;
+        let bytes = avif_serialize::serialize_to_vec(&av1, None, width, height, 8);
+        fs::write(path, bytes).map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn write_tiny_gif(
+        path: &Path,
+        width: u16,
+        height: u16,
+        frames: usize,
+        as_87a: bool,
+    ) -> Result<(), ProbeError> {
+        let file = File::create(path).map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let mut encoder = gif::Encoder::new(
+            BufWriter::new(file),
+            width,
+            height,
+            &[0_u8, 0, 0, 255, 255, 255],
+        )
+        .map_err(|err| in_memory_error(path, format!("failed to create GIF encoder: {err}")))?;
+        if frames == 0 {
+            // An application extension lets `read_info` complete so the
+            // zero-frame rejection is exercised at the frame-count check.
+            encoder.set_repeat(gif::Repeat::Infinite).map_err(|err| {
+                in_memory_error(path, format!("failed to write GIF extension: {err}"))
+            })?;
+        }
+        let palette = vec![0_u8, 0, 0, 255, 255, 255];
+        for _ in 0..frames {
+            let frame = gif::Frame::from_palette_pixels(
+                width,
+                height,
+                vec![0_u8; usize::from(width) * usize::from(height)],
+                palette.clone(),
+                None,
+            );
+            encoder.write_frame(&frame).map_err(|err| {
+                in_memory_error(path, format!("failed to write GIF frame: {err}"))
+            })?;
+        }
+        drop(encoder);
+        if as_87a {
+            let mut bytes = fs::read(path).map_err(|source| ProbeError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            if bytes.len() >= 6 {
+                bytes[3..6].copy_from_slice(b"87a");
+            }
+            fs::write(path, bytes).map_err(|source| ProbeError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Builds an ICO/CUR from `(width_byte, height_byte, bits_per_pixel, payload)` entries.
+    fn write_tiny_ico(
+        path: &Path,
+        entries: &[(u8, u8, u16, Vec<u8>)],
+        cursor: bool,
+    ) -> Result<(), ProbeError> {
+        let count = u16::try_from(entries.len())
+            .map_err(|_| in_memory_error(path, "too many ICO entries for test"))?;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&(if cursor { 2_u16 } else { 1_u16 }).to_le_bytes());
+        bytes.extend_from_slice(&count.to_le_bytes());
+        let mut offset = 6_u32.saturating_add(16_u32.saturating_mul(u32::from(count)));
+        for (width, height, bpp, payload) in entries {
+            bytes.push(*width);
+            bytes.push(*height);
+            bytes.push(0);
+            bytes.push(0);
+            bytes.extend_from_slice(&1_u16.to_le_bytes());
+            bytes.extend_from_slice(&bpp.to_le_bytes());
+            let size = u32::try_from(payload.len())
+                .map_err(|_| in_memory_error(path, "ICO payload too large for test"))?;
+            bytes.extend_from_slice(&size.to_le_bytes());
+            bytes.extend_from_slice(&offset.to_le_bytes());
+            offset = offset.saturating_add(size);
+        }
+        for (_, _, _, payload) in entries {
+            bytes.extend_from_slice(payload);
+        }
         fs::write(path, bytes).map_err(|source| ProbeError::Io {
             path: path.to_path_buf(),
             source,
@@ -1891,7 +2693,7 @@ mod tests {
 
         let ext_err = prepare_image_batch(
             &valid,
-            &root.join("out.gif"),
+            &root.join("out.unknown"),
             Some(ImageCompression::Lossless),
             None,
             None,
@@ -2202,6 +3004,400 @@ mod tests {
             probe_image(&bad_core_1bit),
             Err(ProbeError::InvalidImage { .. })
         ));
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn probes_avif_and_rejects_animated_avif_and_video_containers() -> Result<(), ProbeError> {
+        let root = create_temp_dir("avif")?;
+        let still = root.join("still.avif");
+        write_tiny_avif(&still, 16, 12)?;
+        assert_eq!(
+            probe_image(&still)?,
+            ProbedImage {
+                format: ImageInputFormat::Avif,
+                dimensions: ImageDimensions::new(16, 12)?,
+            }
+        );
+
+        // A valid still AVIF whose ftyp major brand is patched to `avis` must be rejected.
+        let mut bytes = fs::read(&still).map_err(|source| ProbeError::Io {
+            path: still.clone(),
+            source,
+        })?;
+        bytes[8..12].copy_from_slice(b"avis");
+        let animated = root.join("animated.avif");
+        fs::write(&animated, bytes).map_err(|source| ProbeError::Io {
+            path: animated.clone(),
+            source,
+        })?;
+        assert!(matches!(
+            probe_image(&animated),
+            Err(ProbeError::InvalidImage { ref reason, .. }) if reason.contains("animated AVIF")
+        ));
+
+        // 64-bit extended ftyp boxes are recognised by compatible brand.
+        let mut extended = vec![0_u8; 24];
+        extended[0..4].copy_from_slice(&1_u32.to_be_bytes());
+        extended[4..8].copy_from_slice(b"ftyp");
+        extended[16..20].copy_from_slice(b"avif");
+        assert_eq!(
+            super::sniff_magic_format(&extended, false),
+            Some(ImageInputFormat::Avif)
+        );
+
+        // MP4, MOV and HEIC containers must never be accepted as images.
+        for (brand, compat) in [
+            (&b"isom"[..], &b"isomiso2avc1mp41"[..]),
+            (&b"mp42"[..], &b"isomiso2avc1mp41"[..]),
+            (&b"qt  "[..], &b"qt  "[..]),
+            (&b"heic"[..], &b"mif1miaf"[..]),
+        ] {
+            let mut header = vec![0_u8; 32];
+            let compat_len = u32::try_from(compat.len()).unwrap_or(0);
+            header[0..4].copy_from_slice(&(8_u32 + 4 + 4 + compat_len).to_be_bytes());
+            header[4..8].copy_from_slice(b"ftyp");
+            header[8..12].copy_from_slice(brand);
+            header[12..12 + compat.len()].copy_from_slice(compat);
+            assert_eq!(super::sniff_magic_format(&header, false), None);
+        }
+        let video = root.join("clip.mp4");
+        let mut video_bytes = vec![0_u8; 32];
+        video_bytes[0..4].copy_from_slice(&24_u32.to_be_bytes());
+        video_bytes[4..8].copy_from_slice(b"ftyp");
+        video_bytes[8..12].copy_from_slice(b"isom");
+        video_bytes[12..24].copy_from_slice(b"isomiso2avc1");
+        fs::write(&video, video_bytes).map_err(|source| ProbeError::Io {
+            path: video.clone(),
+            source,
+        })?;
+        assert!(matches!(
+            probe_image(&video),
+            Err(ProbeError::InvalidImage { .. })
+        ));
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn probes_gif89a_gif87a_and_rejects_animated_or_empty() -> Result<(), ProbeError> {
+        let root = create_temp_dir("gif")?;
+        let modern = root.join("single.gif");
+        write_tiny_gif(&modern, 20, 12, 1, false)?;
+        assert_eq!(
+            probe_image(&modern)?,
+            ProbedImage {
+                format: ImageInputFormat::Gif,
+                dimensions: ImageDimensions::new(20, 12)?,
+            }
+        );
+
+        let legacy = root.join("legacy.gif");
+        write_tiny_gif(&legacy, 10, 8, 1, true)?;
+        let legacy_bytes = fs::read(&legacy).map_err(|source| ProbeError::Io {
+            path: legacy.clone(),
+            source,
+        })?;
+        assert!(legacy_bytes.starts_with(b"GIF87a"));
+        assert_eq!(
+            probe_image(&legacy)?,
+            ProbedImage {
+                format: ImageInputFormat::Gif,
+                dimensions: ImageDimensions::new(10, 8)?,
+            }
+        );
+
+        let animated = root.join("animated.gif");
+        write_tiny_gif(&animated, 10, 8, 2, false)?;
+        assert!(matches!(
+            probe_image(&animated),
+            Err(ProbeError::InvalidImage { ref reason, .. })
+                if reason.contains("animated GIF")
+        ));
+
+        let empty = root.join("empty.gif");
+        write_tiny_gif(&empty, 10, 8, 0, false)?;
+        assert!(matches!(
+            probe_image(&empty),
+            Err(ProbeError::InvalidImage { ref reason, .. })
+                if reason.contains("no image frames")
+        ));
+
+        let plan = prepare_image_batch(
+            &modern,
+            &root.join("out.gif"),
+            None,
+            Some(ImageOutputFormat::Gif),
+            None,
+            HardwareBackend::Cpu,
+        )?;
+        assert_eq!(plan.mode(), ImageExecutionMode::CpuGif);
+        assert_eq!(plan.output_format(), ImageOutputFormat::Gif);
+        assert_eq!(plan.items()[0].target(), root.join("out.gif"));
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn probes_ico_entries_and_rejects_cursor_empty_and_corrupt() -> Result<(), ProbeError> {
+        let root = create_temp_dir("ico")?;
+        let png16 = make_tiny_png_bytes(16, 16)?;
+        let png8 = make_tiny_png_bytes(8, 8)?;
+
+        let single = root.join("single.ico");
+        write_tiny_ico(&single, &[(16, 16, 32, png16.clone())], false)?;
+        assert_eq!(
+            probe_image(&single)?,
+            ProbedImage {
+                format: ImageInputFormat::Ico,
+                dimensions: ImageDimensions::new(16, 16)?,
+            }
+        );
+
+        // The largest entry wins regardless of directory order.
+        let multi = root.join("multi.ico");
+        write_tiny_ico(
+            &multi,
+            &[(8, 8, 32, png8), (16, 16, 8, png16.clone())],
+            false,
+        )?;
+        assert_eq!(
+            probe_image(&multi)?,
+            ProbedImage {
+                format: ImageInputFormat::Ico,
+                dimensions: ImageDimensions::new(16, 16)?,
+            }
+        );
+
+        let cursor = root.join("cursor.cur");
+        write_tiny_ico(&cursor, &[(16, 16, 0, png16.clone())], true)?;
+        let cursor_file = File::open(&cursor).map_err(|source| ProbeError::Io {
+            path: cursor.clone(),
+            source,
+        })?;
+        assert!(matches!(
+            super::probe_ico(cursor_file, &cursor),
+            Err(ProbeError::InvalidImage { ref reason, .. }) if reason.contains("CUR cursor")
+        ));
+
+        let empty = root.join("empty.ico");
+        write_tiny_ico(&empty, &[], false)?;
+        assert!(matches!(
+            probe_image(&empty),
+            Err(ProbeError::InvalidImage { ref reason, .. })
+                if reason.contains("no icon entries")
+        ));
+
+        let corrupt = root.join("corrupt.ico");
+        write_tiny_ico(
+            &corrupt,
+            &[(8, 8, 32, vec![b'B', b'M', 12, 0, 0, 0])],
+            false,
+        )?;
+        assert!(matches!(
+            probe_image(&corrupt),
+            Err(ProbeError::InvalidImage { .. })
+        ));
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn probes_all_pnm_variants_and_rejects_malformed_headers() -> Result<(), ProbeError> {
+        let root = create_temp_dir("pnm")?;
+        let cases: [(&str, &[u8], u32, u32); 10] = [
+            ("a.pbm", b"P1\n# comment\n2 1\n1 0 1 0\n", 2, 1),
+            ("b.pgm", b"P2\n3 2\n255\n1 2 3 4 5 6\n", 3, 2),
+            (
+                "c.ppm",
+                b"P3\n2 2\n255\n1 2 3 4 5 6 7 8 9 10 11 12\n",
+                2,
+                2,
+            ),
+            ("d.pbm", b"P4\n2 2\n\x00\x00", 2, 2),
+            ("e.pgm", b"P5\n2 2\n255\n\x01\x02\x03\x04", 2, 2),
+            (
+                "f.pgm",
+                b"P5\n2 2\n65535\n\x00\x01\x00\x02\x00\x03\x00\x04",
+                2,
+                2,
+            ),
+            ("g.ppm", b"P6\n2 2\n255\n\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b", 2, 2),
+            (
+                "h.ppm",
+                b"P6\n2 2\n65535\n\x00\x01\x00\x02\x00\x03\x00\x04\x00\x05\x00\x06\x00\x07\x00\x08\x00\x09\x00\x0a\x00\x0b\x00\x0c\x00\x0d",
+                2,
+                2,
+            ),
+            (
+                "i.pam",
+                b"P7\n# generated by fastconv tests\nWIDTH 2\nHEIGHT 2\nDEPTH 1\nMAXVAL 255\nENDHDR\n\x01\x02\x03\x04",
+                2,
+                2,
+            ),
+            (
+                "j.pam",
+                b"P7\r\nWIDTH 2\r\nHEIGHT 2\r\nDEPTH 4\r\nMAXVAL 65535\r\nTUPLTYPE RGB_ALPHA\r\nENDHDR\r\n\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f",
+                2,
+                2,
+            ),
+        ];
+        for (name, bytes, width, height) in cases {
+            let path = root.join(name);
+            fs::write(&path, bytes).map_err(|source| ProbeError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            assert_eq!(
+                probe_image(&path)?,
+                ProbedImage {
+                    format: ImageInputFormat::Pnm,
+                    dimensions: ImageDimensions::new(width, height)?,
+                },
+                "fixture {name}"
+            );
+        }
+
+        // A `#` comment directly after the final token terminates a binary header.
+        let commented = root.join("commented.pgm");
+        fs::write(
+            &commented,
+            b"P5\n2 2\n255# raster follows\n\x01\x02\x03\x04",
+        )
+        .map_err(|source| ProbeError::Io {
+            path: commented.clone(),
+            source,
+        })?;
+        assert_eq!(
+            probe_image(&commented)?,
+            ProbedImage {
+                format: ImageInputFormat::Pnm,
+                dimensions: ImageDimensions::new(2, 2)?,
+            }
+        );
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_malformed_and_truncated_pnm_headers() -> Result<(), ProbeError> {
+        let root = create_temp_dir("pnm-invalid")?;
+
+        for (name, bytes) in [
+            // 5x3 P4 requires ceil(5/8) * 3 = 3 bytes; 2 bytes is truncated even though ceil(15/8) == 2.
+            ("short4_row_padded.pbm", &b"P4\n5 3\n\xaa\x55"[..]),
+            ("short5.pgm", &b"P5\n2 2\n255\n\x01\x02\x03"[..]),
+            ("short6.ppm", &b"P6\n2 2\n255\n\x00\x01\x02"[..]),
+            (
+                "short7.pam",
+                &b"P7\nWIDTH 2\nHEIGHT 2\nDEPTH 3\nMAXVAL 255\nENDHDR\n\x01\x02"[..],
+            ),
+            (
+                "bad_width7.pam",
+                &b"P7\nWIDTH 2abc\nHEIGHT 1\nDEPTH 1\nMAXVAL 255\nENDHDR\n\x01\x02"[..],
+            ),
+            (
+                "unknown_key7.pam",
+                &b"P7\nWIDTH 1\nHEIGHT 1\nDEPTH 1\nMAXVAL 255\nBOGUS 1\nENDHDR\n\x01"[..],
+            ),
+            ("zero.pgm", &b"P5\n2 2\n0\n\x01\x02\x03\x04"[..]),
+            ("huge.pgm", &b"P5\n2 2\n65536\n\x01\x02\x03\x04"[..]),
+        ] {
+            let path = root.join(name);
+            fs::write(&path, bytes).map_err(|source| ProbeError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            assert!(
+                matches!(probe_image(&path), Err(ProbeError::InvalidImage { .. })),
+                "fixture {name} must be rejected"
+            );
+        }
+
+        assert_eq!(
+            super::sniff_magic_format(b"P5\n# c\n2 2\n255\n", true),
+            Some(ImageInputFormat::Pnm)
+        );
+        assert_eq!(
+            super::sniff_magic_format(b"P7\n# c\nWIDTH 2\n", true),
+            Some(ImageInputFormat::Pnm)
+        );
+        assert_eq!(super::sniff_magic_format(b"P1: notes", true), None);
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepares_mixed_new_format_directory_and_rejects_video_source() -> Result<(), ProbeError> {
+        let root = create_temp_dir("new-formats")?;
+        let src = root.join("src");
+        let out = root.join("out");
+        fs::create_dir_all(&src).map_err(|source| ProbeError::Io {
+            path: src.clone(),
+            source,
+        })?;
+        write_tiny_avif(&src.join("01.avif"), 16, 12)?;
+        write_tiny_gif(&src.join("02.gif"), 8, 8, 1, false)?;
+        let png8 = make_tiny_png_bytes(8, 8)?;
+        write_tiny_ico(&src.join("03.ico"), &[(8, 8, 32, png8)], false)?;
+        let pnm_source = src.join("04.pnm");
+        fs::write(
+            &pnm_source,
+            b"P6\n2 2\n255\n\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b",
+        )
+        .map_err(|source| ProbeError::Io {
+            path: pnm_source,
+            source,
+        })?;
+        let mut video = vec![0_u8; 32];
+        video[0..4].copy_from_slice(&24_u32.to_be_bytes());
+        video[4..8].copy_from_slice(b"ftyp");
+        video[8..12].copy_from_slice(b"mp42");
+        video[12..20].copy_from_slice(b"isomavc1");
+        let video_file = src.join("05.mp4");
+        fs::write(&video_file, video).map_err(|source| ProbeError::Io {
+            path: video_file,
+            source,
+        })?;
+        let notes = src.join("notes.txt");
+        fs::write(&notes, b"P1: notes").map_err(|source| ProbeError::Io {
+            path: notes,
+            source,
+        })?;
+
+        let plan = prepare_image_batch(
+            &src,
+            &out,
+            None,
+            Some(ImageOutputFormat::Png),
+            None,
+            HardwareBackend::Cpu,
+        )?;
+        assert_eq!(plan.mode(), ImageExecutionMode::CpuPng);
+        assert_eq!(plan.items().len(), 4);
+        assert_eq!(plan.items()[0].input_format(), ImageInputFormat::Avif);
+        assert_eq!(plan.items()[1].input_format(), ImageInputFormat::Gif);
+        assert_eq!(plan.items()[2].input_format(), ImageInputFormat::Ico);
+        assert_eq!(plan.items()[3].input_format(), ImageInputFormat::Pnm);
+        assert_eq!(plan.items()[0].target(), out.join("01.png"));
+
+        let video_source = src.join("05.mp4");
+        let video_err = prepare_image_batch(
+            &video_source,
+            &root.join("clip.gif"),
+            None,
+            Some(ImageOutputFormat::Gif),
+            None,
+            HardwareBackend::Cpu,
+        );
+        assert!(matches!(video_err, Err(ProbeError::InvalidImage { .. })));
 
         fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
         Ok(())

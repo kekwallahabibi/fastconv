@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 containr.workspace = true
+gif.workspace = true
+ico.workspace = true
+zenavif-parse.workspace = true
 opus-pure.workspace = true
 png.workspace = true
 pollster.workspace = true
@@ -18,8 +21,10 @@ wgpu.workspace = true
 zune-jpeg.workspace = true
 
 [dev-dependencies]
+avif-serialize.workspace = true
 jpeg-encoder.workspace = true
 jixel.workspace = true
+rav1e.workspace = true
 zenwebp.workspace = true
 
 [lints]

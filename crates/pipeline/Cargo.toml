@@ -27,9 +27,13 @@ rusty_mp3.workspace = true
 symphonia.workspace = true
 avif-serialize.workspace = true
 flate2.workspace = true
+gif.workspace = true
+ico.workspace = true
 rav1e.workspace = true
 tiff.workspace = true
 vorbis-enc.workspace = true
+zenavif.workspace = true
+zenavif-parse.workspace = true
 zenwebp.workspace = true
 zune-jpeg.workspace = true
 

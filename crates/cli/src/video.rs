@@ -162,4 +162,9 @@ mod tests {
         assert!(parse_remux_args(&["a", "b", "--threads", "0"]).is_err());
         assert!(parse_remux_args(&["a", "b", "--unknown"]).is_err());
     }
+
+    #[test]
+    fn rejects_video_to_gif_remux() {
+        assert!(parse_remux_args(&["clip.mp4", "out.gif", "--to", "gif"]).is_err());
+    }
 }

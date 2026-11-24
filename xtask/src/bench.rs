@@ -273,6 +273,9 @@ const fn bench_target_cli_arg(format: ImageOutputFormat) -> &'static str {
         ImageOutputFormat::Tiff => "tiff",
         ImageOutputFormat::Jxl => "jxl",
         ImageOutputFormat::Avif => "avif",
+        ImageOutputFormat::Gif => "gif",
+        ImageOutputFormat::Ico => "ico",
+        ImageOutputFormat::Pnm => "pnm",
     }
 }
 
@@ -1133,6 +1136,9 @@ fn validate_target_batch(
         ImageOutputFormat::Avif => {
             validate_avif_batch(source_dir, source_format, out_dir, count, policy)
         }
+        ImageOutputFormat::Gif | ImageOutputFormat::Ico | ImageOutputFormat::Pnm => Err(format!(
+            "no 4K benchmark validator configured for .{target_format}"
+        )),
     }
 }
 
@@ -2482,6 +2488,10 @@ fn verify_image_batch_with_dims(
         ImageInputFormat::Qoi => "QOI",
         ImageInputFormat::Tiff => "TIFF",
         ImageInputFormat::Jxl => "JPEG XL",
+        ImageInputFormat::Avif => "AVIF",
+        ImageInputFormat::Gif => "GIF",
+        ImageInputFormat::Ico => "ICO",
+        ImageInputFormat::Pnm => "PNM",
     };
 
     for index in 1..=IMAGE_BATCH_COUNT {
@@ -2492,7 +2502,11 @@ fn verify_image_batch_with_dims(
             ImageInputFormat::Bmp
             | ImageInputFormat::Qoi
             | ImageInputFormat::Tiff
-            | ImageInputFormat::Jxl => {
+            | ImageInputFormat::Jxl
+            | ImageInputFormat::Avif
+            | ImageInputFormat::Gif
+            | ImageInputFormat::Ico
+            | ImageInputFormat::Pnm => {
                 return Err(format!("no 4K fixture batch configured for {label}"));
             }
         };

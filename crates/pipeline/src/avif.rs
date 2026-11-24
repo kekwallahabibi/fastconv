@@ -385,6 +385,87 @@ pub(crate) fn encode_avif_into(
     Ok(())
 }
 
+/// Decodes a still AVIF into `pixel_buf`, reusing its allocation when large enough.
+pub(crate) fn decode_avif_slice_into(
+    source: &Path,
+    file_bytes: &[u8],
+    pixel_buf: &mut Vec<u8>,
+) -> Result<(u32, u32, DecodedPixelFormat, usize), PipelineError> {
+    let parse_config = zenavif_parse::DecodeConfig::default()
+        .lenient(true)
+        .with_peak_memory_limit(512 * 1024 * 1024)
+        .with_total_megapixels_limit(128);
+    let parser = zenavif_parse::AvifParser::from_bytes_with_config(
+        file_bytes,
+        &parse_config,
+        &zenavif_parse::Unstoppable,
+    )
+    .map_err(|err| PipelineError::DecodeFailed {
+        path: source.to_path_buf(),
+        reason: format!("invalid AVIF container: {err}"),
+    })?;
+    if parser.major_brand() == b"avis" || parser.animation_info().is_some() {
+        return Err(PipelineError::DecodeFailed {
+            path: source.to_path_buf(),
+            reason: "animated AVIF is not supported by the still-image pipeline".to_owned(),
+        });
+    }
+
+    let config = zenavif::DecoderConfig::new()
+        .threads(1)
+        .prefer_8bit(true)
+        .frame_size_limit(128 * 1024 * 1024);
+    let decoded =
+        zenavif::decode_with(file_bytes, &config, &zenavif::Unstoppable).map_err(|err| {
+            PipelineError::DecodeFailed {
+                path: source.to_path_buf(),
+                reason: format!("failed to decode AVIF image: {err}"),
+            }
+        })?;
+
+    let width = decoded.width();
+    let height = decoded.height();
+    let (format, bpp) = match (decoded.is_grayscale(), decoded.has_alpha()) {
+        (true, false) => (DecodedPixelFormat::L8, 1_usize),
+        (true, true) => (DecodedPixelFormat::La8, 2_usize),
+        (false, false) => (DecodedPixelFormat::Rgb8, 3_usize),
+        (false, true) => (DecodedPixelFormat::Rgba8, 4_usize),
+    };
+    let expected_len = usize::try_from(width)
+        .ok()
+        .and_then(|w| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|h| w.checked_mul(h).and_then(|pixels| pixels.checked_mul(bpp)))
+        })
+        .ok_or_else(|| PipelineError::DecodeFailed {
+            path: source.to_path_buf(),
+            reason: "AVIF dimensions overflow decoded buffer size".to_owned(),
+        })?;
+
+    let owned_bytes;
+    let bytes: &[u8] = if let Some(contiguous) = decoded.as_contiguous_bytes() {
+        contiguous
+    } else {
+        owned_bytes = decoded.copy_to_contiguous_bytes();
+        &owned_bytes
+    };
+    if bytes.len() != expected_len {
+        return Err(PipelineError::DecodeFailed {
+            path: source.to_path_buf(),
+            reason: format!(
+                "decoded AVIF buffer has {} bytes, expected {expected_len}",
+                bytes.len()
+            ),
+        });
+    }
+    if pixel_buf.len() < expected_len {
+        pixel_buf.resize(expected_len, 0);
+    }
+    pixel_buf[..expected_len].copy_from_slice(bytes);
+    Ok((width, height, format, expected_len))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,5 +623,76 @@ mod tests {
         assert!(quality_to_quantizer(90) < quality_to_quantizer(80));
         assert!(quality_to_quantizer(80) < quality_to_quantizer(50));
         assert!(quality_to_quantizer(50) < quality_to_quantizer(10));
+    }
+
+    fn assert_decode_roundtrip(
+        format: DecodedPixelFormat,
+        width: u32,
+        height: u32,
+        transparent: bool,
+    ) -> Result<(), PipelineError> {
+        let encoded = encode_test_avif(format, width, height, transparent)?;
+        let mut pixels = Vec::new();
+        let (decoded_w, decoded_h, decoded_format, byte_len) =
+            decode_avif_slice_into(Path::new("test.avif"), encoded.as_slice(), &mut pixels)?;
+        assert_eq!((decoded_w, decoded_h), (width, height));
+        let bpp = match decoded_format {
+            DecodedPixelFormat::L8 => 1_usize,
+            DecodedPixelFormat::La8 => 2_usize,
+            DecodedPixelFormat::Rgb8 => 3_usize,
+            DecodedPixelFormat::Rgba8 => 4_usize,
+        };
+        assert_eq!(
+            byte_len,
+            usize::try_from(width).unwrap_or(0) * usize::try_from(height).unwrap_or(0) * bpp
+        );
+        assert!(pixels.len() >= byte_len);
+        if transparent {
+            assert!(
+                matches!(
+                    decoded_format,
+                    DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8
+                ),
+                "transparent AVIF must decode with alpha, got {decoded_format:?}"
+            );
+        }
+        if matches!(format, DecodedPixelFormat::L8 | DecodedPixelFormat::Rgb8) {
+            assert!(
+                matches!(
+                    decoded_format,
+                    DecodedPixelFormat::L8 | DecodedPixelFormat::Rgb8
+                ),
+                "opaque AVIF must decode without alpha, got {decoded_format:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_rgb8_and_opaque_rgba8_roundtrip() -> Result<(), PipelineError> {
+        assert_decode_roundtrip(DecodedPixelFormat::Rgb8, 53, 37, false)?;
+        assert_decode_roundtrip(DecodedPixelFormat::Rgba8, 53, 37, false)?;
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_transparent_rgba8_roundtrip() -> Result<(), PipelineError> {
+        assert_decode_roundtrip(DecodedPixelFormat::Rgba8, 16, 16, true)
+    }
+
+    #[test]
+    fn decodes_grayscale_and_grayscale_alpha_roundtrip() -> Result<(), PipelineError> {
+        assert_decode_roundtrip(DecodedPixelFormat::L8, 16, 16, false)?;
+        assert_decode_roundtrip(DecodedPixelFormat::La8, 17, 15, false)?;
+        assert_decode_roundtrip(DecodedPixelFormat::La8, 17, 15, true)?;
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_1x1_and_odd_dimensions() -> Result<(), PipelineError> {
+        assert_decode_roundtrip(DecodedPixelFormat::Rgb8, 1, 1, false)?;
+        assert_decode_roundtrip(DecodedPixelFormat::L8, 1, 1, false)?;
+        assert_decode_roundtrip(DecodedPixelFormat::Rgba8, 53, 37, true)?;
+        Ok(())
     }
 }
