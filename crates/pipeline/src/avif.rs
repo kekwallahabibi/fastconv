@@ -115,8 +115,8 @@ fn encode_av1_frame(
                     packet_data = packet.data;
                 }
             }
-            Err(rav1e::EncoderStatus::Encoded | rav1e::EncoderStatus::NeedMoreData) => {}
-            Err(rav1e::EncoderStatus::LimitReached) => break,
+            Err(rav1e::EncoderStatus::Encoded) => {}
+            Err(rav1e::EncoderStatus::NeedMoreData | rav1e::EncoderStatus::LimitReached) => break,
             Err(err) => {
                 return Err(PipelineError::EncodeFailed {
                     path: target.to_path_buf(),
