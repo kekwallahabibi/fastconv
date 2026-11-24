@@ -3,11 +3,13 @@
 //! such as `libopus`/`vorbis_rs` are deliberately avoided so CI needs no system audio libraries.
 
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -17,11 +19,12 @@ use fastconv_domain::{
 };
 use flacenc::bitsink::ByteSink;
 use flacenc::component::BitRepr;
-use flacenc::error::Verify;
+use flacenc::error::{SourceError, Verify};
+use flacenc::source::{Fill, Source};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use opus_pure::{
-    Application, MAX_PACKET_BYTES, MAX_PACKET_SAMPLES, OggOpusReader, OggOpusWriter, OpusEncoder,
-    OpusHead, Trim,
+    Application, DEFAULT_WARMUP_MS, MAX_PACKET_BYTES, MAX_PACKET_SAMPLES, OggOpusReader,
+    OggOpusWriter, OpusEncoder, OpusHead, ParallelConfig, Trim, encode_parallel,
 };
 use rubato::{FftFixedInOut, Resampler};
 use symphonia::core::codecs::audio::AudioDecoderOptions;
@@ -38,6 +41,9 @@ const OPUS_RATE: u32 = 48_000;
 const OPUS_FRAME_MS: u32 = 20;
 const OPUS_BITRATE: i32 = 128_000;
 const RESAMPLE_CHUNK: usize = 1024;
+const WAV_READ_BUF_BYTES: usize = 256 * 1024;
+const WAV_WRITE_BUF_BYTES: usize = 256 * 1024;
+const OPUS_WRITE_BUF_BYTES: usize = 64 * 1024;
 const MAX_PCM_BYTES_PER_FILE: u64 = 512 * 1024 * 1024;
 const MAX_PCM_BYTES_PER_BATCH: u64 = 1024 * 1024 * 1024;
 
@@ -49,7 +55,6 @@ pub struct AudioWorkerBuffer {
     samples_i16: Vec<i16>,
     samples_i32: Vec<i32>,
     resampled_f32: Vec<f32>,
-    opus_block: Vec<i16>,
     packet: Vec<u8>,
 }
 
@@ -67,10 +72,6 @@ impl AudioWorkerBuffer {
             samples_i16: Vec::with_capacity(OPUS_RATE as usize * 2),
             samples_i32: Vec::with_capacity(OPUS_RATE as usize * 2),
             resampled_f32: Vec::new(),
-            opus_block: vec![
-                0_i16;
-                usize::try_from(OPUS_RATE / (1000 / OPUS_FRAME_MS)).unwrap_or(960) * 2
-            ],
             packet: vec![0_u8; MAX_PACKET_BYTES],
         }
     }
@@ -165,9 +166,13 @@ fn decode_opus(path: &Path, buf: &mut AudioWorkerBuffer) -> Result<(u32, usize),
     Ok((OPUS_RATE, channels))
 }
 
+// The decode loop and buffer reservation must stay together to keep the direct-i16
+// decision and its borrow of `buf` in one place.
+#[allow(clippy::too_many_lines)]
 fn decode_symphonia(
     path: &Path,
     format: AudioInputFormat,
+    target: AudioOutputFormat,
     buf: &mut AudioWorkerBuffer,
 ) -> Result<(u32, usize, usize), PipelineError> {
     let file = File::open(path).map_err(|source| PipelineError::Io {
@@ -217,6 +222,34 @@ fn decode_symphonia(
         });
     }
     let track_id = track.id;
+    let total_samples = track.num_frames;
+    // Symphonia left-aligns 16-bit integer samples when converting to i32 (i16 << 16),
+    // so a direct i16 copy is both faster and bit-exact for lossless targets.
+    let integer_pcm = !matches!(
+        params.sample_format,
+        Some(
+            symphonia::core::audio::sample::SampleFormat::F32
+                | symphonia::core::audio::sample::SampleFormat::F64,
+        )
+    );
+    let direct_i16 = matches!(target, AudioOutputFormat::Wav | AudioOutputFormat::Flac)
+        && bits == 16
+        && integer_pcm;
+    let sample_bytes = if direct_i16 { 2_u64 } else { 4_u64 };
+    let max_samples = usize::try_from(MAX_PCM_BYTES_PER_FILE / sample_bytes).unwrap_or(usize::MAX);
+    let reserve = total_samples
+        .map_or(0, |frames| usize::try_from(frames).unwrap_or(usize::MAX))
+        .saturating_mul(channels)
+        .min(max_samples);
+    if direct_i16 {
+        if buf.samples_i16.capacity() < reserve {
+            buf.samples_i16
+                .reserve(reserve.saturating_sub(buf.samples_i16.len()));
+        }
+    } else if buf.samples_f32.capacity() < reserve {
+        buf.samples_f32
+            .reserve(reserve.saturating_sub(buf.samples_f32.len()));
+    }
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(&params, &AudioDecoderOptions::default())
         .map_err(|err| PipelineError::DecodeFailed {
@@ -247,11 +280,31 @@ fn decode_symphonia(
                 });
             }
         };
-        let start = buf.samples_f32.len();
         let count = audio_frame.samples_interleaved();
-        buf.samples_f32.resize(start.saturating_add(count), 0.0);
-        if let Some(slot) = buf.samples_f32.get_mut(start..start.saturating_add(count)) {
-            audio_frame.copy_to_slice_interleaved(slot);
+        let start = if direct_i16 {
+            buf.samples_i16.len()
+        } else {
+            buf.samples_f32.len()
+        };
+        let end = start.saturating_add(count);
+        if end > max_samples {
+            return Err(PipelineError::DecodeFailed {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "decoded PCM exceeds the {MAX_PCM_BYTES_PER_FILE}-byte per-file limit"
+                ),
+            });
+        }
+        if direct_i16 {
+            buf.samples_i16.resize(end, 0);
+            if let Some(slot) = buf.samples_i16.get_mut(start..end) {
+                audio_frame.copy_to_slice_interleaved::<i16, _>(slot);
+            }
+        } else {
+            buf.samples_f32.resize(end, 0.0);
+            if let Some(slot) = buf.samples_f32.get_mut(start..end) {
+                audio_frame.copy_to_slice_interleaved(slot);
+            }
         }
     }
     Ok((sample_rate, channels, bits))
@@ -259,6 +312,7 @@ fn decode_symphonia(
 
 fn decode_audio(
     item: &AudioBatchItem,
+    target: AudioOutputFormat,
     buf: &mut AudioWorkerBuffer,
 ) -> Result<(u32, usize, usize), PipelineError> {
     buf.reset();
@@ -266,7 +320,7 @@ fn decode_audio(
         let (rate, channels) = decode_opus(item.source(), buf)?;
         (rate, channels, 16)
     } else {
-        decode_symphonia(item.source(), item.input_format(), buf)?
+        decode_symphonia(item.source(), item.input_format(), target, buf)?
     };
 
     if channels == 0 {
@@ -275,7 +329,7 @@ fn decode_audio(
             reason: "decoded audio has zero channels".to_owned(),
         });
     }
-    if buf.samples_f32.is_empty() {
+    if buf.samples_f32.is_empty() && buf.samples_i16.is_empty() {
         return Err(PipelineError::EmptyOutput(item.source().to_path_buf()));
     }
 
@@ -326,29 +380,332 @@ fn quantize_for(target: AudioOutputFormat, bits: usize, buf: &mut AudioWorkerBuf
     buf.samples_f32.clear();
 }
 
-fn encode_flac(
-    path: &Path,
-    rate: u32,
+const WAVE_FORMAT_PCM_GUID: [u8; 16] = [
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+];
+
+fn le_u16(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+}
+
+fn le_u32(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+/// A validated signed-integer PCM `data` chunk in a RIFF/WAVE file.
+struct PcmWavStream {
+    reader: BufReader<File>,
     channels: usize,
     bits: usize,
-    buf: &AudioWorkerBuffer,
+    rate: u32,
+    frame_bytes: usize,
+    total_samples: usize,
+    remaining_bytes: u64,
+}
+
+/// Opens a plain signed 16/24-bit PCM WAV for direct FLAC encoding.
+///
+/// Returns `Ok(None)` for anything that needs the full decoder: unsigned 8-bit
+/// WAV, float WAV, RF64, non-canonical extensible PCM, or malformed chunks.
+fn try_open_pcm_wav(path: &Path) -> Result<Option<PcmWavStream>, PipelineError> {
+    let io_err = |source| PipelineError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mut file = File::open(path).map_err(io_err)?;
+    let file_len = file.metadata().map_err(io_err)?.len();
+    let mut head = [0_u8; 12];
+    if file.read_exact(&mut head).is_err() {
+        return Ok(None);
+    }
+    if &head[..4] != b"RIFF" || &head[8..12] != b"WAVE" {
+        return Ok(None);
+    }
+    if le_u32(&head, 4) == u32::MAX {
+        return Ok(None);
+    }
+    let riff_end = u64::from(le_u32(&head, 4)).saturating_add(8).min(file_len);
+
+    let mut pos = 12_u64;
+    let mut fmt: Option<(usize, u32, usize, usize)> = None;
+    let mut data: Option<(u64, u64)> = None;
+    let mut header = [0_u8; 8];
+    let mut payload = vec![0_u8; 4096];
+
+    while pos.saturating_add(8) <= riff_end {
+        if file.seek(SeekFrom::Start(pos)).is_err() || file.read_exact(&mut header).is_err() {
+            return Ok(None);
+        }
+        let size = u64::from(le_u32(&header, 4));
+        if size == u64::from(u32::MAX) {
+            return Ok(None);
+        }
+        if pos.saturating_add(8).saturating_add(size) > riff_end {
+            return Ok(None);
+        }
+        let padded = size.saturating_add(size & 1);
+        match &header[..4] {
+            b"fmt " => {
+                if !(16..=4096).contains(&size) {
+                    return Ok(None);
+                }
+                let len = usize::try_from(size).unwrap_or(0);
+                payload.resize(len, 0);
+                if file.read_exact(&mut payload[..len]).is_err() {
+                    return Ok(None);
+                }
+                let audio_format = le_u16(&payload, 0);
+                let channels = usize::from(le_u16(&payload, 2));
+                let rate = le_u32(&payload, 4);
+                let block_align = usize::from(le_u16(&payload, 12));
+                let bits = usize::from(le_u16(&payload, 14));
+                let canonical = bits == 16 || bits == 24;
+                let extensible = audio_format == 0xFFFE
+                    && size >= 40
+                    && le_u16(&payload, 18) == u16::try_from(bits).unwrap_or(0)
+                    && payload
+                        .get(24..40)
+                        .is_some_and(|guid| guid == WAVE_FORMAT_PCM_GUID.as_slice());
+                if !(canonical && (audio_format == 1 || extensible))
+                    || !(1..=8).contains(&channels)
+                    || rate == 0
+                    || block_align != channels.saturating_mul(bits / 8)
+                {
+                    return Ok(None);
+                }
+                fmt = Some((channels, rate, bits, block_align));
+            }
+            b"data" => {
+                data = Some((pos.saturating_add(8), size));
+                if fmt.is_some() {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        pos = pos.saturating_add(8).saturating_add(padded);
+    }
+
+    let (Some((channels, rate, bits, block_align)), Some((data_offset, data_bytes))) = (fmt, data)
+    else {
+        return Ok(None);
+    };
+    let align = u64::try_from(block_align).unwrap_or(u64::MAX);
+    if data_bytes == 0
+        || data_offset.saturating_add(data_bytes) > riff_end
+        || data_bytes % align != 0
+    {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(data_offset)).map_err(io_err)?;
+    Ok(Some(PcmWavStream {
+        reader: BufReader::with_capacity(WAV_READ_BUF_BYTES, file),
+        channels,
+        bits,
+        rate,
+        frame_bytes: block_align,
+        total_samples: usize::try_from(data_bytes / align).unwrap_or(usize::MAX),
+        remaining_bytes: data_bytes,
+    }))
+}
+
+/// Streams little-endian PCM bytes straight into flacenc's `Fill` target.
+struct LeBytesFlacSource {
+    reader: BufReader<File>,
+    read_buf: Vec<u8>,
+    channels: usize,
+    bits: usize,
+    rate: usize,
+    frame_bytes: usize,
+    total_samples: usize,
+    remaining_bytes: u64,
+}
+
+impl Source for LeBytesFlacSource {
+    fn channels(&self) -> usize {
+        self.channels
+    }
+
+    fn bits_per_sample(&self) -> usize {
+        self.bits
+    }
+
+    fn sample_rate(&self) -> usize {
+        self.rate
+    }
+
+    fn len_hint(&self) -> Option<usize> {
+        Some(self.total_samples)
+    }
+
+    fn read_samples<F: Fill>(
+        &mut self,
+        block_size: usize,
+        dest: &mut F,
+    ) -> Result<usize, SourceError> {
+        let available =
+            usize::try_from(self.remaining_bytes).unwrap_or(usize::MAX) / self.frame_bytes.max(1);
+        let frames = block_size.min(available);
+        if frames == 0 {
+            return Ok(0);
+        }
+        let wanted = frames.saturating_mul(self.frame_bytes);
+        if self.read_buf.len() < wanted {
+            self.read_buf.resize(wanted, 0);
+        }
+        let mut filled = 0_usize;
+        while filled < wanted {
+            match self.reader.read(&mut self.read_buf[filled..wanted]) {
+                Ok(0) => {
+                    return Err(SourceError::from_io_error(io::Error::from(
+                        io::ErrorKind::UnexpectedEof,
+                    )));
+                }
+                Ok(count) => filled += count,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(SourceError::from_io_error(err)),
+            }
+        }
+        let frames = filled / self.frame_bytes;
+        let used = frames.saturating_mul(self.frame_bytes);
+        self.remaining_bytes = self
+            .remaining_bytes
+            .saturating_sub(u64::try_from(used).unwrap_or(u64::MAX));
+        dest.fill_le_bytes(&self.read_buf[..used], self.bits / 8)?;
+        Ok(frames)
+    }
+}
+
+/// Borrows decoded `i32` samples instead of cloning them via `MemSource`.
+struct BorrowedI32FlacSource<'a> {
+    samples: &'a [i32],
+    read_head: usize,
+    channels: usize,
+    bits: usize,
+    rate: usize,
+}
+
+impl Source for BorrowedI32FlacSource<'_> {
+    fn channels(&self) -> usize {
+        self.channels
+    }
+
+    fn bits_per_sample(&self) -> usize {
+        self.bits
+    }
+
+    fn sample_rate(&self) -> usize {
+        self.rate
+    }
+
+    // flacenc calls `len_hint` both before and after consuming the source, so
+    // the declared length stays fixed while only `read_head` advances.
+    fn len_hint(&self) -> Option<usize> {
+        Some(self.samples.len() / self.channels.max(1))
+    }
+
+    fn read_samples<F: Fill>(
+        &mut self,
+        block_size: usize,
+        dest: &mut F,
+    ) -> Result<usize, SourceError> {
+        let remaining = self.samples.len().saturating_sub(self.read_head);
+        let take = block_size.saturating_mul(self.channels).min(remaining);
+        let frames = take / self.channels.max(1);
+        let used = frames.saturating_mul(self.channels);
+        dest.fill_interleaved(&self.samples[self.read_head..self.read_head + used])?;
+        self.read_head = self.read_head.saturating_add(used);
+        Ok(frames)
+    }
+}
+
+/// Keeps flacenc's parallel feeder running after a source read failure so its
+/// workers are always stopped and joined; the failure is reported afterwards.
+struct EofTolerantFlacSource<S> {
+    inner: S,
+    failed: Arc<AtomicBool>,
+    remaining: usize,
+}
+
+impl<S: Source> EofTolerantFlacSource<S> {
+    fn new(inner: S, failed: Arc<AtomicBool>) -> Self {
+        let remaining = inner.len_hint().unwrap_or(0);
+        Self {
+            inner,
+            failed,
+            remaining,
+        }
+    }
+}
+
+impl<S: Source> Source for EofTolerantFlacSource<S> {
+    fn channels(&self) -> usize {
+        self.inner.channels()
+    }
+
+    fn bits_per_sample(&self) -> usize {
+        self.inner.bits_per_sample()
+    }
+
+    fn sample_rate(&self) -> usize {
+        self.inner.sample_rate()
+    }
+
+    fn len_hint(&self) -> Option<usize> {
+        self.inner.len_hint()
+    }
+
+    fn read_samples<F: Fill>(
+        &mut self,
+        block_size: usize,
+        dest: &mut F,
+    ) -> Result<usize, SourceError> {
+        if let Ok(frames) = self.inner.read_samples(block_size, dest) {
+            self.remaining = self.remaining.saturating_sub(frames);
+            Ok(frames)
+        } else {
+            // Never propagate the error into flacenc's feeder: it would skip
+            // request_stop() and leave all encoder workers blocked forever.
+            self.failed.store(true, Ordering::Relaxed);
+            let frames = self.remaining.min(block_size);
+            self.remaining -= frames;
+            if frames > 0 {
+                let zeros = vec![
+                    0_u8;
+                    frames
+                        .saturating_mul(self.channels())
+                        .saturating_mul(self.bits_per_sample() / 8)
+                ];
+                dest.fill_le_bytes(&zeros, self.bits_per_sample() / 8)?;
+            }
+            Ok(frames)
+        }
+    }
+}
+
+fn encode_flac_from_source<S: Source>(
+    path: &Path,
+    source: S,
     batch_workers: usize,
+    source_failed: Option<&AtomicBool>,
 ) -> Result<(), PipelineError> {
+    let pcm_bytes = source
+        .len_hint()
+        .unwrap_or(0)
+        .saturating_mul(source.channels())
+        .saturating_mul(source.bits_per_sample() / 8);
     let mut config = flacenc::config::Encoder::default();
     config.block_size = FLAC_BLOCK_SIZE;
-    // Prefer encode speed over compression ratio: fixed LPC (order <= 4) is cheap, while the
-    // quantized LPC search dominates runtime and only improves compression slightly.
-    // Measured on the 60s fixture with `par` workers: QLPC on => 432.7 ms (slower than ffmpeg's
-    // 240.3 ms), QLPC off => ~135 ms (faster than ffmpeg) at the same decoded samples.
+    // The quantized LPC search dominates runtime for only a small compression gain.
     config.subframe_coding.use_lpc = false;
     let available = std::thread::available_parallelism()
         .map_or(1, NonZeroUsize::get)
         .min(8);
-    // A batch already saturates the host with its worker threads; only use inner parallelism
-    // for a single-file conversion where capacity is otherwise idle.
-    config.multithread = batch_workers <= 1 && available > 1;
+    // A batch already saturates the host; only spend idle capacity on inner workers.
+    let inner_threads = (available / batch_workers.max(1)).max(1);
+    config.multithread = inner_threads > 1;
     config.workers = if config.multithread {
-        NonZeroUsize::new(available)
+        NonZeroUsize::new(inner_threads)
     } else {
         None
     };
@@ -358,20 +715,11 @@ fn encode_flac(
             path: path.to_path_buf(),
             reason: format!("FLAC config invalid: {err}"),
         })?;
-    let source = flacenc::source::MemSource::from_samples(
-        &buf.samples_i32,
-        channels,
-        bits,
-        usize_from(rate),
-    );
     let mut stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
         .map_err(|err| PipelineError::EncodeFailed {
             path: path.to_path_buf(),
             reason: format!("FLAC encoding failed: {err}"),
         })?;
-    // `add_frame` shrinks STREAMINFO's minimum to the short final frame. Symphonia treats such a
-    // stream as variable-blocksize and then rejects the fixed-block frame headers, so advertise
-    // the fixed block size we actually used.
     stream
         .stream_info_mut()
         .set_block_sizes(config.block_size, config.block_size)
@@ -379,17 +727,44 @@ fn encode_flac(
             path: path.to_path_buf(),
             reason: format!("FLAC stream-info update failed: {err}"),
         })?;
-    let mut sink = ByteSink::new();
+    let max_sink_bytes = usize::try_from(MAX_PCM_BYTES_PER_FILE).unwrap_or(usize::MAX);
+    let estimated_bytes =
+        ((pcm_bytes / 10).saturating_mul(6).saturating_add(65_536)).min(max_sink_bytes);
+    let mut sink = ByteSink::with_capacity(estimated_bytes.saturating_mul(8).max(4096));
     stream
         .write(&mut sink)
         .map_err(|err| PipelineError::EncodeFailed {
             path: path.to_path_buf(),
             reason: format!("FLAC bitstream write failed: {err}"),
         })?;
+    if source_failed.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err(PipelineError::DecodeFailed {
+            path: path.to_path_buf(),
+            reason: "WAV source ended before all declared PCM samples were read".to_owned(),
+        });
+    }
     fs::write(path, sink.as_slice()).map_err(|source| PipelineError::Io {
         path: path.to_path_buf(),
         source,
     })
+}
+
+fn encode_flac(
+    path: &Path,
+    rate: u32,
+    channels: usize,
+    bits: usize,
+    buf: &AudioWorkerBuffer,
+    batch_workers: usize,
+) -> Result<(), PipelineError> {
+    let source = BorrowedI32FlacSource {
+        samples: &buf.samples_i32,
+        read_head: 0,
+        channels,
+        bits,
+        rate: usize_from(rate),
+    };
+    encode_flac_from_source(path, source, batch_workers, None)
 }
 
 fn encode_wav(
@@ -409,10 +784,15 @@ fn encode_wav(
         bits_per_sample: u16::try_from(bits).unwrap_or(16),
         sample_format: SampleFormat::Int,
     };
-    let mut writer = WavWriter::create(path, spec).map_err(|err| PipelineError::EncodeFailed {
+    let file = File::create(path).map_err(|source| PipelineError::Io {
         path: path.to_path_buf(),
-        reason: format!("failed to create WAV writer: {err}"),
+        source,
     })?;
+    let mut writer = WavWriter::new(BufWriter::with_capacity(WAV_WRITE_BUF_BYTES, file), spec)
+        .map_err(|err| PipelineError::EncodeFailed {
+            path: path.to_path_buf(),
+            reason: format!("failed to create WAV writer: {err}"),
+        })?;
     if bits == 24 {
         for &sample in &buf.samples_i32 {
             writer
@@ -433,13 +813,17 @@ fn encode_wav(
                 })?;
         }
     } else {
-        for &sample in &buf.samples_i16 {
-            writer
-                .write_sample(sample)
-                .map_err(|err| PipelineError::EncodeFailed {
-                    path: path.to_path_buf(),
-                    reason: format!("WAV sample write failed: {err}"),
-                })?;
+        const CHUNK: usize = 65_536;
+        let samples = &buf.samples_i16;
+        for chunk in samples.chunks(CHUNK) {
+            let mut fast = writer.get_i16_writer(chunk.len().try_into().unwrap_or(u32::MAX));
+            for &sample in chunk {
+                fast.write_sample(sample);
+            }
+            fast.flush().map_err(|err| PipelineError::EncodeFailed {
+                path: path.to_path_buf(),
+                reason: format!("WAV sample write failed: {err}"),
+            })?;
         }
     }
     writer
@@ -450,17 +834,18 @@ fn encode_wav(
         })
 }
 
+// The resampler state, chunk buffer and output accumulation form one linear pipeline.
+#[allow(clippy::too_many_lines)]
 fn resample_to_opus_rate(
     rate: u32,
     channels: usize,
     buf: &mut AudioWorkerBuffer,
 ) -> Result<(), PipelineError> {
-    let input = std::mem::take(&mut buf.samples_f32);
     if rate == OPUS_RATE {
-        buf.resampled_f32.clear();
-        buf.resampled_f32.extend_from_slice(&input);
+        // Opus consumes f32 interleaved at 48 kHz; keep the decoded buffer in place.
         return Ok(());
     }
+    let input = std::mem::take(&mut buf.samples_f32);
     if channels > 2 {
         return Err(PipelineError::EncodeFailed {
             path: Path::new("opus-resampler").to_path_buf(),
@@ -505,8 +890,19 @@ fn resample_to_opus_rate(
         .div_ceil(chunk_in)
         .saturating_add(needed.div_ceil(chunk_out))
         .saturating_add(4);
+    let max_f32_samples = usize::try_from(MAX_PCM_BYTES_PER_FILE / 4).unwrap_or(usize::MAX);
+    let plane_reserve = needed.saturating_add(4).min(max_f32_samples);
+    let interleaved_reserve = plane_reserve.saturating_mul(channels).min(max_f32_samples);
+    for plane in &mut planar_out {
+        plane.reserve(plane_reserve);
+    }
+    if buf.resampled_f32.capacity() < interleaved_reserve {
+        buf.resampled_f32
+            .reserve(interleaved_reserve.saturating_sub(buf.resampled_f32.len()));
+    }
 
     let mut calls = 0_usize;
+    let mut chunk = vec![vec![0_f32; chunk_in]; channels];
     loop {
         let produced_frames = planar_out.first().map_or(0, Vec::len);
         if produced_frames >= needed || calls >= max_calls {
@@ -517,14 +913,19 @@ fn resample_to_opus_rate(
         for slot in &mut out_chunk {
             slot.fill(0.0);
         }
-        let mut chunk = vec![vec![0_f32; chunk_in]; channels];
         for channel in 0..channels {
-            if let (Some(src), Some(dst)) = (planar_in.get(channel), chunk.get_mut(channel)) {
-                for frame in 0..take {
-                    if let (Some(value), Some(slot)) = (src.get(offset + frame), dst.get_mut(frame))
-                    {
-                        *slot = *value;
+            if let Some(dst) = chunk.get_mut(channel) {
+                let copied = if let Some(src) = planar_in.get(channel) {
+                    let available = src.len().saturating_sub(offset).min(take).min(dst.len());
+                    if available > 0 {
+                        dst[..available].copy_from_slice(&src[offset..offset + available]);
                     }
+                    available
+                } else {
+                    0
+                };
+                if copied < dst.len() {
+                    dst[copied..].fill(0.0);
                 }
             }
         }
@@ -553,14 +954,19 @@ fn resample_to_opus_rate(
             }
         }
     }
+    std::mem::swap(&mut buf.samples_f32, &mut buf.resampled_f32);
+    buf.resampled_f32.clear();
     Ok(())
 }
 
+// Frame sizing, parallel/serial dispatch and Ogg writing share one encoder lifetime.
+#[allow(clippy::too_many_lines)]
 fn encode_opus(
     path: &Path,
     rate: u32,
     channels: usize,
     buf: &mut AudioWorkerBuffer,
+    batch_workers: usize,
 ) -> Result<(), PipelineError> {
     if channels > 2 {
         return Err(PipelineError::EncodeFailed {
@@ -569,14 +975,10 @@ fn encode_opus(
         });
     }
     resample_to_opus_rate(rate, channels, buf)?;
-    let total_frames = buf.resampled_f32.len() / channels;
+    let total_frames = buf.samples_f32.len() / channels;
     if total_frames == 0 {
         return Err(PipelineError::EmptyOutput(path.to_path_buf()));
     }
-    std::mem::swap(&mut buf.samples_f32, &mut buf.resampled_f32);
-    buf.resampled_f32.clear();
-    quantize_for(AudioOutputFormat::Opus, 16, buf);
-    let pcm_i16 = &buf.samples_i16;
 
     let mut encoder = OpusEncoder::new(
         i32::try_from(OPUS_RATE).unwrap_or(i32::MAX),
@@ -588,66 +990,116 @@ fn encode_opus(
         reason: format!("failed to create Opus encoder: {err}"),
     })?;
     encoder.bitrate_bps = OPUS_BITRATE;
-    // opus-pure defaults to complexity 9; libopus defaults to 10. Keep 9 explicitly for speed.
     encoder.complexity = 9;
     let head = OpusHead::for_encoder(&encoder, OPUS_RATE);
     let pre_skip = usize::from(head.pre_skip);
-    let file = File::create(path).map_err(|source| PipelineError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let mut writer = OggOpusWriter::new(file, head).map_err(|err| PipelineError::EncodeFailed {
-        path: path.to_path_buf(),
-        reason: format!("failed to create Ogg Opus writer: {err}"),
-    })?;
-
     let frame = usize_from(OPUS_RATE / (1000 / OPUS_FRAME_MS));
     let per_frame = frame.saturating_mul(channels);
     let packet_count = total_frames.saturating_add(pre_skip).div_ceil(frame);
     let final_granule = u64::from(u16::try_from(pre_skip).unwrap_or(u16::MAX))
         + u64::try_from(total_frames).unwrap_or(u64::MAX);
+    buf.samples_f32
+        .resize(packet_count.saturating_mul(per_frame), 0.0_f32);
 
-    for index in 0..packet_count {
-        let start = index.saturating_mul(per_frame);
-        let end = start.saturating_add(per_frame).min(pcm_i16.len());
-        buf.opus_block.fill(0);
-        if end > start
-            && let Some(slot) = buf.opus_block.get_mut(..end - start)
-        {
-            slot.copy_from_slice(&pcm_i16[start..end]);
-        }
-        let written = encoder
-            .encode_s16(&buf.opus_block, frame, &mut buf.packet)
-            .map_err(|err| PipelineError::EncodeFailed {
-                path: path.to_path_buf(),
-                reason: format!("Opus encoding failed: {err}"),
-            })?;
+    let file = File::create(path).map_err(|source| PipelineError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut writer = OggOpusWriter::new(BufWriter::with_capacity(OPUS_WRITE_BUF_BYTES, file), head)
+        .map_err(|err| PipelineError::EncodeFailed {
+            path: path.to_path_buf(),
+            reason: format!("failed to create Ogg Opus writer: {err}"),
+        })?;
+
+    let available = std::thread::available_parallelism()
+        .map_or(1, NonZeroUsize::get)
+        .min(8);
+    let inner_threads = (available / batch_workers.max(1)).max(1);
+    let mut pcfg = ParallelConfig::new(
+        i32::try_from(OPUS_RATE).unwrap_or(i32::MAX),
+        channels,
+        Application::Audio,
+    );
+    pcfg.bitrate_bps = OPUS_BITRATE;
+    pcfg.complexity = 9;
+    pcfg.warmup_ms = DEFAULT_WARMUP_MS;
+    pcfg.threads = inner_threads;
+    let parallel = inner_threads > 1 && pcfg.plan(packet_count, frame).workers > 1;
+
+    let write_packet = |writer: &mut OggOpusWriter<BufWriter<File>>,
+                        index: usize,
+                        packet: &[u8]|
+     -> Result<(), PipelineError> {
         if index + 1 == packet_count {
             let duration =
                 final_granule.saturating_sub(u64::try_from(writer.granule()).unwrap_or(0));
             let duration = u32::try_from(duration).unwrap_or(u32::MAX);
             writer
-                .write_packet_with_duration(&buf.packet[..written], duration)
+                .write_packet_with_duration(packet, duration)
                 .map_err(|err| PipelineError::EncodeFailed {
                     path: path.to_path_buf(),
                     reason: format!("failed to write final Opus packet: {err}"),
                 })?;
         } else {
-            writer.write_packet(&buf.packet[..written]).map_err(|err| {
-                PipelineError::EncodeFailed {
+            writer
+                .write_packet(packet)
+                .map_err(|err| PipelineError::EncodeFailed {
                     path: path.to_path_buf(),
                     reason: format!("failed to write Opus packet: {err}"),
-                }
-            })?;
+                })?;
         }
-    }
-    writer
-        .finish()
-        .map(|_| ())
+        Ok(())
+    };
+
+    if parallel {
+        let packets = encode_parallel(
+            &pcfg,
+            &buf.samples_f32[..packet_count.saturating_mul(per_frame)],
+            frame,
+        )
         .map_err(|err| PipelineError::EncodeFailed {
             path: path.to_path_buf(),
-            reason: format!("failed to finalize Ogg Opus stream: {err}"),
-        })
+            reason: format!("Opus parallel encoding failed: {err}"),
+        })?;
+        if packets.len() != packet_count {
+            return Err(PipelineError::EncodeFailed {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "Opus parallel encoding produced {} packets, expected {packet_count}",
+                    packets.len()
+                ),
+            });
+        }
+        for (index, packet) in packets.iter().enumerate() {
+            write_packet(&mut writer, index, packet)?;
+        }
+    } else {
+        for index in 0..packet_count {
+            let start = index.saturating_mul(per_frame);
+            let Some(block) = buf.samples_f32.get(start..start + per_frame) else {
+                return Err(PipelineError::EncodeFailed {
+                    path: path.to_path_buf(),
+                    reason: format!("Opus PCM buffer shorter than expected packet {index}"),
+                });
+            };
+            let written = encoder
+                .encode(block, frame, &mut buf.packet)
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: path.to_path_buf(),
+                    reason: format!("Opus encoding failed: {err}"),
+                })?;
+            write_packet(&mut writer, index, &buf.packet[..written])?;
+        }
+    }
+
+    let mut buf_writer = writer.finish().map_err(|err| PipelineError::EncodeFailed {
+        path: path.to_path_buf(),
+        reason: format!("failed to finalize Ogg Opus stream: {err}"),
+    })?;
+    buf_writer.flush().map_err(|source| PipelineError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -665,11 +1117,11 @@ fn create_staging_file(target: &Path) -> Result<PathBuf, PipelineError> {
             ".fastconv-audio-{}-{sequence}.tmp",
             std::process::id()
         ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staging)
-        {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&staging) {
             Ok(_) => return Ok(staging),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
             Err(source) => {
@@ -689,14 +1141,9 @@ fn create_staging_file(target: &Path) -> Result<PathBuf, PipelineError> {
     })
 }
 
-fn encode_audio(
+fn encode_staged(
     item: &AudioBatchItem,
-    mode: fastconv_domain::AudioExecutionMode,
-    rate: u32,
-    channels: usize,
-    bits: usize,
-    buf: &mut AudioWorkerBuffer,
-    batch_workers: usize,
+    encode: impl FnOnce(&Path) -> Result<(), PipelineError>,
 ) -> Result<u64, PipelineError> {
     let target = item.target();
     if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -706,35 +1153,8 @@ fn encode_audio(
         })?;
     }
     let temp = create_staging_file(target)?;
-    let bits = if mode.output_format() == AudioOutputFormat::Opus {
-        // Opus quantizes decoded samples to its own 16-bit input depth, so any supported
-        // mono/stereo source precision is acceptable here.
-        16
-    } else {
-        match bits {
-            0 => 16, // lossy source with no declared depth
-            8 | 16 | 24 => bits,
-            unsupported => {
-                let _ = fs::remove_file(&temp);
-                return Err(PipelineError::UnsupportedSampleDepth {
-                    path: item.source().to_path_buf(),
-                    bits: unsupported,
-                });
-            }
-        }
-    };
-    if mode.output_format() != AudioOutputFormat::Opus {
-        quantize_for(mode.output_format(), bits, buf);
-    }
-
-    let encode = (|| -> Result<u64, PipelineError> {
-        match mode.output_format() {
-            AudioOutputFormat::Wav => encode_wav(&temp, rate, channels, bits, buf)?,
-            AudioOutputFormat::Flac => {
-                encode_flac(&temp, rate, channels, bits, buf, batch_workers)?;
-            }
-            AudioOutputFormat::Opus => encode_opus(&temp, rate, channels, buf)?,
-        }
+    let result = (|| -> Result<u64, PipelineError> {
+        encode(&temp)?;
         let output_bytes = fs::metadata(&temp).map_or(0, |meta| meta.len());
         if output_bytes == 0 {
             return Err(PipelineError::EmptyOutput(target.to_path_buf()));
@@ -745,10 +1165,85 @@ fn encode_audio(
         })?;
         Ok(output_bytes)
     })();
-    if encode.is_err() {
+    if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
-    encode
+    result
+}
+
+fn encode_audio(
+    item: &AudioBatchItem,
+    mode: fastconv_domain::AudioExecutionMode,
+    rate: u32,
+    channels: usize,
+    bits: usize,
+    buf: &mut AudioWorkerBuffer,
+    batch_workers: usize,
+) -> Result<u64, PipelineError> {
+    let bits = if mode.output_format() == AudioOutputFormat::Opus {
+        16
+    } else {
+        match bits {
+            0 => 16,
+            8 | 16 | 24 => bits,
+            unsupported => {
+                return Err(PipelineError::UnsupportedSampleDepth {
+                    path: item.source().to_path_buf(),
+                    bits: unsupported,
+                });
+            }
+        }
+    };
+    // A direct i16 decode leaves samples_i16 populated; promote to i32 for FLAC
+    // or pass the i16 buffer through to the bulk WAV writer.
+    let direct_i16 = !buf.samples_i16.is_empty() && buf.samples_f32.is_empty();
+    if direct_i16 {
+        if mode.output_format() == AudioOutputFormat::Flac {
+            buf.samples_i32.clear();
+            buf.samples_i32
+                .extend(buf.samples_i16.iter().copied().map(i32::from));
+        }
+    } else if mode.output_format() != AudioOutputFormat::Opus {
+        quantize_for(mode.output_format(), bits, buf);
+    }
+    encode_staged(item, |temp| match mode.output_format() {
+        AudioOutputFormat::Wav => encode_wav(temp, rate, channels, bits, buf),
+        AudioOutputFormat::Flac => encode_flac(temp, rate, channels, bits, buf, batch_workers),
+        AudioOutputFormat::Opus => encode_opus(temp, rate, channels, buf, batch_workers),
+    })
+}
+
+fn convert_pcm_wav_to_flac(
+    item: &AudioBatchItem,
+    stream: PcmWavStream,
+    buf: &mut AudioWorkerBuffer,
+    batch_workers: usize,
+) -> Result<u64, PipelineError> {
+    buf.reset();
+    encode_staged(item, |temp| {
+        let PcmWavStream {
+            reader,
+            channels,
+            bits,
+            rate,
+            frame_bytes,
+            total_samples,
+            remaining_bytes,
+        } = stream;
+        let source = LeBytesFlacSource {
+            reader,
+            read_buf: Vec::new(),
+            channels,
+            bits,
+            rate: usize_from(rate),
+            frame_bytes,
+            total_samples,
+            remaining_bytes,
+        };
+        let failed = Arc::new(AtomicBool::new(false));
+        let source = EofTolerantFlacSource::new(source, Arc::clone(&failed));
+        encode_flac_from_source(temp, source, batch_workers, Some(&failed))
+    })
 }
 
 fn convert_item(
@@ -763,12 +1258,18 @@ fn convert_item(
             source,
         })?
         .len();
-    let (rate, channels, bits) = decode_audio(item, buf)?;
+    if item.input_format() == AudioInputFormat::Wav
+        && mode.output_format() == AudioOutputFormat::Flac
+        && let Some(stream) = try_open_pcm_wav(item.source())?
+    {
+        let output_bytes = convert_pcm_wav_to_flac(item, stream, buf, batch_workers)?;
+        return Ok((input_bytes, output_bytes));
+    }
+    let (rate, channels, bits) = decode_audio(item, mode.output_format(), buf)?;
     let output_bytes = encode_audio(item, mode, rate, channels, bits, buf, batch_workers)?;
     Ok((input_bytes, output_bytes))
 }
 
-/// Worst-case working-set estimate for one file: interleaved f32 (or i32) samples.
 fn estimate_pcm_bytes(item: &AudioBatchItem) -> u64 {
     let stream = item.stream();
     let channels = u64::from(stream.channels().get()).max(1);
@@ -1111,6 +1612,278 @@ mod tests {
             .spec();
         assert_eq!(spec.sample_rate, 48_000);
         assert_eq!(spec.channels, 2);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    fn fmt_pcm(channels: u16, rate: u32, bits: u16) -> Vec<u8> {
+        let block_align = channels.saturating_mul(bits / 8);
+        let byte_rate = rate.saturating_mul(u32::from(block_align));
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&1_u16.to_le_bytes());
+        fmt.extend_from_slice(&channels.to_le_bytes());
+        fmt.extend_from_slice(&rate.to_le_bytes());
+        fmt.extend_from_slice(&byte_rate.to_le_bytes());
+        fmt.extend_from_slice(&block_align.to_le_bytes());
+        fmt.extend_from_slice(&bits.to_le_bytes());
+        fmt
+    }
+
+    fn wav_bytes(fmt: &[u8], data: &[u8], extra: &[([u8; 4], &[u8])]) -> Vec<u8> {
+        let mut chunks = Vec::new();
+        chunks.extend_from_slice(b"fmt ");
+        chunks.extend_from_slice(&u32::try_from(fmt.len()).unwrap_or(0).to_le_bytes());
+        chunks.extend_from_slice(fmt);
+        if fmt.len() % 2 == 1 {
+            chunks.push(0);
+        }
+        for (id, body) in extra {
+            chunks.extend_from_slice(id);
+            chunks.extend_from_slice(&u32::try_from(body.len()).unwrap_or(0).to_le_bytes());
+            chunks.extend_from_slice(body);
+            if body.len() % 2 == 1 {
+                chunks.push(0);
+            }
+        }
+        chunks.extend_from_slice(b"data");
+        chunks.extend_from_slice(&u32::try_from(data.len()).unwrap_or(0).to_le_bytes());
+        chunks.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            chunks.push(0);
+        }
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(
+            &u32::try_from(chunks.len().saturating_add(4))
+                .unwrap_or(0)
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(&chunks);
+        bytes
+    }
+
+    fn write_raw_wav(path: &Path, bytes: &[u8]) -> Result<(), PipelineError> {
+        fs::write(path, bytes).map_err(|source| PipelineError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn read_wav_i32(path: &Path) -> Vec<i32> {
+        let Ok(mut reader) = hound::WavReader::open(path) else {
+            return Vec::new();
+        };
+        reader.samples::<i32>().filter_map(Result::ok).collect()
+    }
+
+    fn item_bits(
+        source: PathBuf,
+        target: PathBuf,
+        format: AudioInputFormat,
+        channels: u16,
+        rate: u32,
+        bits: u16,
+    ) -> AudioBatchItem {
+        AudioBatchItem::new(
+            source,
+            target,
+            format,
+            fastconv_domain::AudioStreamInfo::new(
+                NonZeroU16::new(channels).unwrap_or(NonZeroU16::MIN),
+                NonZeroU32::new(rate).unwrap_or(NonZeroU32::MIN),
+                NonZeroU16::new(bits),
+                None,
+            )
+            .unwrap_or_else(|_| unreachable!()),
+        )
+        .unwrap_or_else(|_| unreachable!())
+    }
+
+    #[test]
+    fn direct_16bit_wav_to_flac_with_odd_junk_chunk_roundtrips_bit_exactly()
+    -> Result<(), PipelineError> {
+        let dir = temp_dir("direct-flac-16-junk");
+        let wav = dir.join("in.wav");
+        let flac = dir.join("out.flac");
+        let back = dir.join("back.wav");
+        let samples = tone(12_000, 2);
+        let mut data = Vec::with_capacity(samples.len() * 2);
+        for sample in &samples {
+            data.extend_from_slice(&sample.to_le_bytes());
+        }
+        // A JUNK chunk with an odd body length exercises RIFF even-byte padding.
+        let junk = b"JNK";
+        write_raw_wav(
+            &wav,
+            &wav_bytes(&fmt_pcm(2, 48_000, 16), &data, &[(*b"JUNK", junk)]),
+        )?;
+        assert!(
+            try_open_pcm_wav(&wav)?.is_some(),
+            "16-bit PCM must use the direct source"
+        );
+
+        execute_audio_batch(&plan(
+            vec![item_bits(
+                wav,
+                flac.clone(),
+                AudioInputFormat::Wav,
+                2,
+                48_000,
+                16,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuFlac,
+        ))?;
+        execute_audio_batch(&plan(
+            vec![item_bits(
+                flac,
+                back.clone(),
+                AudioInputFormat::Flac,
+                2,
+                48_000,
+                16,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuWav,
+        ))?;
+        assert_eq!(read_wav(&back), samples);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_24bit_wav_to_flac_roundtrips_bit_exactly() -> Result<(), PipelineError> {
+        let dir = temp_dir("direct-flac-24");
+        let wav = dir.join("in.wav");
+        let flac = dir.join("out.flac");
+        let back = dir.join("back.wav");
+        let samples: Vec<i32> = (0..8_000_i32)
+            .map(|i| (i.saturating_mul(7919) % 4_000_000) - 2_000_000)
+            .collect();
+        let mut data = Vec::with_capacity(samples.len() * 3);
+        for sample in &samples {
+            let bytes = sample.to_le_bytes();
+            data.extend_from_slice(&bytes[..3]);
+        }
+        write_raw_wav(&wav, &wav_bytes(&fmt_pcm(1, 44_100, 24), &data, &[]))?;
+        assert!(
+            try_open_pcm_wav(&wav)?.is_some(),
+            "24-bit PCM must use the direct source"
+        );
+
+        execute_audio_batch(&plan(
+            vec![item_bits(
+                wav,
+                flac.clone(),
+                AudioInputFormat::Wav,
+                1,
+                44_100,
+                24,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuFlac,
+        ))?;
+        execute_audio_batch(&plan(
+            vec![item_bits(
+                flac,
+                back.clone(),
+                AudioInputFormat::Flac,
+                1,
+                44_100,
+                24,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuWav,
+        ))?;
+        assert_eq!(read_wav_i32(&back), samples);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn unsigned_8bit_wav_is_not_misread_as_signed() -> Result<(), PipelineError> {
+        let dir = temp_dir("wav-8bit-unsigned");
+        let wav = dir.join("in.wav");
+        let flac = dir.join("out.flac");
+        let back = dir.join("back.wav");
+        // WAV 8-bit is unsigned (0..=255); FLAC 8-bit is signed. The direct
+        // source must reject this file so Symphonia performs the conversion.
+        let unsigned: [u8; 8] = [0, 1, 64, 127, 128, 192, 254, 255];
+        write_raw_wav(&wav, &wav_bytes(&fmt_pcm(1, 8_000, 8), &unsigned, &[]))?;
+        assert!(
+            try_open_pcm_wav(&wav)?.is_none(),
+            "8-bit WAV must fall back to Symphonia"
+        );
+
+        execute_audio_batch(&plan(
+            vec![item_bits(
+                wav,
+                flac.clone(),
+                AudioInputFormat::Wav,
+                1,
+                8_000,
+                8,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuFlac,
+        ))?;
+        execute_audio_batch(&plan(
+            vec![item_bits(
+                flac,
+                back.clone(),
+                AudioInputFormat::Flac,
+                1,
+                8_000,
+                8,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuWav,
+        ))?;
+        let mut reader =
+            hound::WavReader::open(&back).map_err(|err| PipelineError::DecodeFailed {
+                path: back.clone(),
+                reason: format!("failed to reopen 8-bit WAV: {err}"),
+            })?;
+        let decoded: Vec<u8> = reader
+            .samples::<i8>()
+            .filter_map(Result::ok)
+            .map(|sample| sample.wrapping_add(i8::MIN).cast_unsigned())
+            .collect();
+        assert_eq!(decoded, unsigned);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn float_wav_falls_back_to_symphonia() -> Result<(), PipelineError> {
+        let dir = temp_dir("wav-float");
+        let wav = dir.join("in.wav");
+        // audio_format 3 == IEEE float.
+        let mut fmt = fmt_pcm(1, 48_000, 32);
+        fmt[..2].copy_from_slice(&3_u16.to_le_bytes());
+        write_raw_wav(&wav, &wav_bytes(&fmt, &[0_u8; 32], &[]))?;
+        assert!(
+            try_open_pcm_wav(&wav)?.is_none(),
+            "float WAV must fall back to Symphonia"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn ten_second_stereo_wav_parallel_opus_roundtrip() -> Result<(), PipelineError> {
+        let dir = temp_dir("opus-parallel");
+        let wav = dir.join("in.wav");
+        let opus = dir.join("out.opus");
+        let back = dir.join("back.wav");
+        // 10 s at 48 kHz stereo: long enough for encode_parallel to split frames.
+        let samples = tone(480_000, 2);
+        write_wav(&wav, &samples, 48_000, 2);
+
+        execute_audio_batch(&plan(
+            vec![item(wav, opus.clone(), AudioInputFormat::Wav, 2, 48_000)],
+            fastconv_domain::AudioExecutionMode::CpuOpus,
+        ))?;
+        execute_audio_batch(&plan(
+            vec![item(opus, back.clone(), AudioInputFormat::Opus, 2, 48_000)],
+            fastconv_domain::AudioExecutionMode::CpuWav,
+        ))?;
+        let decoded = read_wav(&back);
+        assert_eq!(decoded.len(), samples.len());
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }

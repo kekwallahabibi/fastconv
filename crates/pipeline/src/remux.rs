@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,6 +32,13 @@ use crate::PipelineError;
 /// while staying well inside Matroska's tick range.
 const ROUNDED_TICK_NS: u64 = 1;
 
+/// Window size used by [`WindowedFileReader`].
+const WINDOW_BYTES: usize = 1024 * 1024;
+
+/// Above this source size, MP4 faststart is left on the target file instead of
+/// being staged in RAM.
+const IN_MEMORY_MP4_FASTSTART_LIMIT: u64 = 64 * 1024 * 1024;
+
 fn remux_failed(path: &Path, reason: impl Into<String>) -> PipelineError {
     PipelineError::RemuxFailed {
         path: path.to_path_buf(),
@@ -40,6 +48,109 @@ fn remux_failed(path: &Path, reason: impl Into<String>) -> PipelineError {
 
 fn container_err(path: &Path, err: &containr::Error) -> PipelineError {
     remux_failed(path, format!("container error: {err}"))
+}
+
+/// Keeps a 1 MiB window of the source in memory across containr's absolute
+/// seeks so each EBML/box header and packet does not become a fresh syscall.
+struct WindowedFileReader {
+    file: File,
+    file_len: u64,
+    pos: u64,
+    buf: Vec<u8>,
+    buf_start: u64,
+    buf_valid: usize,
+}
+
+impl WindowedFileReader {
+    fn open(path: &Path) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        let window_len = u64::try_from(WINDOW_BYTES).unwrap_or(u64::MAX);
+        let capacity = usize::try_from(file_len.min(window_len)).unwrap_or(WINDOW_BYTES);
+        Ok(Self {
+            file,
+            file_len,
+            pos: 0,
+            buf: vec![0_u8; capacity],
+            buf_start: 0,
+            buf_valid: 0,
+        })
+    }
+}
+
+impl Seek for WindowedFileReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match pos {
+            SeekFrom::Start(offset) => {
+                self.pos = offset;
+                Ok(self.pos)
+            }
+            SeekFrom::Current(delta) => {
+                self.pos = self.pos.checked_add_signed(delta).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "seek before start of file")
+                })?;
+                Ok(self.pos)
+            }
+            SeekFrom::End(delta) => {
+                // containr probes the input length with `seek(SeekFrom::End(0))`.
+                self.pos = self.file_len.checked_add_signed(delta).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "seek before start of file")
+                })?;
+                Ok(self.pos)
+            }
+        }
+    }
+}
+
+impl Read for WindowedFileReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() || self.pos >= self.file_len {
+            return Ok(0);
+        }
+
+        if let Some(rel) = self.pos.checked_sub(self.buf_start)
+            && let Ok(rel_usize) = usize::try_from(rel)
+            && rel_usize < self.buf_valid
+        {
+            let count = out.len().min(self.buf_valid - rel_usize);
+            out[..count].copy_from_slice(&self.buf[rel_usize..rel_usize + count]);
+            self.pos = self
+                .pos
+                .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+            return Ok(count);
+        }
+
+        if out.len() >= self.buf.len() {
+            self.file.seek(SeekFrom::Start(self.pos))?;
+            let count = self.file.read(out)?;
+            self.pos = self
+                .pos
+                .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+            return Ok(count);
+        }
+
+        self.file.seek(SeekFrom::Start(self.pos))?;
+        let mut filled = 0_usize;
+        while filled < self.buf.len() {
+            match self.file.read(&mut self.buf[filled..]) {
+                Ok(0) => break,
+                Ok(count) => filled += count,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err),
+            }
+        }
+        self.buf_start = self.pos;
+        self.buf_valid = filled;
+        if filled == 0 {
+            return Ok(0);
+        }
+        let count = out.len().min(filled);
+        out[..count].copy_from_slice(&self.buf[..count]);
+        self.pos = self
+            .pos
+            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        Ok(count)
+    }
 }
 
 /// Remuxes a single file from one container to the other without re-encoding.
@@ -138,10 +249,15 @@ fn read_packets(
 }
 
 fn mp4_to_mkv(source: &Path, target: &File, target_path: &Path) -> Result<(), PipelineError> {
+    let reader = WindowedFileReader::open(source).map_err(|source_err| PipelineError::Io {
+        path: source.to_path_buf(),
+        source: source_err,
+    })?;
     let mut input =
-        containr::mp4::Demuxer::open_path(source).map_err(|err| container_err(source, &err))?;
+        containr::mp4::Demuxer::open(reader).map_err(|err| container_err(source, &err))?;
 
-    let mut plans: Vec<(u32, containr::mkv::StreamCopy)> = Vec::new();
+    let mut track_ids: Vec<u32> = Vec::new();
+    let mut plans: Vec<containr::mkv::StreamCopy> = Vec::new();
     for track in input.tracks().iter().filter(|t| !t.chapter_track) {
         let packets = read_packets(
             input
@@ -156,23 +272,24 @@ fn mp4_to_mkv(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
                     .map_err(|err| container_err(source, &err))?
             }
         };
-        plans.push((track.id, plan));
+        track_ids.push(track.id);
+        plans.push(plan);
     }
     if plans.is_empty() {
         return Err(remux_failed(source, "no remuxable tracks in MP4 source"));
     }
 
-    let scales: Vec<containr::mkv::StreamCopy> = plans.iter().map(|(_, p)| p.clone()).collect();
     let options = containr::mkv::MkvOptions {
-        timestamp_scale: containr::mkv::StreamCopy::timestamp_scale(&scales),
+        timestamp_scale: containr::mkv::StreamCopy::timestamp_scale(&plans),
         ..containr::mkv::MkvOptions::default()
     };
 
-    let mut output = containr::mkv::Muxer::new(target, options)
+    let mut writer = BufWriter::with_capacity(512 * 1024, target);
+    let mut output = containr::mkv::Muxer::new(&mut writer, options)
         .map_err(|err| container_err(target_path, &err))?;
 
     let mut ids: Vec<(u32, containr::mkv::TrackId)> = Vec::with_capacity(plans.len());
-    for (source_id, plan) in &plans {
+    for (source_id, plan) in track_ids.iter().zip(&plans) {
         let id = output
             .add_track(plan.spec.clone())
             .map_err(|err| container_err(target_path, &err))?;
@@ -187,17 +304,17 @@ fn mp4_to_mkv(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
         .set_chapters(input.chapters().to_vec())
         .map_err(|err| container_err(target_path, &err))?;
 
+    let mut packet_buf: Vec<u8> = Vec::new();
     for packet in input.packets() {
         let packet = packet.map_err(|err| container_err(source, &err))?;
         let Some(slot) = ids.iter().position(|(id, _)| *id == packet.track_id) else {
             continue;
         };
-        let bytes = input
-            .read_packet(&packet)
+        input
+            .read_packet_into(&packet, &mut packet_buf)
             .map_err(|err| container_err(source, &err))?;
         if let Some(block) = plans[slot]
-            .1
-            .packet(&packet, &bytes)
+            .packet(&packet, &packet_buf)
             .map_err(|err| container_err(source, &err))?
         {
             output
@@ -208,12 +325,24 @@ fn mp4_to_mkv(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
     output
         .finish()
         .map_err(|err| container_err(target_path, &err))?;
+    writer.flush().map_err(|source| PipelineError::Io {
+        path: target_path.to_path_buf(),
+        source,
+    })?;
     Ok(())
 }
 
-fn mkv_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), PipelineError> {
+fn mux_mkv_to_mp4<W: io::Read + io::Write + io::Seek>(
+    source: &Path,
+    target: W,
+    target_path: &Path,
+) -> Result<(), PipelineError> {
+    let reader = WindowedFileReader::open(source).map_err(|source_err| PipelineError::Io {
+        path: source.to_path_buf(),
+        source: source_err,
+    })?;
     let mut input =
-        containr::mkv::Demuxer::open_path(source).map_err(|err| container_err(source, &err))?;
+        containr::mkv::Demuxer::open(reader).map_err(|err| container_err(source, &err))?;
     if input.truncated() {
         return Err(remux_failed(source, "truncated MKV input"));
     }
@@ -284,16 +413,17 @@ fn mkv_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
         .set_chapters(containr::mp4::StreamCopy::chapters(input.chapters()))
         .map_err(|err| container_err(target_path, &err))?;
 
+    let mut packet_buf: Vec<u8> = Vec::new();
     for packet in input.packets() {
         let packet = packet.map_err(|err| container_err(source, &err))?;
         let Some((plan, id)) = plans.get(&packet.track_id) else {
             continue;
         };
-        let bytes = input
-            .read_packet(&packet)
+        input
+            .read_packet_into(&packet, &mut packet_buf)
             .map_err(|err| container_err(source, &err))?;
         let block = plan
-            .packet(&packet, &bytes)
+            .packet(&packet, &packet_buf)
             .map_err(|err| container_err(source, &err))?;
         output
             .write_packet(*id, &block)
@@ -305,9 +435,43 @@ fn mkv_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
     Ok(())
 }
 
-fn mp4_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), PipelineError> {
+fn mkv_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), PipelineError> {
+    let source_len = input_size(source);
+    if source_len <= IN_MEMORY_MP4_FASTSTART_LIMIT {
+        let mut mem = io::Cursor::new(Vec::with_capacity(
+            usize::try_from(source_len)
+                .unwrap_or(0)
+                .saturating_add(256 * 1024),
+        ));
+        mux_mkv_to_mp4(source, &mut mem, target_path)?;
+        let mut writer: &File = target;
+        writer
+            .write_all(mem.get_ref())
+            .map_err(|source| PipelineError::Io {
+                path: target_path.to_path_buf(),
+                source,
+            })?;
+        writer.flush().map_err(|source| PipelineError::Io {
+            path: target_path.to_path_buf(),
+            source,
+        })?;
+        Ok(())
+    } else {
+        mux_mkv_to_mp4(source, target, target_path)
+    }
+}
+
+fn mux_mp4_to_mp4<W: io::Read + io::Write + io::Seek>(
+    source: &Path,
+    target: W,
+    target_path: &Path,
+) -> Result<(), PipelineError> {
+    let reader = WindowedFileReader::open(source).map_err(|source_err| PipelineError::Io {
+        path: source.to_path_buf(),
+        source: source_err,
+    })?;
     let mut input =
-        containr::mp4::Demuxer::open_path(source).map_err(|err| container_err(source, &err))?;
+        containr::mp4::Demuxer::open(reader).map_err(|err| container_err(source, &err))?;
     let options = containr::mp4::MuxOptions {
         faststart: true,
         ..containr::mp4::MuxOptions::default()
@@ -339,16 +503,17 @@ fn mp4_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
     output
         .set_chapters(containr::mp4::StreamCopy::chapters(input.chapters()))
         .map_err(|err| container_err(target_path, &err))?;
+    let mut packet_buf: Vec<u8> = Vec::new();
     for packet in input.packets() {
         let packet = packet.map_err(|err| container_err(source, &err))?;
         let Some((plan, id)) = plans.get(&packet.track_id) else {
             continue;
         };
-        let bytes = input
-            .read_packet(&packet)
+        input
+            .read_packet_into(&packet, &mut packet_buf)
             .map_err(|err| container_err(source, &err))?;
         let block = plan
-            .packet(&packet, &bytes)
+            .packet(&packet, &packet_buf)
             .map_err(|err| container_err(source, &err))?;
         output
             .write_packet(*id, &block)
@@ -360,13 +525,44 @@ fn mp4_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
     Ok(())
 }
 
+fn mp4_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), PipelineError> {
+    let source_len = input_size(source);
+    if source_len <= IN_MEMORY_MP4_FASTSTART_LIMIT {
+        let mut mem = io::Cursor::new(Vec::with_capacity(
+            usize::try_from(source_len)
+                .unwrap_or(0)
+                .saturating_add(256 * 1024),
+        ));
+        mux_mp4_to_mp4(source, &mut mem, target_path)?;
+        let mut writer: &File = target;
+        writer
+            .write_all(mem.get_ref())
+            .map_err(|source| PipelineError::Io {
+                path: target_path.to_path_buf(),
+                source,
+            })?;
+        writer.flush().map_err(|source| PipelineError::Io {
+            path: target_path.to_path_buf(),
+            source,
+        })?;
+        Ok(())
+    } else {
+        mux_mp4_to_mp4(source, target, target_path)
+    }
+}
+
 fn mkv_to_mkv(source: &Path, target: &File, target_path: &Path) -> Result<(), PipelineError> {
+    let reader = WindowedFileReader::open(source).map_err(|source_err| PipelineError::Io {
+        path: source.to_path_buf(),
+        source: source_err,
+    })?;
     let mut input =
-        containr::mkv::Demuxer::open_path(source).map_err(|err| container_err(source, &err))?;
+        containr::mkv::Demuxer::open(reader).map_err(|err| container_err(source, &err))?;
     if input.truncated() {
         return Err(remux_failed(source, "truncated MKV input"));
     }
-    let mut plans: Vec<(u32, containr::mkv::StreamCopy)> = Vec::new();
+    let mut track_ids: Vec<u32> = Vec::new();
+    let mut plans: Vec<containr::mkv::StreamCopy> = Vec::new();
     for track in input.tracks() {
         let packets = read_packets(
             input
@@ -376,18 +572,19 @@ fn mkv_to_mkv(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
         )?;
         let plan = containr::mkv::StreamCopy::plan(track, &packets)
             .map_err(|err| container_err(source, &err))?;
-        plans.push((track.id, plan));
+        track_ids.push(track.id);
+        plans.push(plan);
     }
-    let scales: Vec<containr::mkv::StreamCopy> = plans.iter().map(|(_, p)| p.clone()).collect();
     let options = containr::mkv::MkvOptions {
-        timestamp_scale: containr::mkv::StreamCopy::timestamp_scale(&scales),
+        timestamp_scale: containr::mkv::StreamCopy::timestamp_scale(&plans),
         ..containr::mkv::MkvOptions::default()
     };
 
-    let mut output = containr::mkv::Muxer::new(target, options)
+    let mut writer = BufWriter::with_capacity(512 * 1024, target);
+    let mut output = containr::mkv::Muxer::new(&mut writer, options)
         .map_err(|err| container_err(target_path, &err))?;
     let mut ids: Vec<(u32, containr::mkv::TrackId)> = Vec::with_capacity(plans.len());
-    for (source_id, plan) in &plans {
+    for (source_id, plan) in track_ids.iter().zip(&plans) {
         ids.push((
             *source_id,
             output
@@ -420,17 +617,17 @@ fn mkv_to_mkv(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
             .map_err(|err| container_err(target_path, &err))?;
     }
 
+    let mut packet_buf: Vec<u8> = Vec::new();
     for packet in input.packets() {
         let packet = packet.map_err(|err| container_err(source, &err))?;
         let Some(slot) = ids.iter().position(|(id, _)| *id == packet.track_id) else {
             continue;
         };
-        let bytes = input
-            .read_packet(&packet)
+        input
+            .read_packet_into(&packet, &mut packet_buf)
             .map_err(|err| container_err(source, &err))?;
         if let Some(block) = plans[slot]
-            .1
-            .packet(&packet, &bytes)
+            .packet(&packet, &packet_buf)
             .map_err(|err| container_err(source, &err))?
         {
             output
@@ -441,6 +638,10 @@ fn mkv_to_mkv(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
     output
         .finish()
         .map_err(|err| container_err(target_path, &err))?;
+    writer.flush().map_err(|source| PipelineError::Io {
+        path: target_path.to_path_buf(),
+        source,
+    })?;
     Ok(())
 }
 
@@ -465,39 +666,49 @@ pub fn execute_video_batch(plan: &VideoRemuxPlan) -> Result<VideoRemuxReport, Pi
     let failure: Mutex<Option<PipelineError>> = Mutex::new(None);
     let tag = AtomicUsize::new(0);
 
-    thread::scope(|scope| -> Result<(), PipelineError> {
-        let mut handles = Vec::with_capacity(workers);
-        for _ in 0..workers {
-            let next = &next;
-            let failure = &failure;
-            let tag = &tag;
-            let items = plan.items();
-            handles.push(scope.spawn(move || {
-                loop {
-                    if failure.lock().map_or(true, |guard| guard.is_some()) {
-                        break;
-                    }
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    if index >= items.len() {
-                        break;
-                    }
-                    let my_tag = tag.fetch_add(1, Ordering::Relaxed);
-                    if let Err(err) = remux_with_staging(&items[index], my_tag) {
-                        if let Ok(mut guard) = failure.lock()
-                            && guard.is_none()
-                        {
-                            *guard = Some(err);
+    // A single item does not benefit from a scoped worker: it avoids a thread
+    // spawn and keeps the I/O window and packet buffer on the calling stack.
+    if plan.items().len() == 1 {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            remux_with_staging(&plan.items()[0], 0)
+        }))
+        .map_err(|_| PipelineError::WorkerPanicked)?;
+        result?;
+    } else {
+        thread::scope(|scope| -> Result<(), PipelineError> {
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                let next = &next;
+                let failure = &failure;
+                let tag = &tag;
+                let items = plan.items();
+                handles.push(scope.spawn(move || {
+                    loop {
+                        if failure.lock().map_or(true, |guard| guard.is_some()) {
+                            break;
                         }
-                        break;
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= items.len() {
+                            break;
+                        }
+                        let my_tag = tag.fetch_add(1, Ordering::Relaxed);
+                        if let Err(err) = remux_with_staging(&items[index], my_tag) {
+                            if let Ok(mut guard) = failure.lock()
+                                && guard.is_none()
+                            {
+                                *guard = Some(err);
+                            }
+                            break;
+                        }
                     }
-                }
-            }));
-        }
-        for handle in handles {
-            handle.join().map_err(|_| PipelineError::WorkerPanicked)?;
-        }
-        Ok(())
-    })?;
+                }));
+            }
+            for handle in handles {
+                handle.join().map_err(|_| PipelineError::WorkerPanicked)?;
+            }
+            Ok(())
+        })?;
+    }
 
     if let Some(err) = failure
         .into_inner()
@@ -526,4 +737,88 @@ pub fn execute_video_batch(plan: &VideoRemuxPlan) -> Result<VideoRemuxReport, Pi
 
 fn input_size(path: &Path) -> u64 {
     std::fs::metadata(path).map_or(0, |m| m.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_file(label: &str, bytes: &[u8]) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = std::env::temp_dir().join(format!("fastconv-remux-{label}-{nanos}"));
+        std::fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
+    #[test]
+    fn windowed_reader_seek_and_eof() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_file("seek", b"0123456789")?;
+        let mut reader = WindowedFileReader::open(&path)?;
+        assert_eq!(reader.seek(SeekFrom::End(0))?, 10);
+        assert_eq!(reader.seek(SeekFrom::End(-4))?, 6);
+        let mut out = [0_u8; 4];
+        assert_eq!(reader.read(&mut out)?, 4);
+        assert_eq!(&out, b"6789");
+        reader.seek(SeekFrom::Start(0))?;
+        for pos in [SeekFrom::Current(-1), SeekFrom::End(-11)] {
+            match reader.seek(pos) {
+                Ok(result) => return Err(format!("unexpected seek result: {result}").into()),
+                Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+            }
+        }
+        reader.seek(SeekFrom::Start(100))?;
+        assert_eq!(reader.read(&mut out)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn windowed_reader_backward_seek_hits_buffer() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_file("backward", b"0123456789")?;
+        let mut reader = WindowedFileReader::open(&path)?;
+        let mut out = [0_u8; 4];
+        assert_eq!(reader.read(&mut out)?, 4);
+        assert!(reader.buf_valid >= 4);
+        reader.seek(SeekFrom::Start(2))?;
+        assert_eq!(reader.read(&mut out)?, 4);
+        assert_eq!(&out, b"2345");
+        Ok(())
+    }
+
+    #[test]
+    fn windowed_reader_cross_window_and_large_reads() -> Result<(), Box<dyn std::error::Error>> {
+        let len = WINDOW_BYTES + 4096;
+        let data: Vec<u8> = (0..len)
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let path = temp_file("cross-window", &data)?;
+        let mut reader = WindowedFileReader::open(&path)?;
+        let mut out = vec![0_u8; 4096];
+        let mut total = 0_usize;
+        loop {
+            let count = reader.read(&mut out)?;
+            if count == 0 {
+                break;
+            }
+            assert_eq!(&out[..count], &data[total..total + count]);
+            total += count;
+        }
+        assert_eq!(total, len);
+
+        let mut reader = WindowedFileReader::open(&path)?;
+        let mut big = vec![0_u8; len];
+        let mut total = 0_usize;
+        loop {
+            let count = reader.read(&mut big[total..])?;
+            if count == 0 {
+                break;
+            }
+            total += count;
+        }
+        assert_eq!(total, len);
+        assert_eq!(big, data);
+        Ok(())
+    }
 }
