@@ -1,13 +1,14 @@
 # fastconv — Übergabe-Blatt (Stand: 2026-11-23)
 
 ## Aktuelle Fähigkeiten
-- **CLI-Befehle**: `fastconv probe`, `fastconv convert <source> <target> [--quality <0..=100> | --lossless] [--to <webp|heic|jpeg|png|bmp|qoi|tiff|jxl|avif>] [--threads <N>] [--backend <cpu|nvenc|vaapi|qsv|amf|videotoolbox|vulkan>]`, `fastconv audio <source> <target> [--to <flac|wav|opus>]`, `fastconv remux <source> <target> [--to <mp4|mkv>]`, `--help`, `--version`
+- **CLI-Befehle**: `fastconv probe`, `fastconv convert <source> <target> [--quality <0..=100> | --lossless] [--to <webp|heic|jpeg|png|bmp|qoi|tiff|jxl|avif>] [--threads <N>] [--backend <cpu|nvenc|vaapi|qsv|amf|videotoolbox|vulkan>]`, `fastconv audio <source> <target> [--to <wav|flac|opus|ogg|mp3|aac|m4a|alac|aiff>] [--threads <N>] [--backend cpu]`, `fastconv remux <source> <target> [--to <mp4|mkv>]`, `--help`, `--version`
 - **Probe**: CPU (Topologie, Memory, SIMD: AVX2/AVX-512/NEON), `wgpu`-Adapter (Vulkan), GPU-Backends (NVENC, VA-API, Vulkan Compute), strikte Magic-Byte-Erkennung (`PNG`, `JPEG`, `WebP`, `BMP`, `QOI`, `TIFF` little/big-endian, `JPEG XL` bare codestream `0xFF 0x0A` und ISOBMFF-Container `JXL `) + Header-/Chunk-/Masken-/Farbraum-/Bitdepth-Validierung für Einzeldateien und gemischte Ordner-Batches (ignoriert nicht-Bild-Dateien sicher)
 - **N-zu-M Bild-Pipeline (`crates/pipeline`)**: Entkoppeltes Decode (`crates/pipeline/src/decode.rs`) und Encode über wiederverwendbare Worker-Puffer (7 Inputs × 9 Outputs = 63 Kombinationen; AVIF-Input ist bewusst nicht implementiert):
   - **Inputs**: `PNG` (`png`), `JPEG` (`zune-jpeg`), `WebP` (`zenwebp` VP8/VP8L/VP8X Still-Images), `BMP` (nativer safe-Rust-Decoder: 1/4/8-Bit Palette, 16-Bit, 24-Bit BGR, 32-Bit BGRA & `BI_BITFIELDS`/`BI_ALPHABITFIELDS`, Top-Down & Bottom-Up), `QOI` (nativer safe-Rust-Decoder 3/4 Kanäle), `TIFF` (`tiff` 0.11.3: Gray/GrayA/RGB/RGBA, 1..=16 Bit, U8/U16 Downconversion), `JPEG XL` (`jxl` 0.8.0: Grayscale/RGB mit optionalem Alpha); direkter `OpaqueRgba8`-Decode-Pfad für `JPEG`/`BMP`/`QOI`/`TIFF`/`JXL` Richtung NVENC
   - **Outputs**: `WebP` (`zenwebp` 0.2.0 MIT/Apache, CPU AVX2, Lossy/Lossless), `JPEG` (`jpeg-encoder` CPU-SIMD AVX2, Lossy), `PNG` (`png` Streaming mit `Compression::Fastest` = `fdeflate` + `Filter::Up`, 256 KiB IDAT / 512 KiB `BufWriter`, Lossless), `BMP` (nativer safe-Rust-Encoder mit 2 MiB Chunk-Batching ohne doppelte Pufferkopie, 24-Bit BGR / 32-Bit V4 BGRA / 8-Bit Gray, Lossless), `QOI` (nativer safe-Rust-Encoder mit L1-Cache-Stack-Staging, Lossless), `TIFF` (`tiff` 0.11.3, gestreamtes `zlib-rs` Deflate Fast + Horizontal Predictor, Gray8/RGB8/RGBA8; LA8 wird als RGBA8 kodiert; U8-Zero-Copy-Decode-Fast-Path), `JPEG XL` (`jixel` 0.5.13, Lossless modular oder lossy VarDCT mit Butteraugli-Distance; Speed Fastest, `--quality 100` wird auf Lossless abgebildet), `AVIF` (direkter 8-Bit-4:2:0-Encoder auf `rav1e` + `avif-serialize`, BT.601 Full-Range, Alpha-Frame nur bei echter Transparenz; dieselbe Quality-Transferkurve wie `ravif` 0.13.0), `HEIC` (`--features nvenc` NVIDIA NVENC HEVC-Intra `ABGR` + nativer pure-Rust ISO/IEC 23008-12 Muxer)
-- **Audio-/Remux-Pipeline**: native parallele Konvertierung für `WAV`/`FLAC`/`MP3`/`OGG` nach `WAV`/`FLAC`/`Opus` in `crates/pipeline/src/audio.rs` (direkter WAV→FLAC-`Fill`-Source ohne Zwischenpuffer, 1-Pass-i16-Pfad, gebündelter WAV-Writer, reiner `f32`-Opus-Pfad mit `encode_parallel` und gedeckelter Worker-Zahl, `0o600`-Staging). Video-Remux nutzt einen 1-MiB-Fensterleser, wiederverwendete Packet-Puffer und In-Memory-MP4-Faststart (`<= 64 MiB`) mit Streaming-Fallback für größere Dateien; generisches `execute(&ExecutionPlan)` für Video liefert weiterhin `PipelineError::BackendNotImplemented`
+- **Audio-/Remux-Pipeline**: native parallele Konvertierung, **9 Inputs × 9 Outputs** (`WAV`, `FLAC`, `Opus`, `Ogg Vorbis`, `MP3`, `AAC/ADTS`, `M4A/AAC`, `ALAC/M4A`, `AIFF`) in `crates/pipeline/src/audio.rs` + `aiff.rs` + `m4a.rs` (direkter WAV→FLAC-`Fill`-Source ohne Zwischenpuffer, 1-Pass-i16-Pfad für PCM/ALAC/AIFF, reiner `f32`-Pfad für Opus/Vorbis/MP3/AAC mit `encode_parallel` und gedeckelter Worker-Zahl, `0o600`-Staging, ADTS-Größenguard vor `fs::read`). Kein FFmpeg in `crates/`; GPU-Audio wird im Domain-Layer hart abgelehnt (kein stiller CPU-Fallback). Video-Remux nutzt einen 1-MiB-Fensterleser, wiederverwendete Packet-Puffer und In-Memory-MP4-Faststart (`<= 64 MiB`) mit Streaming-Fallback für größere Dateien; generisches `execute(&ExecutionPlan)` für Video liefert weiterhin `PipelineError::BackendNotImplemented`
 - **Workload-Benchmarks (`cargo xtask bench`)**: 20× 4K PNG, 20× 4K JPEG & 20× 4K WebP Head-to-Head (`PNG -> WebP`, `PNG -> JPEG`, `JPEG -> WebP`, `WebP -> PNG`, `PNG -> QOI`, `WebP -> BMP`, `PNG -> TIFF`, `PNG -> JPEG XL`, `PNG -> AVIF`, optional `PNG/JPEG/WebP -> HEIC` auf NVENC) gegen `ffmpeg` (gleiche Compression/Distance für TIFF und JXL, `libsvtav1` Preset 8 für AVIF), inkl. Dekodier-, Auflösungs-, Größen-, exakter RGB-Pixel-Gleichheits- (Lossless gegen eigene Decoder-Referenz) bzw. RGB-PSNR-Validierung (`bench-output/head-to-head.json` Schema v4)
+- **Audio-Benchmarks (`cargo xtask bench --audio`)**: 8 Head-to-Head-Workloads auf 60 s Stereo (WAV→FLAC/AIFF/ALAC/Opus/Ogg/MP3/AAC/M4A) + gemischter 9-Input-Batch → FLAC, seriell gegen FFmpeg mit identischer Bitrate/Qualitätsklasse. Validierung: FFmpeg-Dekodiercheck, `ffprobe` Codec/Rate/Kanäle/Dauer (exakte Sampledauer für rohes ADTS-AAC), bit-exakte PCM-Roundtrips (FLAC/AIFF/ALAC) und lag-alignierte SNR-Checks (≥ 18 dB Single-File, ≥ 20 dB Batch). Output: `bench-output/audio-head-to-head.json`
 
 ## Dateikarte
 - `crates/cli/src/main.rs`: CLI-Einstiegspunkt, Argument-Parsing (`--to`, `--quality`, `--lossless`, `--threads`, `--backend`), Dispatch für `probe` & `convert`
@@ -23,15 +24,17 @@
 - `crates/pipeline/src/bmp.rs`: Pure-Rust BMP-Decoder und 2-MiB-Chunk-gebatchter BMP-Encoder (24-Bit BGR, 32-Bit V4 BGRA, 8-Bit Gray, ungerade Breiten & `BI_BITFIELDS`)
 - `crates/pipeline/src/qoi.rs`: Pure-Rust QOI-Decoder und L1-gestagter QOI-Encoder (RGB8/RGBA8/L8/LA8, inkl. direktem `OpaqueRgba8`-Pfad)
 - `crates/pipeline/src/cpu.rs`: Paralleler CPU-Worker-Pool mit per-Thread `WorkerScratch`-Puffern für `CpuImageEncoder::{Webp, Jpeg, Png, Bmp, Qoi, Tiff, Jxl, Avif}`
-- `crates/pipeline/src/audio.rs`: Native Audio-Backends (Dekoder/Encoder/Worker-Pool) für WAV/FLAC/MP3/OGG und Opus-Ausgabe
+- `crates/pipeline/src/audio.rs`: Native Audio-Backends (Dekoder/Encoder/Worker-Pool) für alle 9 Inputs und Outputs (WAV/FLAC/Opus/Ogg/MP3/AAC/M4A/ALAC/AIFF)
+- `crates/pipeline/src/aiff.rs`: Pure-Rust AIFF-Encoder (s16be/s24be, CBR-Chunking)
+- `crates/pipeline/src/m4a.rs`: Pure-Rust MP4/M4A-Muxer für AAC und ALAC (priming/duration-Metadaten)
 - `crates/cli/src/audio.rs`: CLI-Dispatch für `fastconv audio`
 - `crates/probe/src/audio.rs`: Audio-Header-Validierung an der Systemgrenze
-- `xtask/src/audio_bench.rs`: Head-to-Head-Audio-Benchmarks gegen ffmpeg
+- `xtask/src/audio_bench.rs`: Head-to-Head-Audio-Benchmarks gegen ffmpeg (8 Formate + 9-Input-Batch, ffprobe-Validierung, bit-exakte und lag-alignierte SNR-Signalchecks)
 - `crates/pipeline/src/gpu/mod.rs`: GPU-Zero-Copy-Stub (`PipelineError::BackendNotImplemented`) für Video-Pläne
 - `crates/pipeline/src/gpu/nvenc.rs`: Überlappendes CPU-Decode (alle 7 Input-Formate) + GPU-NVENC-HEVC-Intra-Encoding (`ABGR` mit gepoolten `RGBA8`-Puffern, BT.601 Limited VUI)
 - `crates/pipeline/src/gpu/heic.rs`: Pure-Rust Annex-B-HEVC-Parser (`VPS`/`SPS`/`PPS`/`IDR`) und ISO/IEC 23008-12 (`ftypheic`/`mif1`) Container-Muxer
 - `xtask/src/main.rs`: Orchestrierung für `verify` (No-FFmpeg-Scanner, `fmt`, `clippy -D warnings`, Tests inkl. `--features nvenc`), `gen-fixtures` & `bench`
-- `xtask/src/fixtures.rs`: Deterministische Testmedien (20× 4K PNG, 20× 4K JPEG, 20× 4K WebP, 60s WAV, 1080p60 MP4)
+- `xtask/src/fixtures.rs`: Deterministische Testmedien (20× 4K PNG, 20× 4K JPEG, 20× 4K WebP, 60s WAV, 1080p60 MP4, 9 gemischte Audio-Inputs komplett nativ erzeugt)
 - `xtask/src/bench.rs`: Head-to-Head Benchmark-Harness (`fastconv` vs. `ffmpeg`) mit Peak-RSS-Messung, Lossless-Exact-RGB- und PSNR-Validierung sowie JSON-Export
 
 ## Harte Architektur-Entscheidungen
@@ -73,8 +76,35 @@
 ## Performance-Update 2026-11-24 (PR #10 — Remux/Audio/Image)
 - **Host/Pfad**: i7-6700 (4C/8T, AVX2/FMA), RTX 2060 für HEIC; FFmpeg n9.1; Fixtures aus `cargo xtask gen-fixtures`; alle Läufe seriell (keine parallelen Benchmarks). Ergebnisse in `bench-output/{head-to-head,audio-head-to-head}.json`.
 - **Bild (20× 4K, 20/20 validiert, Q=80 / gleiche Kompressionsklasse)**: TIFF 908.4 ms / 334.39 MB/s / 328.4 MiB vs. ffmpeg 2847.0 ms (**3.13x**, beide Deflate, exakt); JXL 4297.2 ms / 70.69 MB/s vs. ffmpeg 19572.3 ms (**4.55x** bei Distance 1.9, 34.80 vs. 34.95 dB); AVIF 16745.4 ms / 18.14 MB/s / 1206.0 MiB vs. ffmpeg 3899.0 ms / 3024.0 MiB (**0.23x** im Speed-Preset, aber 1.07 vs. 2.86 MB und 35.96 vs. 35.75 dB). Gegenüber dem alten AVIF-Pfad (157402.7 ms / 1804.2 MiB) ist das **9.4x schneller bei 33 % weniger Peak-RAM**, aber 0.44 dB niedrigerem PSNR (35.96 vs. 36.40 dB; weiterhin über FFmpeg 35.75 dB) bei 3x kleinerer Datei.
-- **Audio (60 s Stereo, ffprobe + Symphonia-Validierung)**: WAV→FLAC 57.0 ms / 201.96 MB/s vs. ffmpeg 202.4 ms (**3.55x**, 4.12 vs. 4.11 MB, bit-exakt); WAV→Opus 151.9 ms / 75.86 MB/s vs. ffmpeg 595.6 ms (**3.92x**, 0.98 vs. 1.35 MB, 37.1 dB SNR); gemischter Batch 74.8 ms vs. 329.1 ms (**4.40x**, alle PCM bit-identisch). Pfad: CPU, kein System-Opus/Vorbis.
+- **Audio (60 s Stereo, alter 3-Format-Stand)**: WAV→FLAC 57.0 ms vs. ffmpeg 202.4 ms (3.55x), WAV→Opus 151.9 ms vs. 595.6 ms (3.92x), 3-Input-Batch 74.8 ms vs. 329.1 ms (4.40x) — jetzt ersetzt durch die 9×9-Messung unten.
 - **Remux (1080p60, 10 s, ffprobe-validiert, 600 Video-Frames)**: MP4→MKV 17.4 ms / 34551 fps / 8.5 MiB vs. ffmpeg 101.9 ms (**5.86x**); MKV→MP4 26.1 ms / 22995 fps / 28.1 MiB vs. ffmpeg 91.1 ms (**3.49x**). Codecs unverändert `aac+h264`, keine Re-Encodierung.
+
+## Audio-Benchmarks 2026-11-24 (9 Inputs × 9 Outputs, messbar seriell)
+- **Host/Pfad**: i7-6700 (4C/8T, AVX2/FMA), CPU-Audio (kein System-Opus/Vorbis), ffmpeg n9.1, 60 s Stereo-Fixture (48 kHz, 16 Bit), `timeout -k 10 180s cargo xtask bench --audio` nach `cargo xtask gen-fixtures`. Alle 18 Single-File-Läufe + 18 Batch-Outputs: FFmpeg-Decode + `ffprobe`-Codec/Rate/Kanäle/Dauer (rohes AAC über exakte Sampledauer) + bit-exakte bzw. lag-alignierte SNR-Signalchecks **bestanden**.
+
+| Workload | Tool | Zeit (ms) | Durchsatz | Peak RAM | Input | Output | Qualität |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `wav_to_flac` | fastconv (flacenc) | 61.4 | 187.52 MB/s | 64.8 MiB | 11.52 MB | 4.12 MB | bit-exakt, **3.43x** |
+| `wav_to_flac` | ffmpeg (`-compression_level 5`) | 210.6 | 54.70 MB/s | 57.2 MiB | 11.52 MB | 4.11 MB | bit-exakt |
+| `wav_to_aiff` | fastconv (native s16be) | 31.8 | 362.74 MB/s | 18.3 MiB | 11.52 MB | 11.52 MB | bit-exakt, **3.62x** |
+| `wav_to_aiff` | ffmpeg (`pcm_s16be`) | 115.0 | 100.22 MB/s | 49.6 MiB | 11.52 MB | 11.52 MB | bit-exakt |
+| `wav_to_alac` | fastconv (alac-encoder) | 479.8 | 24.01 MB/s | 23.6 MiB | 11.52 MB | 5.07 MB | bit-exakt, **0.81x** |
+| `wav_to_alac` | ffmpeg (`alac`) | 387.8 | 29.71 MB/s | 52.4 MiB | 11.52 MB | 4.69 MB | bit-exakt |
+| `wav_to_opus` | fastconv (opus-pure) | 163.8 | 70.32 MB/s | 33.1 MiB | 11.52 MB | 0.98 MB | 37.1 dB, **3.93x** |
+| `wav_to_opus` | ffmpeg (`libopus 128k`) | 643.9 | 17.89 MB/s | 55.2 MiB | 11.52 MB | 1.35 MB | — |
+| `wav_to_ogg` | fastconv (vorbis-enc q4) | 972.2 | 11.85 MB/s | 30.6 MiB | 11.52 MB | 0.74 MB | 35.8 dB, **1.00x** |
+| `wav_to_ogg` | ffmpeg (`libvorbis q4`) | 972.2 | 11.85 MB/s | 55.8 MiB | 11.52 MB | 0.70 MB | — |
+| `wav_to_mp3` | fastconv (rusty_mp3 192k) | 760.4 | 15.15 MB/s | 33.7 MiB | 11.52 MB | 1.44 MB | 64.3 dB, **1.39x** |
+| `wav_to_mp3` | ffmpeg (`libmp3lame 192k`) | 1054.8 | 10.92 MB/s | 55.1 MiB | 11.52 MB | 1.44 MB | — |
+| `wav_to_aac` | fastconv (rusty_aac 128k ADTS) | 201.2 | 57.24 MB/s | 57.1 MiB | 11.52 MB | 0.98 MB | 26.4 dB, **8.80x** |
+| `wav_to_aac` | ffmpeg (`aac 128k`) | 1770.2 | 6.51 MB/s | 56.9 MiB | 11.52 MB | 0.98 MB | — |
+| `wav_to_m4a` | fastconv (rusty_aac 128k muxed) | 219.9 | 52.39 MB/s | 58.4 MiB | 11.52 MB | 0.97 MB | 26.4 dB, **8.08x** |
+| `wav_to_m4a` | ffmpeg (`aac 128k`) | 1776.1 | 6.49 MB/s | 57.1 MiB | 11.52 MB | 0.97 MB | — |
+| `audio_batch_mixed_to_flac` | fastconv (parallel, 9 Inputs) | 145.9 | 41.71 MB/s | 116.4 MiB | 6.09 MB | 5.65 MB | **6.35x** |
+| `audio_batch_mixed_to_flac` | ffmpeg (sequenziell, 9 Inputs) | 926.0 | 6.57 MB/s | 60.4 MiB | 6.09 MB | 6.83 MB | — |
+
+- **Signalchecks**: FLAC/AIFF/ALAC je 5.760.000 Samples bit-identisch; Opus 37.1 dB, Ogg 35.8 dB, MP3 64.3 dB, AAC 26.4 dB (Lag 1024 Frames dank ADTS-Primer-Suche), M4A 26.4 dB. Batch: WAV/FLAC/ALAC/AIFF bit-identisch, Opus 111.9 dB, Ogg 111.0 dB, MP3 104.3 dB, AAC 109.7 dB, M4A 109.0 dB.
+- **Fehlerpfade (Release-Binary)**: `--backend nvenc` bei Audio bricht mit `UnsupportedAudioPipeline` ab (kein CPU-Fallback), fehlende Quelle meldet sauber `No such file or directory`, `out.m4a --to alac` erzeugt nachweislich `codec_name=alac / 48000 Hz / 2ch / 60.000s`.
 
 ## Crate-Wahl und Lizenzen
 - **WebP**: `zenwebp = "=0.2.0"` (pure Rust, `MIT OR Apache-2.0`) – bewusst permissiv gepinned; Lizenz ist mit der AGPL-3.0-only des Projekts kompatibel.
@@ -84,5 +114,6 @@
 - **AVIF Encode**: direkter `rav1e`-Encoder (`asm`+`threading`) mit `avif-serialize`, 8-Bit Full-Range BT.601 4:2:0, Speed-Preset 8; Alpha-Frame entfällt für opake Eingaben. Die Quality-Transferkurve entspricht exakt der alten `ravif`-0.13.0-Kurve (Q=99 -> Quantizer 7, Q=100 -> 0). `ravif` bleibt als Referenz für die Kurve, ist aber nicht mehr im Default-Dependency-Pfad.
 - **AVIF Input**: bewusst optional/out of scope; kein reiner Rust-Decoder wurde in die aktuelle Abhängigkeitsmenge aufgenommen. Die Pipeline bietet AVIF-Output für alle 7 Inputs, aber keine AVIF-Eingabe.
 - **RAM-Deckel**: Schwere 4K-Encoder werden gedeckelt (JXL max. 8, AVIF max. 6 parallele Bilder; übrige logische Kerne gehen in die interne Threading-Budget des Encoders, leichte Formate bleiben auf allen Workern). Gemessener Peak-RAM 4K-JXL 1228.4 MiB, 4K-AVIF 1206.0 MiB (alt: 1804.2 MiB) — unter der 3-GiB-Grenze. In-Memory-MP4-Faststart ist auf 64 MiB pro Item begrenzt, darüber wird gestreamt.
+- **Audio-Codec-Crates (alle AGPL-kompatibel, Default-Build)**: `rusty_aac = "2.1.5"` (Apache-2.0, AAC-LC Encode/ADTS-Decode), `rusty_mp3 = "1.2.2"` (Apache-2.0, MP3-Encode), `vorbis-enc = "0.1.1"` (BSD-3-Clause, Ogg-Vorbis-Encode), `alac-encoder = "0.3.0"` (Apache-2.0 OR MIT, ALAC-Encode), `containr = "0.1.1"` (Apache-2.0, MP4/M4A-Muxer). Dekodierung über `symphonia` (MPL-2.0), Resampling über `rubato` (MIT).
 - **Lizenz-Policy**: `fastconv` selbst steht unter `AGPL-3.0-only` (`LICENSE`). `cargo xtask verify` scannt per `cargo metadata --format-version 1` den Default-Dependency-Graphen und erlaubt permissive Lizenzen (MIT, Apache-2.0, BSD-2/3, Zlib, ISC, Unlicense, CC0, MPL-2.0, NCSA, IJG, Unicode-3.0) sowie AGPL-3.0-kompatibles Copyleft (AGPL-3.0, GPL-3.0, LGPL-3.0, auch in Dual-License-Ausdrücken). Hart abgelehnt werden fehlende/unbekannte, rein proprietäre oder nicht-kommerzielle Lizenzen ohne AGPL-Option sowie AGPL-inkompatibles Copyleft (z. B. `GPL-2.0-only`); die einzige Ausnahme ist `GPL-2.0-only WITH Classpath-exception-2.0`. Unit-Tests in `xtask/src/main.rs` sichern die SPDX-Logik ab.
 - **GPU-Realität**: RTX 2060 hat keine Hardware-Encoder für TIFF/JXL/AVIF; TIFF/JXL/AVIF-Ausgaben werden auf `--backend nvenc` explizit abgelehnt, TIFF/JXL-Inputs werden aber für NVENC-HEIC decodiert.
