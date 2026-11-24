@@ -40,6 +40,19 @@ pub(crate) enum DecodeTargetHint {
     OpaqueRgba8,
 }
 
+/// Only NVENC inspects native alpha before 8-bit scaling.
+const fn needs_native_alpha_scan(hint: DecodeTargetHint) -> bool {
+    #[cfg(feature = "nvenc")]
+    {
+        matches!(hint, DecodeTargetHint::OpaqueRgba8)
+    }
+    #[cfg(not(feature = "nvenc"))]
+    {
+        let _ = hint;
+        false
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DecodedFrameMeta {
     pub width: u32,
@@ -129,9 +142,13 @@ pub(crate) fn decode_image_into(
                 has_non_opaque_native_alpha: false,
             })
         }
-        ImageInputFormat::Tiff => {
-            decode_tiff_slice_into(item, file_bytes.as_slice(), input_file_bytes, pixel_buf)
-        }
+        ImageInputFormat::Tiff => decode_tiff_slice_into(
+            item,
+            file_bytes.as_slice(),
+            input_file_bytes,
+            pixel_buf,
+            hint,
+        ),
         ImageInputFormat::Jxl => {
             decode_jxl_slice_into(item, file_bytes.as_slice(), input_file_bytes, pixel_buf)
         }
@@ -432,6 +449,7 @@ fn decode_tiff_slice_into(
     file_bytes: &[u8],
     input_file_bytes: u64,
     pixel_buf: &mut Vec<u8>,
+    hint: DecodeTargetHint,
 ) -> Result<DecodedFrameMeta, PipelineError> {
     let mut decoder = TiffDecoder::new(io::Cursor::new(file_bytes)).map_err(|err| {
         PipelineError::DecodeFailed {
@@ -512,6 +530,72 @@ fn decode_tiff_slice_into(
         pixel_buf.resize(expected_len, 0);
     }
 
+    let alpha_associated = matches!(format, DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8)
+        && decoder
+            .find_tag_unsigned_vec::<u16>(Tag::ExtraSamples)
+            .map_err(|err| PipelineError::DecodeFailed {
+                path: item.source().to_path_buf(),
+                reason: format!("invalid TIFF ExtraSamples tag: {err}"),
+            })?
+            .and_then(|values| values.first().copied())
+            == Some(1);
+
+    let width_usize = usize::try_from(width).map_err(|_| PipelineError::DecodeFailed {
+        path: item.source().to_path_buf(),
+        reason: "TIFF width exceeds addressable memory".to_owned(),
+    })?;
+    let height_usize = usize::try_from(height).map_err(|_| PipelineError::DecodeFailed {
+        path: item.source().to_path_buf(),
+        reason: "TIFF height exceeds addressable memory".to_owned(),
+    })?;
+    let fast_u8 = bits == 8
+        && layout.planes == 1
+        && layout.sample_type == Some(tiff::decoder::DecodingSampleType::U8)
+        && layout.complete_len == expected_len
+        && layout
+            .row_stride
+            .is_some_and(|stride| stride.get() == width_usize.saturating_mul(channels));
+
+    if fast_u8 {
+        decoder
+            .read_image_bytes(&mut pixel_buf[..expected_len])
+            .map_err(|err| PipelineError::DecodeFailed {
+                path: item.source().to_path_buf(),
+                reason: format!("failed to decode TIFF image: {err}"),
+            })?;
+        if alpha_associated && matches!(format, DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8)
+        {
+            let color_samples = if format == DecodedPixelFormat::La8 {
+                1
+            } else {
+                3
+            };
+            unpremultiply_native_u8(&mut pixel_buf[..expected_len], color_samples);
+        }
+        let has_non_opaque_native_alpha = needs_native_alpha_scan(hint)
+            && matches!(format, DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8)
+            && {
+                let alpha_stride = if format == DecodedPixelFormat::La8 {
+                    2
+                } else {
+                    4
+                };
+                pixel_buf[..expected_len]
+                    .iter()
+                    .skip(alpha_stride - 1)
+                    .step_by(alpha_stride)
+                    .any(|&alpha| alpha < u8::MAX)
+            };
+        return Ok(DecodedFrameMeta {
+            width,
+            height,
+            format,
+            byte_len: expected_len,
+            input_file_bytes,
+            has_non_opaque_native_alpha,
+        });
+    }
+
     let result = decoder
         .read_image()
         .map_err(|err| PipelineError::DecodeFailed {
@@ -524,24 +608,7 @@ fn decode_tiff_slice_into(
         u8::try_from((value * 255 + max_sample / 2) / max_sample).unwrap_or(u8::MAX)
     };
 
-    let width_usize = usize::try_from(width).map_err(|_| PipelineError::DecodeFailed {
-        path: item.source().to_path_buf(),
-        reason: "TIFF width exceeds addressable memory".to_owned(),
-    })?;
-    let height_usize = usize::try_from(height).map_err(|_| PipelineError::DecodeFailed {
-        path: item.source().to_path_buf(),
-        reason: "TIFF height exceeds addressable memory".to_owned(),
-    })?;
     let mut has_non_opaque_native_alpha = false;
-    let alpha_associated = matches!(format, DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8)
-        && decoder
-            .find_tag_unsigned_vec::<u16>(Tag::ExtraSamples)
-            .map_err(|err| PipelineError::DecodeFailed {
-                path: item.source().to_path_buf(),
-                reason: format!("invalid TIFF ExtraSamples tag: {err}"),
-            })?
-            .and_then(|values| values.first().copied())
-            == Some(1);
 
     match result {
         tiff::decoder::DecodingResult::U8(mut samples) => {
@@ -609,7 +676,9 @@ fn decode_tiff_slice_into(
                         unpremultiply_native_u8(&mut samples[..expected_len], color_samples);
                     }
                     pixel_buf[..expected_len].copy_from_slice(&samples[..expected_len]);
-                    if matches!(format, DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8) {
+                    if needs_native_alpha_scan(hint)
+                        && matches!(format, DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8)
+                    {
                         let alpha_stride = if format == DecodedPixelFormat::La8 {
                             2
                         } else {
@@ -641,7 +710,9 @@ fn decode_tiff_slice_into(
                     ),
                 });
             }
-            if matches!(format, DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8) {
+            if needs_native_alpha_scan(hint)
+                && matches!(format, DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8)
+            {
                 let alpha_stride = if format == DecodedPixelFormat::La8 {
                     2
                 } else {
@@ -749,7 +820,7 @@ fn decode_jxl_slice_into(
                 let has_alpha = info
                     .extra_channels
                     .iter()
-                    .any(|channel| format!("{:?}", channel.ec_type) == "Alpha")
+                    .any(|channel| channel.ec_type == jxl::api::ExtraChannel::Alpha)
                     || decoder
                         .current_pixel_format()
                         .is_some_and(|format| format.color_type.has_alpha());

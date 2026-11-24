@@ -32,10 +32,11 @@ opus-pure = "0.2.3"
 png = "0.18"
 pollster = "1"
 rubato = "0.16.2"
-# `ravif` is the pure-Rust rav1e-based AVIF encoder. The `asm` feature enables
-# rav1e's NASM-accelerated paths; CI installs NASM explicitly.
-ravif = { version = "0.13.0", default-features = false, features = ["asm", "threading"] }
-rgb = "0.8"
+# Direct AVIF pipeline: avif-serialize (BSD-3-Clause) writes ISOBMFF boxes,
+# rav1e (BSD-2-Clause) encodes AV1 frames, flate2 (MIT/Apache-2.0) is zlib-rs based.
+avif-serialize = "0.8.9"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+rav1e = { version = "0.8.1", default-features = false, features = ["asm", "threading"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 symphonia = { version = "0.6.1", default-features = false, features = ["opt-simd", "pcm", "wav", "flac", "vorbis", "mp3", "ogg"] }
@@ -70,7 +71,7 @@ opt-level = 3
 opt-level = 3
 
 
-[profile.dev.package.ravif]
+[profile.dev.package.zlib-rs]
 opt-level = 3
 
 [profile.dev.package.rav1e]

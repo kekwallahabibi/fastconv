@@ -18,10 +18,11 @@ use jixel::{
 };
 use jpeg_encoder::{ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder as JpegEncoder};
 use tiff::encoder::{Compression as TiffCompression, DeflateLevel, TiffEncoder, colortype};
-use tiff::tags::ExtraSamples;
+use tiff::tags::{ExtraSamples, Predictor, Tag};
 use zenwebp::{Encoder as WebpEncoder, EncoderConfig as WebpEncoderConfig};
 
 use crate::PipelineError;
+use crate::avif::encode_avif_into;
 use crate::bmp::encode_bmp_to_writer;
 use crate::decode::{
     DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat, decode_image_into,
@@ -251,21 +252,28 @@ pub(crate) fn execute_cpu_image_batch(
 
     // Heavy 4K encoders can otherwise allocate several gigabytes of working
     // state across all worker threads. Keep lightweight formats on the full
-    // worker set, but cap JXL/AVIF concurrency to four images.
+    // worker set, and cap JXL/AVIF image concurrency (8/6) while assigning
+    // remaining logical cores to per-encoder internal threading.
     let requested_workers = plan.effective_workers().get();
-    let worker_count = match encoder {
-        CpuImageEncoder::Jxl(_) => requested_workers.clamp(1, 4),
-        CpuImageEncoder::Avif { .. } => requested_workers.clamp(1, 3),
-        _ => requested_workers,
+    let (worker_count, inner_threads) = match encoder {
+        CpuImageEncoder::Jxl(_) => {
+            let count = requested_workers.min(items.len()).clamp(1, 8);
+            (count, (requested_workers / count).max(1))
+        }
+        CpuImageEncoder::Avif { .. } => {
+            let count = requested_workers.min(items.len()).clamp(1, 6);
+            (count, (requested_workers / count).max(1))
+        }
+        _ => (requested_workers, 1),
     };
     let worker_threads = NonZeroUsize::new(worker_count).unwrap_or(NonZeroUsize::MIN);
     let files_converted = NonZeroUsize::new(items.len())
         .ok_or_else(|| PipelineError::EmptyOutput(first_item.target().to_path_buf()))?;
 
     let (total_input, total_output) = if worker_threads.get() == 1 || items.len() == 1 {
-        execute_sequential(items, encoder)?
+        execute_sequential(items, encoder, inner_threads)?
     } else {
-        execute_parallel(items, encoder, worker_threads.get())?
+        execute_parallel(items, encoder, worker_threads.get(), inner_threads)?
     };
 
     let input_nz = NonZeroU64::new(total_input)
@@ -286,13 +294,15 @@ pub(crate) fn execute_cpu_image_batch(
 fn execute_sequential(
     items: &[ImageBatchItem],
     encoder: CpuImageEncoder,
+    jxl_inner_threads: usize,
 ) -> Result<(u64, u64), PipelineError> {
     let mut scratch = WorkerScratch::new();
     let mut total_in = 0_u64;
     let mut total_out = 0_u64;
 
     for item in items {
-        let (in_bytes, out_bytes) = convert_single_item(item, encoder, &mut scratch)?;
+        let (in_bytes, out_bytes) =
+            convert_single_item(item, encoder, &mut scratch, jxl_inner_threads)?;
         total_in = total_in.saturating_add(in_bytes);
         total_out = total_out.saturating_add(out_bytes);
     }
@@ -304,6 +314,7 @@ fn execute_parallel(
     items: &[ImageBatchItem],
     encoder: CpuImageEncoder,
     worker_count: usize,
+    inner_threads: usize,
 ) -> Result<(u64, u64), PipelineError> {
     let next_index = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
@@ -320,7 +331,7 @@ fn execute_parallel(
                     let Some(item) = items.get(index) else {
                         break;
                     };
-                    match convert_single_item(item, encoder, &mut scratch) {
+                    match convert_single_item(item, encoder, &mut scratch, inner_threads) {
                         Ok((in_bytes, out_bytes)) => {
                             total_in.fetch_add(in_bytes, Ordering::Relaxed);
                             total_out.fetch_add(out_bytes, Ordering::Relaxed);
@@ -355,6 +366,7 @@ fn convert_single_item(
     item: &ImageBatchItem,
     encoder: CpuImageEncoder,
     scratch: &mut WorkerScratch,
+    encode_threads: usize,
 ) -> Result<(u64, u64), PipelineError> {
     let decoded = decode_image_into(
         item,
@@ -405,27 +417,19 @@ fn convert_single_item(
             encode_bmp_streaming(item.target(), pixels, decoded, &mut scratch.aux_buf)?
         }
         CpuImageEncoder::Tiff => {
-            scratch.encoded_buf.clear();
-            encode_tiff_into(item.target(), pixels, decoded, &mut scratch.encoded_buf)?;
-            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
+            encode_tiff_streaming(item.target(), pixels, decoded, &mut scratch.aux_buf)?
         }
         CpuImageEncoder::Jxl(compression) => {
-            scratch.encoded_buf.clear();
-            encode_jxl_into(
-                item.target(),
-                compression,
-                pixels,
-                decoded,
-                &mut scratch.encoded_buf,
-            )?;
-            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
+            let jxl_output =
+                encode_jxl_into(item.target(), compression, pixels, decoded, encode_threads)?;
+            write_encoded_buffer(item.target(), &jxl_output)?
         }
         CpuImageEncoder::Avif { quality, threads } => {
             scratch.encoded_buf.clear();
             encode_avif_into(
                 item.target(),
                 quality,
-                threads,
+                threads.max(encode_threads),
                 pixels,
                 decoded,
                 &mut scratch.encoded_buf,
@@ -671,90 +675,124 @@ fn encode_jpeg_into(
         })
 }
 
-fn encode_tiff_into(
+fn expand_la8_to_rgba(
+    target: &Path,
+    pixels: &[u8],
+    aux_buf: &mut Vec<u8>,
+) -> Result<usize, PipelineError> {
+    let (pairs, remainder) = pixels.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(PipelineError::DecodeFailed {
+            path: target.to_path_buf(),
+            reason: "invalid grayscale-alpha pixel buffer length".to_owned(),
+        });
+    }
+    let needed = pairs
+        .len()
+        .checked_mul(4)
+        .ok_or_else(|| PipelineError::EncodeFailed {
+            path: target.to_path_buf(),
+            reason: "TIFF RGBA scratch buffer size overflow".to_owned(),
+        })?;
+    if aux_buf.len() < needed {
+        aux_buf.resize(needed, 0);
+    }
+    let (quads, _) = aux_buf[..needed].as_chunks_mut::<4>();
+    for (pair, out) in pairs.iter().zip(quads.iter_mut()) {
+        let value = pair[0];
+        out.copy_from_slice(&[value, value, value, pair[1]]);
+    }
+    Ok(needed)
+}
+
+fn encode_tiff_streaming(
     target: &Path,
     pixels: &[u8],
     decoded: DecodedFrameMeta,
-    encoded_buf: &mut Vec<u8>,
-) -> Result<(), PipelineError> {
-    let width = decoded.width;
-    let height = decoded.height;
+    aux_buf: &mut Vec<u8>,
+) -> Result<u64, PipelineError> {
+    use std::io::Write;
 
-    let mut writer = io::Cursor::new(encoded_buf);
+    use crate::PipelineError;
+
+    let (staging, file) = StagingFile::create_for(target)?;
+    let mut writer = BufWriter::with_capacity(STREAM_IO_BUF_BYTES, file);
     let mut encoder = TiffEncoder::new(&mut writer).map_err(|err| PipelineError::EncodeFailed {
         path: target.to_path_buf(),
         reason: format!("failed to create TIFF encoder: {err}"),
     })?;
-    encoder = encoder.with_compression(TiffCompression::Deflate(DeflateLevel::Fast));
+    encoder = encoder
+        .with_compression(TiffCompression::Deflate(DeflateLevel::Fast))
+        .with_predictor(Predictor::Horizontal);
 
     match decoded.format {
         DecodedPixelFormat::L8 => encoder
-            .write_image::<colortype::Gray8>(width, height, pixels)
+            .write_image::<colortype::Gray8>(decoded.width, decoded.height, pixels)
             .map_err(|err| PipelineError::EncodeFailed {
                 path: target.to_path_buf(),
                 reason: format!("failed to encode TIFF grayscale image: {err}"),
             })?,
-        DecodedPixelFormat::La8 => {
-            let (pairs, remainder) = pixels.as_chunks::<2>();
-            if !remainder.is_empty() {
-                return Err(PipelineError::DecodeFailed {
-                    path: target.to_path_buf(),
-                    reason: "unaligned LA8 pixel buffer".to_owned(),
-                });
-            }
-            let mut rgba = Vec::with_capacity(pairs.len() * 4);
-            for pair in pairs {
-                let value = pair[0];
-                rgba.extend_from_slice(&[value, value, value, pair[1]]);
-            }
-            let mut image = encoder
-                .new_image::<colortype::RGB8>(width, height)
-                .map_err(|err| PipelineError::EncodeFailed {
-                    path: target.to_path_buf(),
-                    reason: format!("failed to create TIFF gray+alpha image: {err}"),
-                })?;
-            image
-                .extra_samples(&[ExtraSamples::UnassociatedAlpha])
-                .map_err(|err| PipelineError::EncodeFailed {
-                    path: target.to_path_buf(),
-                    reason: format!("failed to declare TIFF alpha sample: {err}"),
-                })?;
-            image
-                .write_data(&rgba)
-                .map_err(|err| PipelineError::EncodeFailed {
-                    path: target.to_path_buf(),
-                    reason: format!("failed to encode TIFF gray+alpha image: {err}"),
-                })?;
-        }
         DecodedPixelFormat::Rgb8 => encoder
-            .write_image::<colortype::RGB8>(width, height, pixels)
+            .write_image::<colortype::RGB8>(decoded.width, decoded.height, pixels)
             .map_err(|err| PipelineError::EncodeFailed {
                 path: target.to_path_buf(),
                 reason: format!("failed to encode TIFF RGB image: {err}"),
             })?,
-        DecodedPixelFormat::Rgba8 => {
+        DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8 => {
+            let rgba = if decoded.format == DecodedPixelFormat::La8 {
+                let needed = expand_la8_to_rgba(target, pixels, aux_buf)?;
+                &aux_buf[..needed]
+            } else {
+                pixels
+            };
+            // Use RGBA8 (not RGB8 + extra_samples) so tiff's horizontal predictor
+            // steps by 4 samples instead of 3, while still tagging unassociated alpha.
             let mut image = encoder
-                .new_image::<colortype::RGB8>(width, height)
+                .new_image::<colortype::RGBA8>(decoded.width, decoded.height)
                 .map_err(|err| PipelineError::EncodeFailed {
                     path: target.to_path_buf(),
                     reason: format!("failed to create TIFF RGBA image: {err}"),
                 })?;
             image
-                .extra_samples(&[ExtraSamples::UnassociatedAlpha])
+                .encoder()
+                .write_tag(
+                    Tag::ExtraSamples,
+                    &[ExtraSamples::UnassociatedAlpha.to_u16()][..],
+                )
                 .map_err(|err| PipelineError::EncodeFailed {
                     path: target.to_path_buf(),
                     reason: format!("failed to declare TIFF alpha sample: {err}"),
                 })?;
             image
-                .write_data(pixels)
+                .write_data(rgba)
                 .map_err(|err| PipelineError::EncodeFailed {
                     path: target.to_path_buf(),
                     reason: format!("failed to encode TIFF RGBA image: {err}"),
                 })?;
         }
     }
-
-    Ok(())
+    let mut file = writer
+        .into_inner()
+        .map_err(|err| PipelineError::EncodeFailed {
+            path: target.to_path_buf(),
+            reason: format!("failed to flush TIFF writer: {err}"),
+        })?;
+    file.flush().map_err(|source| PipelineError::Io {
+        path: target.to_path_buf(),
+        source,
+    })?;
+    let bytes = file
+        .metadata()
+        .map_err(|source| PipelineError::Io {
+            path: target.to_path_buf(),
+            source,
+        })?
+        .len();
+    if bytes == 0 {
+        return Err(PipelineError::EmptyOutput(target.to_path_buf()));
+    }
+    staging.commit(target, file)?;
+    Ok(bytes)
 }
 
 fn encode_jxl_into(
@@ -762,19 +800,16 @@ fn encode_jxl_into(
     compression: ImageCompression,
     pixels: &[u8],
     decoded: DecodedFrameMeta,
-    encoded_buf: &mut Vec<u8>,
-) -> Result<(), PipelineError> {
-    let width = decoded.width;
-    let height = decoded.height;
-
+    inner_threads: usize,
+) -> Result<Vec<u8>, PipelineError> {
+    let width = decoded.width as usize;
+    let height = decoded.height as usize;
     let mut config = EncodeConfig::default();
     config.speed = Speed::Fastest;
-    config.num_threads = 1;
+    config.num_threads = inner_threads.max(1);
 
     match compression {
-        ImageCompression::Lossless => {
-            config.lossless = true;
-        }
+        ImageCompression::Lossless => config.lossless = true,
         ImageCompression::Lossy { quality } => {
             if quality.get() >= 100 {
                 config.lossless = true;
@@ -785,150 +820,16 @@ fn encode_jxl_into(
     }
 
     let encoded = match decoded.format {
-        DecodedPixelFormat::L8 => {
-            encode_image_gray(pixels, width as usize, height as usize, &config)
-        }
-        DecodedPixelFormat::La8 => {
-            encode_image_gray_alpha(pixels, width as usize, height as usize, &config)
-        }
-        DecodedPixelFormat::Rgb8 => encode_image(pixels, width as usize, height as usize, &config),
-        DecodedPixelFormat::Rgba8 => {
-            encode_image_with_alpha(pixels, width as usize, height as usize, &config)
-        }
+        DecodedPixelFormat::L8 => encode_image_gray(pixels, width, height, &config),
+        DecodedPixelFormat::La8 => encode_image_gray_alpha(pixels, width, height, &config),
+        DecodedPixelFormat::Rgb8 => encode_image(pixels, width, height, &config),
+        DecodedPixelFormat::Rgba8 => encode_image_with_alpha(pixels, width, height, &config),
     }
     .map_err(|err: JixelEncodeError| PipelineError::EncodeFailed {
         path: target.to_path_buf(),
         reason: format!("failed to encode JPEG XL: {err}"),
     })?;
-
-    encoded_buf.extend_from_slice(&encoded);
-    Ok(())
-}
-
-fn decoded_pixels_to_rgba(
-    target: &Path,
-    pixels: &[u8],
-    format: DecodedPixelFormat,
-    pixel_count: usize,
-) -> Result<Vec<ravif::RGBA8>, PipelineError> {
-    match format {
-        DecodedPixelFormat::L8 => {
-            if pixels.len() != pixel_count {
-                return Err(PipelineError::DecodeFailed {
-                    path: target.to_path_buf(),
-                    reason: "decoded L8 buffer has unexpected length".to_owned(),
-                });
-            }
-            Ok(pixels
-                .iter()
-                .map(|&value| ravif::RGBA8 {
-                    r: value,
-                    g: value,
-                    b: value,
-                    a: 255,
-                })
-                .collect())
-        }
-        DecodedPixelFormat::La8 => {
-            if pixels.len() != pixel_count * 2 {
-                return Err(PipelineError::DecodeFailed {
-                    path: target.to_path_buf(),
-                    reason: "decoded LA8 buffer has unexpected length".to_owned(),
-                });
-            }
-            let (pairs, _) = pixels.as_chunks::<2>();
-            Ok(pairs
-                .iter()
-                .map(|pair| ravif::RGBA8 {
-                    r: pair[0],
-                    g: pair[0],
-                    b: pair[0],
-                    a: pair[1],
-                })
-                .collect())
-        }
-        DecodedPixelFormat::Rgb8 => {
-            if pixels.len() != pixel_count * 3 {
-                return Err(PipelineError::DecodeFailed {
-                    path: target.to_path_buf(),
-                    reason: "decoded RGB8 buffer has unexpected length".to_owned(),
-                });
-            }
-            let (triples, _) = pixels.as_chunks::<3>();
-            Ok(triples
-                .iter()
-                .map(|triple| ravif::RGBA8 {
-                    r: triple[0],
-                    g: triple[1],
-                    b: triple[2],
-                    a: 255,
-                })
-                .collect())
-        }
-        DecodedPixelFormat::Rgba8 => {
-            if pixels.len() != pixel_count * 4 {
-                return Err(PipelineError::DecodeFailed {
-                    path: target.to_path_buf(),
-                    reason: "decoded RGBA8 buffer has unexpected length".to_owned(),
-                });
-            }
-            let (quads, _) = pixels.as_chunks::<4>();
-            Ok(quads
-                .iter()
-                .map(|quad| ravif::RGBA8 {
-                    r: quad[0],
-                    g: quad[1],
-                    b: quad[2],
-                    a: quad[3],
-                })
-                .collect())
-        }
-    }
-}
-
-fn encode_avif_into(
-    target: &Path,
-    quality: ImageQuality,
-    threads: usize,
-    pixels: &[u8],
-    decoded: DecodedFrameMeta,
-    encoded_buf: &mut Vec<u8>,
-) -> Result<(), PipelineError> {
-    let width = usize::try_from(decoded.width).map_err(|_| PipelineError::EncodeFailed {
-        path: target.to_path_buf(),
-        reason: format!("AVIF width {} is too large", decoded.width),
-    })?;
-    let height = usize::try_from(decoded.height).map_err(|_| PipelineError::EncodeFailed {
-        path: target.to_path_buf(),
-        reason: format!("AVIF height {} is too large", decoded.height),
-    })?;
-
-    let pixel_count = width
-        .checked_mul(height)
-        .ok_or_else(|| PipelineError::EncodeFailed {
-            path: target.to_path_buf(),
-            reason: "AVIF dimensions overflow pixel count".to_owned(),
-        })?;
-
-    let rgba_pixels = decoded_pixels_to_rgba(target, pixels, decoded.format, pixel_count)?;
-
-    let quality = f32::from(quality.get().max(1));
-    let encoded = ravif::Encoder::new()
-        .with_quality(quality)
-        .with_alpha_quality(quality)
-        .with_speed(7)
-        .with_num_threads(Some(threads.max(1)))
-        .encode_rgba(ravif::Img::new(&rgba_pixels, width, height))
-        .map_err(|err| PipelineError::EncodeFailed {
-            path: target.to_path_buf(),
-            reason: format!("failed to encode AVIF: {err}"),
-        })?;
-
-    if encoded.avif_file.is_empty() {
-        return Err(PipelineError::EmptyOutput(target.to_path_buf()));
-    }
-    encoded_buf.extend_from_slice(&encoded.avif_file);
-    Ok(())
+    Ok(encoded)
 }
 
 #[cfg(test)]
@@ -1114,6 +1015,201 @@ mod tests {
             leftover_tmps.is_empty(),
             "expected no leftover staging files: {leftover_tmps:?}"
         );
+
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tiff_streaming_roundtrips_through_zero_copy_decoder()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_tiff_streaming;
+        use crate::decode::{DecodeTargetHint, decode_image_into};
+        use fastconv_domain::{ImageBatchItem, ImageDimensions, ImageInputFormat};
+
+        let id = CPU_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = env::temp_dir().join(format!("fastconv-cpu-tiff-{}-{id}", process::id()));
+        fs::create_dir_all(&dir)?;
+
+        let mut file_bytes = Vec::new();
+        let mut decoded_buf = Vec::new();
+        let mut aux_buf = Vec::new();
+
+        for (name, format, channels) in [
+            ("l8.tif", DecodedPixelFormat::L8, 1_usize),
+            ("rgb8.tif", DecodedPixelFormat::Rgb8, 3_usize),
+            ("rgba8.tif", DecodedPixelFormat::Rgba8, 4_usize),
+        ] {
+            let pixels: Vec<u8> = (0..17 * 13 * channels)
+                .map(|i| u8::try_from((i * 29 + 7) % 256).unwrap_or(0))
+                .collect();
+            let meta = DecodedFrameMeta {
+                width: 17,
+                height: 13,
+                format,
+                byte_len: pixels.len(),
+                input_file_bytes: 1,
+                has_non_opaque_native_alpha: false,
+            };
+            let target = dir.join(name);
+            encode_tiff_streaming(&target, &pixels, meta, &mut aux_buf)?;
+
+            let item = ImageBatchItem::new(
+                target,
+                dir.join(format!("{name}.out.png")),
+                ImageInputFormat::Tiff,
+                ImageDimensions::new(17, 13)?,
+            )?;
+            let roundtrip = decode_image_into(
+                &item,
+                DecodeTargetHint::Native,
+                &mut file_bytes,
+                &mut decoded_buf,
+            )?;
+            assert_eq!(roundtrip.format, format);
+            assert_eq!(roundtrip.byte_len, pixels.len());
+            assert_eq!(&decoded_buf[..roundtrip.byte_len], pixels.as_slice());
+        }
+
+        let la_pixels: Vec<u8> = (0..15 * 11 * 2)
+            .map(|i| u8::try_from((i * 19 + 3) % 256).unwrap_or(0))
+            .collect();
+        let la_meta = DecodedFrameMeta {
+            width: 15,
+            height: 11,
+            format: DecodedPixelFormat::La8,
+            byte_len: la_pixels.len(),
+            input_file_bytes: 1,
+            has_non_opaque_native_alpha: false,
+        };
+        let la_target = dir.join("la8.tif");
+        encode_tiff_streaming(&la_target, &la_pixels, la_meta, &mut aux_buf)?;
+        let la_item = ImageBatchItem::new(
+            la_target,
+            dir.join("la8.out.png"),
+            ImageInputFormat::Tiff,
+            ImageDimensions::new(15, 11)?,
+        )?;
+        let la_roundtrip = decode_image_into(
+            &la_item,
+            DecodeTargetHint::Native,
+            &mut file_bytes,
+            &mut decoded_buf,
+        )?;
+        assert_eq!(la_roundtrip.format, DecodedPixelFormat::Rgba8);
+        let expected_rgba: Vec<u8> = la_pixels
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|pair| [pair[0], pair[0], pair[0], pair[1]])
+            .collect();
+        assert_eq!(
+            &decoded_buf[..la_roundtrip.byte_len],
+            expected_rgba.as_slice()
+        );
+
+        let odd_la_target = dir.join("odd_la8.tif");
+        assert!(matches!(
+            encode_tiff_streaming(&odd_la_target, &[1_u8, 2, 3], la_meta, &mut aux_buf),
+            Err(PipelineError::DecodeFailed { .. })
+        ));
+
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn jxl_encodes_lossless_and_lossy_roundtrips() -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_jxl_into;
+        use crate::decode::{DecodeTargetHint, decode_image_into};
+        use fastconv_domain::{
+            ImageBatchItem, ImageCompression, ImageDimensions, ImageInputFormat, ImageQuality,
+        };
+
+        let id = CPU_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = env::temp_dir().join(format!("fastconv-cpu-jxl-{}-{id}", process::id()));
+        fs::create_dir_all(&dir)?;
+
+        let mut file_bytes = Vec::new();
+        let mut decoded_buf = Vec::new();
+
+        for (name, format, channels) in [
+            ("l8.jxl", DecodedPixelFormat::L8, 1_usize),
+            ("la8.jxl", DecodedPixelFormat::La8, 2_usize),
+            ("rgb8.jxl", DecodedPixelFormat::Rgb8, 3_usize),
+            ("rgba8.jxl", DecodedPixelFormat::Rgba8, 4_usize),
+        ] {
+            let pixels: Vec<u8> = (0..16 * 16 * channels)
+                .map(|i| u8::try_from((i * 31 + 11) % 256).unwrap_or(0))
+                .collect();
+            let meta = DecodedFrameMeta {
+                width: 16,
+                height: 16,
+                format,
+                byte_len: pixels.len(),
+                input_file_bytes: 1,
+                has_non_opaque_native_alpha: false,
+            };
+            let target = dir.join(name);
+            let encoded = encode_jxl_into(&target, ImageCompression::Lossless, &pixels, meta, 1)?;
+            fs::write(&target, &encoded)?;
+
+            let item = ImageBatchItem::new(
+                target,
+                dir.join(format!("{name}.out.png")),
+                ImageInputFormat::Jxl,
+                ImageDimensions::new(16, 16)?,
+            )?;
+            let roundtrip = decode_image_into(
+                &item,
+                DecodeTargetHint::Native,
+                &mut file_bytes,
+                &mut decoded_buf,
+            )?;
+            assert_eq!(roundtrip.width, 16);
+            assert_eq!(roundtrip.height, 16);
+            assert_eq!(roundtrip.format, format);
+            assert_eq!(roundtrip.byte_len, pixels.len());
+            assert_eq!(&decoded_buf[..roundtrip.byte_len], pixels.as_slice());
+        }
+
+        let lossy_pixels: Vec<u8> = (0..16 * 16 * 3)
+            .map(|i| u8::try_from((i * 17) % 256).unwrap_or(0))
+            .collect();
+        let lossy_meta = DecodedFrameMeta {
+            width: 16,
+            height: 16,
+            format: DecodedPixelFormat::Rgb8,
+            byte_len: lossy_pixels.len(),
+            input_file_bytes: 1,
+            has_non_opaque_native_alpha: false,
+        };
+        let lossy_target = dir.join("lossy.jxl");
+        let lossy_encoded = encode_jxl_into(
+            &lossy_target,
+            ImageCompression::Lossy {
+                quality: ImageQuality::new(80)?,
+            },
+            &lossy_pixels,
+            lossy_meta,
+            1,
+        )?;
+        fs::write(&lossy_target, &lossy_encoded)?;
+        let lossy_item = ImageBatchItem::new(
+            lossy_target,
+            dir.join("lossy.out.png"),
+            ImageInputFormat::Jxl,
+            ImageDimensions::new(16, 16)?,
+        )?;
+        let lossy_roundtrip = decode_image_into(
+            &lossy_item,
+            DecodeTargetHint::Native,
+            &mut file_bytes,
+            &mut decoded_buf,
+        )?;
+        assert_eq!(lossy_roundtrip.width, 16);
+        assert_eq!(lossy_roundtrip.height, 16);
+        assert_eq!(lossy_roundtrip.format, DecodedPixelFormat::Rgb8);
 
         fs::remove_dir_all(&dir)?;
         Ok(())
