@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +13,9 @@ use fastconv_domain::{
 use crate::{ProbeError, available_cpu_threads};
 
 const MAGIC_PREFIX_BYTES: usize = 64;
+
+/// Window size used by [`WindowedFileReader`].
+const WINDOW_BYTES: usize = 1024 * 1024;
 
 /// Top-level ISO base media box types that identify MP4/MOV files.
 const MP4_TOP_LEVEL_BOXES: [&[u8; 4]; 10] = [
@@ -53,11 +56,114 @@ pub fn detect_video_magic(bytes: &[u8]) -> Option<VideoContainerFormat> {
     None
 }
 
-fn read_magic_prefix(path: &Path) -> Result<[u8; MAGIC_PREFIX_BYTES], ProbeError> {
-    let mut file = File::open(path).map_err(|source| ProbeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+/// A `Read + Seek` adapter that keeps a 1 MiB window of the file in memory.
+///
+/// `containr` seeks to an absolute offset before every EBML/box header and
+/// packet. `BufReader::seek(Start(..))` discards its buffer on every such call,
+/// which turns a clip into thousands of tiny reads; this reader only refills
+/// the window when the requested position falls outside it.
+struct WindowedFileReader {
+    file: File,
+    file_len: u64,
+    pos: u64,
+    buf: Vec<u8>,
+    buf_start: u64,
+    buf_valid: usize,
+}
+
+impl WindowedFileReader {
+    #[cfg(test)]
+    fn open(path: &Path) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        Ok(Self::from_file(file, file_len))
+    }
+
+    fn from_file(file: File, file_len: u64) -> Self {
+        let window_len = u64::try_from(WINDOW_BYTES).unwrap_or(u64::MAX);
+        let capacity = usize::try_from(file_len.min(window_len)).unwrap_or(WINDOW_BYTES);
+        Self {
+            file,
+            file_len,
+            pos: 0,
+            buf: vec![0_u8; capacity],
+            buf_start: 0,
+            buf_valid: 0,
+        }
+    }
+}
+
+impl Seek for WindowedFileReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match pos {
+            SeekFrom::Start(offset) => {
+                self.pos = offset;
+                Ok(self.pos)
+            }
+            SeekFrom::Current(delta) => {
+                self.pos = self.pos.checked_add_signed(delta).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "seek before start of file")
+                })?;
+                Ok(self.pos)
+            }
+            SeekFrom::End(delta) => {
+                // `containr::*::Demuxer::open` probes the input length with
+                // `seek(SeekFrom::End(0))`; resolve it from metadata with no I/O.
+                self.pos = self.file_len.checked_add_signed(delta).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "seek before start of file")
+                })?;
+                Ok(self.pos)
+            }
+        }
+    }
+}
+
+impl Read for WindowedFileReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() || self.pos >= self.file_len {
+            return Ok(0);
+        }
+
+        if let Some(rel) = self.pos.checked_sub(self.buf_start)
+            && let Ok(rel_usize) = usize::try_from(rel)
+            && rel_usize < self.buf_valid
+        {
+            let count = out.len().min(self.buf_valid - rel_usize);
+            out[..count].copy_from_slice(&self.buf[rel_usize..rel_usize + count]);
+            self.pos = self.pos.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+            return Ok(count);
+        }
+
+        if out.len() >= self.buf.len() {
+            self.file.seek(SeekFrom::Start(self.pos))?;
+            let count = self.file.read(out)?;
+            self.pos = self.pos.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+            return Ok(count);
+        }
+
+        self.file.seek(SeekFrom::Start(self.pos))?;
+        let mut filled = 0_usize;
+        while filled < self.buf.len() {
+            match self.file.read(&mut self.buf[filled..]) {
+                Ok(0) => break,
+                Ok(count) => filled += count,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err),
+            }
+        }
+        self.buf_start = self.pos;
+        self.buf_valid = filled;
+        if filled == 0 {
+            return Ok(0);
+        }
+        let count = out.len().min(filled);
+        out[..count].copy_from_slice(&self.buf[..count]);
+        self.pos = self.pos.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        Ok(count)
+    }
+}
+
+fn read_magic_prefix(file: &mut File, path: &Path) -> Result<[u8; MAGIC_PREFIX_BYTES], ProbeError> {
     let mut prefix = [0_u8; MAGIC_PREFIX_BYTES];
     let mut filled = 0_usize;
     while filled < prefix.len() {
@@ -186,15 +292,18 @@ fn stream_info(track: &Track) -> VideoStreamInfo {
 fn probe_containr(
     path: &Path,
     format: VideoContainerFormat,
+    file: File,
+    file_len: u64,
 ) -> Result<Vec<VideoStreamInfo>, ProbeError> {
+    let reader = WindowedFileReader::from_file(file, file_len);
     let streams = match format {
         VideoContainerFormat::Mp4 => {
-            let demuxer = containr::mp4::Demuxer::open_path(path)
+            let demuxer = containr::mp4::Demuxer::open(reader)
                 .map_err(|err| invalid_video(path, format!("container parse failed: {err}")))?;
             demuxer.tracks().iter().map(stream_info).collect::<Vec<_>>()
         }
         VideoContainerFormat::Mkv => {
-            let demuxer = containr::mkv::Demuxer::open_path(path)
+            let demuxer = containr::mkv::Demuxer::open(reader)
                 .map_err(|err| invalid_video(path, format!("container parse failed: {err}")))?;
             if demuxer.truncated() {
                 return Err(invalid_video(path, "truncated MKV input"));
@@ -222,14 +331,22 @@ pub fn probe_video(path: &Path) -> Result<ProbedVideo, ProbeError> {
         return Err(invalid_video(path, "video file is empty"));
     }
 
-    let prefix = read_magic_prefix(path)?;
+    let mut file = File::open(path).map_err(|source| ProbeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let prefix = read_magic_prefix(&mut file, path)?;
+    file.seek(SeekFrom::Start(0)).map_err(|source| ProbeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let format = detect_video_magic(&prefix).ok_or_else(|| {
         invalid_video(
             path,
             "unrecognized container magic bytes (expected MP4/MOV or Matroska/MKV)",
         )
     })?;
-    let streams = probe_containr(path, format)?;
+    let streams = probe_containr(path, format, file, metadata.len())?;
     if streams.is_empty() {
         return Err(invalid_video(path, "container has no tracks"));
     }
@@ -386,7 +503,8 @@ fn prepare_directory_batch(
 }
 
 fn detect_video_magic_file(path: &Path) -> Option<VideoContainerFormat> {
-    read_magic_prefix(path)
+    let mut file = File::open(path).ok()?;
+    read_magic_prefix(&mut file, path)
         .ok()
         .and_then(|prefix| detect_video_magic(&prefix))
 }
@@ -451,6 +569,55 @@ pub fn prepare_video_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_file(label: &str, bytes: &[u8]) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = std::env::temp_dir().join(format!("fastconv-probe-video-{label}-{nanos}"));
+        fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
+    fn ebml_el(id: u32, body: &[u8]) -> Vec<u8> {
+        let raw = id.to_be_bytes();
+        let skip = raw.iter().take_while(|&&b| b == 0).count();
+        let mut out = raw[skip..].to_vec();
+        let size = u8::try_from(body.len()).unwrap_or(u8::MAX);
+        out.push(0x80_u8 | size);
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn ebml_uint(id: u32, value: u64) -> Vec<u8> {
+        let bytes = value.to_be_bytes();
+        let skip = bytes.iter().take_while(|&&b| b == 0).count().min(7);
+        ebml_el(id, &bytes[skip..])
+    }
+
+    /// An EBML/MKV file whose declared Segment size extends past the real data.
+    fn truncated_mkv() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend(ebml_uint(0x4286, 1));
+        body.extend(ebml_uint(0x42F2, 4));
+        body.extend(ebml_uint(0x42F3, 8));
+        body.extend(ebml_el(0x4282, b"matroska"));
+        body.extend(ebml_uint(0x4287, 4));
+        body.extend(ebml_uint(0x4285, 2));
+        let mut bytes = ebml_el(0x1A45_DFA3, &body);
+        // Segment id followed by a one-byte size declaring 100 bytes of data.
+        bytes.extend_from_slice(&[0x18, 0x53, 0x80, 0x67, 0xE4]);
+        bytes.extend(ebml_el(0x1549_A966, &ebml_uint(0x2AD7_B1, 1_000_000)));
+        let mut entry = Vec::new();
+        entry.extend(ebml_uint(0xD7, 1));
+        entry.extend(ebml_uint(0x73C5, 1));
+        entry.extend(ebml_uint(0x83, 1));
+        entry.extend(ebml_el(0x86, b"V_MPEG4/ISO/AVC"));
+        bytes.extend(ebml_el(0x1654_AE6B, &ebml_el(0xAE, &entry)));
+        bytes
+    }
 
     #[test]
     fn detects_magic_without_extension_help() {
@@ -467,5 +634,115 @@ mod tests {
         assert_eq!(detect_video_magic(&mov), Some(VideoContainerFormat::Mp4));
 
         assert_eq!(detect_video_magic(b"unknown"), None);
+    }
+
+    #[test]
+    fn windowed_reader_end_seek_and_current_seek() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_file("end-seek", b"0123456789")?;
+        let mut reader = WindowedFileReader::open(&path)?;
+        assert_eq!(reader.seek(SeekFrom::End(0))?, 10);
+        assert_eq!(reader.seek(SeekFrom::End(-4))?, 6);
+        let mut out = [0_u8; 4];
+        assert_eq!(reader.read(&mut out)?, 4);
+        assert_eq!(&out, b"6789");
+        assert_eq!(reader.seek(SeekFrom::Current(-2))?, 8);
+        assert_eq!(reader.read(&mut out)?, 2);
+        assert_eq!(&out[..2], b"89");
+        Ok(())
+    }
+
+    #[test]
+    fn windowed_reader_rejects_seek_before_start() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_file("negative-seek", b"0123456789")?;
+        let mut reader = WindowedFileReader::open(&path)?;
+        for pos in [SeekFrom::Current(-1), SeekFrom::End(-11)] {
+            match reader.seek(pos) {
+                Ok(result) => assert!(false, "unexpected seek result: {result}"),
+                Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn windowed_reader_past_eof_read_returns_zero() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_file("past-eof", b"0123456789")?;
+        let mut reader = WindowedFileReader::open(&path)?;
+        reader.seek(SeekFrom::Start(100))?;
+        assert_eq!(reader.read(&mut [0_u8; 4])?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn windowed_reader_backward_seek_hits_buffer() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_file("backward", b"0123456789")?;
+        let mut reader = WindowedFileReader::open(&path)?;
+        let mut out = [0_u8; 4];
+        assert_eq!(reader.read(&mut out)?, 4);
+        assert_eq!(&out, b"0123");
+        assert!(reader.buf_valid >= 4);
+        assert_eq!(reader.buf_start, 0);
+        reader.seek(SeekFrom::Start(2))?;
+        assert_eq!(reader.read(&mut out)?, 4);
+        assert_eq!(&out, b"2345");
+        Ok(())
+    }
+
+    #[test]
+    fn windowed_reader_crosses_window_boundary() -> Result<(), Box<dyn std::error::Error>> {
+        let len = WINDOW_BYTES + 4096;
+        let data: Vec<u8> = (0..len)
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let path = temp_file("cross-window", &data)?;
+        let mut reader = WindowedFileReader::open(&path)?;
+        let mut out = vec![0_u8; 4096];
+        let mut total = 0_usize;
+        loop {
+            let count = reader.read(&mut out)?;
+            if count == 0 {
+                break;
+            }
+            assert_eq!(&out[..count], &data[total..total + count]);
+            total += count;
+        }
+        assert_eq!(total, len);
+        Ok(())
+    }
+
+    #[test]
+    fn windowed_reader_large_read_exceeds_window() -> Result<(), Box<dyn std::error::Error>> {
+        let len = WINDOW_BYTES + 4096;
+        let data: Vec<u8> = (0..len)
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let path = temp_file("large-read", &data)?;
+        let mut reader = WindowedFileReader::open(&path)?;
+        let mut out = vec![0_u8; len];
+        let mut total = 0_usize;
+        loop {
+            let count = reader.read(&mut out[total..])?;
+            if count == 0 {
+                break;
+            }
+            total += count;
+        }
+        assert_eq!(total, len);
+        assert_eq!(out, data);
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_mkv_is_still_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let bytes = truncated_mkv();
+        let path = temp_file("truncated-mkv", &bytes)?;
+        match probe_video(&path) {
+            Ok(_) => assert!(false, "a truncated MKV must be rejected"),
+            Err(ProbeError::InvalidVideo { reason, .. }) => {
+                assert!(reason.contains("truncated MKV input"), "reason: {reason}");
+            }
+            Err(err) => assert!(false, "unexpected probe error: {err}"),
+        }
+        Ok(())
     }
 }
