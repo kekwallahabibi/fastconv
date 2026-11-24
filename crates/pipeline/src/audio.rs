@@ -2681,10 +2681,12 @@ mod tests {
             vec![item(wav, out, AudioInputFormat::Wav, 4, 48_000)],
             mode,
         ));
-        let reason = match result {
-            Err(PipelineError::EncodeFailed { reason, .. }) => reason,
-            Err(other) => format!("unexpected error: {other:?}"),
-            Ok(_) => "4-channel conversion unexpectedly succeeded".to_owned(),
+        assert!(
+            matches!(result, Err(PipelineError::EncodeFailed { .. })),
+            "4-channel {extension} must fail with EncodeFailed, got {result:?}"
+        );
+        let Err(PipelineError::EncodeFailed { reason, .. }) = result else {
+            return;
         };
         assert!(
             reason.contains(expected_reason),
