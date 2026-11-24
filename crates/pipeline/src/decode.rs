@@ -15,7 +15,11 @@ use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
 
 use crate::PipelineError;
+use crate::avif::decode_avif_slice_into;
 use crate::bmp::decode_bmp_slice_into;
+use crate::gif::decode_gif_slice_into;
+use crate::ico::decode_ico_slice_into;
+use crate::pnm::decode_pnm_slice_into;
 use crate::qoi::decode_qoi_slice_into;
 
 // 512 MiB decoded RGBA8, matching the probe budget for hostile headers.
@@ -84,6 +88,7 @@ pub(crate) fn precreate_target_directories(items: &[ImageBatchItem]) -> Result<(
 }
 
 /// Reads and decodes a validated still-image item into `pixel_buf`, reusing `file_bytes`.
+#[allow(clippy::too_many_lines)] // One explicit decoding arm per validated input container.
 pub(crate) fn decode_image_into(
     item: &ImageBatchItem,
     hint: DecodeTargetHint,
@@ -151,6 +156,58 @@ pub(crate) fn decode_image_into(
         ),
         ImageInputFormat::Jxl => {
             decode_jxl_slice_into(item, file_bytes.as_slice(), input_file_bytes, pixel_buf)
+        }
+        ImageInputFormat::Avif => {
+            let (width, height, format, byte_len) =
+                decode_avif_slice_into(item.source(), file_bytes.as_slice(), pixel_buf)?;
+            verify_decoded_dimensions(item, width, height)?;
+            Ok(DecodedFrameMeta {
+                width,
+                height,
+                format,
+                byte_len,
+                input_file_bytes,
+                has_non_opaque_native_alpha: false,
+            })
+        }
+        ImageInputFormat::Gif => {
+            let (width, height, format, byte_len) =
+                decode_gif_slice_into(item.source(), file_bytes.as_slice(), pixel_buf)?;
+            verify_decoded_dimensions(item, width, height)?;
+            Ok(DecodedFrameMeta {
+                width,
+                height,
+                format,
+                byte_len,
+                input_file_bytes,
+                has_non_opaque_native_alpha: false,
+            })
+        }
+        ImageInputFormat::Ico => {
+            let (width, height, format, byte_len) =
+                decode_ico_slice_into(item.source(), file_bytes.as_slice(), pixel_buf)?;
+            verify_decoded_dimensions(item, width, height)?;
+            Ok(DecodedFrameMeta {
+                width,
+                height,
+                format,
+                byte_len,
+                input_file_bytes,
+                has_non_opaque_native_alpha: false,
+            })
+        }
+        ImageInputFormat::Pnm => {
+            let (width, height, format, byte_len) =
+                decode_pnm_slice_into(item.source(), file_bytes.as_slice(), pixel_buf)?;
+            verify_decoded_dimensions(item, width, height)?;
+            Ok(DecodedFrameMeta {
+                width,
+                height,
+                format,
+                byte_len,
+                input_file_bytes,
+                has_non_opaque_native_alpha: false,
+            })
         }
     }
 }

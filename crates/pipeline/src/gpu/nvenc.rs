@@ -541,7 +541,13 @@ mod enabled {
                     decode_image_into(item, DecodeTargetHint::OpaqueRgba8, file_bytes, pixel_buf)?;
                 finish_rgba_expansion(item_index, item, decoded, pixel_buf, rgba_bytes)
             }
-            ImageInputFormat::Png | ImageInputFormat::Webp | ImageInputFormat::Jxl => {
+            ImageInputFormat::Png
+            | ImageInputFormat::Webp
+            | ImageInputFormat::Jxl
+            | ImageInputFormat::Avif
+            | ImageInputFormat::Gif
+            | ImageInputFormat::Ico
+            | ImageInputFormat::Pnm => {
                 let decoded =
                     decode_image_into(item, DecodeTargetHint::Native, file_bytes, pixel_buf)?;
                 finish_rgba_expansion(item_index, item, decoded, pixel_buf, rgba_bytes)
