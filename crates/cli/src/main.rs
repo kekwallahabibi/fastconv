@@ -20,7 +20,7 @@ fn print_usage() {
         "  fastconv convert <source> <target> [--quality <0..=100> | --lossless] [--to <webp|heic|jpeg|png|bmp|qoi|tiff|jxl|avif>] [--threads <N>] [--backend <cpu|nvenc|vaapi|qsv|amf|videotoolbox|vulkan>]"
     );
     println!(
-        "  fastconv audio <source> <target> [--to <flac|wav|opus>] [--threads <N>] [--backend <cpu|...>]"
+        "  fastconv audio <source> <target> [--to <flac|wav|opus|ogg|mp3|aac|m4a|alac|aiff>] [--threads <N>] [--backend <cpu|...>]"
     );
     println!("  fastconv remux <source> <target> [--to <mp4|mkv>] [--threads <N>]");
     println!("  fastconv --version");

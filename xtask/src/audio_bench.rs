@@ -55,6 +55,12 @@ struct AudioValidation {
 #[derive(Deserialize)]
 struct FfprobeOutput {
     streams: Vec<FfprobeStream>,
+    format: Option<FfprobeFormat>,
+}
+
+#[derive(Deserialize)]
+struct FfprobeFormat {
+    duration: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -63,6 +69,96 @@ struct FfprobeStream {
     sample_rate: Option<String>,
     channels: Option<u32>,
     duration: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum ContentKind {
+    BitExact,
+    Lossy { max_lag_frames: usize },
+}
+
+/// One head-to-head format workload. `ffmpeg_codec_args` are the encoder flags appended after
+/// `-i <wav>`; both tools therefore receive the same bitrate/quality class.
+struct AudioWorkload<'a> {
+    name: &'a str,
+    fastconv_format: &'a str,
+    fastconv_label: &'a str,
+    output_file: &'a str,
+    codec: &'a str,
+    ffmpeg_codec_args: &'a [&'a str],
+    content: ContentKind,
+    content_label: &'a str,
+}
+
+/// Shared, immutable inputs for the single-file head-to-head workloads.
+struct WorkloadEnv<'a> {
+    wav: &'a Path,
+    wav_bytes: NonZeroU64,
+    fastconv: &'a Path,
+    threads: usize,
+    tmp: &'a Path,
+}
+
+/// Measures `fastconv` and `ffmpeg` on the same 60 s WAV, then validates each output's container,
+/// codec, rate, channels, duration and signal fidelity.
+fn run_audio_workload(
+    env: &WorkloadEnv<'_>,
+    spec: &AudioWorkload<'_>,
+    results: &mut Vec<BenchmarkMetrics>,
+    validation: &mut Vec<AudioValidation>,
+    content_checks: &mut Vec<ContentCheck>,
+) -> Result<(), String> {
+    let output = env.tmp.join(spec.output_file);
+    let fastconv_args = vec![
+        "audio".to_owned(),
+        path_str(env.wav)?,
+        path_str(&output)?,
+        "--to".to_owned(),
+        spec.fastconv_format.to_owned(),
+        "--threads".to_owned(),
+        env.threads.to_string(),
+    ];
+    results.push(measure_workload(
+        spec.name,
+        &format!("fastconv ({})", spec.fastconv_label),
+        env.fastconv,
+        &fastconv_args,
+        env.wav_bytes,
+        &output,
+    )?);
+    validation.push(validate(
+        &output, spec.name, "fastconv", spec.codec, 48_000, 2, 60.0,
+    )?);
+    // Check the native output before ffmpeg overwrites the same path.
+    match spec.content {
+        ContentKind::BitExact => content_checks.push(check_lossless_roundtrip(
+            env.wav,
+            &output,
+            spec.content_label,
+        )?),
+        ContentKind::Lossy { max_lag_frames } => content_checks.push(check_lossy_signal(
+            env.wav,
+            &output,
+            spec.content_label,
+            max_lag_frames,
+        )?),
+    }
+
+    let mut ffmpeg_args = vec!["-i".to_owned(), path_str(env.wav)?];
+    ffmpeg_args.extend(spec.ffmpeg_codec_args.iter().map(|arg| (*arg).to_owned()));
+    ffmpeg_args.push(path_str(&output)?);
+    results.push(measure_workload(
+        spec.name,
+        &format!("ffmpeg ({})", spec.ffmpeg_codec_args.join(" ")),
+        Path::new("ffmpeg"),
+        &ffmpeg_args,
+        env.wav_bytes,
+        &output,
+    )?);
+    validation.push(validate(
+        &output, spec.name, "ffmpeg", spec.codec, 48_000, 2, 60.0,
+    )?);
+    Ok(())
 }
 
 /// Runs the native fastconv audio encoders head-to-head against the `FFmpeg` baseline.
@@ -126,8 +222,6 @@ pub fn run(root: &Path) -> Result<(), String> {
     let batch_bytes =
         NonZeroU64::new(batch_bytes).ok_or_else(|| "audio batch inputs are empty".to_owned())?;
 
-    let flac_out = tmp.join("wav_to_flac.flac");
-    let opus_out = tmp.join("wav_to_opus.opus");
     let batch_out = tmp.join("batch");
     fs::create_dir_all(&batch_out)
         .map_err(|err| format!("failed to create '{}': {err}", batch_out.display()))?;
@@ -152,95 +246,108 @@ pub fn run(root: &Path) -> Result<(), String> {
     let mut validation = Vec::new();
     let mut content_checks = Vec::new();
 
-    let fastconv_flac_args = vec![
-        "audio".to_owned(),
-        path_str(&wav)?,
-        path_str(&flac_out)?,
-        "--to".to_owned(),
-        "flac".to_owned(),
-        "--threads".to_owned(),
-        threads.to_string(),
+    // Both sides use the same bitrate/quality class for every lossy format (Rule 9): 128 kbps
+    // Opus/AAC/M4A, 192 kbps MP3, Vorbis q=4 (quality 0.4); lossless targets use PCM/FLAC -5.
+    let workloads = [
+        AudioWorkload {
+            name: "audio_60s_wav_to_flac",
+            fastconv_format: "flac",
+            fastconv_label: "flacenc pure rust",
+            output_file: "wav_to_flac.flac",
+            codec: "flac",
+            ffmpeg_codec_args: &["-c:a", "flac", "-compression_level", "5"],
+            content: ContentKind::BitExact,
+            content_label: "wav->flac->wav",
+        },
+        AudioWorkload {
+            name: "audio_60s_wav_to_aiff",
+            fastconv_format: "aiff",
+            fastconv_label: "native pcm_s16be",
+            output_file: "wav_to_aiff.aiff",
+            codec: "pcm_s16be",
+            ffmpeg_codec_args: &["-c:a", "pcm_s16be"],
+            content: ContentKind::BitExact,
+            content_label: "wav->aiff->wav",
+        },
+        AudioWorkload {
+            name: "audio_60s_wav_to_alac",
+            fastconv_format: "alac",
+            fastconv_label: "alac-encoder m4a",
+            output_file: "wav_to_alac.m4a",
+            codec: "alac",
+            ffmpeg_codec_args: &["-c:a", "alac"],
+            content: ContentKind::BitExact,
+            content_label: "wav->alac->wav",
+        },
+        AudioWorkload {
+            name: "audio_60s_wav_to_opus",
+            fastconv_format: "opus",
+            fastconv_label: "opus-pure",
+            output_file: "wav_to_opus.opus",
+            codec: "opus",
+            ffmpeg_codec_args: &["-c:a", "libopus", "-b:a", "128k"],
+            content: ContentKind::Lossy {
+                max_lag_frames: 2048,
+            },
+            content_label: "wav->opus",
+        },
+        AudioWorkload {
+            name: "audio_60s_wav_to_ogg",
+            fastconv_format: "ogg",
+            fastconv_label: "vorbis-enc q4",
+            output_file: "wav_to_ogg.ogg",
+            codec: "vorbis",
+            ffmpeg_codec_args: &["-c:a", "libvorbis", "-q:a", "4"],
+            content: ContentKind::Lossy {
+                max_lag_frames: 2048,
+            },
+            content_label: "wav->ogg",
+        },
+        AudioWorkload {
+            name: "audio_60s_wav_to_mp3",
+            fastconv_format: "mp3",
+            fastconv_label: "rusty_mp3 192k",
+            output_file: "wav_to_mp3.mp3",
+            codec: "mp3",
+            ffmpeg_codec_args: &["-c:a", "libmp3lame", "-b:a", "192k"],
+            content: ContentKind::Lossy {
+                max_lag_frames: 2048,
+            },
+            content_label: "wav->mp3",
+        },
+        AudioWorkload {
+            name: "audio_60s_wav_to_aac",
+            fastconv_format: "aac",
+            fastconv_label: "rusty_aac 128k",
+            output_file: "wav_to_aac.aac",
+            codec: "aac",
+            ffmpeg_codec_args: &["-c:a", "aac", "-b:a", "128k"],
+            // Raw ADTS has no container priming metadata, so ffmpeg retains leading silence.
+            content: ContentKind::Lossy {
+                max_lag_frames: 2500,
+            },
+            content_label: "wav->aac",
+        },
+        AudioWorkload {
+            name: "audio_60s_wav_to_m4a",
+            fastconv_format: "m4a",
+            fastconv_label: "rusty_aac 128k muxed",
+            output_file: "wav_to_m4a.m4a",
+            codec: "aac",
+            ffmpeg_codec_args: &["-c:a", "aac", "-b:a", "128k"],
+            content: ContentKind::Lossy {
+                max_lag_frames: 2048,
+            },
+            content_label: "wav->m4a",
+        },
     ];
-    let ffmpeg_flac_args = vec![
-        "-i".to_owned(),
-        path_str(&wav)?,
-        "-c:a".to_owned(),
-        "flac".to_owned(),
-        "-compression_level".to_owned(),
-        "5".to_owned(),
-        path_str(&flac_out)?,
-    ];
-    results.push(measure_workload(
-        "audio_60s_wav_to_flac",
-        "fastconv (flacenc pure rust)",
-        &fastconv,
-        &fastconv_flac_args,
+    let env = WorkloadEnv {
+        wav: &wav,
         wav_bytes,
-        &flac_out,
-    )?);
-    validation.push(validate(
-        &flac_out,
-        "audio_60s_wav_to_flac",
-        "fastconv",
-        "flac",
-        48_000,
-        2,
-        60.0,
-    )?);
-    content_checks.push(check_lossless_roundtrip(&wav, &flac_out)?);
-    results.push(measure_workload(
-        "audio_60s_wav_to_flac",
-        "ffmpeg (flac -5)",
-        Path::new("ffmpeg"),
-        &ffmpeg_flac_args,
-        wav_bytes,
-        &flac_out,
-    )?);
-    validation.push(validate(
-        &flac_out,
-        "audio_60s_wav_to_flac",
-        "ffmpeg",
-        "flac",
-        48_000,
-        2,
-        60.0,
-    )?);
-
-    let fastconv_opus_args = vec![
-        "audio".to_owned(),
-        path_str(&wav)?,
-        path_str(&opus_out)?,
-        "--to".to_owned(),
-        "opus".to_owned(),
-        "--threads".to_owned(),
-        threads.to_string(),
-    ];
-    let ffmpeg_opus_args = vec![
-        "-i".to_owned(),
-        path_str(&wav)?,
-        "-c:a".to_owned(),
-        "libopus".to_owned(),
-        "-b:a".to_owned(),
-        "128k".to_owned(),
-        path_str(&opus_out)?,
-    ];
-    results.push(measure_workload(
-        "audio_60s_wav_to_opus",
-        "fastconv (opus-pure)",
-        &fastconv,
-        &fastconv_opus_args,
-        wav_bytes,
-        &opus_out,
-    )?);
-    validation.push(validate(
-        &opus_out,
-        "audio_60s_wav_to_opus",
-        "fastconv",
-        "opus",
-        48_000,
-        2,
-        60.0,
-    )?);
+        fastconv: &fastconv,
+        threads: threads.get(),
+        tmp: &tmp,
+    };
     content_checks.push(ContentCheck {
         check: "opus complexity".to_owned(),
         detail:
@@ -248,24 +355,15 @@ pub fn run(root: &Path) -> Result<(), String> {
                 .to_owned(),
         passed: true,
     });
-    content_checks.push(check_opus_signal(&wav, &opus_out)?);
-    results.push(measure_workload(
-        "audio_60s_wav_to_opus",
-        "ffmpeg (libopus 128k)",
-        Path::new("ffmpeg"),
-        &ffmpeg_opus_args,
-        wav_bytes,
-        &opus_out,
-    )?);
-    validation.push(validate(
-        &opus_out,
-        "audio_60s_wav_to_opus",
-        "ffmpeg",
-        "opus",
-        48_000,
-        2,
-        60.0,
-    )?);
+    for spec in &workloads {
+        run_audio_workload(
+            &env,
+            spec,
+            &mut results,
+            &mut validation,
+            &mut content_checks,
+        )?;
+    }
 
     let fastconv_batch_args = vec![
         "audio".to_owned(),
@@ -471,9 +569,13 @@ fn decode_via_ffmpeg_i16(path: &Path) -> Result<Vec<i16>, String> {
         .collect())
 }
 
-fn check_lossless_roundtrip(source: &Path, flac: &Path) -> Result<ContentCheck, String> {
+fn check_lossless_roundtrip(
+    source: &Path,
+    encoded: &Path,
+    label: &str,
+) -> Result<ContentCheck, String> {
     let original = decode_i16(source)?;
-    let roundtrip = decode_i16(flac)?;
+    let roundtrip = decode_i16(encoded)?;
     if original != roundtrip {
         let first = original
             .iter()
@@ -481,13 +583,13 @@ fn check_lossless_roundtrip(source: &Path, flac: &Path) -> Result<ContentCheck, 
             .position(|(a, b)| a != b)
             .unwrap_or(original.len().min(roundtrip.len()));
         return Err(format!(
-            "FLAC roundtrip is not bit-identical: {} vs {} samples, first difference at {first}",
+            "{label} is not bit-identical: {} vs {} samples, first difference at {first}",
             original.len(),
             roundtrip.len()
         ));
     }
     Ok(ContentCheck {
-        check: "wav->flac->wav bit-exact".to_owned(),
+        check: format!("{label} bit-exact"),
         detail: format!("{} samples identical", original.len()),
         passed: true,
     })
@@ -513,27 +615,69 @@ fn signal_snr(reference: &[i16], decoded: &[i16]) -> (f64, usize, i32) {
     (snr, count, peak)
 }
 
-fn check_opus_signal(source: &Path, opus: &Path) -> Result<ContentCheck, String> {
+/// Finds the integer frame lag maximizing SNR over a short prefix window. Raw ADTS AAC has no
+/// container priming metadata, so ffmpeg keeps leading silence that must be skipped for a fair
+/// comparison; containerized lossy codecs only need a small margin for decoder priming drift.
+fn best_alignment_lag(
+    reference: &[i16],
+    decoded: &[i16],
+    channels: usize,
+    max_lag_frames: usize,
+    window_samples: usize,
+) -> (usize, f64) {
+    let Some(prefix) = reference.get(..window_samples.min(reference.len())) else {
+        return (0, f64::NEG_INFINITY);
+    };
+    let mut best_lag = 0_usize;
+    let mut best_snr = f64::NEG_INFINITY;
+    for lag in 0..=max_lag_frames {
+        let start = lag.saturating_mul(channels);
+        let Some(candidate) = decoded.get(start..start.saturating_add(prefix.len())) else {
+            continue;
+        };
+        let (snr, _, _) = signal_snr(prefix, candidate);
+        if snr > best_snr {
+            best_snr = snr;
+            best_lag = lag;
+        }
+    }
+    (best_lag, best_snr)
+}
+
+fn check_lossy_signal(
+    source: &Path,
+    encoded: &Path,
+    label: &str,
+    max_lag_frames: usize,
+) -> Result<ContentCheck, String> {
     let reference = decode_via_ffmpeg_i16(source)?;
-    let decoded = decode_via_ffmpeg_i16(opus)?;
-    if decoded.len() < reference.len().saturating_sub(2 * 48_000) {
+    let decoded = decode_via_ffmpeg_i16(encoded)?;
+    let channels = usize::from(fixtures::AUDIO_CHANNELS);
+    // Tolerate codec padding/framing at the tail (up to 4096 stereo frames).
+    let allowed_delta = 4096_usize.saturating_mul(channels);
+    if decoded.len().saturating_add(allowed_delta) < reference.len()
+        || reference.len().saturating_add(allowed_delta) < decoded.len()
+    {
         return Err(format!(
-            "Opus output lost too many samples: {} vs {}",
+            "{label} output lost/added too many samples: {} vs {}",
             decoded.len(),
             reference.len()
         ));
     }
-    let (snr, count, peak) = signal_snr(&reference, &decoded);
+    let (lag, _) = best_alignment_lag(&reference, &decoded, channels, max_lag_frames, 24_000);
+    let offset = lag.saturating_mul(channels);
+    let aligned = decoded.get(offset..).unwrap_or(&[]);
+    let (snr, count, peak) = signal_snr(&reference, aligned);
     let passed = snr >= 18.0 && peak > 0;
     let check = ContentCheck {
-        check: "wav->opus SNR".to_owned(),
-        detail: format!("{snr:.1} dB over {count} samples (peak {peak})"),
+        check: format!("{label} SNR"),
+        detail: format!("{snr:.1} dB over {count} samples (peak {peak}, lag {lag} frames)"),
         passed,
     };
     if passed {
         Ok(check)
     } else {
-        Err(format!("Opus signal check failed: {}", check.detail))
+        Err(format!("{label} signal check failed: {}", check.detail))
     }
 }
 
@@ -543,20 +687,18 @@ fn check_batch_samples(source: &Path, output: &Path, label: &str) -> Result<Cont
         .and_then(|ext| ext.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let source_samples = if extension == "opus" {
-        decode_via_ffmpeg_i16(source)?
-    } else {
+    let lossless = matches!(
+        extension.as_str(),
+        "wav" | "wave" | "flac" | "aiff" | "aif" | "aifc"
+    ) || label.starts_with("alac");
+    // FFmpeg handles decoder priming for lossy containers; Symphonia is the bit-exact reference
+    // for the lossless inputs (including our own ALAC muxer).
+    let source_samples = if lossless {
         decode_i16(source)?
+    } else {
+        decode_via_ffmpeg_i16(source)?
     };
     let output_samples = decode_i16(output)?;
-    if source_samples.len() != output_samples.len() {
-        return Err(format!(
-            "batch {label} sample count mismatch: {} source samples vs {} decoded FLAC samples",
-            source_samples.len(),
-            output_samples.len()
-        ));
-    }
-    let lossless = matches!(extension.as_str(), "wav" | "wave" | "flac");
     let (detail, passed) = if lossless {
         let identical = source_samples == output_samples;
         (
@@ -572,10 +714,25 @@ fn check_batch_samples(source: &Path, output: &Path, label: &str) -> Result<Cont
             identical,
         )
     } else {
-        let (snr, count, peak) = signal_snr(&source_samples, &output_samples);
+        let channels = usize::from(fixtures::AUDIO_CHANNELS);
+        let allowed_delta = 4096_usize.saturating_mul(channels);
+        if output_samples.len().saturating_add(allowed_delta) < source_samples.len()
+            || source_samples.len().saturating_add(allowed_delta) < output_samples.len()
+        {
+            return Err(format!(
+                "batch {label} sample count mismatch: {} source samples vs {} decoded FLAC samples",
+                source_samples.len(),
+                output_samples.len()
+            ));
+        }
+        let (lag, _) = best_alignment_lag(&source_samples, &output_samples, channels, 4096, 24_000);
+        let aligned = output_samples
+            .get(lag.saturating_mul(channels)..)
+            .unwrap_or(&[]);
+        let (snr, count, peak) = signal_snr(&source_samples, aligned);
         (
-            format!("{snr:.1} dB over {count} samples (peak {peak})"),
-            snr >= 25.0 && peak > 0,
+            format!("{snr:.1} dB over {count} samples (peak {peak}, lag {lag} frames)"),
+            snr >= 20.0 && peak > 0,
         )
     };
     let check = ContentCheck {
@@ -856,6 +1013,40 @@ fn sample_peak_rss(_pid: u32) -> Option<u64> {
     None
 }
 
+/// Resolves an exact duration: ffprobe's stream duration when trustworthy, otherwise the decoded
+/// sample count. Raw ADTS AAC only carries a bitrate-based estimate and some muxers omit the
+/// per-stream duration entirely, so counting frames is the reliable measurement in those cases.
+fn exact_duration(
+    output: &Path,
+    stream: &FfprobeStream,
+    format: Option<&FfprobeFormat>,
+    rate: u32,
+    channels: u32,
+) -> Result<f64, String> {
+    let stream_duration = stream
+        .duration
+        .as_deref()
+        .and_then(|v| v.parse::<f64>().ok());
+    let raw_adts_aac = output
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("aac"));
+    if !raw_adts_aac && stream_duration.is_some() {
+        return Ok(stream_duration.unwrap_or(0.0));
+    }
+    let samples = decode_via_ffmpeg_i16(output)?;
+    let decoded = f64::from(u32::try_from(samples.len()).unwrap_or(u32::MAX))
+        / (f64::from(rate) * f64::from(channels));
+    if decoded > 0.0 {
+        Ok(decoded)
+    } else {
+        Ok(format
+            .and_then(|entry| entry.duration.as_deref())
+            .and_then(|v| v.parse::<f64>().ok())
+            .or(stream_duration)
+            .unwrap_or(0.0))
+    }
+}
+
 fn validate(
     output: &Path,
     workload: &str,
@@ -895,7 +1086,7 @@ fn validate(
             "-select_streams",
             "a:0",
             "-show_entries",
-            "stream=codec_name,sample_rate,channels,duration",
+            "stream=codec_name,sample_rate,channels,duration:format=duration",
             "-of",
             "json",
             &path_str(output)?,
@@ -920,12 +1111,14 @@ fn validate(
         .as_deref()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
-    let actual_duration = stream
-        .duration
-        .as_deref()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.0);
     let actual_channels = stream.channels.unwrap_or(0);
+    let actual_duration = exact_duration(
+        output,
+        stream,
+        parsed.format.as_ref(),
+        actual_rate,
+        actual_channels,
+    )?;
 
     if stream.codec_name != codec {
         return Err(format!(

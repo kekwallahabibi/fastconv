@@ -15,6 +15,10 @@ pub enum AudioInputFormat {
     Mp3,
     Vorbis,
     Opus,
+    Aac,
+    M4a,
+    Alac,
+    Aiff,
 }
 
 impl AudioInputFormat {
@@ -26,6 +30,9 @@ impl AudioInputFormat {
             Self::Mp3 => "mp3",
             Self::Vorbis => "ogg",
             Self::Opus => "opus",
+            Self::Aac => "aac",
+            Self::M4a | Self::Alac => "m4a",
+            Self::Aiff => "aiff",
         }
     }
 
@@ -37,6 +44,10 @@ impl AudioInputFormat {
             Self::Mp3 => "MP3",
             Self::Vorbis => "Ogg Vorbis",
             Self::Opus => "Ogg Opus",
+            Self::Aac => "AAC (ADTS)",
+            Self::M4a => "M4A",
+            Self::Alac => "ALAC",
+            Self::Aiff => "AIFF",
         }
     }
 }
@@ -53,6 +64,12 @@ pub enum AudioOutputFormat {
     Wav,
     Flac,
     Opus,
+    Ogg,
+    Mp3,
+    Aac,
+    M4a,
+    Alac,
+    Aiff,
 }
 
 impl AudioOutputFormat {
@@ -62,6 +79,11 @@ impl AudioOutputFormat {
             Self::Wav => "wav",
             Self::Flac => "flac",
             Self::Opus => "opus",
+            Self::Ogg => "ogg",
+            Self::Mp3 => "mp3",
+            Self::Aac => "aac",
+            Self::M4a | Self::Alac => "m4a",
+            Self::Aiff => "aiff",
         }
     }
 
@@ -71,12 +93,18 @@ impl AudioOutputFormat {
             Self::Wav => "WAV",
             Self::Flac => "FLAC",
             Self::Opus => "Opus",
+            Self::Ogg => "Ogg Vorbis",
+            Self::Mp3 => "MP3",
+            Self::Aac => "AAC",
+            Self::M4a => "M4A (AAC)",
+            Self::Alac => "ALAC (M4A)",
+            Self::Aiff => "AIFF",
         }
     }
 
     #[must_use]
     pub const fn is_lossless(self) -> bool {
-        !matches!(self, Self::Opus)
+        matches!(self, Self::Wav | Self::Flac | Self::Alac | Self::Aiff)
     }
 
     #[must_use]
@@ -87,8 +115,35 @@ impl AudioOutputFormat {
             Some(Self::Flac)
         } else if ext.eq_ignore_ascii_case("opus") {
             Some(Self::Opus)
+        } else if ext.eq_ignore_ascii_case("ogg") || ext.eq_ignore_ascii_case("oga") {
+            Some(Self::Ogg)
+        } else if ext.eq_ignore_ascii_case("mp3") {
+            Some(Self::Mp3)
+        } else if ext.eq_ignore_ascii_case("aac") {
+            Some(Self::Aac)
+        } else if ext.eq_ignore_ascii_case("m4a") {
+            Some(Self::M4a)
+        } else if ext.eq_ignore_ascii_case("alac") {
+            Some(Self::Alac)
+        } else if ext.eq_ignore_ascii_case("aiff")
+            || ext.eq_ignore_ascii_case("aif")
+            || ext.eq_ignore_ascii_case("aifc")
+        {
+            Some(Self::Aiff)
         } else {
             None
+        }
+    }
+
+    /// Returns true if `ext` is a valid target file extension for this output format.
+    ///
+    /// ALAC is stored inside an M4A container, so both `.m4a` and `.alac` are accepted when
+    /// `--to alac` is explicitly requested.
+    #[must_use]
+    pub fn accepts_extension(self, ext: &str) -> bool {
+        match self {
+            Self::Alac => ext.eq_ignore_ascii_case("m4a") || ext.eq_ignore_ascii_case("alac"),
+            _ => Self::from_extension(ext) == Some(self),
         }
     }
 }
@@ -161,6 +216,12 @@ pub enum AudioExecutionMode {
     CpuWav,
     CpuFlac,
     CpuOpus,
+    CpuOgg,
+    CpuMp3,
+    CpuAac,
+    CpuM4a,
+    CpuAlac,
+    CpuAiff,
 }
 
 impl AudioExecutionMode {
@@ -181,6 +242,12 @@ impl AudioExecutionMode {
                 AudioOutputFormat::Wav => Self::CpuWav,
                 AudioOutputFormat::Flac => Self::CpuFlac,
                 AudioOutputFormat::Opus => Self::CpuOpus,
+                AudioOutputFormat::Ogg => Self::CpuOgg,
+                AudioOutputFormat::Mp3 => Self::CpuMp3,
+                AudioOutputFormat::Aac => Self::CpuAac,
+                AudioOutputFormat::M4a => Self::CpuM4a,
+                AudioOutputFormat::Alac => Self::CpuAlac,
+                AudioOutputFormat::Aiff => Self::CpuAiff,
             }),
             HardwareBackend::Gpu(backend) => Err(DomainError::UnsupportedAudioPipeline {
                 format,
@@ -198,6 +265,12 @@ impl AudioExecutionMode {
             Self::CpuWav => AudioOutputFormat::Wav,
             Self::CpuFlac => AudioOutputFormat::Flac,
             Self::CpuOpus => AudioOutputFormat::Opus,
+            Self::CpuOgg => AudioOutputFormat::Ogg,
+            Self::CpuMp3 => AudioOutputFormat::Mp3,
+            Self::CpuAac => AudioOutputFormat::Aac,
+            Self::CpuM4a => AudioOutputFormat::M4a,
+            Self::CpuAlac => AudioOutputFormat::Alac,
+            Self::CpuAiff => AudioOutputFormat::Aiff,
         }
     }
 
@@ -213,6 +286,12 @@ impl fmt::Display for AudioExecutionMode {
             Self::CpuWav => "wav pcm (cpu)",
             Self::CpuFlac => "flac (cpu)",
             Self::CpuOpus => "opus (cpu)",
+            Self::CpuOgg => "ogg vorbis (cpu)",
+            Self::CpuMp3 => "mp3 (cpu)",
+            Self::CpuAac => "aac adts (cpu)",
+            Self::CpuM4a => "m4a aac (cpu)",
+            Self::CpuAlac => "alac m4a (cpu)",
+            Self::CpuAiff => "aiff pcm (cpu)",
         })
     }
 }
@@ -456,15 +535,22 @@ mod tests {
 
     #[test]
     fn resolves_only_cpu_audio_modes() {
-        assert_eq!(
-            AudioExecutionMode::resolve(AudioOutputFormat::Flac, HardwareBackend::Cpu),
-            Ok(AudioExecutionMode::CpuFlac)
-        );
-        for format in [
-            AudioOutputFormat::Wav,
-            AudioOutputFormat::Flac,
-            AudioOutputFormat::Opus,
+        for (format, expected) in [
+            (AudioOutputFormat::Wav, AudioExecutionMode::CpuWav),
+            (AudioOutputFormat::Flac, AudioExecutionMode::CpuFlac),
+            (AudioOutputFormat::Opus, AudioExecutionMode::CpuOpus),
+            (AudioOutputFormat::Ogg, AudioExecutionMode::CpuOgg),
+            (AudioOutputFormat::Mp3, AudioExecutionMode::CpuMp3),
+            (AudioOutputFormat::Aac, AudioExecutionMode::CpuAac),
+            (AudioOutputFormat::M4a, AudioExecutionMode::CpuM4a),
+            (AudioOutputFormat::Alac, AudioExecutionMode::CpuAlac),
+            (AudioOutputFormat::Aiff, AudioExecutionMode::CpuAiff),
         ] {
+            assert_eq!(
+                AudioExecutionMode::resolve(format, HardwareBackend::Cpu),
+                Ok(expected)
+            );
+            assert_eq!(expected.output_format(), format);
             for backend in [GpuBackend::Nvenc, GpuBackend::Vaapi, GpuBackend::Vulkan] {
                 assert!(matches!(
                     AudioExecutionMode::resolve(format, HardwareBackend::Gpu(backend)),
@@ -472,6 +558,15 @@ mod tests {
                 ));
             }
         }
+        assert!(AudioOutputFormat::Alac.accepts_extension("m4a"));
+        assert!(AudioOutputFormat::Alac.accepts_extension("alac"));
+        assert!(!AudioOutputFormat::Alac.accepts_extension("flac"));
+        assert!(AudioOutputFormat::Aiff.is_lossless());
+        assert!(AudioOutputFormat::Alac.is_lossless());
+        assert!(!AudioOutputFormat::Aac.is_lossless());
+        assert!(!AudioOutputFormat::M4a.is_lossless());
+        assert!(!AudioOutputFormat::Mp3.is_lossless());
+        assert!(!AudioOutputFormat::Ogg.is_lossless());
     }
 
     #[test]

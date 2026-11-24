@@ -66,12 +66,18 @@ pub fn audio_batch_dir(root: &Path) -> PathBuf {
 
 /// Mixed-format input files used by `cargo xtask bench --audio`.
 #[must_use]
-pub fn audio_batch_inputs(root: &Path) -> [PathBuf; 3] {
+pub fn audio_batch_inputs(root: &Path) -> [PathBuf; 9] {
     let dir = audio_batch_dir(root);
     [
         dir.join("wav_track.wav"),
         dir.join("flac_track.flac"),
         dir.join("opus_track.opus"),
+        dir.join("ogg_track.ogg"),
+        dir.join("mp3_track.mp3"),
+        dir.join("aac_track.aac"),
+        dir.join("m4a_track.m4a"),
+        dir.join("alac_track.m4a"),
+        dir.join("aiff_track.aiff"),
     ]
 }
 
@@ -372,10 +378,9 @@ fn generate_audio_batch(root: &Path, force: bool) -> Result<(), String> {
     }
     fs::create_dir_all(&dir)
         .map_err(|err| format!("failed to create '{}': {err}", dir.display()))?;
-    for obsolete in [dir.join("mp3_track.mp3"), dir.join("vorbis_track.ogg")] {
-        if obsolete.exists() {
-            let _ = fs::remove_file(&obsolete);
-        }
+    let obsolete = dir.join("vorbis_track.ogg");
+    if obsolete.exists() {
+        let _ = fs::remove_file(&obsolete);
     }
 
     let source = audio_wav_path(root);
@@ -393,7 +398,16 @@ fn generate_audio_batch(root: &Path, force: bool) -> Result<(), String> {
         write_short_wav(&source, wav_target)?;
         println!("==> generated {}", wav_target.display());
     }
-    for (target, format) in [(&inputs[1], "flac"), (&inputs[2], "opus")] {
+    for (target, format) in [
+        (&inputs[1], "flac"),
+        (&inputs[2], "opus"),
+        (&inputs[3], "ogg"),
+        (&inputs[4], "mp3"),
+        (&inputs[5], "aac"),
+        (&inputs[6], "m4a"),
+        (&inputs[7], "alac"),
+        (&inputs[8], "aiff"),
+    ] {
         if !force && is_non_empty_file(target) {
             continue;
         }

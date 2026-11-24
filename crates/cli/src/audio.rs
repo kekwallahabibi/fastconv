@@ -21,10 +21,16 @@ pub(crate) enum AudioCommand {
 fn parse_target_format(value: &str) -> Result<AudioOutputFormat, String> {
     match value {
         "flac" => Ok(AudioOutputFormat::Flac),
-        "wav" => Ok(AudioOutputFormat::Wav),
+        "wav" | "wave" => Ok(AudioOutputFormat::Wav),
         "opus" => Ok(AudioOutputFormat::Opus),
+        "ogg" | "oga" => Ok(AudioOutputFormat::Ogg),
+        "mp3" => Ok(AudioOutputFormat::Mp3),
+        "aac" => Ok(AudioOutputFormat::Aac),
+        "m4a" => Ok(AudioOutputFormat::M4a),
+        "alac" => Ok(AudioOutputFormat::Alac),
+        "aiff" | "aif" | "aifc" => Ok(AudioOutputFormat::Aiff),
         other => Err(format!(
-            "unknown audio format '{other}' (expected flac, wav, or opus)"
+            "unknown audio format '{other}' (expected flac, wav, opus, ogg, mp3, aac, m4a, alac, or aiff)"
         )),
     }
 }
@@ -88,7 +94,7 @@ pub(crate) fn parse_audio_args(args: &[&str]) -> Result<AudioCommand, String> {
 
     let [source, target] = positional.as_slice() else {
         return Err(
-            "expected `fastconv audio <source> <target> [--to <flac|wav|opus>]`".to_owned(),
+            "expected `fastconv audio <source> <target> [--to <flac|wav|opus|ogg|mp3|aac|m4a|alac|aiff>]`".to_owned(),
         );
     };
 
@@ -171,9 +177,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_every_target_format_and_alias() -> Result<(), String> {
+        let expected = [
+            ("flac", AudioOutputFormat::Flac),
+            ("wav", AudioOutputFormat::Wav),
+            ("wave", AudioOutputFormat::Wav),
+            ("opus", AudioOutputFormat::Opus),
+            ("ogg", AudioOutputFormat::Ogg),
+            ("oga", AudioOutputFormat::Ogg),
+            ("mp3", AudioOutputFormat::Mp3),
+            ("aac", AudioOutputFormat::Aac),
+            ("m4a", AudioOutputFormat::M4a),
+            ("alac", AudioOutputFormat::Alac),
+            ("aiff", AudioOutputFormat::Aiff),
+            ("aif", AudioOutputFormat::Aiff),
+            ("aifc", AudioOutputFormat::Aiff),
+        ];
+        for (name, format) in expected {
+            let AudioCommand::Run(parsed) = parse_audio_args(&["a", "b", "--to", name])? else {
+                return Err("expected audio run args".to_owned());
+            };
+            assert_eq!(parsed.to, Some(format), "wrong format for '--to {name}'");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn rejects_invalid_audio_args() {
         assert!(parse_audio_args(&["only-source"]).is_err());
-        assert!(parse_audio_args(&["a", "b", "--to", "mp3"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--to", "wma"]).is_err());
         assert!(parse_audio_args(&["a", "b", "--to", "flac", "--to", "wav"]).is_err());
         assert!(parse_audio_args(&["a", "b", "--threads", "0"]).is_err());
         assert!(parse_audio_args(&["a", "b", "--backend", "magic"]).is_err());
