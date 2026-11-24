@@ -22,7 +22,10 @@ fn print_usage() {
     println!(
         "  fastconv audio <source> <target> [--to <flac|wav|opus|ogg|mp3|aac|m4a|alac|aiff>] [--threads <N>] [--backend <cpu|...>]"
     );
-    println!("  fastconv remux <source> <target> [--to <mp4|mkv>] [--threads <N>]");
+    println!("  fastconv remux <source> <target> [--to <mp4|mkv|webm|mov|avi|ts>] [--threads <N>]");
+    println!(
+        "  fastconv video <source> <target> [--to <mp4|mkv|webm|mov|avi|ts>] [--vcodec <h264|hevc|h265|av1|vp9|copy>] [--acodec <aac|opus|mp3|copy>] [--quality <0..=100>] [--threads <N>] [--backend <cpu|nvenc|vaapi|qsv|amf|videotoolbox|vulkan>]"
+    );
     println!("  fastconv --version");
     println!("  fastconv --help");
 }
@@ -328,6 +331,23 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Ok(video::RemuxCommand::Run(parsed)) => match video::run_remux(&parsed) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(message) => {
+                    eprintln!("error: {message}");
+                    ExitCode::FAILURE
+                }
+            },
+            Err(message) => {
+                eprintln!("error: {message}");
+                ExitCode::FAILURE
+            }
+        },
+        ["video", rest @ ..] => match video::parse_video_args(rest) {
+            Ok(video::VideoCommand::Help) => {
+                video::print_video_help();
+                ExitCode::SUCCESS
+            }
+            Ok(video::VideoCommand::Run(parsed)) => match video::run_video(&parsed) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(message) => {
                     eprintln!("error: {message}");

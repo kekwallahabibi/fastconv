@@ -6,7 +6,10 @@ pub mod video;
 pub use audio::{ProbedAudio, prepare_audio_batch, probe_audio};
 pub use hardware::detect_host_hardware;
 pub use image::{ProbedImage, prepare_image_batch, probe_image};
-pub use video::{ProbedVideo, detect_video_magic, prepare_video_batch, probe_video};
+pub use video::{
+    ProbedVideo, RequestedAudioCodec, RequestedVideoCodec, detect_video_magic, prepare_video_batch,
+    prepare_video_transcode_batch, probe_video,
+};
 
 use std::error::Error;
 use std::fmt;
@@ -97,7 +100,7 @@ impl fmt::Display for ProbeError {
             Self::EmptyVideoDirectory(path) => {
                 write!(
                     f,
-                    "no supported video files (MP4, MOV, or MKV) found in source directory: {}",
+                    "no supported video files (MP4, MKV, WebM, MOV, AVI, or TS) found in source directory: {}",
                     path.display()
                 )
             }
@@ -142,7 +145,7 @@ impl ProbeError {
     pub(crate) fn requires_to_for_video_directory() -> Self {
         Self::InvalidVideo {
             path: PathBuf::new(),
-            reason: "batch remux requires --to <mp4|mkv> when the target is a directory".to_owned(),
+            reason: "batch video operation requires --to <mp4|mkv|webm|mov|avi|ts> when the target is a directory".to_owned(),
         }
     }
 }

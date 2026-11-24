@@ -19,11 +19,15 @@ use std::os::unix::fs::OpenOptionsExt;
 static STAGING_SERIAL: AtomicUsize = AtomicUsize::new(0);
 
 use containr::Packet;
+use containr::mkv::DocType;
+use containr::mp4::Brand;
 use fastconv_domain::{
-    HardwareBackend, VideoContainerFormat, VideoRemuxItem, VideoRemuxPlan, VideoRemuxReport,
+    HardwareBackend, VideoCodec, VideoContainerFormat, VideoRemuxItem, VideoRemuxPlan,
+    VideoRemuxReport,
 };
 
 use crate::PipelineError;
+use crate::video_container::{demux_video, mux_video};
 
 /// Nanoseconds per Matroska tick used when an exact timestamp plan is not possible.
 ///
@@ -153,22 +157,100 @@ impl Read for WindowedFileReader {
     }
 }
 
-/// Remuxes a single file from one container to the other without re-encoding.
+/// Whether `containr`'s zero-copy `StreamCopy` path can carry every stream.
+///
+/// MP3 in MP4 needs a rebuilt `mp4a` sample entry, VP9 in MP4 needs a `vp09`
+/// sample entry, and neither `StreamCopy` planner models those. Everything
+/// else inside the MP4/MOV <-> MKV/WebM family is a pure descriptor copy.
+fn stream_copy_supports(item: &VideoRemuxItem) -> bool {
+    let input = item.input_format();
+    let output = item.output_format();
+    let family = |format| {
+        matches!(
+            format,
+            VideoContainerFormat::Mp4 | VideoContainerFormat::Mov
+        )
+    };
+    let direct = (input == VideoContainerFormat::Mp4 && output == VideoContainerFormat::Mp4)
+        || (matches!(
+            input,
+            VideoContainerFormat::Mkv | VideoContainerFormat::Webm
+        ) && matches!(
+            output,
+            VideoContainerFormat::Mkv | VideoContainerFormat::Webm
+        ))
+        || (family(input)
+            && matches!(
+                output,
+                VideoContainerFormat::Mkv | VideoContainerFormat::Webm
+            ))
+        || (matches!(
+            input,
+            VideoContainerFormat::Mkv | VideoContainerFormat::Webm
+        ) && family(output));
+    if !direct {
+        return false;
+    }
+    item.streams().iter().all(|stream| {
+        stream.codec() != VideoCodec::Mp3 && !(stream.codec() == VideoCodec::Vp9 && family(output))
+    })
+}
+
+/// Remuxes a single file without re-encoding, rejecting unsupported codecs.
 fn remux_file(item: &VideoRemuxItem, target: &File) -> Result<(), PipelineError> {
     let source = item.source();
-    match (item.input_format(), item.output_format()) {
-        (VideoContainerFormat::Mp4, VideoContainerFormat::Mkv) => {
-            mp4_to_mkv(source, target, item.target())
+    let output = item.output_format();
+    for stream in item.streams() {
+        if !stream.codec().supported_in(output) {
+            return Err(remux_failed(
+                item.target(),
+                format!(
+                    "codec {} cannot be carried by {}",
+                    stream.codec(),
+                    output.label()
+                ),
+            ));
         }
-        (VideoContainerFormat::Mkv, VideoContainerFormat::Mp4) => {
-            mkv_to_mp4(source, target, item.target())
-        }
-        (VideoContainerFormat::Mp4, VideoContainerFormat::Mp4) => {
-            mp4_to_mp4(source, target, item.target())
-        }
-        (VideoContainerFormat::Mkv, VideoContainerFormat::Mkv) => {
-            mkv_to_mkv(source, target, item.target())
-        }
+    }
+    if !stream_copy_supports(item) {
+        let media = demux_video(source, item.input_format())?;
+        return mux_video(target, item.target(), output, &media);
+    }
+    let brand = if output == VideoContainerFormat::Mov {
+        Brand::QuickTime
+    } else {
+        Brand::Isom
+    };
+    let doc_type = if output == VideoContainerFormat::Webm {
+        DocType::WebM
+    } else {
+        DocType::Matroska
+    };
+    match (item.input_format(), output) {
+        (
+            VideoContainerFormat::Mp4 | VideoContainerFormat::Mov,
+            VideoContainerFormat::Mp4 | VideoContainerFormat::Mov,
+        ) => mp4_to_mp4(source, target, item.target(), brand),
+        (
+            VideoContainerFormat::Mp4 | VideoContainerFormat::Mov,
+            VideoContainerFormat::Mkv | VideoContainerFormat::Webm,
+        ) => mp4_to_mkv(source, target, item.target(), doc_type),
+        (
+            VideoContainerFormat::Mkv | VideoContainerFormat::Webm,
+            VideoContainerFormat::Mp4 | VideoContainerFormat::Mov,
+        ) => mkv_to_mp4(source, target, item.target(), brand),
+        (
+            VideoContainerFormat::Mkv | VideoContainerFormat::Webm,
+            VideoContainerFormat::Mkv | VideoContainerFormat::Webm,
+        ) => mkv_to_mkv(source, target, item.target(), doc_type),
+        _ => Err(remux_failed(
+            item.target(),
+            format!(
+                "{} -> {} remuxing is not implemented yet",
+                item.input_format(),
+                output
+            ),
+        )),
     }
 }
 
@@ -248,7 +330,12 @@ fn read_packets(
         .map_err(|err| container_err(path, &err))
 }
 
-fn mp4_to_mkv(source: &Path, target: &File, target_path: &Path) -> Result<(), PipelineError> {
+fn mp4_to_mkv(
+    source: &Path,
+    target: &File,
+    target_path: &Path,
+    doc_type: DocType,
+) -> Result<(), PipelineError> {
     let reader = WindowedFileReader::open(source).map_err(|source_err| PipelineError::Io {
         path: source.to_path_buf(),
         source: source_err,
@@ -280,6 +367,7 @@ fn mp4_to_mkv(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
     }
 
     let options = containr::mkv::MkvOptions {
+        doc_type,
         timestamp_scale: containr::mkv::StreamCopy::timestamp_scale(&plans),
         ..containr::mkv::MkvOptions::default()
     };
@@ -336,6 +424,7 @@ fn mux_mkv_to_mp4<W: io::Read + io::Write + io::Seek>(
     source: &Path,
     target: W,
     target_path: &Path,
+    brand: Brand,
 ) -> Result<(), PipelineError> {
     let reader = WindowedFileReader::open(source).map_err(|source_err| PipelineError::Io {
         path: source.to_path_buf(),
@@ -354,6 +443,7 @@ fn mux_mkv_to_mp4<W: io::Read + io::Write + io::Seek>(
     }
 
     let options = containr::mp4::MuxOptions {
+        brand,
         faststart: true,
         ..containr::mp4::MuxOptions::default()
     };
@@ -435,7 +525,12 @@ fn mux_mkv_to_mp4<W: io::Read + io::Write + io::Seek>(
     Ok(())
 }
 
-fn mkv_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), PipelineError> {
+fn mkv_to_mp4(
+    source: &Path,
+    target: &File,
+    target_path: &Path,
+    brand: Brand,
+) -> Result<(), PipelineError> {
     let source_len = input_size(source);
     if source_len <= IN_MEMORY_MP4_FASTSTART_LIMIT {
         let mut mem = io::Cursor::new(Vec::with_capacity(
@@ -443,7 +538,7 @@ fn mkv_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
                 .unwrap_or(0)
                 .saturating_add(256 * 1024),
         ));
-        mux_mkv_to_mp4(source, &mut mem, target_path)?;
+        mux_mkv_to_mp4(source, &mut mem, target_path, brand)?;
         let mut writer: &File = target;
         writer
             .write_all(mem.get_ref())
@@ -457,7 +552,7 @@ fn mkv_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
         })?;
         Ok(())
     } else {
-        mux_mkv_to_mp4(source, target, target_path)
+        mux_mkv_to_mp4(source, target, target_path, brand)
     }
 }
 
@@ -465,6 +560,7 @@ fn mux_mp4_to_mp4<W: io::Read + io::Write + io::Seek>(
     source: &Path,
     target: W,
     target_path: &Path,
+    brand: Brand,
 ) -> Result<(), PipelineError> {
     let reader = WindowedFileReader::open(source).map_err(|source_err| PipelineError::Io {
         path: source.to_path_buf(),
@@ -473,6 +569,7 @@ fn mux_mp4_to_mp4<W: io::Read + io::Write + io::Seek>(
     let mut input =
         containr::mp4::Demuxer::open(reader).map_err(|err| container_err(source, &err))?;
     let options = containr::mp4::MuxOptions {
+        brand,
         faststart: true,
         ..containr::mp4::MuxOptions::default()
     };
@@ -525,7 +622,12 @@ fn mux_mp4_to_mp4<W: io::Read + io::Write + io::Seek>(
     Ok(())
 }
 
-fn mp4_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), PipelineError> {
+fn mp4_to_mp4(
+    source: &Path,
+    target: &File,
+    target_path: &Path,
+    brand: Brand,
+) -> Result<(), PipelineError> {
     let source_len = input_size(source);
     if source_len <= IN_MEMORY_MP4_FASTSTART_LIMIT {
         let mut mem = io::Cursor::new(Vec::with_capacity(
@@ -533,7 +635,7 @@ fn mp4_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
                 .unwrap_or(0)
                 .saturating_add(256 * 1024),
         ));
-        mux_mp4_to_mp4(source, &mut mem, target_path)?;
+        mux_mp4_to_mp4(source, &mut mem, target_path, brand)?;
         let mut writer: &File = target;
         writer
             .write_all(mem.get_ref())
@@ -547,11 +649,16 @@ fn mp4_to_mp4(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
         })?;
         Ok(())
     } else {
-        mux_mp4_to_mp4(source, target, target_path)
+        mux_mp4_to_mp4(source, target, target_path, brand)
     }
 }
 
-fn mkv_to_mkv(source: &Path, target: &File, target_path: &Path) -> Result<(), PipelineError> {
+fn mkv_to_mkv(
+    source: &Path,
+    target: &File,
+    target_path: &Path,
+    doc_type: DocType,
+) -> Result<(), PipelineError> {
     let reader = WindowedFileReader::open(source).map_err(|source_err| PipelineError::Io {
         path: source.to_path_buf(),
         source: source_err,
@@ -576,6 +683,7 @@ fn mkv_to_mkv(source: &Path, target: &File, target_path: &Path) -> Result<(), Pi
         plans.push(plan);
     }
     let options = containr::mkv::MkvOptions {
+        doc_type,
         timestamp_scale: containr::mkv::StreamCopy::timestamp_scale(&plans),
         ..containr::mkv::MkvOptions::default()
     };
@@ -820,5 +928,583 @@ mod tests {
         assert_eq!(total, len);
         assert_eq!(big, data);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod container_tests {
+    use super::*;
+    use crate::video_container::{
+        ContainerMedia, ContainerPacket, ContainerTrack, US_TIMESCALE, demux_video, mux_video,
+    };
+    use fastconv_domain::VideoStreamInfo;
+    use std::num::NonZeroUsize;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(label: &str, extension: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        std::env::temp_dir().join(format!("fastconv-container-{label}-{nanos}.{extension}"))
+    }
+
+    fn avc_config() -> Vec<u8> {
+        crate::video_bitstream::extract_avcc_from_annex_b(&[
+            0, 0, 1, 0x67, 0x42, 0x00, 0x1E, 0, 0, 1, 0x68, 0xCE,
+        ])
+        .unwrap_or_default()
+    }
+
+    fn h264_aac_media() -> ContainerMedia {
+        ContainerMedia {
+            tracks: vec![
+                ContainerTrack {
+                    codec: VideoCodec::H264,
+                    width: Some(320),
+                    height: Some(240),
+                    channels: None,
+                    sample_rate: None,
+                    config: avc_config(),
+                    timescale: US_TIMESCALE,
+                },
+                ContainerTrack {
+                    codec: VideoCodec::Aac,
+                    width: None,
+                    height: None,
+                    channels: Some(2),
+                    sample_rate: Some(48_000),
+                    config: vec![0x11, 0x90],
+                    timescale: US_TIMESCALE,
+                },
+            ],
+            packets: vec![
+                ContainerPacket {
+                    track: 0,
+                    pts: 0,
+                    dts: 0,
+                    duration: 33_333,
+                    keyframe: true,
+                    data: vec![0, 0, 0, 2, 0x65, 0x88],
+                },
+                ContainerPacket {
+                    track: 1,
+                    pts: 0,
+                    dts: 0,
+                    duration: 21_000,
+                    keyframe: true,
+                    data: vec![0xAA; 8],
+                },
+                ContainerPacket {
+                    track: 0,
+                    pts: 33_333,
+                    dts: 33_333,
+                    duration: 33_333,
+                    keyframe: false,
+                    data: vec![0, 0, 0, 2, 0x41, 0x22],
+                },
+                ContainerPacket {
+                    track: 1,
+                    pts: 21_000,
+                    dts: 21_000,
+                    duration: 21_000,
+                    keyframe: true,
+                    data: vec![0xBB; 8],
+                },
+            ],
+        }
+    }
+
+    fn vp9_opus_media() -> ContainerMedia {
+        ContainerMedia {
+            tracks: vec![
+                ContainerTrack {
+                    codec: VideoCodec::Vp9,
+                    width: Some(640),
+                    height: Some(360),
+                    channels: None,
+                    sample_rate: None,
+                    config: Vec::new(),
+                    timescale: US_TIMESCALE,
+                },
+                ContainerTrack {
+                    codec: VideoCodec::Opus,
+                    width: None,
+                    height: None,
+                    channels: Some(2),
+                    sample_rate: Some(48_000),
+                    config: crate::video_bitstream::default_opus_head(2, 0),
+                    timescale: US_TIMESCALE,
+                },
+            ],
+            packets: vec![
+                ContainerPacket {
+                    track: 0,
+                    pts: 0,
+                    dts: 0,
+                    duration: 33_333,
+                    keyframe: true,
+                    data: vec![0x82, 0x31, 0x01],
+                },
+                ContainerPacket {
+                    track: 1,
+                    pts: 0,
+                    dts: 0,
+                    duration: 20_000,
+                    keyframe: true,
+                    data: vec![0xFC, 0x01],
+                },
+            ],
+        }
+    }
+
+    fn write_container(
+        path: &Path,
+        format: VideoContainerFormat,
+        media: &ContainerMedia,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let file = File::create(path)?;
+        mux_video(&file, path, format, media)?;
+        drop(file);
+        Ok(())
+    }
+
+    fn streams(media: &ContainerMedia) -> Vec<VideoStreamInfo> {
+        media
+            .tracks
+            .iter()
+            .map(|track| {
+                VideoStreamInfo::new(
+                    track.codec,
+                    if track.codec.is_video() {
+                        fastconv_domain::VideoStreamKind::Video
+                    } else {
+                        fastconv_domain::VideoStreamKind::Audio
+                    },
+                    track.width.map(u32::from),
+                    track.height.map(u32::from),
+                    track.channels,
+                    track.sample_rate,
+                    1,
+                    US_TIMESCALE,
+                    None,
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    fn remux(
+        source: &Path,
+        target: &Path,
+        input: VideoContainerFormat,
+        output: VideoContainerFormat,
+    ) -> Result<(), PipelineError> {
+        let plan = VideoRemuxPlan::new(
+            vec![VideoRemuxItem::new(
+                source.to_path_buf(),
+                target.to_path_buf(),
+                input,
+                output,
+                streams(&demux_video(source, input)?),
+            )],
+            NonZeroUsize::MIN,
+        )
+        .map_err(|err| remux_failed(target, err.to_string()))?;
+        execute_video_batch(&plan).map(|_| ())
+    }
+
+    fn payloads(media: &ContainerMedia, codec: VideoCodec) -> Vec<Vec<u8>> {
+        media
+            .packets
+            .iter()
+            .filter(|packet| media.tracks[packet.track].codec == codec)
+            .map(|packet| packet.data.clone())
+            .collect()
+    }
+
+    #[test]
+    fn mp4_to_mov_writes_quicktime_brand_and_preserves_packets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = temp_path("mp4-mov-source", "mp4");
+        let target = temp_path("mp4-mov-target", "mov");
+        let media = h264_aac_media();
+        write_container(&source, VideoContainerFormat::Mp4, &media)?;
+        remux(
+            &source,
+            &target,
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mov,
+        )?;
+        let bytes = std::fs::read(&target)?;
+        assert_eq!(&bytes[4..8], b"ftyp");
+        assert_eq!(&bytes[8..12], b"qt  ");
+        let out = demux_video(&target, VideoContainerFormat::Mov)?;
+        assert_eq!(out.tracks[0].codec, VideoCodec::H264);
+        assert_eq!(
+            payloads(&out, VideoCodec::H264),
+            payloads(&media, VideoCodec::H264)
+        );
+        assert_eq!(
+            payloads(&out, VideoCodec::Aac),
+            payloads(&media, VideoCodec::Aac)
+        );
+        std::fs::remove_file(source)?;
+        std::fs::remove_file(target)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mkv_to_webm_writes_webm_doctype_and_preserves_packets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = temp_path("mkv-webm-source", "mkv");
+        let target = temp_path("mkv-webm-target", "webm");
+        let media = vp9_opus_media();
+        write_container(&source, VideoContainerFormat::Mkv, &media)?;
+        remux(
+            &source,
+            &target,
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Webm,
+        )?;
+        let bytes = std::fs::read(&target)?;
+        assert_eq!(&bytes[..4], &[0x1A, 0x45, 0xDF, 0xA3]);
+        assert!(bytes.windows(4).any(|window| window == b"webm"));
+        let out = demux_video(&target, VideoContainerFormat::Webm)?;
+        assert_eq!(out.tracks[0].codec, VideoCodec::Vp9);
+        assert_eq!(
+            payloads(&out, VideoCodec::Vp9),
+            payloads(&media, VideoCodec::Vp9)
+        );
+        assert_eq!(
+            payloads(&out, VideoCodec::Opus),
+            payloads(&media, VideoCodec::Opus)
+        );
+        std::fs::remove_file(source)?;
+        std::fs::remove_file(target)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mp4_avi_ts_mkv_mp4_chain_preserves_codecs_and_payloads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let media = h264_aac_media();
+        let mp4 = temp_path("chain-mp4", "mp4");
+        let avi = temp_path("chain-avi", "avi");
+        let ts = temp_path("chain-ts", "ts");
+        let mkv = temp_path("chain-mkv", "mkv");
+        let final_mp4 = temp_path("chain-final", "mp4");
+        write_container(&mp4, VideoContainerFormat::Mp4, &media)?;
+        let mut source = mp4.clone();
+        for (target, format) in [
+            (&avi, VideoContainerFormat::Avi),
+            (&ts, VideoContainerFormat::Ts),
+            (&mkv, VideoContainerFormat::Mkv),
+            (&final_mp4, VideoContainerFormat::Mp4),
+        ] {
+            let input = VideoContainerFormat::from_extension(
+                source.extension().and_then(|e| e.to_str()).unwrap_or("mp4"),
+            )
+            .unwrap_or(VideoContainerFormat::Mp4);
+            remux(&source, target, input, format)?;
+            source = target.clone();
+        }
+        let out = demux_video(&final_mp4, VideoContainerFormat::Mp4)?;
+        assert_eq!(out.tracks.len(), 2);
+        assert_eq!(out.tracks[0].codec, VideoCodec::H264);
+        assert_eq!(out.tracks[1].codec, VideoCodec::Aac);
+        for (codec, source_payloads) in [
+            (VideoCodec::H264, payloads(&media, VideoCodec::H264)),
+            (VideoCodec::Aac, payloads(&media, VideoCodec::Aac)),
+        ] {
+            let target_payloads = payloads(&out, codec);
+            assert_eq!(
+                target_payloads.len(),
+                source_payloads.len(),
+                "codec {codec}"
+            );
+            for (original, remuxed) in source_payloads.iter().zip(&target_payloads) {
+                assert!(
+                    remuxed.ends_with(original),
+                    "codec {codec}: {original:?} vs {remuxed:?}"
+                );
+            }
+        }
+        for path in [mp4, avi, ts, mkv, final_mp4] {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn webm_and_ts_reject_unsupported_codecs_explicitly() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let webm = temp_path("reject-webm", "webm");
+        let ts = temp_path("reject-ts", "ts");
+        let file = File::create(&webm)?;
+        assert!(matches!(
+            mux_video(&file, &webm, VideoContainerFormat::Webm, &h264_aac_media()),
+            Err(PipelineError::RemuxFailed { .. })
+        ));
+        drop(file);
+        let file = File::create(&ts)?;
+        assert!(matches!(
+            mux_video(&file, &ts, VideoContainerFormat::Ts, &vp9_opus_media()),
+            Err(PipelineError::RemuxFailed { .. })
+        ));
+        drop(file);
+        std::fs::remove_file(webm)?;
+        std::fs::remove_file(ts)?;
+        Ok(())
+    }
+
+    fn one_second_h264_aac_media() -> ContainerMedia {
+        let mut packets = Vec::new();
+        for i in 0..30_u32 {
+            let pts = i64::from(i) * 33_333;
+            let nal = if i == 0 { 0x65 } else { 0x41 };
+            packets.push(ContainerPacket {
+                track: 0,
+                pts,
+                dts: pts,
+                duration: 33_333,
+                keyframe: i == 0,
+                data: vec![0, 0, 0, 4, nal, 0x88, 0x01, 0x02],
+            });
+        }
+        for i in 0..47_u32 {
+            let pts = i64::from(i) * 21_333;
+            packets.push(ContainerPacket {
+                track: 1,
+                pts,
+                dts: pts,
+                duration: 21_333,
+                keyframe: true,
+                data: vec![0xA0 + u8::try_from(i % 8).unwrap_or(0); 8],
+            });
+        }
+        ContainerMedia {
+            tracks: vec![
+                ContainerTrack {
+                    codec: VideoCodec::H264,
+                    width: Some(320),
+                    height: Some(240),
+                    channels: None,
+                    sample_rate: None,
+                    config: avc_config(),
+                    timescale: US_TIMESCALE,
+                },
+                ContainerTrack {
+                    codec: VideoCodec::Aac,
+                    width: None,
+                    height: None,
+                    channels: Some(2),
+                    sample_rate: Some(48_000),
+                    config: vec![0x11, 0x90],
+                    timescale: US_TIMESCALE,
+                },
+            ],
+            packets,
+        }
+    }
+
+    fn one_second_vp9_opus_media() -> ContainerMedia {
+        let mut packets = Vec::new();
+        for i in 0..30_u32 {
+            let pts = i64::from(i) * 33_333;
+            packets.push(ContainerPacket {
+                track: 0,
+                pts,
+                dts: pts,
+                duration: 33_333,
+                keyframe: i == 0,
+                data: vec![0x82, 0x31, u8::try_from(i).unwrap_or(0)],
+            });
+        }
+        for i in 0..50_u32 {
+            let pts = i64::from(i) * 20_000;
+            packets.push(ContainerPacket {
+                track: 1,
+                pts,
+                dts: pts,
+                duration: 20_000,
+                keyframe: true,
+                data: vec![0xFC, u8::try_from(i).unwrap_or(0)],
+            });
+        }
+        ContainerMedia {
+            tracks: vec![
+                ContainerTrack {
+                    codec: VideoCodec::Vp9,
+                    width: Some(640),
+                    height: Some(360),
+                    channels: None,
+                    sample_rate: None,
+                    config: Vec::new(),
+                    timescale: US_TIMESCALE,
+                },
+                ContainerTrack {
+                    codec: VideoCodec::Opus,
+                    width: None,
+                    height: None,
+                    channels: Some(2),
+                    sample_rate: Some(48_000),
+                    config: crate::video_bitstream::default_opus_head(2, 0),
+                    timescale: US_TIMESCALE,
+                },
+            ],
+            packets,
+        }
+    }
+
+    /// Presentation span in microseconds. A span (rather than an absolute
+    /// timestamp) is used because MPEG-TS deliberately starts at a PCR offset.
+    fn track_span_us(media: &ContainerMedia, codec: VideoCodec) -> i64 {
+        let mut start = i64::MAX;
+        let mut end = i64::MIN;
+        for packet in &media.packets {
+            if media.tracks[packet.track].codec == codec {
+                start = start.min(packet.pts);
+                end = end.max(
+                    packet
+                        .pts
+                        .saturating_add(i64::try_from(packet.duration).unwrap_or(0)),
+                );
+            }
+        }
+        if start == i64::MAX {
+            0
+        } else {
+            end.saturating_sub(start)
+        }
+    }
+
+    fn assert_one_second(media: &ContainerMedia, codec: VideoCodec, hop: &str) {
+        let span = track_span_us(media, codec);
+        assert!(
+            (span - 1_000_000).abs() <= 50_000,
+            "{hop}: {codec} span is {span} µs, expected ~1_000_000 µs"
+        );
+    }
+
+    #[test]
+    fn one_second_h264_aac_timing_survives_every_container_hop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let media = one_second_h264_aac_media();
+        let mp4 = temp_path("timing-h264-source", "mp4");
+        write_container(&mp4, VideoContainerFormat::Mp4, &media)?;
+        assert_one_second(
+            &demux_video(&mp4, VideoContainerFormat::Mp4)?,
+            VideoCodec::H264,
+            "source mp4",
+        );
+
+        let mut source = mp4.clone();
+        let mut outputs = Vec::new();
+        for (format, ext) in [
+            (VideoContainerFormat::Mov, "mov"),
+            (VideoContainerFormat::Mkv, "mkv"),
+            (VideoContainerFormat::Avi, "avi"),
+            (VideoContainerFormat::Ts, "ts"),
+            (VideoContainerFormat::Mp4, "mp4"),
+        ] {
+            let target = temp_path("timing-h264-hop", ext);
+            let input = VideoContainerFormat::from_extension(
+                source.extension().and_then(|e| e.to_str()).unwrap_or("mp4"),
+            )
+            .unwrap_or(VideoContainerFormat::Mp4);
+            remux(&source, &target, input, format)?;
+            let out = demux_video(&target, format)?;
+            assert_eq!(out.tracks[0].codec, VideoCodec::H264);
+            assert_one_second(&out, VideoCodec::H264, ext);
+            source = target.clone();
+            outputs.push(target);
+        }
+        for path in std::iter::once(mp4).chain(outputs) {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn one_second_vp9_opus_timing_survives_webm_mkv_mp4() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let media = one_second_vp9_opus_media();
+        let webm = temp_path("timing-vp9-webm", "webm");
+        let mkv = temp_path("timing-vp9-mkv", "mkv");
+        let mp4 = temp_path("timing-vp9-mp4", "mp4");
+        write_container(&webm, VideoContainerFormat::Webm, &media)?;
+        assert_one_second(
+            &demux_video(&webm, VideoContainerFormat::Webm)?,
+            VideoCodec::Vp9,
+            "webm",
+        );
+        remux(
+            &webm,
+            &mkv,
+            VideoContainerFormat::Webm,
+            VideoContainerFormat::Mkv,
+        )?;
+        assert_one_second(
+            &demux_video(&mkv, VideoContainerFormat::Mkv)?,
+            VideoCodec::Vp9,
+            "mkv",
+        );
+        remux(
+            &mkv,
+            &mp4,
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Mp4,
+        )?;
+        assert_one_second(
+            &demux_video(&mp4, VideoContainerFormat::Mp4)?,
+            VideoCodec::Vp9,
+            "mp4",
+        );
+        for path in [webm, mkv, mp4] {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stream_copy_paths_exclude_mp3_and_vp9_to_mp4() {
+        let stream = |codec| {
+            VideoStreamInfo::new(
+                codec,
+                fastconv_domain::VideoStreamKind::Video,
+                None,
+                None,
+                None,
+                None,
+                1,
+                1000,
+                None,
+                None,
+            )
+        };
+        let mp3_item = VideoRemuxItem::new(
+            PathBuf::from("in.mkv"),
+            PathBuf::from("out.mp4"),
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Mp4,
+            vec![stream(VideoCodec::Mp3)],
+        );
+        assert!(!stream_copy_supports(&mp3_item));
+        let vp9_item = VideoRemuxItem::new(
+            PathBuf::from("in.mkv"),
+            PathBuf::from("out.mp4"),
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Mp4,
+            vec![stream(VideoCodec::Vp9)],
+        );
+        assert!(!stream_copy_supports(&vp9_item));
+        let plain = VideoRemuxItem::new(
+            PathBuf::from("in.mkv"),
+            PathBuf::from("out.mp4"),
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Mp4,
+            vec![stream(VideoCodec::H264)],
+        );
+        assert!(stream_copy_supports(&plain));
     }
 }

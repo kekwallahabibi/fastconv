@@ -2,6 +2,7 @@
 
 mod aiff;
 pub mod audio;
+mod avi;
 mod avif;
 mod bmp;
 pub mod cpu;
@@ -10,11 +11,17 @@ mod gif;
 pub mod gpu;
 mod ico;
 mod m4a;
+mod mpegts;
 mod pnm;
 mod qoi;
 pub mod remux;
+mod video_bitstream;
+pub(crate) mod video_codecs;
+mod video_container;
+pub mod video_transcode;
 
 pub use audio::execute_audio_batch;
+pub use video_transcode::execute_video_transcode_batch;
 
 use std::error::Error;
 use std::fmt;

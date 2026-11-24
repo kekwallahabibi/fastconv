@@ -18,8 +18,10 @@ pub use image::{
 };
 pub use metrics::{BenchmarkMetrics, BenchmarkSample, PeakMemory, Throughput, WorkloadUnit};
 pub use video::{
-    VideoCodec, VideoContainerFormat, VideoRemuxItem, VideoRemuxPlan, VideoRemuxReport,
-    VideoStreamInfo, VideoStreamKind,
+    AudioTrackAction, TargetAudioCodec, TargetVideoCodec, VideoCodec, VideoContainerFormat,
+    VideoEncodeMode, VideoQuality, VideoRemuxItem, VideoRemuxPlan, VideoRemuxReport,
+    VideoStreamInfo, VideoStreamKind, VideoTrackAction, VideoTranscodeItem, VideoTranscodePlan,
+    VideoTranscodeReport,
 };
 
 use std::error::Error;
@@ -103,6 +105,15 @@ pub enum DomainError {
     UnsupportedVideoCodec {
         codec: VideoCodec,
         container: VideoContainerFormat,
+    },
+    UnsupportedVideoPipeline {
+        codec: VideoCodec,
+        backend: HardwareBackend,
+        reason: String,
+    },
+    InvalidVideoQuality {
+        value: u8,
+        max: u8,
     },
     UnsupportedAudioPipeline {
         format: AudioOutputFormat,
@@ -190,6 +201,17 @@ impl fmt::Display for DomainError {
                 f,
                 "codec '{codec}' is not supported in {container} containers"
             ),
+            Self::UnsupportedVideoPipeline {
+                codec,
+                backend,
+                reason,
+            } => write!(
+                f,
+                "backend '{backend}' cannot encode video codec '{codec}': {reason}"
+            ),
+            Self::InvalidVideoQuality { value, max } => {
+                write!(f, "video quality must be in 0..={max}, got {value}")
+            }
             Self::InvalidQuality { value, max } => {
                 write!(f, "image quality must be in 0..={max}, got {value}")
             }

@@ -2,7 +2,7 @@
 mod enabled {
     use std::fs;
     use std::num::{NonZeroU64, NonZeroUsize};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver, SyncSender};
     use std::sync::{Arc, Mutex};
@@ -11,14 +11,15 @@ mod enabled {
     use cudarc::driver::CudaContext;
     use fastconv_domain::{
         GpuBackend, HardwareBackend, ImageBatchItem, ImageBatchPlan, ImageConversionReport,
-        ImageInputFormat, ImageQuality,
+        ImageInputFormat, ImageQuality, VideoCodec, VideoEncodeMode, VideoQuality,
     };
     use nvidia_video_codec_sdk::{
         Bitstream, Buffer, EncodePictureParams, Encoder, EncoderInitParams, EncoderInput, Session,
         sys::nvEncodeAPI::{
-            NV_ENC_BUFFER_FORMAT, NV_ENC_CODEC_HEVC_GUID, NV_ENC_CONFIG, NV_ENC_PARAMS_RC_MODE,
-            NV_ENC_PIC_TYPE, NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO, NV_ENC_VUI_COLOR_PRIMARIES,
-            NV_ENC_VUI_MATRIX_COEFFS, NV_ENC_VUI_TRANSFER_CHARACTERISTIC, NV_ENC_VUI_VIDEO_FORMAT,
+            NV_ENC_BUFFER_FORMAT, NV_ENC_CODEC_H264_GUID, NV_ENC_CODEC_HEVC_GUID, NV_ENC_CONFIG,
+            NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_TYPE, NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO,
+            NV_ENC_VUI_COLOR_PRIMARIES, NV_ENC_VUI_MATRIX_COEFFS,
+            NV_ENC_VUI_TRANSFER_CHARACTERISTIC, NV_ENC_VUI_VIDEO_FORMAT,
         },
     };
 
@@ -28,6 +29,12 @@ mod enabled {
         precreate_target_directories,
     };
     use crate::gpu::heic::{HeicColorInfo, mux_annex_b_hevc_to_heic};
+    use crate::video_bitstream::{
+        annex_b_to_avcc, annex_b_to_hvcc, extract_avcc_from_annex_b, extract_hvcc_from_annex_b,
+        is_h264_keyframe_annex_b, is_hevc_keyframe_annex_b,
+    };
+    use crate::video_codecs::{EncodedVideoStream, Yuv420Frame};
+    use crate::video_container::{ContainerPacket, ContainerTrack, US_TIMESCALE};
 
     const DECODE_QUEUE_CAPACITY: usize = 2;
 
@@ -875,13 +882,305 @@ mod enabled {
         }
         Ok(())
     }
+
+    /// Maps video quality (`0..=100`) to NVENC `ConstQP` (`1..=51`).
+    fn quality_to_video_qp(quality: VideoQuality) -> u32 {
+        let inv = u32::from(100_u8.saturating_sub(quality.get()));
+        (8 + (inv.saturating_mul(43).saturating_add(50) / 100)).clamp(1, 51)
+    }
+
+    fn video_error(reason: impl Into<String>) -> PipelineError {
+        PipelineError::GpuBackendFailed {
+            backend: GpuBackend::Nvenc,
+            reason: reason.into(),
+        }
+    }
+
+    fn estimate_video_fps(frames: &[Yuv420Frame]) -> u32 {
+        let mut durations: Vec<u64> = frames
+            .iter()
+            .map(|frame| frame.duration_us.max(1))
+            .collect();
+        durations.sort_unstable();
+        let duration = if durations.is_empty() {
+            1_000_000 / 30
+        } else {
+            durations[durations.len() / 2]
+        };
+        (1_000_000_u64 / duration.max(1)).clamp(1, 240) as u32
+    }
+
+    // NVENC exposes codec-specific config in a C union (`NV_ENC_CODEC_CONFIG`).
+    // The active member is chosen by the encode GUID used for the preset query.
+    #[allow(unsafe_code)]
+    fn configure_video_codec_config(cfg: &mut NV_ENC_CONFIG, h264: bool) {
+        if h264 {
+            // SAFETY: `cfg` came from `get_preset_config(NV_ENC_CODEC_H264_GUID, ...)`,
+            // so `encodeCodecConfig.h264Config` is the active union member.
+            let h264_cfg = unsafe { &mut cfg.encodeCodecConfig.h264Config };
+            h264_cfg.set_repeatSPSPPS(1);
+            h264_cfg.set_outputAUD(0);
+            h264_cfg.chromaFormatIDC = 1;
+        } else {
+            // SAFETY: `cfg` came from `get_preset_config(NV_ENC_CODEC_HEVC_GUID, ...)`,
+            // so `encodeCodecConfig.hevcConfig` is the active union member.
+            let hevc_cfg = unsafe { &mut cfg.encodeCodecConfig.hevcConfig };
+            hevc_cfg.set_repeatSPSPPS(1);
+            hevc_cfg.set_outputAUD(0);
+            hevc_cfg.set_chromaFormatIDC(1);
+            hevc_cfg.set_pixelBitDepthMinus8(0);
+        }
+    }
+
+    /// Converts one 8-bit YUV 4:2:0 frame into a pitched NV12 upload buffer.
+    fn prepare_nv12_payload<'a>(
+        frame: &Yuv420Frame,
+        pitch_u32: u32,
+        buf: &'a mut Vec<u8>,
+    ) -> Result<(&'a [u8], usize), PipelineError> {
+        let width = usize::try_from(frame.width)
+            .map_err(|_| video_error("NVENC frame width exceeds usize"))?;
+        let height = usize::try_from(frame.height)
+            .map_err(|_| video_error("NVENC frame height exceeds usize"))?;
+        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+            return Err(video_error(format!(
+                "NVENC requires even, non-zero dimensions; got {}x{}",
+                frame.width, frame.height
+            )));
+        }
+        let (cw, ch) = (width / 2, height / 2);
+        if frame.y.len() != width.saturating_mul(height)
+            || frame.u.len() != cw.saturating_mul(ch)
+            || frame.v.len() != cw.saturating_mul(ch)
+        {
+            return Err(video_error("NVENC input frame has invalid plane sizes"));
+        }
+        let pitch = usize::try_from(pitch_u32)
+            .map_err(|_| video_error("NVENC buffer pitch exceeds usize"))?;
+        if pitch < width {
+            return Err(video_error(format!(
+                "NVENC buffer pitch ({pitch}) is smaller than frame width ({width})"
+            )));
+        }
+        let expected = pitch
+            .checked_mul(height)
+            .and_then(|value| value.checked_add(pitch.checked_mul(ch)?))
+            .ok_or_else(|| video_error("NVENC NV12 buffer size overflow"))?;
+        buf.clear();
+        buf.resize(expected, 0);
+        for row in 0..height {
+            let start = row.saturating_mul(pitch);
+            let src = frame
+                .y
+                .get(row.saturating_mul(width)..row.saturating_mul(width).saturating_add(width))
+                .ok_or_else(|| video_error("NVENC Y plane row out of bounds"))?;
+            let dst = buf
+                .get_mut(start..start.saturating_add(width))
+                .ok_or_else(|| video_error("NVENC Y pitch row out of bounds"))?;
+            dst.copy_from_slice(src);
+        }
+        for row in 0..ch {
+            let start = height.saturating_add(row).saturating_mul(pitch);
+            let dst = buf
+                .get_mut(start..start.saturating_add(width))
+                .ok_or_else(|| video_error("NVENC UV pitch row out of bounds"))?;
+            for x in 0..cw {
+                let u = frame.u[row.saturating_mul(cw).saturating_add(x)];
+                let v = frame.v[row.saturating_mul(cw).saturating_add(x)];
+                let u_index = x.saturating_mul(2);
+                let v_index = u_index.saturating_add(1);
+                if let Some(slot) = dst.get_mut(u_index) {
+                    *slot = u;
+                }
+                if let Some(slot) = dst.get_mut(v_index) {
+                    *slot = v;
+                }
+            }
+        }
+        Ok((buf.as_slice(), expected))
+    }
+
+    // The encoder, session and bitstream lifetimes must stay in one scope.
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn encode_video_nvenc_enabled(
+        path: &Path,
+        frames: &[Yuv420Frame],
+        mode: VideoEncodeMode,
+        track_index: usize,
+    ) -> Result<(EncodedVideoStream, String), PipelineError> {
+        let (guid, h264, quality) = match mode {
+            VideoEncodeMode::NvencH264 { quality } => (NV_ENC_CODEC_H264_GUID, true, quality),
+            VideoEncodeMode::NvencHevc { quality } => (NV_ENC_CODEC_HEVC_GUID, false, quality),
+            other => {
+                return Err(video_error(format!(
+                    "NVENC video encoding rejects mode {other}; only H.264 and HEVC are supported"
+                )));
+            }
+        };
+        let first = frames
+            .first()
+            .ok_or_else(|| video_error("no video frames to encode"))?;
+        let (width, height) = (first.width, first.height);
+        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+            return Err(video_error(format!(
+                "NVENC requires even, non-zero dimensions; got {width}x{height}"
+            )));
+        }
+        for frame in frames {
+            if frame.width != width || frame.height != height {
+                return Err(video_error("video frame dimensions change mid-stream"));
+            }
+        }
+        let fps = estimate_video_fps(frames);
+        let qp = quality_to_video_qp(quality);
+
+        let cuda_ctx = CudaContext::new(0)
+            .map_err(|err| video_error(format!("failed to initialize CUDA device 0: {err}")))?;
+        let device_name = cuda_ctx
+            .name()
+            .map_err(|err| video_error(format!("failed to query CUDA device name: {err}")))?;
+        let encoder = Encoder::initialize_with_cuda(Arc::clone(&cuda_ctx))
+            .map_err(|err| video_error(format!("failed to open NVENC encoder: {err}")))?;
+        let guids = encoder
+            .get_encode_guids()
+            .map_err(|err| video_error(format!("failed to query NVENC codecs: {err}")))?;
+        if !guids.contains(&guid) {
+            return Err(video_error(
+                "this NVIDIA GPU does not expose the requested NVENC video codec",
+            ));
+        }
+        let formats = encoder
+            .get_supported_input_formats(guid)
+            .map_err(|err| video_error(format!("failed to query NVENC input formats: {err}")))?;
+        if !formats.contains(&NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12) {
+            return Err(video_error(
+                "NVENC on this GPU does not support NV12 input buffers",
+            ));
+        }
+        let mut preset_cfg = encoder
+            .get_preset_config(
+                guid,
+                NV_ENC_PRESET_P4_GUID,
+                NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_HIGH_QUALITY,
+            )
+            .map_err(|err| video_error(format!("failed to query NVENC P4 preset: {err}")))?;
+        preset_cfg.presetCfg.gopLength = 60;
+        preset_cfg.presetCfg.frameIntervalP = 1;
+        preset_cfg.presetCfg.rcParams.rateControlMode =
+            NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CONSTQP;
+        preset_cfg.presetCfg.rcParams.constQP.qpIntra = qp;
+        preset_cfg.presetCfg.rcParams.constQP.qpInterP = qp;
+        preset_cfg.presetCfg.rcParams.constQP.qpInterB = qp;
+        configure_video_codec_config(&mut preset_cfg.presetCfg, h264);
+
+        let mut init = EncoderInitParams::new(guid, width, height);
+        init.preset_guid(NV_ENC_PRESET_P4_GUID)
+            .tuning_info(NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_HIGH_QUALITY)
+            .framerate(fps, 1)
+            .display_aspect_ratio(width, height)
+            .enable_picture_type_decision()
+            .encode_config(&mut preset_cfg.presetCfg);
+        let session = encoder
+            .start_session(NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12, init)
+            .map_err(|err| video_error(format!("failed to start NVENC video session: {err}")))?;
+
+        let (mut input, mut bitstream, pitch) = allocate_session_buffers(&session)?;
+        let mut pitched_buf = Vec::new();
+        let mut annex_b_frames: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
+        for frame in frames {
+            let (upload, expected_len) = prepare_nv12_payload(frame, pitch, &mut pitched_buf)?;
+            write_pitched_nvenc_buffer(&mut input, expected_len, upload)?;
+            session
+                .encode_picture(&mut input, &mut bitstream, EncodePictureParams::default())
+                .map_err(|err| video_error(format!("NVENC video encode failed: {err}")))?;
+            let lock = bitstream
+                .lock()
+                .map_err(|err| video_error(format!("failed to lock NVENC bitstream: {err}")))?;
+            annex_b_frames.push(lock.data().to_vec());
+        }
+        session
+            .end_of_stream()
+            .map_err(|err| video_error(format!("NVENC EOS failed: {err}")))?;
+        // With IPPP GOPs the EOS flush normally produces no additional
+        // bitstream; a lock failure here only means there is nothing to drain.
+        if let Ok(lock) = bitstream.lock()
+            && !lock.data().is_empty()
+        {
+            if let Some(last) = annex_b_frames.last_mut() {
+                last.extend_from_slice(lock.data());
+            } else {
+                annex_b_frames.push(lock.data().to_vec());
+            }
+        }
+
+        let mut track = ContainerTrack {
+            codec: if h264 {
+                VideoCodec::H264
+            } else {
+                VideoCodec::Hevc
+            },
+            width: u16::try_from(width).ok(),
+            height: u16::try_from(height).ok(),
+            channels: None,
+            sample_rate: None,
+            config: Vec::new(),
+            timescale: US_TIMESCALE,
+        };
+        let mut packets = Vec::with_capacity(annex_b_frames.len());
+        for (index, data) in annex_b_frames.into_iter().enumerate() {
+            if data.is_empty() {
+                return Err(video_error("NVENC produced an empty access unit"));
+            }
+            let keyframe = if h264 {
+                is_h264_keyframe_annex_b(&data)
+            } else {
+                is_hevc_keyframe_annex_b(&data)
+            };
+            if track.config.is_empty() && keyframe {
+                let config = if h264 {
+                    extract_avcc_from_annex_b(&data)
+                } else {
+                    extract_hvcc_from_annex_b(&data)
+                };
+                if let Some(config) = config {
+                    track.config = config;
+                }
+            }
+            let payload = if h264 {
+                annex_b_to_avcc(&data)
+            } else {
+                annex_b_to_hvcc(&data)
+            };
+            let frame = frames.get(index).or_else(|| frames.last());
+            let (pts, duration) = frame.map_or((0, 1_000_000 / u64::from(fps.max(1))), |frame| {
+                (frame.pts_us, frame.duration_us.max(1))
+            });
+            packets.push(ContainerPacket {
+                track: track_index,
+                pts,
+                dts: pts,
+                duration,
+                keyframe,
+                data: payload,
+            });
+        }
+        if packets.is_empty() {
+            return Err(video_error(
+                "NVENC produced no video packets (no silent CPU fallback)",
+            ));
+        }
+        let _ = path;
+        Ok((EncodedVideoStream { track, packets }, device_name))
+    }
 }
 
 #[cfg(not(feature = "nvenc"))]
 use fastconv_domain::GpuBackend;
-use fastconv_domain::{ImageBatchPlan, ImageConversionReport, ImageQuality};
+use fastconv_domain::{ImageBatchPlan, ImageConversionReport, ImageQuality, VideoEncodeMode};
+use std::path::Path;
 
 use crate::PipelineError;
+use crate::video_codecs::{EncodedVideoStream, Yuv420Frame};
 
 /// Converts a validated image batch to `.heic` using hardware NVIDIA NVENC HEVC-Intra encoding.
 ///
@@ -907,6 +1206,36 @@ pub fn execute_heic_batch(
         Err(PipelineError::GpuBackendFailed {
             backend: GpuBackend::Nvenc,
             reason: "this fastconv binary was built without the 'nvenc' Cargo feature (rebuild with `--features nvenc` on an NVIDIA host)".to_owned(),
+        })
+    }
+}
+
+/// Encodes video frames with NVIDIA NVENC H.264 or HEVC.
+///
+/// Never falls back to CPU: an explicit error is returned if the `nvenc`
+/// feature is missing or the selected mode is not an NVENC video mode.
+///
+/// # Errors
+///
+/// Returns [`PipelineError::GpuBackendFailed`] for missing hardware support or
+/// an unsupported mode, and [`PipelineError::EncodeFailed`] if the encoder fails.
+pub(crate) fn encode_video_nvenc(
+    path: &Path,
+    frames: &[Yuv420Frame],
+    mode: VideoEncodeMode,
+    track_index: usize,
+) -> Result<(EncodedVideoStream, String), PipelineError> {
+    #[cfg(feature = "nvenc")]
+    {
+        enabled::encode_video_nvenc_enabled(path, frames, mode, track_index)
+    }
+
+    #[cfg(not(feature = "nvenc"))]
+    {
+        let _ = (path, frames, mode, track_index);
+        Err(PipelineError::GpuBackendFailed {
+            backend: GpuBackend::Nvenc,
+            reason: "NVENC video encoding requires building with --features nvenc (no silent CPU fallback)".to_owned(),
         })
     }
 }

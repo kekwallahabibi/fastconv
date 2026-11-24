@@ -33,6 +33,11 @@ opus-pure = "0.2.3"
 png = "0.18"
 pollster = "1"
 rubato = "0.16.2"
+# Pure-Rust video codecs for native transcoding (no C/FFI, AGPL-compatible licenses).
+rav1d-safe = "0.5.7"
+rusty_h264 = "0.17.4"
+rusty_h265 = "0.7.2"
+rusty_vp9 = "0.3.0"
 # Direct AVIF pipeline: avif-serialize (BSD-3-Clause) writes ISOBMFF boxes,
 # rav1e (BSD-2-Clause) encodes AV1 frames, flate2 (MIT/Apache-2.0) is zlib-rs based.
 avif-serialize = "0.8.9"
@@ -103,6 +108,27 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.rav1d-safe]
+opt-level = 3
+
+[profile.dev.package.rusty_h264]
+opt-level = 3
+
+[profile.dev.package.rusty_h264-decoder]
+opt-level = 3
+
+[profile.dev.package.rusty_h264-encoder]
+opt-level = 3
+
+[profile.dev.package.rusty_h264-common]
+opt-level = 3
+
+[profile.dev.package.rusty_h265]
+opt-level = 3
+
+[profile.dev.package.rusty_h265-accel]
+opt-level = 3
+
+[profile.dev.package.rusty_vp9]
 opt-level = 3
 
 [profile.dev.package.zenavif]
