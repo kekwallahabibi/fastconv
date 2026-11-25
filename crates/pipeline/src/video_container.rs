@@ -1299,8 +1299,12 @@ fn validate_mkv_presentation_edits(
                 .saturating_add(i64::try_from(duration).unwrap_or(i64::MAX))
         });
         let has_excluded_packet = media.packets.iter().any(|packet| {
+            let packet_end = packet
+                .pts
+                .saturating_add(i64::try_from(packet.duration).unwrap_or(i64::MAX));
             packet.track == index
-                && (packet.pts < edit.start_us || visible_end.is_some_and(|end| packet.pts >= end))
+                && (packet.pts < edit.start_us
+                    || visible_end.is_some_and(|end| packet.pts >= end || packet_end > end))
         });
         if has_excluded_packet {
             return Err(container_error(
@@ -2372,6 +2376,41 @@ mod tests {
         assert!(
             matches!(result, Err(PipelineError::RemuxFailed { .. })),
             "an edit with preroll must be rejected instead of clamping timestamps"
+        );
+
+        std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn mux_mkv_rejects_edit_that_trims_a_packet_end() -> Result<(), String> {
+        let dir =
+            std::env::temp_dir().join(format!("fastconv-mp4-edit-end-mkv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let source = dir.join("in.mp4");
+        let target = dir.join("out.mkv");
+
+        // The edit covers [0, 60_000) but the packet at PTS 40_000 runs to
+        // 80_000, so Matroska would need discard padding to trim its end.
+        let audio: Vec<(i64, u64)> = (0_i64..2).map(|idx| (idx * 30_000, 30_000)).collect();
+        let video: Vec<(i64, i64, u64, bool)> =
+            vec![(0, 0, 40_000, true), (40_000, 40_000, 40_000, false)];
+        let video_edit = EditList {
+            movie_timescale: US_TIMESCALE,
+            entries: vec![EditEntry {
+                segment_duration: 60_000,
+                media_time: 0,
+                media_rate: EditEntry::NORMAL_RATE,
+            }],
+        };
+        write_edited_mp4(&source, &audio, None, &video, Some(&video_edit))?;
+        let demuxed = demux_mp4(&source).map_err(|err| err.to_string())?;
+        let out_file = File::create(&target).map_err(|err| err.to_string())?;
+        let result = mux_video(&out_file, &target, VideoContainerFormat::Mkv, &demuxed);
+        drop(out_file);
+        assert!(
+            matches!(result, Err(PipelineError::RemuxFailed { .. })),
+            "an edit ending inside a packet must be rejected explicitly"
         );
 
         std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
