@@ -898,8 +898,11 @@ mod enabled {
                     au_timing(packet.pts, packet.duration, au_count, picture_index);
                 if has_vcl {
                     picture_index = picture_index.saturating_add(1);
+                    // Header-only units still need a submission timestamp, but
+                    // registering a duration for them would overwrite the
+                    // duration of the next picture at the same PTS.
+                    state.durations.insert(timestamp, step);
                 }
-                state.durations.insert(timestamp, step);
                 let mut flags = nvcuvid::CUvideopacketflags::CUVID_PKT_TIMESTAMP as u32;
                 if complete {
                     flags |= nvcuvid::CUvideopacketflags::CUVID_PKT_ENDOFPICTURE as u32;
