@@ -28,9 +28,6 @@ const AVI_HEADER_CAP: usize = 4 * 1024 * 1024;
 /// Upper bound for the MPEG-TS table/PES scan.
 const TS_SCAN_CAP: usize = 2 * 1024 * 1024;
 
-/// Upper bound for the animated WebP RIFF walk; protects against hostile chunk sizes.
-const WEBP_HEADER_CAP: usize = 16 * 1024 * 1024;
-
 /// Per-frame memory ceiling for GIF metadata probing (512 MiB).
 const GIF_FRAME_MEMORY_LIMIT: u64 = 512 * 1024 * 1024;
 
@@ -1166,8 +1163,10 @@ fn probe_gif_video(path: &Path, file: File) -> Result<Vec<VideoStreamInfo>, Prob
 
     let mut frames = 0_u64;
     let mut total_delay_cs = 0_u64;
+    // `skip_frame_decoding(true)` is set above, so metadata alone is available
+    // without allocating any frame pixel buffers.
     while let Some(frame) = decoder
-        .read_next_frame()
+        .next_frame_info()
         .map_err(|err| invalid_video(path, format!("GIF frame data is invalid: {err}")))?
     {
         frames = frames.saturating_add(1);
@@ -1198,28 +1197,23 @@ fn le_u24(bytes: &[u8]) -> Option<u32> {
     Some(u32::from(raw[0]) | (u32::from(raw[1]) << 8) | (u32::from(raw[2]) << 16))
 }
 
-/// Collects top-level RIFF chunks, rejecting any truncated chunk.
-fn riff_chunks_strict(bytes: &[u8]) -> Option<Vec<([u8; 4], &[u8])>> {
-    let mut chunks = Vec::new();
-    let mut idx = 0_usize;
-    while idx < bytes.len() {
-        if bytes.len().saturating_sub(idx) < 8 {
-            return None;
-        }
-        let Ok(id) = <[u8; 4]>::try_from(&bytes[idx..idx + 4]) else {
-            return None;
-        };
-        let size = usize::try_from(le_u32(&bytes[idx + 4..idx + 8])?).ok()?;
-        let payload_start = idx.checked_add(8)?;
-        let payload_end = payload_start.checked_add(size)?;
-        let padded_end = payload_end.checked_add(size & 1)?;
-        if padded_end > bytes.len() {
-            return None;
-        }
-        chunks.push((id, &bytes[payload_start..payload_end]));
-        idx = padded_end;
-    }
-    Some(chunks)
+/// Reads a fixed-size header at an absolute offset without buffering the file.
+fn read_chunk_at(
+    path: &Path,
+    file: &mut File,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<(), ProbeError> {
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.read_exact(buf).map_err(|source| ProbeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
 }
 
 /// Dimensions of a raw VP8 keyframe (the payload of a `VP8 ` chunk).
@@ -1247,113 +1241,142 @@ fn non_zero_dimensions(width: u32, height: u32) -> bool {
     width > 0 && height > 0
 }
 
-/// First still and extended-image headers found in top-level WebP chunks.
 #[derive(Default)]
-struct WebpHeaders {
+struct WebpProbeScan {
     still: Option<(u32, u32)>,
     extended: Option<(bool, u32, u32)>,
+    animated: bool,
+    frames: u64,
+    total_ms: u64,
 }
 
-/// Reads the first still and extended-image headers from top-level WebP chunks.
-fn webp_chunk_info(path: &Path, chunks: &[([u8; 4], &[u8])]) -> Result<WebpHeaders, ProbeError> {
-    let mut headers = WebpHeaders::default();
-    for (id, payload) in chunks {
-        match id {
-            b"VP8 " if headers.still.is_none() => {
-                headers.still = Some(vp8_dimensions(payload).ok_or_else(|| {
+/// Visits RIFF chunks with fixed-size reads, skipping `ANMF` payloads.
+fn scan_webp_chunks(
+    path: &Path,
+    file: &mut File,
+    riff_end: u64,
+) -> Result<WebpProbeScan, ProbeError> {
+    let mut scan = WebpProbeScan::default();
+    let mut pos = 12_u64;
+    while pos.saturating_add(8) <= riff_end {
+        let mut header = [0_u8; 8];
+        read_chunk_at(path, file, pos, &mut header)?;
+        let id = [header[0], header[1], header[2], header[3]];
+        let size = u64::from(
+            le_u32(&header[4..]).ok_or_else(|| invalid_video(path, "WebP chunk size truncated"))?,
+        );
+        let payload_start = pos.saturating_add(8);
+        let payload_end = payload_start
+            .checked_add(size)
+            .ok_or_else(|| invalid_video(path, "WebP chunk size overflows"))?;
+        if payload_end > riff_end {
+            return Err(invalid_video(path, "WebP RIFF chunk is truncated"));
+        }
+        match &id {
+            b"VP8 " if scan.still.is_none() => {
+                let mut prefix = [0_u8; 10];
+                if size < 10 {
+                    return Err(invalid_video(path, "WebP VP8 chunk is truncated"));
+                }
+                read_chunk_at(path, file, payload_start, &mut prefix)?;
+                scan.still = Some(vp8_dimensions(&prefix).ok_or_else(|| {
                     invalid_video(path, "WebP VP8 bitstream has invalid dimensions")
                 })?);
             }
-            b"VP8L" if headers.still.is_none() => {
-                headers.still = Some(vp8l_dimensions(payload).ok_or_else(|| {
+            b"VP8L" if scan.still.is_none() => {
+                let mut prefix = [0_u8; 5];
+                if size < 5 {
+                    return Err(invalid_video(path, "WebP VP8L chunk is truncated"));
+                }
+                read_chunk_at(path, file, payload_start, &mut prefix)?;
+                scan.still = Some(vp8l_dimensions(&prefix).ok_or_else(|| {
                     invalid_video(path, "WebP VP8L bitstream has invalid dimensions")
                 })?);
             }
-            b"VP8X" if headers.extended.is_none() => {
-                let flags = *payload
-                    .first()
-                    .ok_or_else(|| invalid_video(path, "WebP VP8X chunk has no flags byte"))?;
-                let header = payload.get(4..10).ok_or_else(|| {
-                    invalid_video(path, "WebP VP8X chunk has an incomplete canvas size")
-                })?;
-                let width = le_u24(&header[..3])
+            b"VP8X" if scan.extended.is_none() => {
+                let mut prefix = [0_u8; 10];
+                if size < 10 {
+                    return Err(invalid_video(path, "WebP VP8X chunk is truncated"));
+                }
+                read_chunk_at(path, file, payload_start, &mut prefix)?;
+                let width = le_u24(&prefix[4..7])
                     .ok_or_else(|| invalid_video(path, "WebP VP8X width is truncated"))?
                     .saturating_add(1);
-                let height = le_u24(&header[3..])
+                let height = le_u24(&prefix[7..10])
                     .ok_or_else(|| invalid_video(path, "WebP VP8X height is truncated"))?
                     .saturating_add(1);
-                headers.extended = Some((flags & 0x02 != 0, width, height));
+                scan.extended = Some((prefix[0] & 0x02 != 0, width, height));
+            }
+            b"ANIM" => {
+                if size < 6 {
+                    return Err(invalid_video(
+                        path,
+                        "WebP ANIM chunk is shorter than six bytes",
+                    ));
+                }
+                scan.animated = true;
+            }
+            b"ANMF" => {
+                let mut duration = [0_u8; 3];
+                if size < 16 {
+                    return Err(invalid_video(path, "WebP ANMF chunk is too short"));
+                }
+                read_chunk_at(path, file, payload_start.saturating_add(12), &mut duration)?;
+                let ms = le_u24(&duration)
+                    .ok_or_else(|| invalid_video(path, "WebP ANMF duration is truncated"))?;
+                scan.frames = scan.frames.saturating_add(1);
+                scan.total_ms =
+                    scan.total_ms
+                        .saturating_add(u64::from(if ms == 0 { 100 } else { ms }));
             }
             _ => {}
         }
+        pos = payload_end.saturating_add(size & 1);
     }
-    Ok(headers)
+    Ok(scan)
 }
 
-/// Sums every ANMF frame duration, normalising a zero delay to 100 ms.
-fn webp_animation_duration(path: &Path, chunks: &[([u8; 4], &[u8])]) -> Result<u64, ProbeError> {
-    let anim = chunks
-        .iter()
-        .find(|(id, _)| id == b"ANIM")
-        .map(|(_, payload)| *payload)
-        .ok_or_else(|| invalid_video(path, "animated WebP is missing its ANIM chunk"))?;
-    if anim.len() < 6 {
-        return Err(invalid_video(
-            path,
-            "WebP ANIM chunk is shorter than six bytes",
-        ));
-    }
-    let mut frames = 0_u64;
-    let mut total_ms = 0_u64;
-    for (id, payload) in chunks {
-        if id != b"ANMF" {
-            continue;
-        }
-        let field = payload
-            .get(12..15)
-            .ok_or_else(|| invalid_video(path, "WebP ANMF chunk has no duration field"))?;
-        let duration = le_u24(field)
-            .ok_or_else(|| invalid_video(path, "WebP ANMF duration field is truncated"))?;
-        let duration = if duration == 0 { 100 } else { duration };
-        frames = frames.saturating_add(1);
-        total_ms = total_ms.saturating_add(u64::from(duration));
-    }
-    if frames == 0 {
-        return Err(invalid_video(path, "animated WebP has no ANMF frames"));
-    }
-    Ok(total_ms)
-}
-
-/// Probes animated and still WebP files with a bounded, pure-Rust RIFF walk.
+/// Probes animated and still WebP files with a seek-based RIFF chunk walk.
+///
+/// Only fixed-size chunk headers are read and `ANMF` payloads are skipped, so
+/// the probe uses O(1) RAM even for animations larger than 16 MiB. Bytes after
+/// the declared RIFF end are ignored as trailing padding.
 fn probe_webp_video(
     path: &Path,
     file: &mut File,
     file_len: u64,
 ) -> Result<Vec<VideoStreamInfo>, ProbeError> {
-    let bytes = read_bounded_prefix(file, path, file_len, WEBP_HEADER_CAP)?;
-    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+    let mut signature = [0_u8; 12];
+    read_chunk_at(path, file, 0, &mut signature)?;
+    if &signature[..4] != b"RIFF" || &signature[8..12] != b"WEBP" {
         return Err(invalid_video(path, "truncated RIFF/WEBP header"));
     }
     let declared = u64::from(
-        le_u32(&bytes[4..8]).ok_or_else(|| invalid_video(path, "WebP RIFF size is missing"))?,
+        le_u32(&signature[4..8]).ok_or_else(|| invalid_video(path, "WebP RIFF size is missing"))?,
     );
-    if declared < 4 || declared.saturating_add(8) > file_len {
+    let riff_end = declared
+        .checked_add(8)
+        .ok_or_else(|| invalid_video(path, "WebP RIFF size overflows"))?;
+    if declared < 4 || riff_end > file_len {
         return Err(invalid_video(
             path,
-            "WebP RIFF size does not match the file length",
+            "WebP RIFF size extends past the end of the file",
         ));
     }
 
-    let chunks = riff_chunks_strict(bytes.get(12..).unwrap_or_default())
-        .ok_or_else(|| invalid_video(path, "WebP RIFF chunk is truncated"))?;
-    let headers = webp_chunk_info(path, &chunks)?;
-    let simple = headers.still;
-    let extended = headers.extended;
-
-    let (width, height, total_ms) = match extended {
-        Some((true, width, height)) => (width, height, webp_animation_duration(path, &chunks)?),
+    let scan = scan_webp_chunks(path, file, riff_end)?;
+    let (width, height, total_ms) = match scan.extended {
+        Some((true, width, height)) => {
+            if !scan.animated || scan.frames == 0 {
+                return Err(invalid_video(
+                    path,
+                    "animated WebP is missing ANIM or ANMF chunks",
+                ));
+            }
+            (width, height, scan.total_ms)
+        }
         Some((false, width, height)) => {
-            if simple.is_none() {
+            if scan.still.is_none() {
                 return Err(invalid_video(
                     path,
                     "extended WebP has no VP8 or VP8L image chunk",
@@ -1362,7 +1385,8 @@ fn probe_webp_video(
             (width, height, 100)
         }
         None => {
-            let (width, height) = simple
+            let (width, height) = scan
+                .still
                 .ok_or_else(|| invalid_video(path, "WebP has no VP8, VP8L, or VP8X image chunk"))?;
             (width, height, 100)
         }
