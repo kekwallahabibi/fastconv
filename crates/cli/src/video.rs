@@ -1,5 +1,5 @@
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use fastconv_domain::{
     HardwareBackend, TargetAudioCodec, TargetVideoCodec, VideoContainerFormat, VideoQuality,
@@ -99,14 +99,9 @@ pub(crate) fn parse_remux_args(args: &[&str]) -> Result<RemuxCommand, String> {
                 .to_owned(),
         );
     };
-    if let Some(ext) = Path::new(*target).extension().and_then(|ext| ext.to_str())
-        && let Some(inferred) = VideoContainerFormat::from_extension(ext)
-        && !inferred.supports_remux()
-    {
-        return Err(format!(
-            "target extension '{ext}' cannot be remuxed; use `fastconv video` for GIF/WebP"
-        ));
-    }
+    // Do not reject GIF/WebP from the positional target here: an explicit
+    // `--to mkv` may name a directory whose path ends in `.gif`. The probe
+    // layer rejects animation *file* targets after target resolution.
 
     Ok(RemuxCommand::Run(RemuxArgs {
         source: PathBuf::from(*source),
@@ -443,15 +438,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_video_to_gif_remux() {
+    fn rejects_explicit_animation_remux_targets_but_accepts_positional_paths() -> Result<(), String>
+    {
         assert!(parse_remux_args(&["clip.mp4", "out.gif", "--to", "gif"]).is_err());
-        assert!(parse_remux_args(&["clip.mp4", "out.gif"]).is_err());
-    }
-
-    #[test]
-    fn rejects_video_to_webp_remux() {
         assert!(parse_remux_args(&["clip.mp4", "out.webp", "--to", "webp"]).is_err());
-        assert!(parse_remux_args(&["clip.mp4", "out.webp"]).is_err());
+        let RemuxCommand::Run(gif_target) = parse_remux_args(&["clip.mp4", "out.gif"])? else {
+            return Err("expected remux run args".to_owned());
+        };
+        assert_eq!(gif_target.target, PathBuf::from("out.gif"));
+        // A directory target merely named `archive.gif` is valid when `--to`
+        // selects a remuxable container; rejection happens after resolution.
+        let RemuxCommand::Run(dir_target) =
+            parse_remux_args(&["clips", "archive.gif", "--to", "mkv"])?
+        else {
+            return Err("expected remux run args".to_owned());
+        };
+        assert_eq!(dir_target.to, Some(VideoContainerFormat::Mkv));
+        Ok(())
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! with bounded parallel worker pools that preserve strict display order.
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::path::Path;
@@ -13,10 +13,10 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use fastconv_domain::{VideoContainerFormat, VideoQuality};
+use fastconv_domain::{AnimationLoop, VideoContainerFormat, VideoQuality};
 
 use crate::PipelineError;
-use crate::video_codecs::Yuv420Frame;
+use crate::video_codecs::{Yuv420Frame, YuvColor, YuvMatrix, YuvRange};
 use crate::video_container::{ContainerMedia, ContainerPacket, ContainerTrack, US_TIMESCALE};
 
 /// Decoder memory ceiling for both animation codecs (512 MiB).
@@ -67,20 +67,15 @@ fn byte_len(width: u32, height: u32, bpp: usize) -> Result<usize, PipelineError>
         .ok_or_else(|| decode_error(path, "animation frame buffer overflows usize"))
 }
 
-/// Geometry and exact timing of one decoded animation frame.
+/// Geometry, exact timing and pixel layout of one decoded animation frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AnimFrameInfo {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) pts_us: i64,
     pub(crate) duration_us: u64,
-}
-
-impl AnimFrameInfo {
-    fn next(self, duration_us: u64) -> i64 {
-        self.pts_us
-            .saturating_add(i64::try_from(duration_us).unwrap_or(i64::MAX))
-    }
+    /// 3 for flattened RGB, 4 when transparency is preserved.
+    pub(crate) channels: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -261,12 +256,30 @@ pub(crate) fn write_nv12(
     Ok(())
 }
 
-/// Inverse BT.601 limited-range conversion of pitched NV12 into packed RGB8.
+/// 8.8 fixed-point YUV→RGB coefficients: `(y_gain, y_offset, r_v, g_u, g_v, b_u)`.
+/// Limited range expands luma by 255/219 and chroma by 255/224; full range
+/// uses the raw matrix coefficients. BT.601 is only the explicit default for
+/// sources that signal no matrix.
+fn inverse_coeffs(color: YuvColor) -> (i32, i32, i32, i32, i32, i32) {
+    let limited = color.range == YuvRange::Limited;
+    match (color.matrix, limited) {
+        (YuvMatrix::Bt709, true) => (298, 16, 459, -55, -137, 541),
+        (YuvMatrix::Bt709, false) => (256, 0, 364, -48, -120, 519),
+        (YuvMatrix::Bt2020, true) => (298, 16, 430, -48, -166, 548),
+        (YuvMatrix::Bt2020, false) => (256, 0, 377, -42, -146, 482),
+        (YuvMatrix::Bt601, true) => (298, 16, 409, -100, -208, 516),
+        (YuvMatrix::Bt601, false) => (256, 0, 403, -88, -183, 454),
+    }
+}
+
+/// Inverse conversion of pitched NV12 into packed RGB8 using the source's
+/// signalled colour matrix and range.
 pub(crate) fn nv12_to_rgb8(
     nv12: &[u8],
     pitch: usize,
     width: u32,
     height: u32,
+    color: YuvColor,
 ) -> Result<Vec<u8>, PipelineError> {
     let path = Path::new("animation-nv12-to-rgb8");
     if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
@@ -295,17 +308,18 @@ pub(crate) fn nv12_to_rgb8(
             format!("NV12 buffer is {} bytes, needs {needed}", nv12.len()),
         ));
     }
+    let (y_gain, y_offset, r_v, g_u, g_v, b_u) = inverse_coeffs(color);
     let mut rgb = vec![0_u8; byte_len(width, height, 3)?];
     for row_y in 0..frame_h {
         let chroma_y = row_y / 2;
         for sample_x in 0..frame_w {
-            let luma_delta = i32::from(nv12[row_y * pitch + sample_x]) - 16;
+            let luma_delta = y_gain * (i32::from(nv12[row_y * pitch + sample_x]) - y_offset);
             let u_delta = i32::from(nv12[uv_base + chroma_y * pitch + (sample_x & !1)]) - 128;
             let v_delta = i32::from(nv12[uv_base + chroma_y * pitch + (sample_x & !1) + 1]) - 128;
             let idx = (row_y * frame_w + sample_x) * 3;
-            rgb[idx] = clamp_u8((298 * luma_delta + 409 * v_delta + 128) >> 8);
-            rgb[idx + 1] = clamp_u8((298 * luma_delta - 100 * u_delta - 208 * v_delta + 128) >> 8);
-            rgb[idx + 2] = clamp_u8((298 * luma_delta + 516 * u_delta + 128) >> 8);
+            rgb[idx] = clamp_u8((luma_delta + r_v * v_delta + 128) >> 8);
+            rgb[idx + 1] = clamp_u8((luma_delta + g_u * u_delta + g_v * v_delta + 128) >> 8);
+            rgb[idx + 2] = clamp_u8((luma_delta + b_u * u_delta + 128) >> 8);
         }
     }
     Ok(rgb)
@@ -476,6 +490,12 @@ fn scan_webp_chunks(
                 read_at(path, file, payload_start.saturating_add(12), &mut duration)?;
                 let ms = le_u24_at(&duration)
                     .ok_or_else(|| decode_error(path, "WebP ANMF duration is truncated"))?;
+                if !anmf_has_bitstream(path, file, payload_start, payload_end)? {
+                    return Err(decode_error(
+                        path,
+                        "WebP ANMF has no nested VP8 or VP8L bitstream",
+                    ));
+                }
                 // A 24-bit millisecond value overflows u32 when scaled to microseconds.
                 let duration_us = if ms == 0 {
                     100_000
@@ -486,9 +506,52 @@ fn scan_webp_chunks(
             }
             _ => {}
         }
-        pos = payload_end.saturating_add(size & 1);
+        let padded_end = payload_end.saturating_add(size & 1);
+        if padded_end > riff_end {
+            return Err(decode_error(path, "WebP RIFF chunk padding is truncated"));
+        }
+        pos = padded_end;
     }
     Ok(scan)
+}
+
+/// Mirrors the probe's RFC 9649 check so directly decoded files cannot smuggle
+/// an ANMF without a nested image bitstream past the boundary validation.
+fn anmf_has_bitstream(
+    path: &Path,
+    file: &mut File,
+    payload_start: u64,
+    payload_end: u64,
+) -> Result<bool, PipelineError> {
+    let mut pos = payload_start.saturating_add(16);
+    while pos.saturating_add(8) <= payload_end {
+        let mut header = [0_u8; 8];
+        read_at(path, file, pos, &mut header)?;
+        let id = [header[0], header[1], header[2], header[3]];
+        let size = u64::from(
+            le_u32_at(&header[4..])
+                .ok_or_else(|| decode_error(path, "WebP ANMF subchunk size truncated"))?,
+        );
+        let start = pos.saturating_add(8);
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| decode_error(path, "WebP ANMF subchunk size overflows"))?;
+        if end > payload_end {
+            return Err(decode_error(path, "WebP ANMF subchunk is truncated"));
+        }
+        if (id == *b"VP8 " || id == *b"VP8L") && size > 0 {
+            return Ok(true);
+        }
+        let padded = end.saturating_add(size & 1);
+        if padded > payload_end {
+            return Err(decode_error(
+                path,
+                "WebP ANMF subchunk padding is truncated",
+            ));
+        }
+        pos = padded;
+    }
+    Ok(false)
 }
 
 /// Seek-based RIFF/WEBP walk: only fixed-size chunk headers are read and ANMF
@@ -634,9 +697,33 @@ fn rgba_to_rgb(src: &[u8], bpp: usize, width: u32, height: u32) -> Result<Vec<u8
     Ok(rgb)
 }
 
-/// Composites every GIF frame onto an RGBA canvas and streams packed RGB8.
-pub(crate) fn decode_gif_frames_streaming_rgb<F>(
+/// Expands flattened RGB into RGBA with fully opaque alpha, so an animation
+/// source without transparency still has a well-defined pixel layout.
+fn rgb_to_rgba(src: &[u8], width: u32, height: u32) -> Result<Vec<u8>, PipelineError> {
+    if src.len() != byte_len(width, height, 3)? {
+        return Err(decode_error(
+            Path::new("animation-rgb-to-rgba"),
+            "decoded frame buffer has the wrong length",
+        ));
+    }
+    let mut rgba = vec![0_u8; byte_len(width, height, 4)?];
+    for (dst, px) in rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(src.as_chunks::<3>().0.iter())
+    {
+        dst[..3].copy_from_slice(px);
+        dst[3] = 255;
+    }
+    Ok(rgba)
+}
+
+/// Composites every GIF frame onto an RGBA canvas and streams either packed
+/// RGB8 (flattened) or RGBA8 (transparency preserved).
+fn gif_streaming_pixels_impl<F>(
     path: &Path,
+    preserve_alpha: bool,
     mut on_frame: F,
 ) -> Result<(), PipelineError>
 where
@@ -658,7 +745,18 @@ where
     if width == 0 || height == 0 {
         return Err(decode_error(path, "GIF canvas has a zero width or height"));
     }
-    let mut canvas = vec![0_u8; byte_len(anim_w, anim_h, 4)?];
+    let canvas_len = byte_len(anim_w, anim_h, 4)?;
+    // A hostile logical screen (e.g. 65535x65535) must fail before the RGBA
+    // canvas is requested from the allocator.
+    if u64::try_from(canvas_len).unwrap_or(u64::MAX) > ANIM_MEMORY_LIMIT {
+        return Err(decode_error(
+            path,
+            format!(
+                "GIF canvas ({canvas_len} bytes) exceeds the {ANIM_MEMORY_LIMIT}-byte memory limit"
+            ),
+        ));
+    }
+    let mut canvas = vec![0_u8; canvas_len];
     let mut pts_us = 0_i64;
     let mut saved: Option<Vec<u8>> = None;
 
@@ -696,38 +794,88 @@ where
             }
         }
 
-        let rgb = rgba_to_rgb(&canvas, 4, anim_w, anim_h)?;
         let duration = if frame.delay == 0 {
             100_000_u64
         } else {
             u64::from(frame.delay) * 10_000
         };
-        let info = AnimFrameInfo {
-            width: anim_w,
-            height: anim_h,
-            pts_us,
-            duration_us: duration,
-        };
-        on_frame(info, &rgb)?;
-        pts_us = info.next(duration);
-
-        match disposal {
-            gif::DisposalMethod::Background => {
-                for y in y0..y1 {
-                    let start = (y * width + x0) * 4;
-                    let end = (y * width + x1) * 4;
-                    canvas[start..end].fill(0);
-                }
-            }
-            gif::DisposalMethod::Previous => {
-                if let Some(previous) = saved.take() {
-                    canvas = previous;
-                }
-            }
-            gif::DisposalMethod::Keep | gif::DisposalMethod::Any => {}
+        if preserve_alpha {
+            let info = AnimFrameInfo {
+                width: anim_w,
+                height: anim_h,
+                pts_us,
+                duration_us: duration,
+                channels: 4,
+            };
+            on_frame(info, &canvas)?;
+        } else {
+            let rgb = rgba_to_rgb(&canvas, 4, anim_w, anim_h)?;
+            let info = AnimFrameInfo {
+                width: anim_w,
+                height: anim_h,
+                pts_us,
+                duration_us: duration,
+                channels: 3,
+            };
+            on_frame(info, &rgb)?;
         }
+        pts_us = pts_us.saturating_add(i64::try_from(duration).unwrap_or(i64::MAX));
+
+        apply_gif_disposal(&mut canvas, width, frame, &mut saved);
     }
     Ok(())
+}
+
+fn apply_gif_disposal(
+    canvas: &mut Vec<u8>,
+    width: usize,
+    frame: &gif::Frame<'_>,
+    saved: &mut Option<Vec<u8>>,
+) {
+    let height = canvas.len() / 4 / width;
+    let left = usize::from(frame.left);
+    let top = usize::from(frame.top);
+    let x0 = left.min(width);
+    let y0 = top.min(height);
+    let x1 = left.saturating_add(usize::from(frame.width)).min(width);
+    let y1 = top.saturating_add(usize::from(frame.height)).min(height);
+    match frame.dispose {
+        gif::DisposalMethod::Background => {
+            for y in y0..y1 {
+                let start = (y * width + x0) * 4;
+                let end = (y * width + x1) * 4;
+                canvas[start..end].fill(0);
+            }
+        }
+        gif::DisposalMethod::Previous => {
+            if let Some(previous) = saved.take() {
+                *canvas = previous;
+            }
+        }
+        gif::DisposalMethod::Keep | gif::DisposalMethod::Any => {}
+    }
+}
+
+/// Composites GIF frames and streams flattened RGB8 for non-animation outputs.
+pub(crate) fn decode_gif_frames_streaming_rgb<F>(
+    path: &Path,
+    on_frame: F,
+) -> Result<(), PipelineError>
+where
+    F: FnMut(AnimFrameInfo, &[u8]) -> Result<(), PipelineError>,
+{
+    gif_streaming_pixels_impl(path, false, on_frame)
+}
+
+/// Composites GIF frames and streams RGBA8, preserving the one-bit GIF mask.
+pub(crate) fn decode_gif_frames_streaming_pixels<F>(
+    path: &Path,
+    on_frame: F,
+) -> Result<(), PipelineError>
+where
+    F: FnMut(AnimFrameInfo, &[u8]) -> Result<(), PipelineError>,
+{
+    gif_streaming_pixels_impl(path, true, on_frame)
 }
 
 /// Streams GIF frames directly into a caller-supplied pitched NV12 buffer.
@@ -792,26 +940,36 @@ pub(crate) fn decode_gif_frames_yuv420(
 // Animated WebP decoding
 // ---------------------------------------------------------------------------
 
-/// Decodes a still or animated WebP file and streams packed RGB8 frames.
-pub(crate) fn decode_webp_frames_streaming_rgb<F>(
+/// Reads a WebP from one open handle, capped at `limit + 1` bytes. Reading one
+/// extra byte closes the metadata/read TOCTOU window: the decoder receives
+/// exactly the bytes that were checked against the memory limit.
+fn read_bounded_animation_file(path: &Path, limit: u64) -> Result<Vec<u8>, PipelineError> {
+    let mut file = File::open(path).map_err(|source| io_error(path, source))?;
+    let capacity = limit.saturating_add(1);
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(capacity)
+        .read_to_end(&mut bytes)
+        .map_err(|source| io_error(path, source))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+        return Err(decode_error(
+            path,
+            format!("WebP input exceeds the {limit}-byte memory limit"),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Decodes a still or animated WebP file and streams packed RGB8 or RGBA8.
+fn webp_streaming_pixels_impl<F>(
     path: &Path,
+    preserve_alpha: bool,
     mut on_frame: F,
 ) -> Result<(), PipelineError>
 where
     F: FnMut(AnimFrameInfo, &[u8]) -> Result<(), PipelineError>,
 {
-    let file_len = fs::metadata(path)
-        .map_err(|source| io_error(path, source))?
-        .len();
-    if file_len > ANIM_MEMORY_LIMIT {
-        return Err(decode_error(
-            path,
-            format!(
-                "WebP input ({file_len} bytes) exceeds the {ANIM_MEMORY_LIMIT}-byte memory limit"
-            ),
-        ));
-    }
-    let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
+    let bytes = read_bounded_animation_file(path, ANIM_MEMORY_LIMIT)?;
     let mut decoder = zenwebp::WebPDecoder::new(&bytes)
         .map_err(|err| decode_error(path, format!("WebP header is invalid: {err}")))?;
     decoder.set_memory_limit(usize::try_from(ANIM_MEMORY_LIMIT).unwrap_or(usize::MAX));
@@ -836,6 +994,30 @@ where
     let mut buf = vec![0_u8; buf_len];
     let mut pts_us = 0_i64;
 
+    let emit = |info: AnimFrameInfo, buf: &[u8], on_frame: &mut F| -> Result<(), PipelineError> {
+        if preserve_alpha {
+            if bpp == 4 {
+                let info = AnimFrameInfo {
+                    channels: 4,
+                    ..info
+                };
+                on_frame(info, buf)
+            } else {
+                let rgba = rgb_to_rgba(buf, width, height)?;
+                on_frame(
+                    AnimFrameInfo {
+                        channels: 4,
+                        ..info
+                    },
+                    &rgba,
+                )
+            }
+        } else {
+            let rgb = rgba_to_rgb(buf, bpp, width, height)?;
+            on_frame(info, &rgb)
+        }
+    };
+
     if decoder.is_animated() {
         loop {
             let ms = match decoder.read_frame(&mut buf) {
@@ -858,10 +1040,10 @@ where
                 height,
                 pts_us,
                 duration_us: duration,
+                channels: if preserve_alpha { 4 } else { 3 },
             };
-            let rgb = rgba_to_rgb(&buf, bpp, width, height)?;
-            on_frame(info, &rgb)?;
-            pts_us = info.next(duration);
+            emit(info, &buf, &mut on_frame)?;
+            pts_us = pts_us.saturating_add(i64::try_from(duration).unwrap_or(i64::MAX));
         }
     } else {
         decoder
@@ -872,11 +1054,33 @@ where
             height,
             pts_us,
             duration_us: 100_000,
+            channels: if preserve_alpha { 4 } else { 3 },
         };
-        let rgb = rgba_to_rgb(&buf, bpp, width, height)?;
-        on_frame(info, &rgb)?;
+        emit(info, &buf, &mut on_frame)?;
     }
     Ok(())
+}
+
+/// Streams flattened RGB8 frames from a still or animated WebP file.
+pub(crate) fn decode_webp_frames_streaming_rgb<F>(
+    path: &Path,
+    on_frame: F,
+) -> Result<(), PipelineError>
+where
+    F: FnMut(AnimFrameInfo, &[u8]) -> Result<(), PipelineError>,
+{
+    webp_streaming_pixels_impl(path, false, on_frame)
+}
+
+/// Streams WebP frames as RGBA8 so transparency survives animation re-encoding.
+pub(crate) fn decode_webp_frames_streaming_pixels<F>(
+    path: &Path,
+    on_frame: F,
+) -> Result<(), PipelineError>
+where
+    F: FnMut(AnimFrameInfo, &[u8]) -> Result<(), PipelineError>,
+{
+    webp_streaming_pixels_impl(path, true, on_frame)
 }
 
 /// Streams WebP frames directly into a caller-supplied pitched NV12 buffer.
@@ -951,8 +1155,9 @@ fn gif_speed(quality: VideoQuality) -> i32 {
     }
 }
 
-/// Extracts the inner `VP8 `/`VP8L` chunk (including its even-padding byte) so
-/// it can be nested inside an RFC 9649 `ANMF` chunk.
+/// Extracts the nested image chunks (including even-padding bytes) for an
+/// RFC 9649 `ANMF` frame. An `ALPH` chunk precedes `VP8 `/`VP8L` and must be
+/// carried along or the frame's transparency would be silently dropped.
 fn extract_inner_vp8_chunk(bytes: &[u8]) -> Result<Vec<u8>, PipelineError> {
     let path = Path::new("webp-encoder");
     if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
@@ -962,6 +1167,7 @@ fn extract_inner_vp8_chunk(bytes: &[u8]) -> Result<Vec<u8>, PipelineError> {
         ));
     }
     let mut pos = 12_usize;
+    let mut inner = Vec::new();
     while pos.saturating_add(8) <= bytes.len() {
         let id = &bytes[pos..pos + 4];
         let size = usize::try_from(le_u32_at(&bytes[pos + 4..pos + 8]).unwrap_or(0))
@@ -971,13 +1177,16 @@ fn extract_inner_vp8_chunk(bytes: &[u8]) -> Result<Vec<u8>, PipelineError> {
         if payload_end > bytes.len() {
             return Err(encode_error(path, "WebP chunk is truncated"));
         }
-        if id == b"VP8 " || id == b"VP8L" {
-            let padded = size.saturating_add(size & 1);
-            let end = payload_start.saturating_add(padded);
-            if end > bytes.len() {
-                return Err(encode_error(path, "WebP chunk padding is truncated"));
-            }
-            return Ok(bytes[pos..end].to_vec());
+        let padded = size.saturating_add(size & 1);
+        let end = payload_start.saturating_add(padded);
+        if end > bytes.len() {
+            return Err(encode_error(path, "WebP chunk padding is truncated"));
+        }
+        if id == b"ALPH" {
+            inner.extend_from_slice(&bytes[pos..end]);
+        } else if id == b"VP8 " || id == b"VP8L" {
+            inner.extend_from_slice(&bytes[pos..end]);
+            return Ok(inner);
         }
         pos = payload_end.saturating_add(size & 1);
     }
@@ -1008,18 +1217,30 @@ fn prepare_frame(
     let w = u16::try_from(job.info.width).unwrap_or(u16::MAX);
     let h = u16::try_from(job.info.height).unwrap_or(u16::MAX);
     if format == VideoContainerFormat::Gif {
-        let mut frame = gif::Frame::from_rgb_speed(w, h, &job.rgb, gif_speed(quality));
+        let mut frame = if job.info.channels == 4 {
+            // GIF stores a one-bit transparency mask; `from_rgba_speed`
+            // selects a transparent palette index for zero-alpha pixels.
+            let mut rgba = job.rgb.clone();
+            gif::Frame::from_rgba_speed(w, h, &mut rgba, gif_speed(quality))
+        } else {
+            gif::Frame::from_rgb_speed(w, h, &job.rgb, gif_speed(quality))
+        };
         frame.delay = u16::try_from(job.delay).unwrap_or(u16::MAX);
         frame.dispose = gif::DisposalMethod::Keep;
         Ok(PreparedFrame::Gif(frame))
     } else {
         let path = Path::new("webp-encoder");
-        let encoded = zenwebp::Encoder::new_rgb(&job.rgb, job.info.width, job.info.height)
+        let encoder = if job.info.channels == 4 {
+            zenwebp::Encoder::new_rgba(&job.rgb, job.info.width, job.info.height)
+        } else {
+            zenwebp::Encoder::new_rgb(&job.rgb, job.info.width, job.info.height)
+        };
+        let webp_bytes = encoder
             .quality(f32::from(quality.get()))
             .method(4)
             .encode()
             .map_err(|err| encode_error(path, format!("WebP encoding failed: {err}")))?;
-        let inner = extract_inner_vp8_chunk(&encoded)?;
+        let inner = extract_inner_vp8_chunk(&webp_bytes)?;
         Ok(PreparedFrame::Webp {
             inner,
             delay_ms: job.delay,
@@ -1027,7 +1248,13 @@ fn prepare_frame(
     }
 }
 
-fn write_webp_header<W: Write>(out: &mut W, width: u16, height: u16) -> Result<(), PipelineError> {
+fn write_webp_header<W: Write>(
+    out: &mut W,
+    width: u16,
+    height: u16,
+    loop_count: AnimationLoop,
+    has_alpha: bool,
+) -> Result<(), PipelineError> {
     let path = Path::new("webp-encoder");
     out.write_all(b"RIFF")
         .and_then(|()| out.write_all(&[0_u8; 4]))
@@ -1036,14 +1263,69 @@ fn write_webp_header<W: Write>(out: &mut W, width: u16, height: u16) -> Result<(
     // VP8X stores canvas dimensions minus one as 24-bit little-endian values.
     let w = u32::from(width).saturating_sub(1).to_le_bytes();
     let h = u32::from(height).saturating_sub(1).to_le_bytes();
+    // VP8X flags: animation (0x02) and, when present, the alpha hint (0x10)
+    // that tells decoders to plan for an RGBA output buffer.
+    let flags = 0x02 | if has_alpha { 0x10 } else { 0 };
     let vp8x = [
-        b'V', b'P', b'8', b'X', 10, 0, 0, 0, 0x02, 0, 0, 0, w[0], w[1], w[2], h[0], h[1], h[2],
+        b'V', b'P', b'8', b'X', 10, 0, 0, 0, flags, 0, 0, 0, w[0], w[1], w[2], h[0], h[1], h[2],
     ];
     out.write_all(&vp8x)
         .map_err(|source| io_error(path, source))?;
-    out.write_all(&[b'A', b'N', b'I', b'M', 6, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    // ANIM payload: four-byte background colour then the little-endian loop
+    // count. Zero is RFC 9649's "loop forever".
+    let iterations = match loop_count {
+        AnimationLoop::Infinite => 0_u16,
+        AnimationLoop::Times(times) => times.get(),
+    };
+    let [lo, hi] = iterations.to_le_bytes();
+    out.write_all(&[b'A', b'N', b'I', b'M', 6, 0, 0, 0, 0, 0, 0, 0, lo, hi])
         .map_err(|source| io_error(path, source))?;
     Ok(())
+}
+
+fn spawn_animation_workers<'scope>(
+    scope: &'scope thread::Scope<'scope, '_>,
+    workers: usize,
+    format: VideoContainerFormat,
+    quality: VideoQuality,
+    job_rx: Arc<Mutex<mpsc::Receiver<AnimJob>>>,
+    ready_tx: mpsc::SyncSender<(usize, AnimFrameInfo, PreparedFrame)>,
+) -> Result<Vec<thread::ScopedJoinHandle<'scope, Result<(), PipelineError>>>, PipelineError> {
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let job_rx = Arc::clone(&job_rx);
+        let ready_tx = ready_tx.clone();
+        handles.push(
+            thread::Builder::new()
+                .name("fastconv-anim-worker".to_owned())
+                .spawn_scoped(scope, move || -> Result<(), PipelineError> {
+                    loop {
+                        let received = {
+                            let guard = job_rx.lock().map_err(|_| PipelineError::WorkerPanicked)?;
+                            guard.recv()
+                        };
+                        let Ok(job) = received else {
+                            return Ok(());
+                        };
+                        let index = job.index;
+                        let info = job.info;
+                        let prepared = match prepare_frame(format, quality, &job) {
+                            Ok(frame) => frame,
+                            Err(err) => PreparedFrame::Failed(err.to_string()),
+                        };
+                        if ready_tx.send((index, info, prepared)).is_err() {
+                            // The writer is gone; intentionally keep draining jobs so a producer
+                            // blocked on a full job channel can reach its next admission token
+                            // and observe the failure instead of hanging.
+                        }
+                    }
+                })
+                .map_err(PipelineError::WorkerStartFailed)?,
+        );
+    }
+    drop(job_rx);
+    drop(ready_tx);
+    Ok(handles)
 }
 
 /// Drives a bounded, ordered animation encode from a frame producer.
@@ -1054,6 +1336,7 @@ pub(crate) fn encode_animation_stream<P>(
     format: VideoContainerFormat,
     quality: VideoQuality,
     worker_threads: usize,
+    loop_count: AnimationLoop,
     file: &File,
     produce: P,
 ) -> Result<u64, PipelineError>
@@ -1068,52 +1351,26 @@ where
         let (job_tx, job_rx) = mpsc::sync_channel::<AnimJob>(capacity);
         let (ready_tx, ready_rx) =
             mpsc::sync_channel::<(usize, AnimFrameInfo, PreparedFrame)>(capacity);
+        // One admission token per outstanding frame. Tokens are consumed only
+        // after an ordered write, so out-of-order arrivals cannot accumulate
+        // an unbounded pending map. Dropping the writer closes this channel
+        // and immediately wakes a blocked producer.
+        let (slot_tx, slot_rx) = mpsc::sync_channel::<()>(capacity);
         let job_rx = Arc::new(Mutex::new(job_rx));
 
-        let mut workers_handles = Vec::with_capacity(workers);
-        for _ in 0..workers {
-            let job_rx = Arc::clone(&job_rx);
-            let ready_tx = ready_tx.clone();
-            workers_handles.push(
-                thread::Builder::new()
-                    .name("fastconv-anim-worker".to_owned())
-                    .spawn_scoped(scope, move || -> Result<(), PipelineError> {
-                        loop {
-                            let received = {
-                                let guard =
-                                    job_rx.lock().map_err(|_| PipelineError::WorkerPanicked)?;
-                                guard.recv()
-                            };
-                            let Ok(job) = received else {
-                                return Ok(());
-                            };
-                            let index = job.index;
-                            let info = job.info;
-                            let prepared = match prepare_frame(format, quality, &job) {
-                                Ok(frame) => frame,
-                                Err(err) => PreparedFrame::Failed(err.to_string()),
-                            };
-                            if ready_tx.send((index, info, prepared)).is_err() {
-                                return Ok(());
-                            }
-                        }
-                    })
-                    .map_err(PipelineError::WorkerStartFailed)?,
-            );
-        }
-        drop(job_rx);
-        drop(ready_tx);
+        let workers_handles =
+            spawn_animation_workers(scope, workers, format, quality, job_rx, ready_tx)?;
 
         let writer = thread::Builder::new()
             .name("fastconv-anim-writer".to_owned())
             .spawn_scoped(scope, move || -> Result<u64, PipelineError> {
-                write_animation_frames(format, file, ready_rx)
+                write_animation_frames(format, loop_count, file, ready_rx, slot_rx)
             })
             .map_err(PipelineError::WorkerStartFailed)?;
 
         let mut cumulative_us = 0_u64;
         let mut emitted_delay = 0_u64;
-        let mut expected_dims: Option<(u32, u32)> = None;
+        let mut expected_dims: Option<(u32, u32, u8)> = None;
         let mut index = 0_usize;
         let produced = {
             let mut push = |info: AnimFrameInfo, rgb: &[u8]| -> Result<(), PipelineError> {
@@ -1126,6 +1383,7 @@ where
                     &mut expected_dims,
                     index,
                     &job_tx,
+                    &slot_tx,
                 )?;
                 index = index.saturating_add(1);
                 Ok(())
@@ -1177,19 +1435,20 @@ fn push_animation_frame(
     rgb: &[u8],
     cumulative_us: &mut u64,
     emitted_delay: &mut u64,
-    expected_dims: &mut Option<(u32, u32)>,
+    expected_dims: &mut Option<(u32, u32, u8)>,
     index: usize,
     job_tx: &mpsc::SyncSender<AnimJob>,
+    slot_tx: &mpsc::SyncSender<()>,
 ) -> Result<(), PipelineError> {
     let path = Path::new("animation-encoder");
-    let dims = (info.width, info.height);
+    let dims = (info.width, info.height, info.channels);
     match expected_dims {
         Some(expected) if *expected != dims => {
             return Err(encode_error(
                 path,
                 format!(
-                    "animation frames must share dimensions; expected {}x{}, got {}x{}",
-                    expected.0, expected.1, dims.0, dims.1
+                    "animation frames must share dimensions and pixel layout; expected {}x{} ({} ch), got {}x{} ({} ch)",
+                    expected.0, expected.1, expected.2, dims.0, dims.1, dims.2
                 ),
             ));
         }
@@ -1206,15 +1465,29 @@ fn push_animation_frame(
                     format!("invalid animation dimensions {}x{}", dims.0, dims.1),
                 ));
             }
-            *expected_dims = Some(dims);
+            *expected_dims = Some((info.width, info.height, info.channels));
         }
     }
-    if rgb.len() != byte_len(info.width, info.height, 3)? {
+    let channels = match info.channels {
+        3 | 4 => usize::from(info.channels),
+        other => {
+            return Err(encode_error(
+                path,
+                format!("unsupported animation pixel layout: {other} channels"),
+            ));
+        }
+    };
+    if rgb.len() != byte_len(info.width, info.height, channels)? {
         return Err(encode_error(
             path,
-            "animation frame has the wrong RGB length",
+            "animation frame has the wrong pixel buffer length",
         ));
     }
+    // Wait for a free admission slot before queueing; a failed writer closes
+    // the channel so this send fails instead of deadlocking.
+    slot_tx
+        .send(())
+        .map_err(|_| PipelineError::WorkerPanicked)?;
     *cumulative_us = cumulative_us.saturating_add(info.duration_us);
     let target = if format == VideoContainerFormat::Gif {
         cumulative_us.saturating_add(5_000) / 10_000
@@ -1228,11 +1501,9 @@ fn push_animation_frame(
     };
     let raw_delay = target.saturating_sub(*emitted_delay);
     let delay = raw_delay.clamp(1, max_delay);
-    *emitted_delay = if raw_delay > max_delay {
-        target
-    } else {
-        emitted_delay.saturating_add(delay)
-    };
+    // Even when the requested delay exceeds the container maximum, the next
+    // frame must start after the delay actually written, not the ideal target.
+    *emitted_delay = emitted_delay.saturating_add(delay);
     job_tx
         .send(AnimJob {
             index,
@@ -1274,18 +1545,116 @@ fn write_webp_frame(
         .ok_or_else(|| encode_error(path, "ANMF chunk size overflow"))
 }
 
+struct AnimationWriters<'a> {
+    gif: Option<gif::Encoder<BufWriter<&'a File>>>,
+    webp: Option<BufWriter<&'a File>>,
+    riff_len: u64,
+}
+
+impl AnimationWriters<'_> {
+    fn new() -> Self {
+        Self {
+            gif: None,
+            webp: None,
+            riff_len: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.gif.is_none() && self.webp.is_none()
+    }
+}
+
+fn init_animation_writer<'a>(
+    format: VideoContainerFormat,
+    loop_count: AnimationLoop,
+    file: &'a File,
+    info: AnimFrameInfo,
+    prepared: &PreparedFrame,
+) -> Result<AnimationWriters<'a>, PipelineError> {
+    let path = Path::new("animation-encoder");
+    let width = u16::try_from(info.width).unwrap_or(u16::MAX);
+    let height = u16::try_from(info.height).unwrap_or(u16::MAX);
+    match (format, prepared) {
+        (VideoContainerFormat::Gif, PreparedFrame::Gif(_)) => {
+            let mut encoder = gif::Encoder::new(BufWriter::new(file), width, height, &[])
+                .map_err(|err| encode_error(path, format!("GIF encoder failed: {err}")))?;
+            let repeat = match loop_count {
+                AnimationLoop::Infinite => gif::Repeat::Infinite,
+                AnimationLoop::Times(times) => gif::Repeat::Finite(times.get()),
+            };
+            encoder
+                .set_repeat(repeat)
+                .map_err(|err| encode_error(path, format!("GIF encoder failed: {err}")))?;
+            Ok(AnimationWriters {
+                gif: Some(encoder),
+                webp: None,
+                riff_len: 0,
+            })
+        }
+        (VideoContainerFormat::Webp, PreparedFrame::Webp { inner, .. }) => {
+            let mut out = BufWriter::new(file);
+            write_webp_header(
+                &mut out,
+                width,
+                height,
+                loop_count,
+                inner.windows(4).any(|w| w == b"ALPH"),
+            )?;
+            // 12-byte RIFF/WEBP prefix + 18-byte VP8X + 14-byte ANIM.
+            Ok(AnimationWriters {
+                gif: None,
+                webp: Some(out),
+                riff_len: 44_u64,
+            })
+        }
+        _ => Err(encode_error(path, "animation encoder/format mismatch")),
+    }
+}
+
+fn finish_animation_writer(
+    writers: AnimationWriters<'_>,
+    mut file: &File,
+) -> Result<(), PipelineError> {
+    let path = Path::new("animation-encoder");
+    if let Some(encoder) = writers.gif {
+        let mut buffered = encoder
+            .into_inner()
+            .map_err(|err| encode_error(path, format!("GIF encoder failed: {err}")))?;
+        buffered.flush().map_err(|source| io_error(path, source))?;
+    }
+    if let Some(mut out) = writers.webp {
+        out.flush().map_err(|source| io_error(path, source))?;
+        if writers.riff_len > u64::from(u32::MAX).saturating_add(8) {
+            return Err(encode_error(
+                path,
+                "animated WebP exceeds the 4 GiB RIFF limit",
+            ));
+        }
+        let size = u32::try_from(writers.riff_len.saturating_sub(8))
+            .unwrap_or(u32::MAX)
+            .to_le_bytes();
+        file.seek(SeekFrom::Start(4))
+            .map_err(|source| io_error(path, source))?;
+        file.write_all(&size)
+            .map_err(|source| io_error(path, source))?;
+        file.flush().map_err(|source| io_error(path, source))?;
+    }
+    Ok(())
+}
+
 fn write_animation_frames(
     format: VideoContainerFormat,
-    mut file: &File,
+    loop_count: AnimationLoop,
+    file: &File,
     ready_rx: mpsc::Receiver<(usize, AnimFrameInfo, PreparedFrame)>,
+    slot_rx: mpsc::Receiver<()>,
 ) -> Result<u64, PipelineError> {
     let path = Path::new("animation-encoder");
     let mut pending: HashMap<usize, (AnimFrameInfo, PreparedFrame)> = HashMap::new();
     let mut next = 0_usize;
     let mut written = 0_u64;
-    let mut gif_encoder: Option<gif::Encoder<BufWriter<&File>>> = None;
-    let mut webp_writer: Option<BufWriter<&File>> = None;
-    let mut riff_len = 0_u64;
+    let mut writers = AnimationWriters::new();
 
     for (index, info, frame) in ready_rx {
         pending.insert(index, (info, frame));
@@ -1293,76 +1662,33 @@ fn write_animation_frames(
             if let PreparedFrame::Failed(reason) = &prepared {
                 return Err(encode_error(path, reason.clone()));
             }
-            if gif_encoder.is_none() && webp_writer.is_none() {
-                match (&format, &prepared) {
-                    (VideoContainerFormat::Gif, PreparedFrame::Gif(_)) => {
-                        let mut encoder = gif::Encoder::new(
-                            BufWriter::new(file),
-                            u16::try_from(frame_info.width).unwrap_or(u16::MAX),
-                            u16::try_from(frame_info.height).unwrap_or(u16::MAX),
-                            &[],
-                        )
-                        .map_err(|err| encode_error(path, format!("GIF encoder failed: {err}")))?;
-                        encoder.set_repeat(gif::Repeat::Infinite).map_err(|err| {
-                            encode_error(path, format!("GIF encoder failed: {err}"))
-                        })?;
-                        gif_encoder = Some(encoder);
-                    }
-                    (VideoContainerFormat::Webp, PreparedFrame::Webp { .. }) => {
-                        let mut out = BufWriter::new(file);
-                        write_webp_header(
-                            &mut out,
-                            u16::try_from(frame_info.width).unwrap_or(u16::MAX),
-                            u16::try_from(frame_info.height).unwrap_or(u16::MAX),
-                        )?;
-                        // 12-byte RIFF/WEBP prefix + 18-byte VP8X + 14-byte ANIM.
-                        riff_len = 44_u64;
-                        webp_writer = Some(out);
-                    }
-                    _ => return Err(encode_error(path, "animation encoder/format mismatch")),
-                }
+            if writers.is_empty() {
+                writers = init_animation_writer(format, loop_count, file, frame_info, &prepared)?;
             }
-            match (&mut gif_encoder, &mut webp_writer, prepared) {
+            let mut webp_bytes = 0_u64;
+            match (&mut writers.gif, &mut writers.webp, prepared) {
                 (Some(encoder), _, PreparedFrame::Gif(frame)) => {
                     encoder
                         .write_frame(&frame)
                         .map_err(|err| encode_error(path, format!("GIF encode failed: {err}")))?;
                 }
                 (_, Some(out), PreparedFrame::Webp { inner, delay_ms }) => {
-                    riff_len = riff_len
-                        .saturating_add(write_webp_frame(out, frame_info, &inner, delay_ms)?);
+                    webp_bytes = write_webp_frame(out, frame_info, &inner, delay_ms)?;
                 }
                 (_, _, PreparedFrame::Failed(reason)) => {
                     return Err(encode_error(path, reason));
                 }
                 _ => return Err(encode_error(path, "animation encoder/format mismatch")),
             }
+            writers.riff_len = writers.riff_len.saturating_add(webp_bytes);
             next = next.saturating_add(1);
             written = written.saturating_add(1);
+            // Release the slot only after the frame has been written in order;
+            // receiving alone would let the pending map grow without bound.
+            slot_rx.recv().map_err(|_| PipelineError::WorkerPanicked)?;
         }
     }
-    if let Some(encoder) = gif_encoder {
-        let mut buffered = encoder
-            .into_inner()
-            .map_err(|err| encode_error(path, format!("GIF encoder failed: {err}")))?;
-        buffered.flush().map_err(|source| io_error(path, source))?;
-    }
-    if let Some(mut out) = webp_writer {
-        out.flush().map_err(|source| io_error(path, source))?;
-        if riff_len > u64::from(u32::MAX).saturating_add(8) {
-            return Err(encode_error(
-                path,
-                "animated WebP exceeds the 4 GiB RIFF limit",
-            ));
-        }
-        let payload = riff_len.saturating_sub(8);
-        let size = u32::try_from(payload).unwrap_or(u32::MAX).to_le_bytes();
-        file.seek(SeekFrom::Start(4))
-            .map_err(|source| io_error(path, source))?;
-        file.write_all(&size)
-            .map_err(|source| io_error(path, source))?;
-        file.flush().map_err(|source| io_error(path, source))?;
-    }
+    finish_animation_writer(writers, file)?;
     if !pending.is_empty() {
         return Err(encode_error(
             path,
@@ -1372,12 +1698,14 @@ fn write_animation_frames(
     if written == 0 {
         return Err(encode_error(path, "animation source produced no frames"));
     }
+    drop(slot_rx);
     Ok(written)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn info(w: u32, h: u32) -> AnimFrameInfo {
         AnimFrameInfo {
@@ -1385,6 +1713,7 @@ mod tests {
             height: h,
             pts_us: 0,
             duration_us: 100_000,
+            channels: 3,
         }
     }
 
@@ -1450,7 +1779,7 @@ mod tests {
         let mut buf = vec![0xAA_u8; 2 * 6 + 4];
         write_nv12(&rgb, 2, 2, &mut buf, 4)?;
         assert_eq!(buf[2], 0xAA, "row padding untouched");
-        let decoded = nv12_to_rgb8(&buf, 4, 2, 2)?;
+        let decoded = nv12_to_rgb8(&buf, 4, 2, 2, YuvColor::default())?;
         assert_eq!(decoded.len(), 12);
         for (got, want) in decoded.iter().zip(&rgb) {
             assert!(got.abs_diff(*want) <= 4, "NV12 roundtrip drift");
@@ -1512,14 +1841,20 @@ mod tests {
         let path = dir.join("anim.webp");
         let quality = VideoQuality::new(80).map_err(|_| encode_error(&path, "quality"))?;
         let file = File::create(&path).map_err(|source| io_error(&path, source))?;
-        let written =
-            encode_animation_stream(VideoContainerFormat::Webp, quality, 2, &file, |sink| {
+        let written = encode_animation_stream(
+            VideoContainerFormat::Webp,
+            quality,
+            2,
+            AnimationLoop::Infinite,
+            &file,
+            |sink| {
                 for i in 0..3_u32 {
                     let rgb = vec![u8::try_from(i * 40).unwrap_or(0); 3_usize * 5 * 5];
                     sink(info(5, 5), &rgb)?;
                 }
                 Ok(())
-            })?;
+            },
+        )?;
         assert_eq!(written, 3);
         drop(file);
 
@@ -1555,21 +1890,28 @@ mod tests {
         let ms = 5_000_000_u32.to_le_bytes();
         let w = 4_u32.to_le_bytes();
         let h = 4_u32.to_le_bytes();
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"RIFF");
-        bytes.extend_from_slice(&60_u32.to_le_bytes());
-        bytes.extend_from_slice(b"WEBP");
-        bytes.extend_from_slice(b"VP8X");
-        bytes.extend_from_slice(&10_u32.to_le_bytes());
-        bytes.extend_from_slice(&[0x02, 0, 0, 0, w[0], w[1], w[2], h[0], h[1], h[2]]);
-        bytes.extend_from_slice(b"ANIM");
-        bytes.extend_from_slice(&6_u32.to_le_bytes());
-        bytes.extend_from_slice(&[0; 6]);
-        bytes.extend_from_slice(b"ANMF");
-        bytes.extend_from_slice(&16_u32.to_le_bytes());
-        bytes.extend_from_slice(&[0; 12]);
-        bytes.extend_from_slice(&ms[..3]);
-        bytes.push(0x02);
+        let mut frame = vec![0_u8; 12];
+        frame.extend_from_slice(&ms[..3]);
+        frame.push(0x02);
+        let mut bitstream = vec![0x2F];
+        bitstream.extend_from_slice(&3_u32.to_le_bytes());
+        frame.extend_from_slice(b"VP8L");
+        frame.extend_from_slice(&5_u32.to_le_bytes());
+        frame.extend_from_slice(&bitstream);
+        frame.push(0); // RIFF pad for the odd-sized nested chunk
+        let mut body = b"WEBP".to_vec();
+        body.extend_from_slice(b"VP8X");
+        body.extend_from_slice(&10_u32.to_le_bytes());
+        body.extend_from_slice(&[0x02, 0, 0, 0, w[0], w[1], w[2], h[0], h[1], h[2]]);
+        body.extend_from_slice(b"ANIM");
+        body.extend_from_slice(&6_u32.to_le_bytes());
+        body.extend_from_slice(&[0; 6]);
+        body.extend_from_slice(b"ANMF");
+        body.extend_from_slice(&u32::try_from(frame.len()).unwrap_or(0).to_le_bytes());
+        body.extend_from_slice(&frame);
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&u32::try_from(body.len()).unwrap_or(0).to_le_bytes());
+        bytes.extend_from_slice(&body);
         fs::write(&path, &bytes).map_err(|source| io_error(&path, source))?;
 
         let media = demux_webp_metadata(&path)?;
@@ -1586,11 +1928,18 @@ mod tests {
         let path = dir.join("odd.webp");
         let quality = VideoQuality::new(80).map_err(|_| encode_error(&path, "quality"))?;
         let file = File::create(&path).map_err(|source| io_error(&path, source))?;
-        encode_animation_stream(VideoContainerFormat::Webp, quality, 1, &file, |sink| {
-            let rgb = vec![128_u8; 3_usize * 7 * 3];
-            sink(info(7, 3), &rgb)?;
-            Ok(())
-        })?;
+        encode_animation_stream(
+            VideoContainerFormat::Webp,
+            quality,
+            1,
+            AnimationLoop::Infinite,
+            &file,
+            |sink| {
+                let rgb = vec![128_u8; 3_usize * 7 * 3];
+                sink(info(7, 3), &rgb)?;
+                Ok(())
+            },
+        )?;
         drop(file);
         let mut decoded = Vec::new();
         decode_webp_frames_streaming_rgb(&path, |frame, rgb| {
@@ -1611,5 +1960,322 @@ mod tests {
         assert_eq!(gif_speed(q(80)), 10);
         assert_eq!(gif_speed(q(0)), 30);
         assert!((1..=30).contains(&gif_speed(q(50))));
+    }
+
+    #[test]
+    fn nv12_uses_signalled_source_color_matrix() -> Result<(), PipelineError> {
+        // A mid-tone colour encoded with BT.709 limited-range coefficients.
+        let nv12 = [117_u8, 117, 117, 117, 96, 178, 96, 178];
+        let bt709 = nv12_to_rgb8(
+            &nv12,
+            2,
+            2,
+            2,
+            YuvColor::specified(YuvMatrix::Bt709, YuvRange::Limited),
+        )?;
+        let bt601 = nv12_to_rgb8(&nv12, 2, 2, 2, YuvColor::default())?;
+        assert!(bt709[0].abs_diff(208) <= 3, "BT.709 red: {}", bt709[0]);
+        assert!(
+            i32::from(bt709[0]) - i32::from(bt601[0]) >= 8,
+            "source matrix must change the decoded colour: {bt601:?} vs {bt709:?}"
+        );
+        let full = nv12_to_rgb8(
+            &nv12,
+            2,
+            2,
+            2,
+            YuvColor::specified(YuvMatrix::Bt709, YuvRange::Full),
+        )?;
+        assert_ne!(full, bt709, "range must be honoured as well as matrix");
+        Ok(())
+    }
+
+    fn temp_anim_dir(label: &str) -> Result<std::path::PathBuf, PipelineError> {
+        let dir =
+            std::env::temp_dir().join(format!("fastconv-anim-{label}-{}", std::process::id()));
+        fs::create_dir_all(&dir).map_err(|source| io_error(&dir, source))?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn animation_alpha_survives_gif_and_webp_roundtrip() -> Result<(), PipelineError> {
+        let dir = temp_anim_dir("alpha")?;
+        let quality = VideoQuality::new(90).map_err(|_| encode_error(&dir, "quality"))?;
+        let mut rgba = vec![255_u8; 4 * 2 * 2];
+        rgba[0..4].copy_from_slice(&[0, 0, 0, 0]); // transparent top-left
+        rgba[4..8].copy_from_slice(&[220, 24, 24, 255]);
+        rgba[8..12].copy_from_slice(&[24, 220, 24, 255]);
+        rgba[12..16].copy_from_slice(&[24, 24, 220, 255]);
+        let mut info = info(2, 2);
+        info.channels = 4;
+
+        for format in [VideoContainerFormat::Gif, VideoContainerFormat::Webp] {
+            let path = dir.join(format!("alpha.{}", format.extension()));
+            let file = File::create(&path).map_err(|source| io_error(&path, source))?;
+            encode_animation_stream(format, quality, 1, AnimationLoop::Infinite, &file, |sink| {
+                sink(info, &rgba)?;
+                Ok(())
+            })?;
+            drop(file);
+            let mut decoded = Vec::new();
+            let decode = |frame: AnimFrameInfo, pixels: &[u8]| {
+                decoded.push((frame.channels, pixels.to_vec()));
+                Ok(())
+            };
+            if format == VideoContainerFormat::Gif {
+                decode_gif_frames_streaming_pixels(&path, decode)?;
+            } else {
+                decode_webp_frames_streaming_pixels(&path, decode)?;
+            }
+            assert_eq!(decoded.len(), 1);
+            let (channels, pixels) = &decoded[0];
+            assert_eq!(*channels, 4, "alpha must not be flattened");
+            assert_eq!(pixels.len(), 4 * 2 * 2);
+            assert_eq!(pixels[3], 0, "{format} transparent pixel");
+            assert_eq!(pixels[15], 255, "{format} opaque pixel");
+        }
+        fs::remove_dir_all(&dir).map_err(|source| io_error(&dir, source))?;
+        Ok(())
+    }
+
+    #[test]
+    fn gif_canvas_is_bounded_before_allocation() -> Result<(), PipelineError> {
+        let dir = temp_anim_dir("huge-gif")?;
+        let path = dir.join("huge.gif");
+        let mut bytes = b"GIF89a".to_vec();
+        bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+        bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+        bytes.extend_from_slice(&[0x80, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF]);
+        bytes.extend_from_slice(&[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 1, 0, 0]);
+        bytes.push(0x3B);
+        fs::write(&path, &bytes).map_err(|source| io_error(&path, source))?;
+        assert!(matches!(
+            decode_gif_frames_streaming_rgb(&path, |_, _| Ok(())),
+            Err(PipelineError::DecodeFailed { .. })
+        ));
+        fs::remove_dir_all(&dir).map_err(|source| io_error(&dir, source))?;
+        Ok(())
+    }
+
+    #[test]
+    fn webp_read_is_bounded_by_one_handle() -> Result<(), PipelineError> {
+        let dir = temp_anim_dir("bounded-read")?;
+        let path = dir.join("small.webp");
+        let quality = VideoQuality::new(80).map_err(|_| encode_error(&path, "quality"))?;
+        let file = File::create(&path).map_err(|source| io_error(&path, source))?;
+        encode_animation_stream(
+            VideoContainerFormat::Webp,
+            quality,
+            1,
+            AnimationLoop::Infinite,
+            &file,
+            |sink| {
+                sink(info(2, 2), &[128_u8; 12])?;
+                Ok(())
+            },
+        )?;
+        drop(file);
+        assert!(read_bounded_animation_file(&path, 4).is_err());
+        assert_ne!(read_bounded_animation_file(&path, 1_000_000)?, Vec::new());
+        fs::remove_dir_all(&dir).map_err(|source| io_error(&dir, source))?;
+        Ok(())
+    }
+
+    #[test]
+    fn finite_loop_count_reaches_both_animation_headers() -> Result<(), PipelineError> {
+        let dir = temp_anim_dir("loop")?;
+        let quality = VideoQuality::new(80).map_err(|_| encode_error(&dir, "quality"))?;
+        let times = std::num::NonZeroU16::new(3).unwrap_or(std::num::NonZeroU16::MIN);
+        let webp = dir.join("loop.webp");
+        let file = File::create(&webp).map_err(|source| io_error(&webp, source))?;
+        encode_animation_stream(
+            VideoContainerFormat::Webp,
+            quality,
+            1,
+            AnimationLoop::Times(times),
+            &file,
+            |sink| {
+                sink(info(2, 2), &[90_u8; 12])?;
+                Ok(())
+            },
+        )?;
+        drop(file);
+        let bytes = fs::read(&webp).map_err(|source| io_error(&webp, source))?;
+        let decoder = zenwebp::WebPDecoder::new(&bytes)
+            .map_err(|err| decode_error(&webp, format!("{err}")))?;
+        assert_eq!(decoder.loop_count(), zenwebp::LoopCount::Times(times));
+
+        let gif = dir.join("loop.gif");
+        let file = File::create(&gif).map_err(|source| io_error(&gif, source))?;
+        encode_animation_stream(
+            VideoContainerFormat::Gif,
+            quality,
+            1,
+            AnimationLoop::Times(times),
+            &file,
+            |sink| {
+                sink(info(2, 2), &[90_u8; 12])?;
+                Ok(())
+            },
+        )?;
+        drop(file);
+        let bytes = fs::read(&gif).map_err(|source| io_error(&gif, source))?;
+        assert!(
+            bytes.windows(11).any(|w| w == b"NETSCAPE2.0"),
+            "GIF must carry a Netscape loop extension"
+        );
+        assert!(
+            bytes.windows(2).any(|w| w == [3, 0]),
+            "GIF loop count must be finite"
+        );
+        fs::remove_dir_all(&dir).map_err(|source| io_error(&dir, source))?;
+        Ok(())
+    }
+
+    #[test]
+    fn capped_gif_delay_advances_only_by_written_delay() -> Result<(), PipelineError> {
+        let (job_tx, job_rx) = mpsc::sync_channel::<AnimJob>(4);
+        let (slot_tx, _slot_rx) = mpsc::sync_channel::<()>(4);
+        let mut cumulative = 0_u64;
+        let mut emitted = 0_u64;
+        let mut dims = None;
+        push_animation_frame(
+            VideoContainerFormat::Gif,
+            AnimFrameInfo { ..info(2, 2) },
+            &[128_u8; 12],
+            &mut cumulative,
+            &mut emitted,
+            &mut dims,
+            0,
+            &job_tx,
+            &slot_tx,
+        )?;
+        let mut long = info(2, 2);
+        long.duration_us = 700_000_000; // 700 s exceeds GIF's 65535 cs limit
+        push_animation_frame(
+            VideoContainerFormat::Gif,
+            long,
+            &[128_u8; 12],
+            &mut cumulative,
+            &mut emitted,
+            &mut dims,
+            1,
+            &job_tx,
+            &slot_tx,
+        )?;
+        let first = job_rx.recv().map_err(|_| PipelineError::WorkerPanicked)?;
+        assert_eq!(first.delay, 10);
+        let second = job_rx.recv().map_err(|_| PipelineError::WorkerPanicked)?;
+        assert_eq!(second.delay, u32::from(u16::MAX));
+        push_animation_frame(
+            VideoContainerFormat::Gif,
+            info(2, 2),
+            &[128_u8; 12],
+            &mut cumulative,
+            &mut emitted,
+            &mut dims,
+            2,
+            &job_tx,
+            &slot_tx,
+        )?;
+        let third = job_rx.recv().map_err(|_| PipelineError::WorkerPanicked)?;
+        assert!(
+            third.delay > 1_000,
+            "the next frame must wait for the real 65535 cs hold, got {}",
+            third.delay
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admission_slots_release_after_ordered_writes() -> Result<(), PipelineError> {
+        let dir = temp_anim_dir("slot-release")?;
+        let path = dir.join("slots.gif");
+        let file = File::create(&path).map_err(|source| io_error(&path, source))?;
+        let (ready_tx, ready_rx) = mpsc::sync_channel(8);
+        let (slot_tx, slot_rx) = mpsc::sync_channel::<()>(2);
+        // Two tokens for four frames: receiving frames must not free slots.
+        slot_tx
+            .send(())
+            .map_err(|_| PipelineError::WorkerPanicked)?;
+        slot_tx
+            .send(())
+            .map_err(|_| PipelineError::WorkerPanicked)?;
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let result = write_animation_frames(
+                VideoContainerFormat::Gif,
+                AnimationLoop::Infinite,
+                &file,
+                ready_rx,
+                slot_rx,
+            );
+            done_tx.send(result).ok();
+        });
+        let frame = || PreparedFrame::Gif(gif::Frame::from_rgb_speed(2, 2, &[0_u8; 12], 1));
+        for index in [2_usize, 3, 0, 1] {
+            ready_tx
+                .send((index, info(2, 2), frame()))
+                .map_err(|_| PipelineError::WorkerPanicked)?;
+        }
+        drop(ready_tx);
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "writer must block once the admission window is exhausted"
+        );
+        slot_tx
+            .send(())
+            .map_err(|_| PipelineError::WorkerPanicked)?;
+        slot_tx
+            .send(())
+            .map_err(|_| PipelineError::WorkerPanicked)?;
+        let written = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| encode_error(&path, "writer stayed blocked after slot release"))?
+            .map_err(|err| encode_error(&path, format!("writer failed: {err}")))?;
+        assert_eq!(written, 4);
+        handle.join().map_err(|_| PipelineError::WorkerPanicked)?;
+        drop(slot_tx);
+        fs::remove_dir_all(&dir).map_err(|source| io_error(&dir, source))?;
+        Ok(())
+    }
+
+    #[test]
+    fn writer_failure_closes_admission_window() -> Result<(), PipelineError> {
+        let dir = temp_anim_dir("writer-failure")?;
+        let path = dir.join("readonly.webp");
+        fs::write(&path, b"seed").map_err(|source| io_error(&path, source))?;
+        let quality = VideoQuality::new(80).map_err(|_| encode_error(&path, "quality"))?;
+        // A read-only handle cannot receive frames; the writer exits and must
+        // wake the producer instead of leaving it blocked on a full window.
+        let file = File::open(&path).map_err(|source| io_error(&path, source))?;
+        let (result_tx, result_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let result = encode_animation_stream(
+                VideoContainerFormat::Webp,
+                quality,
+                1,
+                AnimationLoop::Infinite,
+                &file,
+                |sink| {
+                    for index in 0..64_u32 {
+                        let mut frame = info(2, 2);
+                        frame.pts_us = i64::from(index) * 100_000;
+                        sink(frame, &[128_u8; 12])?;
+                    }
+                    Ok(())
+                },
+            );
+            result_tx.send(result.is_err()).ok();
+        });
+        let failed = result_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .map_err(|_| encode_error(&path, "producer was not woken by writer failure"))?;
+        handle.join().map_err(|_| PipelineError::WorkerPanicked)?;
+        assert!(failed, "a read-only output must fail the encode");
+        fs::remove_dir_all(&dir).map_err(|source| io_error(&dir, source))?;
+        Ok(())
     }
 }

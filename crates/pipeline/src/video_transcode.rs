@@ -16,7 +16,7 @@ use std::thread;
 use std::time::Instant;
 
 use fastconv_domain::{
-    AudioTrackAction, GpuBackend, HardwareBackend, TargetAudioCodec, VideoCodec,
+    AnimationMeta, AudioTrackAction, GpuBackend, HardwareBackend, TargetAudioCodec, VideoCodec,
     VideoContainerFormat, VideoEncodeMode, VideoTrackAction, VideoTranscodeItem,
     VideoTranscodePlan, VideoTranscodeReport,
 };
@@ -37,7 +37,8 @@ use crate::video_codecs::{
     nv12_buffer_len,
 };
 use crate::video_container::{
-    ContainerPacket, ContainerTrack, US_TIMESCALE, demux_video, mux_video, rescale_ticks,
+    ContainerPacket, ContainerTrack, TrackPresentation, US_TIMESCALE, demux_video, mux_video,
+    rescale_ticks,
 };
 
 const AAC_BITRATE_BPS: u32 = 128_000;
@@ -1713,6 +1714,24 @@ fn drain_audio_nonblocking(
     Ok(())
 }
 
+/// Drops frames outside a source edit interval and rebases retained timestamps
+/// to the interval start, matching the visible timeline of the source.
+fn apply_presentation_edit(edit: Option<TrackPresentation>, packets: &mut Vec<ContainerPacket>) {
+    let Some(edit) = edit else {
+        return;
+    };
+    let end_us = edit.duration_us.map(|duration| {
+        edit.start_us
+            .saturating_add(i64::try_from(duration).unwrap_or(i64::MAX))
+    });
+    packets
+        .retain(|packet| packet.pts >= edit.start_us && end_us.is_none_or(|end| packet.pts < end));
+    for packet in packets {
+        packet.pts = packet.pts.saturating_sub(edit.start_us);
+        packet.dts = packet.dts.saturating_sub(edit.start_us);
+    }
+}
+
 /// Encodes an animation container directly from decoded frames: audio is
 /// dropped and the video frames bypass 4:2:0 entirely for animation sources.
 fn transcode_to_animation(
@@ -1753,19 +1772,30 @@ fn transcode_to_animation(
         .cloned()
         .collect();
     packets.sort_by_key(|packet| (packet.dts, packet.pts));
+    apply_presentation_edit(track.presentation_edit, &mut packets);
+
+    // Loop count and alpha support were validated at the probe boundary;
+    // plain video sources keep infinite playback and opaque pixels.
+    let animation: AnimationMeta = item
+        .streams()
+        .iter()
+        .find_map(fastconv_domain::VideoStreamInfo::animation)
+        .unwrap_or_default();
+    let loop_count = animation.loop_count();
 
     let staging = StagingTarget::new(target, tag)?;
     let written = video_anim::encode_animation_stream(
         format,
         quality,
         frame_workers,
+        loop_count,
         staging.file()?,
         |sink| match item.input_format() {
             VideoContainerFormat::Gif => {
-                video_anim::decode_gif_frames_streaming_rgb(source, |info, rgb| sink(info, rgb))
+                video_anim::decode_gif_frames_streaming_pixels(source, |info, rgb| sink(info, rgb))
             }
             VideoContainerFormat::Webp => {
-                video_anim::decode_webp_frames_streaming_rgb(source, |info, rgb| sink(info, rgb))
+                video_anim::decode_webp_frames_streaming_pixels(source, |info, rgb| sink(info, rgb))
             }
             _ => decode_video_track_streaming(source, track, &packets, |info, pack| {
                 let pitch = usize::try_from(info.width)
@@ -1773,13 +1803,15 @@ fn transcode_to_animation(
                 let length = nv12_buffer_len(info.width, info.height, pitch)?;
                 let mut nv12 = vec![0_u8; length];
                 pack(&mut nv12, pitch)?;
-                let rgb = video_anim::nv12_to_rgb8(&nv12, pitch, info.width, info.height)?;
+                let rgb =
+                    video_anim::nv12_to_rgb8(&nv12, pitch, info.width, info.height, info.color)?;
                 sink(
                     AnimFrameInfo {
                         width: info.width,
                         height: info.height,
                         pts_us: info.pts_us,
                         duration_us: info.duration_us,
+                        channels: 3,
                     },
                     &rgb,
                 )
@@ -2363,7 +2395,7 @@ mod tests {
     use super::*;
     use crate::video_codecs::Yuv420Frame;
     use crate::video_container::{ContainerMedia, mux_video};
-    use fastconv_domain::{VideoContainerFormat, VideoStreamKind};
+    use fastconv_domain::{AnimationLoop, VideoContainerFormat, VideoStreamKind};
     use std::num::NonZeroUsize;
     use std::process::{Command, ExitStatus, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3663,28 +3695,36 @@ mod tests {
             path: path.to_path_buf(),
             source,
         })?;
-        crate::video_anim::encode_animation_stream(format, quality, 2, &file, |sink| {
-            for index in 0..count {
-                let color: [u8; 3] = match index % 3 {
-                    0 => [220, 24, 24],
-                    1 => [24, 220, 24],
-                    _ => [24, 24, 220],
-                };
-                let rgb = color.repeat(
-                    usize::try_from(width).unwrap_or(0) * usize::try_from(height).unwrap_or(0),
-                );
-                sink(
-                    AnimFrameInfo {
-                        width,
-                        height,
-                        pts_us: i64::from(index).saturating_mul(100_000),
-                        duration_us: 100_000,
-                    },
-                    &rgb,
-                )?;
-            }
-            Ok(())
-        })?;
+        crate::video_anim::encode_animation_stream(
+            format,
+            quality,
+            2,
+            AnimationLoop::Infinite,
+            &file,
+            |sink| {
+                for index in 0..count {
+                    let color: [u8; 3] = match index % 3 {
+                        0 => [220, 24, 24],
+                        1 => [24, 220, 24],
+                        _ => [24, 24, 220],
+                    };
+                    let rgb = color.repeat(
+                        usize::try_from(width).unwrap_or(0) * usize::try_from(height).unwrap_or(0),
+                    );
+                    sink(
+                        AnimFrameInfo {
+                            width,
+                            height,
+                            pts_us: i64::from(index).saturating_mul(100_000),
+                            duration_us: 100_000,
+                            channels: 3,
+                        },
+                        &rgb,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
         drop(file);
         Ok(())
     }
@@ -3957,5 +3997,76 @@ mod tests {
             source,
         })?;
         Ok(())
+    }
+
+    #[test]
+    fn presentation_edit_filters_and_rebases_animation_frames() {
+        let packet = |pts: i64| ContainerPacket {
+            track: 0,
+            pts,
+            dts: pts,
+            duration: 40_000,
+            keyframe: true,
+            data: Vec::new(),
+        };
+        let mut packets = vec![packet(0), packet(40_000), packet(80_000), packet(120_000)];
+        apply_presentation_edit(
+            Some(TrackPresentation {
+                start_us: 40_000,
+                duration_us: Some(80_000),
+            }),
+            &mut packets,
+        );
+        assert_eq!(
+            packets.iter().map(|p| p.pts).collect::<Vec<_>>(),
+            [0, 40_000],
+            "frames outside the visible interval must be dropped and rebased"
+        );
+        assert_eq!(packets[0].dts, 0);
+        assert_eq!(packets[1].dts, 40_000);
+
+        let mut open_ended = vec![packet(0), packet(40_000)];
+        apply_presentation_edit(
+            Some(TrackPresentation {
+                start_us: 40_000,
+                duration_us: None,
+            }),
+            &mut open_ended,
+        );
+        assert_eq!(open_ended.len(), 1);
+        assert_eq!(open_ended[0].pts, 0);
+    }
+
+    #[test]
+    fn presentation_edit_reaches_animation_transcode() {
+        // The edit list filter is shared by all animation conversions; a
+        // truncated interval must leave fewer frames than the source track.
+        let mut packets = vec![
+            ContainerPacket {
+                track: 0,
+                pts: 0,
+                dts: 0,
+                duration: 100_000,
+                keyframe: true,
+                data: Vec::new(),
+            },
+            ContainerPacket {
+                track: 0,
+                pts: 100_000,
+                dts: 100_000,
+                duration: 100_000,
+                keyframe: true,
+                data: Vec::new(),
+            },
+        ];
+        apply_presentation_edit(
+            Some(TrackPresentation {
+                start_us: 100_000,
+                duration_us: None,
+            }),
+            &mut packets,
+        );
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].pts, 0);
     }
 }

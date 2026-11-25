@@ -18,10 +18,10 @@ pub use image::{
 };
 pub use metrics::{BenchmarkMetrics, BenchmarkSample, PeakMemory, Throughput, WorkloadUnit};
 pub use video::{
-    AudioTrackAction, TargetAudioCodec, TargetVideoCodec, VideoCodec, VideoContainerFormat,
-    VideoEncodeMode, VideoQuality, VideoRemuxItem, VideoRemuxPlan, VideoRemuxReport,
-    VideoStreamInfo, VideoStreamKind, VideoTrackAction, VideoTranscodeItem, VideoTranscodePlan,
-    VideoTranscodeReport,
+    AnimationLoop, AnimationMeta, AudioTrackAction, TargetAudioCodec, TargetVideoCodec, VideoCodec,
+    VideoContainerFormat, VideoEncodeMode, VideoQuality, VideoRemuxItem, VideoRemuxPlan,
+    VideoRemuxReport, VideoStreamInfo, VideoStreamKind, VideoTrackAction, VideoTranscodeItem,
+    VideoTranscodePlan, VideoTranscodeReport,
 };
 
 use std::error::Error;

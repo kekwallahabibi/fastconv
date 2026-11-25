@@ -546,6 +546,43 @@ impl fmt::Display for VideoStreamKind {
     }
 }
 
+/// Playback loop count signalled by an animation source. `Times(1)` plays once;
+/// there is deliberately no `Times(0)` (that bit pattern means "forever").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum AnimationLoop {
+    #[default]
+    Infinite,
+    Times(NonZeroU16),
+}
+
+/// Animation facts validated once at the probe boundary and carried unchanged
+/// into execution, so the pipeline never re-parses container metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct AnimationMeta {
+    loop_count: AnimationLoop,
+    has_alpha: bool,
+}
+
+impl AnimationMeta {
+    #[must_use]
+    pub const fn new(loop_count: AnimationLoop, has_alpha: bool) -> Self {
+        Self {
+            loop_count,
+            has_alpha,
+        }
+    }
+
+    #[must_use]
+    pub const fn loop_count(self) -> AnimationLoop {
+        self.loop_count
+    }
+
+    #[must_use]
+    pub const fn has_alpha(self) -> bool {
+        self.has_alpha
+    }
+}
+
 /// Probed stream metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VideoStreamInfo {
@@ -559,6 +596,7 @@ pub struct VideoStreamInfo {
     timebase_den: u32,
     duration: Option<u64>,
     language: Option<String>,
+    animation: Option<AnimationMeta>,
 }
 
 impl VideoStreamInfo {
@@ -588,7 +626,20 @@ impl VideoStreamInfo {
             timebase_den,
             duration,
             language,
+            animation: None,
         }
+    }
+
+    /// Attaches animation metadata validated by the probe boundary.
+    #[must_use]
+    pub const fn with_animation(mut self, animation: AnimationMeta) -> Self {
+        self.animation = Some(animation);
+        self
+    }
+
+    #[must_use]
+    pub const fn animation(&self) -> Option<AnimationMeta> {
+        self.animation
     }
 
     #[must_use]
@@ -1417,6 +1468,25 @@ mod tests {
             Some(TargetAudioCodec::Opus)
         );
         assert_eq!(AudioTrackAction::Drop.to_string(), "drop");
+    }
+
+    #[test]
+    fn animation_meta_carries_validated_playback_facts() {
+        let times = NonZeroU16::new(3).unwrap_or(NonZeroU16::MIN);
+        let meta = AnimationMeta::new(AnimationLoop::Times(times), true);
+        assert_eq!(meta.loop_count(), AnimationLoop::Times(times));
+        assert!(meta.has_alpha());
+        assert_eq!(
+            AnimationMeta::default().loop_count(),
+            AnimationLoop::Infinite
+        );
+        assert!(!AnimationMeta::default().has_alpha());
+        let with_meta = stream(VideoCodec::Webp, VideoStreamKind::Video).with_animation(meta);
+        assert_eq!(with_meta.animation(), Some(meta));
+        assert_eq!(
+            stream(VideoCodec::Webp, VideoStreamKind::Video).animation(),
+            None
+        );
     }
 
     #[test]
