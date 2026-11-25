@@ -459,6 +459,18 @@ fn vp9_frame(
     })
 }
 
+/// Emits buffered H.264 frames in presentation order. `rusty_h264` decodes in
+/// bitstream (decode) order, so B-frames must be held until a newer keyframe or
+/// EOF proves no earlier presentation time can still arrive.
+fn flush_h264_reorder_vec(reorder: &mut Vec<Yuv420Frame>, frames: &mut Vec<Yuv420Frame>) {
+    reorder.sort_by_key(|frame| frame.pts_us);
+    frames.append(reorder);
+}
+
+fn has_b_frame_reordering(ordered: &[&ContainerPacket]) -> bool {
+    ordered.windows(2).any(|pair| pair[1].pts < pair[0].pts)
+}
+
 /// Decodes one canonical video track into display-ordered 8-bit YUV 4:2:0
 /// frames. Every failure is explicit; unsupported codecs are rejected.
 // One branch per codec keeps decode-order and timestamp handling explicit.
@@ -473,15 +485,37 @@ pub(crate) fn decode_video_track(
         VideoCodec::H264 => {
             let mut decoder = H264Decoder::new();
             let mut frames = Vec::with_capacity(ordered.len());
+            let needs_reorder = has_b_frame_reordering(&ordered);
+            let mut reorder: Vec<Yuv420Frame> =
+                Vec::with_capacity(if needs_reorder { 16 } else { 0 });
             for packet in ordered {
+                if needs_reorder && packet.keyframe {
+                    flush_h264_reorder_vec(&mut reorder, &mut frames);
+                }
                 let annex_b = avcc_to_annex_b(&track.config, &packet.data, true)
                     .map_err(|reason| decode_error(path, reason))?;
                 let frame = decoder
                     .decode(&annex_b)
                     .map_err(|err| decode_error(path, format!("H.264 decode failed: {err}")))?;
                 if let Some(frame) = frame {
-                    frames.push(h264_frame(frame, packet.pts, packet.duration));
+                    let yuv = h264_frame(frame, packet.pts, packet.duration);
+                    if needs_reorder {
+                        reorder.push(yuv);
+                        if reorder.len() > 16 {
+                            let earliest = reorder
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, frame)| frame.pts_us)
+                                .map_or(0, |(index, _)| index);
+                            frames.push(reorder.remove(earliest));
+                        }
+                    } else {
+                        frames.push(yuv);
+                    }
                 }
+            }
+            if needs_reorder {
+                flush_h264_reorder_vec(&mut reorder, &mut frames);
             }
             Ok(frames)
         }
@@ -608,16 +642,19 @@ mod streaming {
     use super::{
         Av1Decoder, Av1Planes, ContainerPacket, ContainerTrack, DecodedFrameInfo, H264Decoder,
         H264YuvFrame, HevcDecoder, Path, PipelineError, PixelLayout, VideoCodec, Vp9DecodedFrame,
-        Vp9Decoder, Vp9Error, avcc_to_annex_b, decode_error, decode_order, hevc_picture_duration,
-        hevc_picture_pts, hevc_pts_to_packet, hvcc_to_annex_b, median_duration,
+        Vp9Decoder, Vp9Error, avcc_to_annex_b, decode_error, decode_order, has_b_frame_reordering,
+        hevc_picture_duration, hevc_picture_pts, hevc_pts_to_packet, hvcc_to_annex_b,
+        median_duration,
     };
 
-    /// Estimates the frame rate implied by the median packet duration.
+    /// Estimates the frame rate implied by the median packet duration, rounded
+    /// to the nearest integer so 16,666 µs and 16,667 µs both resolve to 60 fps.
     ///
     /// Kept as a pure helper so the streaming GPU path and CPU path share one
     /// definition of "fps" derived from container timing.
     pub(crate) fn estimate_video_fps_from_packets(packets: &[ContainerPacket]) -> u32 {
-        let fps = 1_000_000_u64 / median_duration(packets).max(1);
+        let duration = median_duration(packets).max(1);
+        let fps = 1_000_000_u64.saturating_add(duration / 2) / duration;
         u32::try_from(fps.clamp(1, 240)).unwrap_or(30)
     }
 
@@ -1208,6 +1245,24 @@ mod streaming {
         emit_nv12_frame(path, on_frame, info, write_y, write_uv)
     }
 
+    fn flush_stream_h264_reorder<F>(
+        path: &Path,
+        reorder: &mut Vec<(H264YuvFrame, i64, u64)>,
+        on_frame: &mut F,
+    ) -> Result<(), PipelineError>
+    where
+        F: FnMut(
+            DecodedFrameInfo,
+            &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        ) -> Result<(), PipelineError>,
+    {
+        reorder.sort_by_key(|(_, pts, _)| *pts);
+        for (frame, pts, duration) in reorder.drain(..) {
+            emit_h264_frame(path, &frame, pts, duration, on_frame)?;
+        }
+        Ok(())
+    }
+
     fn stream_h264(
         path: &Path,
         track: &ContainerTrack,
@@ -1218,15 +1273,37 @@ mod streaming {
         ) -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError> {
         let mut decoder = H264Decoder::new();
+        let needs_reorder = has_b_frame_reordering(ordered);
+        let mut reorder: Vec<(H264YuvFrame, i64, u64)> =
+            Vec::with_capacity(if needs_reorder { 16 } else { 0 });
         for packet in ordered {
+            if needs_reorder && packet.keyframe {
+                flush_stream_h264_reorder(path, &mut reorder, on_frame)?;
+            }
             let annex_b = avcc_to_annex_b(&track.config, &packet.data, true)
                 .map_err(|reason| decode_error(path, reason))?;
             let frame = decoder
                 .decode(&annex_b)
                 .map_err(|err| decode_error(path, format!("H.264 decode failed: {err}")))?;
             if let Some(frame) = frame {
-                emit_h264_frame(path, &frame, packet.pts, packet.duration, on_frame)?;
+                if needs_reorder {
+                    reorder.push((frame, packet.pts, packet.duration));
+                    if reorder.len() > 16 {
+                        let earliest = reorder
+                            .iter()
+                            .enumerate()
+                            .min_by_key(|(_, (_, pts, _))| *pts)
+                            .map_or(0, |(index, _)| index);
+                        let (frame, pts, duration) = reorder.remove(earliest);
+                        emit_h264_frame(path, &frame, pts, duration, on_frame)?;
+                    }
+                } else {
+                    emit_h264_frame(path, &frame, packet.pts, packet.duration, on_frame)?;
+                }
             }
+        }
+        if needs_reorder {
+            flush_stream_h264_reorder(path, &mut reorder, on_frame)?;
         }
         Ok(())
     }
@@ -2042,6 +2119,43 @@ mod tests {
     }
 
     #[cfg(feature = "nvenc")]
+    fn assert_nvenc_quality_scales_bitrate(
+        path: &Path,
+        source: &EncodedVideoStream,
+        codec: VideoCodec,
+    ) -> Result<(), PipelineError> {
+        let low = VideoQuality::new(40).unwrap_or(VideoQuality::DEFAULT);
+        let high = VideoQuality::new(90).unwrap_or(VideoQuality::DEFAULT);
+        let make_mode = |quality| match codec {
+            VideoCodec::H264 => Ok(VideoEncodeMode::NvencH264 { quality }),
+            VideoCodec::Hevc => Ok(VideoEncodeMode::NvencHevc { quality }),
+            _ => Err(PipelineError::WorkerPanicked),
+        };
+        let encoded_bytes = |mode| -> Result<u64, PipelineError> {
+            let (stream, _, _) = crate::gpu::nvenc::encode_video_nvenc_streaming(
+                path,
+                &source.track,
+                &source.packets,
+                mode,
+                0,
+                || Ok(()),
+            )?;
+            Ok(stream
+                .packets
+                .iter()
+                .map(|packet| u64::try_from(packet.data.len()).unwrap_or(u64::MAX))
+                .sum())
+        };
+        let low_bytes = encoded_bytes(make_mode(low)?)?;
+        let high_bytes = encoded_bytes(make_mode(high)?)?;
+        assert!(
+            high_bytes > low_bytes,
+            "{codec}: quality 90 ({high_bytes} bytes) must exceed quality 40 ({low_bytes} bytes)"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "nvenc")]
     #[test]
     fn roundtrips_nvenc_h264_and_hevc() -> Result<(), PipelineError> {
         // The encode itself probes CUDA device 0. Skip only that expected
@@ -2050,7 +2164,17 @@ mod tests {
             return Ok(());
         }
         let path = Path::new("nvenc-video.mp4");
-        let frames = synthetic_frames(256, 144, 4);
+        // 24 frames give NVENC enough lookahead and GOP depth to emit real
+        // B-frame reordering rather than a single IPPP anchor.
+        let frames = synthetic_frames(256, 144, 24);
+        let source = encode_video_cpu(
+            path,
+            &frames,
+            VideoEncodeMode::CpuH264 {
+                quality: VideoQuality::DEFAULT,
+            },
+            0,
+        )?;
         for (mode, codec) in [
             (
                 VideoEncodeMode::NvencH264 {
@@ -2065,28 +2189,62 @@ mod tests {
                 VideoCodec::Hevc,
             ),
         ] {
-            let source = encode_video_cpu(
-                path,
-                &frames,
-                VideoEncodeMode::CpuH264 {
-                    quality: VideoQuality::DEFAULT,
-                },
-                0,
-            )?;
-            let (stream, _, _device) = crate::gpu::nvenc::encode_video_nvenc_streaming(
-                path,
-                &source.track,
-                &source.packets,
-                mode,
-                0,
-                || Ok(()),
-            )?;
+            let (stream, frames_encoded, _device) =
+                crate::gpu::nvenc::encode_video_nvenc_streaming(
+                    path,
+                    &source.track,
+                    &source.packets,
+                    mode,
+                    0,
+                    || Ok(()),
+                )?;
             assert_eq!(stream.track.codec, codec);
-            let decoded = decode_video_track(path, &stream.track, &stream.packets)?;
-            assert_eq!(decoded.len(), 4);
-            for frame in &decoded {
-                assert_eq!((frame.width, frame.height), (256, 144));
+            assert_eq!(frames_encoded, u64::try_from(frames.len()).unwrap_or(0));
+            assert_eq!(
+                stream.packets.len(),
+                frames.len(),
+                "{codec}: every input frame must produce exactly one packet"
+            );
+            let mut max_pts_seen: Option<i64> = None;
+            let mut has_pts_inversion = false;
+            for (index, packet) in stream.packets.iter().enumerate() {
+                assert!(
+                    packet.dts <= packet.pts,
+                    "{codec}: packet {index} has dts {} > pts {}",
+                    packet.dts,
+                    packet.pts
+                );
+                if index > 0 {
+                    assert!(
+                        packet.dts > stream.packets[index - 1].dts,
+                        "{codec}: DTS must increase at packet {index}"
+                    );
+                }
+                if let Some(prev_max) = max_pts_seen
+                    && packet.pts < prev_max
+                {
+                    has_pts_inversion = true;
+                }
+                max_pts_seen = Some(max_pts_seen.map_or(packet.pts, |m| m.max(packet.pts)));
             }
+            if crate::gpu::nvenc::codec_supports_b_frames(codec)? {
+                assert!(
+                    has_pts_inversion,
+                    "{codec}: B-frame reordering must place a lower PTS after a higher PTS in decode order"
+                );
+            }
+            let decoded = decode_video_track(path, &stream.track, &stream.packets)?;
+            assert_eq!(decoded.len(), frames.len());
+            for (index, frame) in decoded.iter().enumerate() {
+                assert_eq!((frame.width, frame.height), (256, 144));
+                if index > 0 {
+                    assert!(
+                        frame.pts_us > decoded[index - 1].pts_us,
+                        "{codec}: decoded frames must be in display order"
+                    );
+                }
+            }
+            assert_nvenc_quality_scales_bitrate(path, &source, codec)?;
         }
         Ok(())
     }
@@ -2253,7 +2411,12 @@ mod tests {
             keyframe: true,
             data: Vec::new(),
         };
+        assert_eq!(estimate_video_fps_from_packets(&[packet(16_666)]), 60);
+        assert_eq!(estimate_video_fps_from_packets(&[packet(16_667)]), 60);
+        assert_eq!(estimate_video_fps_from_packets(&[packet(33_333)]), 30);
+        assert_eq!(estimate_video_fps_from_packets(&[packet(33_334)]), 30);
         assert_eq!(estimate_video_fps_from_packets(&[packet(40_000)]), 25);
+        assert_eq!(estimate_video_fps_from_packets(&[packet(41_667)]), 24);
         assert_eq!(estimate_video_fps_from_packets(&[]), 30);
         assert_eq!(estimate_video_fps_from_packets(&[packet(1)]), 240);
     }

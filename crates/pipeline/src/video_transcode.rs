@@ -2959,4 +2959,155 @@ mod tests {
         })?;
         Ok(())
     }
+
+    #[test]
+    fn nvenc_source_rebase_preserves_inter_track_presentation_offset() {
+        // MPEG-TS style timestamps: audio starts at 1.40 s, video presents 80 ms
+        // later (PTS 1.48 s) while its decode preroll starts at DTS 1.40 s.
+        // Rebasing both tracks by the same file-level origin must keep the
+        // 80 ms A/V presentation offset intact.
+        let mut audio = vec![ContainerPacket {
+            track: 1,
+            pts: 1_400_000,
+            dts: 1_400_000,
+            duration: 21_333,
+            keyframe: true,
+            data: Vec::new(),
+        }];
+        let mut nvenc_video = vec![ContainerPacket {
+            track: 0,
+            pts: 1_480_000,
+            dts: 1_446_667,
+            duration: 16_667,
+            keyframe: true,
+            data: Vec::new(),
+        }];
+        let origin = 1_400_000_i64;
+        rebase_source_packets(&mut audio, origin);
+        rebase_source_packets(&mut nvenc_video, origin);
+        assert_eq!(audio[0].pts, 0);
+        assert_eq!(nvenc_video[0].pts, 80_000);
+        assert_eq!(nvenc_video[0].dts, 46_667);
+    }
+
+    #[cfg(feature = "nvenc")]
+    fn nvenc_sized_frames(width: u32, height: u32, count: usize) -> Vec<Yuv420Frame> {
+        let width_usize = usize::try_from(width).unwrap_or(0);
+        let height_usize = usize::try_from(height).unwrap_or(0);
+        (0..count)
+            .map(|index| {
+                let y = (0..width_usize.saturating_mul(height_usize))
+                    .map(|sample| {
+                        u8::try_from(24 + (sample + index.saturating_mul(11)) % 180).unwrap_or(24)
+                    })
+                    .collect();
+                let chroma = (width_usize / 2).saturating_mul(height_usize / 2);
+                Yuv420Frame {
+                    width,
+                    height,
+                    y,
+                    u: vec![110; chroma],
+                    v: vec![140; chroma],
+                    pts_us: i64::try_from(index).unwrap_or(0).saturating_mul(40_000),
+                    duration_us: 40_000,
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "nvenc")]
+    #[test]
+    fn nvenc_mkv_encode_and_reopen_preserves_decode_order() -> Result<(), PipelineError> {
+        if cudarc::driver::CudaContext::new(0).is_err() {
+            return Ok(());
+        }
+        let dir = temp_dir("nvenc-mkv-bframes")?;
+        let source = dir.join("in.mp4");
+        // NVENC HEVC requires at least 145x49; 256x144 with 24 frames exercises
+        // real B-frames across both H.264 and HEVC.
+        let video = nvenc_sized_frames(256, 144, 24);
+        let encoded = encode_video_cpu(
+            &source,
+            &video,
+            VideoEncodeMode::CpuH264 {
+                quality: fastconv_domain::VideoQuality::DEFAULT,
+            },
+            0,
+        )?;
+        let media = ContainerMedia {
+            tracks: vec![encoded.track],
+            packets: encoded.packets,
+        };
+        let file = File::create(&source).map_err(|err| PipelineError::Io {
+            path: source.clone(),
+            source: err,
+        })?;
+        mux_video(&file, &source, VideoContainerFormat::Mp4, &media)?;
+        drop(file);
+
+        for (name, codec, mode) in [
+            (
+                "out_h264.mkv",
+                VideoCodec::H264,
+                VideoEncodeMode::NvencH264 {
+                    quality: fastconv_domain::VideoQuality::DEFAULT,
+                },
+            ),
+            (
+                "out_hevc.mkv",
+                VideoCodec::Hevc,
+                VideoEncodeMode::NvencHevc {
+                    quality: fastconv_domain::VideoQuality::DEFAULT,
+                },
+            ),
+        ] {
+            let target = dir.join(name);
+            transcode(
+                &source,
+                &target,
+                VideoContainerFormat::Mp4,
+                VideoContainerFormat::Mkv,
+                VideoTrackAction::Encode(mode),
+                AudioTrackAction::Copy,
+            )?;
+            let reopened = demux_video(&target, VideoContainerFormat::Mkv)?;
+            assert_eq!(reopened.tracks.len(), 1);
+            assert_eq!(reopened.packets.len(), 24);
+            let mut max_pts_seen: Option<i64> = None;
+            let mut has_pts_inversion = false;
+            for (index, packet) in reopened.packets.iter().enumerate() {
+                assert!(packet.dts <= packet.pts);
+                if index > 0 {
+                    assert!(packet.dts > reopened.packets[index - 1].dts);
+                }
+                if let Some(prev_max) = max_pts_seen
+                    && packet.pts < prev_max
+                {
+                    has_pts_inversion = true;
+                }
+                max_pts_seen = Some(max_pts_seen.map_or(packet.pts, |m| m.max(packet.pts)));
+            }
+            if crate::gpu::nvenc::codec_supports_b_frames(codec)? {
+                assert!(
+                    has_pts_inversion,
+                    "{name}: reopened MKV must retain B-frame PTS inversions in decode order"
+                );
+            }
+            let decoded = decode_video_track(&target, &reopened.tracks[0], &reopened.packets)?;
+            assert_eq!(decoded.len(), 24);
+            for (index, frame) in decoded.iter().enumerate() {
+                if index > 0 {
+                    assert!(
+                        frame.pts_us > decoded[index - 1].pts_us,
+                        "{name}: reopened MKV frames must decode in display order"
+                    );
+                }
+            }
+        }
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
 }
