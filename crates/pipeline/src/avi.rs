@@ -389,6 +389,7 @@ pub(crate) fn demux_avi(path: &Path) -> Result<DemuxedMedia, PipelineError> {
                 sample_rate: s.sample_rate,
                 config: s.config.clone(),
                 timescale: US_TIMESCALE,
+                presentation_edit: None,
             })
             .collect(),
         ..ContainerMedia::default()
@@ -460,6 +461,7 @@ pub(crate) fn demux_avi(path: &Path) -> Result<DemuxedMedia, PipelineError> {
                         sample_rate: None,
                         config: streams[number].config.clone(),
                         timescale: US_TIMESCALE,
+                        presentation_edit: None,
                     };
                     let (canonical, sync) = crate::video_container::video_packet_from_annex_b(
                         &mut proxy, data, keyframe,
@@ -918,6 +920,7 @@ mod tests {
                     sample_rate: None,
                     config: h264_config(),
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Aac,
@@ -927,6 +930,7 @@ mod tests {
                     sample_rate: Some(48_000),
                     config: asc.to_vec(),
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
             ],
             packets: vec![
@@ -991,6 +995,7 @@ mod tests {
                     sample_rate: None,
                     config: hevc_config(),
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Mp3,
@@ -1000,6 +1005,7 @@ mod tests {
                     sample_rate: Some(44_100),
                     config: Vec::new(),
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
             ],
             packets: vec![
@@ -1042,6 +1048,7 @@ mod tests {
                     sample_rate: None,
                     config: Vec::new(),
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Opus,
@@ -1051,6 +1058,7 @@ mod tests {
                     sample_rate: Some(48_000),
                     config: default_opus_head(2, 0),
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
             ],
             packets: vec![
@@ -1088,6 +1096,7 @@ mod tests {
                     sample_rate: None,
                     config: Vec::new(),
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Aac,
@@ -1097,6 +1106,7 @@ mod tests {
                     sample_rate: Some(44_100),
                     config: vec![0x12, 0x10],
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
             ],
             packets: vec![
@@ -1137,6 +1147,7 @@ mod tests {
                 sample_rate: None,
                 config: Vec::new(),
                 timescale: US_TIMESCALE,
+                presentation_edit: None,
             }],
             packets: [true, false, true]
                 .into_iter()
@@ -1253,6 +1264,7 @@ mod tests {
                 sample_rate: Some(48_000),
                 config: vec![0x12, 0x10],
                 timescale: US_TIMESCALE,
+                presentation_edit: None,
             }],
             packets: (0..47)
                 .map(|index| ContainerPacket {
@@ -1310,6 +1322,7 @@ mod tests {
                 sample_rate: Some(44_100),
                 config: Vec::new(),
                 timescale: US_TIMESCALE,
+                presentation_edit: None,
             }],
             packets: (0..2)
                 .map(|index| ContainerPacket {
@@ -1368,6 +1381,7 @@ mod tests {
                 sample_rate: None,
                 config: Vec::new(),
                 timescale: US_TIMESCALE,
+                presentation_edit: None,
             }],
             packets: sizes
                 .into_iter()
@@ -1445,6 +1459,7 @@ mod tests {
                 sample_rate: Some(48_000),
                 config: default_opus_head(2, 0),
                 timescale: US_TIMESCALE,
+                presentation_edit: None,
             }],
             packets: (0..3)
                 .map(|index| ContainerPacket {
@@ -1603,6 +1618,7 @@ mod tests {
                 sample_rate: Some(48_000),
                 config: default_opus_head(2, 0),
                 timescale: US_TIMESCALE,
+                presentation_edit: None,
             }],
             packets: vec![ContainerPacket {
                 track: 0,

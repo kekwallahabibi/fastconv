@@ -1,6 +1,7 @@
 mod audio_bench;
 mod bench;
 mod fixtures;
+mod nvenc_bench;
 mod remux_bench;
 
 use std::env;
@@ -616,6 +617,9 @@ fn print_usage() {
     println!(
         "  cargo xtask bench --remux     Video remux head-to-head (fastconv vs ffmpeg -c copy) with ffprobe validation"
     );
+    println!(
+        "  cargo xtask bench --nvenc     Fair NVENC video head-to-head (fastconv vs ffmpeg NVENC) with codec/B-frame/timestamp/PSNR validation"
+    );
     println!("  cargo xtask bench --status    Report local fixture availability");
 }
 
@@ -638,6 +642,7 @@ fn main() -> ExitCode {
         ["bench", "--audio"] => workspace_root().and_then(|root| audio_bench::run(&root)),
         ["bench", "--status"] => workspace_root().map(|root| cmd_bench_status(&root)),
         ["bench", "--remux"] => workspace_root().and_then(|root| remux_bench::run(&root)),
+        ["bench", "--nvenc"] => workspace_root().and_then(|root| nvenc_bench::run(&root)),
         [] | ["-h" | "--help"] => {
             print_usage();
             Ok(())

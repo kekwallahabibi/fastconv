@@ -1023,6 +1023,7 @@ mod container_tests {
                     sample_rate: None,
                     config: avc_config(),
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Aac,
@@ -1032,6 +1033,7 @@ mod container_tests {
                     sample_rate: Some(48_000),
                     config: vec![0x11, 0x90],
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
             ],
             packets: vec![
@@ -1082,6 +1084,7 @@ mod container_tests {
                     sample_rate: None,
                     config: Vec::new(),
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Opus,
@@ -1091,6 +1094,7 @@ mod container_tests {
                     sample_rate: Some(48_000),
                     config: crate::video_bitstream::default_opus_head(2, 0),
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
             ],
             packets: vec![
@@ -1349,6 +1353,7 @@ mod container_tests {
                     sample_rate: None,
                     config: avc_config(),
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Aac,
@@ -1358,6 +1363,7 @@ mod container_tests {
                     sample_rate: Some(48_000),
                     config: vec![0x11, 0x90],
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
             ],
             packets,
@@ -1398,6 +1404,7 @@ mod container_tests {
                     sample_rate: None,
                     config: Vec::new(),
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Opus,
@@ -1407,6 +1414,7 @@ mod container_tests {
                     sample_rate: Some(48_000),
                     config: crate::video_bitstream::default_opus_head(2, 0),
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
             ],
             packets,

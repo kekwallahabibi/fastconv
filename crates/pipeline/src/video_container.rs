@@ -36,6 +36,30 @@ pub(crate) const MKV_TICK_NS: u64 = 1_000;
 /// target instead of staging the whole movie in RAM.
 const IN_MEMORY_MP4_FASTSTART_LIMIT: u64 = 64 * 1024 * 1024;
 
+/// Explicit visible presentation interval from a container edit list (such as
+/// MP4 `elst`), expressed in canonical microseconds on the same timeline as
+/// the track's packets.
+///
+/// Packets with `pts < start_us` are retained for decoding as preroll/priming
+/// rather than discarded at demux time, but excluded from visible playback and
+/// movie-origin calculation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TrackPresentation {
+    pub(crate) start_us: i64,
+    /// Optional explicit presentation duration (`segment_duration > 0` in
+    /// `elst`). `None` plays through the end of the track.
+    pub(crate) duration_us: Option<u64>,
+}
+
+impl TrackPresentation {
+    pub(crate) fn shifted(self, offset_us: i64) -> Self {
+        Self {
+            start_us: self.start_us.saturating_add(offset_us),
+            duration_us: self.duration_us,
+        }
+    }
+}
+
 /// One decoded track in the canonical representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContainerTrack {
@@ -49,6 +73,8 @@ pub(crate) struct ContainerTrack {
     pub(crate) config: Vec<u8>,
     /// Always [`US_TIMESCALE`]; kept explicit so AVI/TS can rescale.
     pub(crate) timescale: u32,
+    /// Optional explicit presentation window from a source edit list.
+    pub(crate) presentation_edit: Option<TrackPresentation>,
 }
 
 /// One coded frame with microsecond timestamps.
@@ -90,6 +116,22 @@ pub(crate) fn rescale_ticks(value: i64, num: u32, den: u32) -> i64 {
         .saturating_mul(i128::from(num))
         .saturating_mul(i128::from(US_TIMESCALE));
     let denominator = i128::from(den.max(1));
+    let rounded = if numerator >= 0 {
+        numerator.saturating_add(denominator / 2) / denominator
+    } else {
+        numerator.saturating_sub(denominator / 2) / denominator
+    };
+    i64::try_from(rounded).unwrap_or(if numerator >= 0 { i64::MAX } else { i64::MIN })
+}
+
+/// Rescales a canonical microsecond timestamp into rounded ticks of `timescale`
+/// ticks per second (identity when `timescale == US_TIMESCALE`).
+fn us_to_ticks(value_us: i64, timescale: u32) -> i64 {
+    if timescale == US_TIMESCALE {
+        return value_us;
+    }
+    let numerator = i128::from(value_us).saturating_mul(i128::from(timescale.max(1)));
+    let denominator = i128::from(US_TIMESCALE);
     let rounded = if numerator >= 0 {
         numerator.saturating_add(denominator / 2) / denominator
     } else {
@@ -521,6 +563,53 @@ fn canonical_config(
     }
 }
 
+/// Parses a supported single-segment normal-rate MP4 `elst` box into:
+/// - the timestamp shift (`delay_us - media_start_us`) added to raw packet
+///   PTS/DTS so visible samples sit at their movie presentation times, and
+/// - the track's visible [`TrackPresentation`] interval starting at `delay_us`,
+///   keeping earlier raw packets as decode preroll or audio priming.
+fn mp4_track_edit(track: &Track) -> Option<(i64, TrackPresentation)> {
+    let EditList {
+        movie_timescale,
+        entries,
+    } = &track.edit_list;
+    let (empty, media) = match entries.as_slice() {
+        [media] if !media.is_empty() => (None, media),
+        [empty, media] if empty.is_empty() && !media.is_empty() => (Some(empty), media),
+        _ => return None,
+    };
+    if media.media_rate != EditEntry::NORMAL_RATE || *movie_timescale == 0 {
+        return None;
+    }
+    let delay_us = empty.map_or(0_i64, |entry| {
+        rescale_ticks(
+            i64::try_from(entry.segment_duration).unwrap_or(i64::MAX),
+            1,
+            *movie_timescale,
+        )
+    });
+    let media_start_us = if media.media_time > 0 {
+        rescale_ticks(media.media_time, 1, track.timebase.den.max(1))
+    } else {
+        0
+    };
+    let duration_us = (media.segment_duration > 0).then(|| {
+        u64::try_from(rescale_ticks(
+            i64::try_from(media.segment_duration).unwrap_or(i64::MAX),
+            1,
+            *movie_timescale,
+        ))
+        .unwrap_or(u64::MAX)
+    });
+    Some((
+        delay_us.saturating_sub(media_start_us),
+        TrackPresentation {
+            start_us: delay_us,
+            duration_us,
+        },
+    ))
+}
+
 fn demux_mp4(path: &Path) -> Result<ContainerMedia, PipelineError> {
     let reader = WindowedFileReader::open(path).map_err(|source| PipelineError::Io {
         path: path.to_path_buf(),
@@ -530,6 +619,7 @@ fn demux_mp4(path: &Path) -> Result<ContainerMedia, PipelineError> {
         containr::mp4::Demuxer::open(reader).map_err(|err| containr_error(path, &err))?;
     let mut media = ContainerMedia::default();
     let mut id_to_index = std::collections::HashMap::new();
+    let mut track_meta: Vec<(u32, i64)> = Vec::new();
     for track in input.tracks().iter().filter(|t| !t.chapter_track) {
         let Some(codec) = mp4_codec(track) else {
             continue;
@@ -544,7 +634,12 @@ fn demux_mp4(path: &Path) -> Result<ContainerMedia, PipelineError> {
                 (a.sample_rate > 0).then_some(a.sample_rate),
             )
         });
+        let (edit_shift, presentation_edit) = match mp4_track_edit(track) {
+            Some((shift, edit)) => (shift, Some(edit)),
+            None => (0, None),
+        };
         id_to_index.insert(track.id, media.tracks.len());
+        track_meta.push((track.timebase.den.max(1), edit_shift));
         media.tracks.push(ContainerTrack {
             codec,
             width,
@@ -553,6 +648,7 @@ fn demux_mp4(path: &Path) -> Result<ContainerMedia, PipelineError> {
             sample_rate,
             config,
             timescale: US_TIMESCALE,
+            presentation_edit,
         });
     }
     if media.tracks.is_empty() {
@@ -567,36 +663,17 @@ fn demux_mp4(path: &Path) -> Result<ContainerMedia, PipelineError> {
         input
             .read_packet_into(&packet, &mut buf)
             .map_err(|err| containr_error(path, &err))?;
+        let (timescale, edit_shift) = track_meta[track];
         let dts = packet.dts.unwrap_or(packet.pts);
         media.packets.push(ContainerPacket {
             track,
-            pts: rescale_ticks(
-                packet.pts,
-                1,
-                input
-                    .tracks()
-                    .iter()
-                    .find(|t| t.id == packet.track_id)
-                    .map_or(US_TIMESCALE, |t| t.timebase.den),
-            ),
-            dts: rescale_ticks(
-                dts,
-                1,
-                input
-                    .tracks()
-                    .iter()
-                    .find(|t| t.id == packet.track_id)
-                    .map_or(US_TIMESCALE, |t| t.timebase.den),
-            ),
+            pts: rescale_ticks(packet.pts, 1, timescale).saturating_add(edit_shift),
+            dts: rescale_ticks(dts, 1, timescale).saturating_add(edit_shift),
             duration: packet.duration.map_or(1, |d| {
                 u64::try_from(rescale_ticks(
                     i64::try_from(d).unwrap_or(i64::MAX),
                     1,
-                    input
-                        .tracks()
-                        .iter()
-                        .find(|t| t.id == packet.track_id)
-                        .map_or(US_TIMESCALE, |t| t.timebase.den),
+                    timescale,
                 ))
                 .unwrap_or(1)
             }),
@@ -668,6 +745,7 @@ fn demux_mkv(path: &Path) -> Result<ContainerMedia, PipelineError> {
             sample_rate,
             config,
             timescale: US_TIMESCALE,
+            presentation_edit: None,
         });
     }
     if media.tracks.is_empty() {
@@ -718,7 +796,72 @@ fn demux_mkv(path: &Path) -> Result<ContainerMedia, PipelineError> {
             data: buf.clone(),
         });
     }
+    synthesize_mkv_decode_timestamps(path, &mut media.packets, media.tracks.len())?;
     Ok(media)
+}
+
+/// Matroska blocks sit in coding (decode) order and carry only presentation
+/// timestamps. When a track contains B-frames (PTS inversions in block order),
+/// assign strictly increasing `dts <= pts` in block order so downstream
+/// `decode_order` sorts never move B-frames ahead of their reference frames.
+fn synthesize_mkv_decode_timestamps(
+    path: &Path,
+    packets: &mut [ContainerPacket],
+    track_count: usize,
+) -> Result<(), PipelineError> {
+    let mut by_track: Vec<Vec<usize>> = vec![Vec::new(); track_count];
+    for (index, packet) in packets.iter().enumerate() {
+        if let Some(indices) = by_track.get_mut(packet.track) {
+            indices.push(index);
+        }
+    }
+    for indices in by_track {
+        if indices.len() < 2 {
+            continue;
+        }
+        let has_inversion = indices
+            .windows(2)
+            .any(|pair| packets[pair[1]].pts < packets[pair[0]].pts);
+        if !has_inversion {
+            continue;
+        }
+        let mut sorted_pts: Vec<i64> = indices.iter().map(|&idx| packets[idx].pts).collect();
+        sorted_pts.sort_unstable();
+        let reorder_shift = sorted_pts
+            .iter()
+            .zip(&indices)
+            .fold(0_i128, |max, (&display_pts, &idx)| {
+                max.max(i128::from(display_pts) - i128::from(packets[idx].pts))
+            })
+            .max(0);
+        let mut dts = Vec::with_capacity(sorted_pts.len());
+        for &display_pts in &sorted_pts {
+            let shifted = i64::try_from(i128::from(display_pts) - reorder_shift).map_err(|_| {
+                container_error(
+                    path,
+                    "Matroska synthesized DTS underflowed signed 64-bit range",
+                )
+            })?;
+            dts.push(shifted);
+        }
+        // Single O(n) backward pass: bounding each provisional DTS by `next - 1`
+        // keeps block order and PTS intact while ensuring strict monotonicity.
+        for k in (0..dts.len().saturating_sub(1)).rev() {
+            let max_allowed = dts[k + 1].checked_sub(1).ok_or_else(|| {
+                container_error(
+                    path,
+                    "Matroska DTS tie repair exhausted signed 64-bit range",
+                )
+            })?;
+            if dts[k] > max_allowed {
+                dts[k] = max_allowed;
+            }
+        }
+        for (&idx, packet_dts) in indices.iter().zip(dts) {
+            packets[idx].dts = packet_dts;
+        }
+    }
+    Ok(())
 }
 
 /// Demuxes any supported container into the canonical representation.
@@ -792,17 +935,46 @@ fn mp4_decode_origins(media: &ContainerMedia) -> Vec<Option<i64>> {
 /// A reordered B-frame may present before the first packet in decode order;
 /// using the smaller of the two as the presentation base keeps every rebased
 /// PTS non-negative.
-fn mp4_presentation_bases(media: &ContainerMedia, origins: &[Option<i64>]) -> Vec<Option<i64>> {
+fn mp4_earliest_presentation_times(media: &ContainerMedia) -> Vec<Option<i64>> {
     let mut earliest_pts: Vec<Option<i64>> = vec![None; media.tracks.len()];
     for packet in &media.packets {
         earliest_pts[packet.track] =
             Some(earliest_pts[packet.track].map_or(packet.pts, |min| min.min(packet.pts)));
     }
+    earliest_pts
+}
+
+fn mp4_presentation_bases(media: &ContainerMedia, origins: &[Option<i64>]) -> Vec<Option<i64>> {
+    let earliest_pts = mp4_earliest_presentation_times(media);
     origins
         .iter()
         .zip(earliest_pts)
         .map(|(origin, earliest)| {
             origin.and_then(|first_dts| earliest.map(|earliest| first_dts.min(earliest)))
+        })
+        .collect()
+}
+
+/// Visible movie-timeline start per track. When a track carries an explicit
+/// container edit interval, decode preroll / audio priming packets with
+/// `pts < edit.start_us` stay in the track for decoding without pulling the
+/// track's visible start or the movie origin backward.
+fn mp4_visible_starts(
+    media: &ContainerMedia,
+    pts_bases: &[Option<i64>],
+    earliest_pts: &[Option<i64>],
+) -> Vec<Option<i64>> {
+    media
+        .tracks
+        .iter()
+        .enumerate()
+        .map(|(index, track)| {
+            let pts_base = pts_bases[index]?;
+            let earliest = earliest_pts[index]?;
+            Some(match track.presentation_edit {
+                Some(edit) => edit.start_us.max(pts_base),
+                None => earliest,
+            })
         })
         .collect()
 }
@@ -848,26 +1020,36 @@ fn mux_mp4_into<W: Read + Write + Seek>(
     let mut output = containr::mp4::Muxer::new(writer, options)
         .map_err(|err| containr_error(target_path, &err))?;
     let mut ids = Vec::with_capacity(media.tracks.len());
-    for track in &media.tracks {
-        let sample_entry = match track.codec {
-            VideoCodec::H264 => SampleEntrySpec::Visual {
-                codec: VisualCodec::Avc,
-                config: track.config.clone(),
-                width: track.width.unwrap_or(1920),
-                height: track.height.unwrap_or(1080),
-            },
-            VideoCodec::Hevc => SampleEntrySpec::Visual {
-                codec: VisualCodec::Hevc,
-                config: track.config.clone(),
-                width: track.width.unwrap_or(1920),
-                height: track.height.unwrap_or(1080),
-            },
-            VideoCodec::Av1 => SampleEntrySpec::Visual {
-                codec: VisualCodec::Av1,
-                config: track.config.clone(),
-                width: track.width.unwrap_or(1920),
-                height: track.height.unwrap_or(1080),
-            },
+    let mut track_timescales = Vec::with_capacity(media.tracks.len());
+    for (index, track) in media.tracks.iter().enumerate() {
+        let (sample_entry, track_timescale) = match track.codec {
+            VideoCodec::H264 => (
+                SampleEntrySpec::Visual {
+                    codec: VisualCodec::Avc,
+                    config: track.config.clone(),
+                    width: track.width.unwrap_or(1920),
+                    height: track.height.unwrap_or(1080),
+                },
+                US_TIMESCALE,
+            ),
+            VideoCodec::Hevc => (
+                SampleEntrySpec::Visual {
+                    codec: VisualCodec::Hevc,
+                    config: track.config.clone(),
+                    width: track.width.unwrap_or(1920),
+                    height: track.height.unwrap_or(1080),
+                },
+                US_TIMESCALE,
+            ),
+            VideoCodec::Av1 => (
+                SampleEntrySpec::Visual {
+                    codec: VisualCodec::Av1,
+                    config: track.config.clone(),
+                    width: track.width.unwrap_or(1920),
+                    height: track.height.unwrap_or(1080),
+                },
+                US_TIMESCALE,
+            ),
             VideoCodec::Vp9 => {
                 // Canonical config is Matroska codec features; MP4 needs a
                 // parsed vpcC record, never a byte-for-byte copy. Without
@@ -876,11 +1058,10 @@ fn mux_mp4_into<W: Read + Write + Seek>(
                 let vpcc = if let Some(vpcc) = vp9_codec_private_to_vpcc(&track.config) {
                     vpcc
                 } else {
-                    let track_index = track_index(media, track);
                     let color = media
                         .packets
                         .iter()
-                        .filter(|packet| packet.track == track_index && packet.keyframe)
+                        .filter(|packet| packet.track == index && packet.keyframe)
                         .find_map(|packet| vp9_color_from_keyframe(&packet.data))
                         .ok_or_else(|| {
                             container_error(
@@ -902,29 +1083,49 @@ fn mux_mp4_into<W: Read + Write + Seek>(
                         container_error(target_path, "derived VP9 features exceed vpcC limits")
                     })?
                 };
-                SampleEntrySpec::Raw(build_vp09_sample_entry(
-                    track.width.unwrap_or(0),
-                    track.height.unwrap_or(0),
-                    &vpcc,
-                ))
+                (
+                    SampleEntrySpec::Raw(build_vp09_sample_entry(
+                        track.width.unwrap_or(0),
+                        track.height.unwrap_or(0),
+                        &vpcc,
+                    )),
+                    US_TIMESCALE,
+                )
             }
-            VideoCodec::Aac => SampleEntrySpec::Audio {
-                codec: AudioCodec::Aac,
-                config: build_aac_esds(&track.config),
-                channels: track.channels.unwrap_or(2),
-                sample_rate: track.sample_rate.unwrap_or(48_000),
-            },
-            VideoCodec::Opus => SampleEntrySpec::Audio {
-                codec: AudioCodec::Opus,
-                config: opus_head_to_dops(&track.config)
-                    .map_err(|reason| container_error(target_path, reason))?,
-                channels: track.channels.unwrap_or(2),
-                sample_rate: 48_000,
-            },
-            VideoCodec::Mp3 => SampleEntrySpec::Raw(build_mp3_mp4a_sample_entry(
-                track.channels.unwrap_or(2),
-                track.sample_rate.unwrap_or(44_100),
-            )),
+            VideoCodec::Aac => {
+                let sample_rate = track.sample_rate.unwrap_or(48_000).max(1);
+                // Audio `mdhd` timescale must match the sample rate so MP4
+                // priming `elst.media_time` maps to exact sample counts.
+                (
+                    SampleEntrySpec::Audio {
+                        codec: AudioCodec::Aac,
+                        config: build_aac_esds(&track.config),
+                        channels: track.channels.unwrap_or(2),
+                        sample_rate,
+                    },
+                    sample_rate,
+                )
+            }
+            VideoCodec::Opus => (
+                SampleEntrySpec::Audio {
+                    codec: AudioCodec::Opus,
+                    config: opus_head_to_dops(&track.config)
+                        .map_err(|reason| container_error(target_path, reason))?,
+                    channels: track.channels.unwrap_or(2),
+                    sample_rate: 48_000,
+                },
+                48_000,
+            ),
+            VideoCodec::Mp3 => {
+                let sample_rate = track.sample_rate.unwrap_or(44_100).max(1);
+                (
+                    SampleEntrySpec::Raw(build_mp3_mp4a_sample_entry(
+                        track.channels.unwrap_or(2),
+                        sample_rate,
+                    )),
+                    sample_rate,
+                )
+            }
             _ => {
                 return Err(container_error(
                     target_path,
@@ -937,13 +1138,18 @@ fn mux_mp4_into<W: Read + Write + Seek>(
         } else {
             TrackKind::Audio
         };
-        let mut spec = Mp4TrackSpec::new(kind, US_TIMESCALE, sample_entry);
-        spec.default_duration =
-            Some(u32::try_from(track_duration(media, track_index(media, track))).unwrap_or(1));
+        let mut spec = Mp4TrackSpec::new(kind, track_timescale, sample_entry);
+        let default_dur_ticks = us_to_ticks(
+            i64::try_from(track_duration(media, index)).unwrap_or(i64::MAX),
+            track_timescale,
+        )
+        .max(1);
+        spec.default_duration = Some(u32::try_from(default_dur_ticks).unwrap_or(1));
         if kind == TrackKind::Video {
             spec.display_width = u32::from(track.width.unwrap_or(0)) << 16;
             spec.display_height = u32::from(track.height.unwrap_or(0)) << 16;
         }
+        track_timescales.push(track_timescale);
         ids.push(
             output
                 .add_track(spec)
@@ -958,14 +1164,21 @@ fn mux_mp4_into<W: Read + Write + Seek>(
     // restores each track's delay relative to the common timeline.
     let dts_origins = mp4_decode_origins(media);
     let pts_bases = mp4_presentation_bases(media, &dts_origins);
-    let timeline_origin = pts_bases.iter().flatten().copied().min().unwrap_or(0);
+    let earliest_pts = mp4_earliest_presentation_times(media);
+    let visible_starts = mp4_visible_starts(media, &pts_bases, &earliest_pts);
+    // The common timeline starts at the earliest *visible* presentation time.
+    // Decode preroll and audio priming packets sit before `visible_starts` and
+    // must not pull the movie origin backward or shift sibling tracks.
+    let timeline_origin = visible_starts.iter().flatten().copied().min().unwrap_or(0);
     let timestamps = mp4_rebased_timestamps(media, &dts_origins, &pts_bases);
     let mut last_packet_for_track = vec![None; media.tracks.len()];
     for (index, packet) in media.packets.iter().enumerate() {
         last_packet_for_track[packet.track] = Some(index);
     }
     let mut media_end: Vec<u64> = vec![0; media.tracks.len()];
+    let mut prev_dts_ticks: Vec<Option<i64>> = vec![None; media.tracks.len()];
     for (packet_index, (packet, &(dts, pts))) in media.packets.iter().zip(&timestamps).enumerate() {
+        let track_timescale = track_timescales[packet.track];
         // pts already includes the composition offset derived from the
         // original PTS, independent of any monotonic DTS adjustment.
         let end = pts
@@ -973,14 +1186,31 @@ fn mux_mp4_into<W: Read + Write + Seek>(
             .max(0);
         media_end[packet.track] =
             media_end[packet.track].max(u64::try_from(end).unwrap_or(u64::MAX));
+        let raw_dts_ticks = us_to_ticks(dts, track_timescale);
+        let dts_ticks = match prev_dts_ticks[packet.track] {
+            None => 0,
+            Some(prev) => raw_dts_ticks.max(prev.saturating_add(1)),
+        };
+        prev_dts_ticks[packet.track] = Some(dts_ticks);
+        let pts_ticks = us_to_ticks(pts, track_timescale);
+        let final_duration_ticks = (last_packet_for_track[packet.track] == Some(packet_index))
+            .then(|| {
+                u64::try_from(
+                    us_to_ticks(
+                        i64::try_from(packet.duration).unwrap_or(i64::MAX),
+                        track_timescale,
+                    )
+                    .max(1),
+                )
+                .unwrap_or(1)
+            });
         let input = containr::mp4::PacketIn {
             data: &packet.data,
-            pts,
-            dts,
+            pts: pts_ticks,
+            dts: dts_ticks,
             // Only the final packet needs an explicit duration; intermediate
             // stts deltas come from the next DTS without 1 µs rounding.
-            duration: (last_packet_for_track[packet.track] == Some(packet_index))
-                .then(|| packet.duration.max(1)),
+            duration: final_duration_ticks,
             sync: packet.keyframe,
         };
         output
@@ -988,36 +1218,48 @@ fn mux_mp4_into<W: Read + Write + Seek>(
             .map_err(|err| containr_error(target_path, &err))?;
     }
     for (index, id) in ids.iter().enumerate() {
-        let Some(pts_base) = pts_bases[index] else {
+        let (Some(track_visible_start), Some(pts_base)) = (visible_starts[index], pts_bases[index])
+        else {
             continue;
         };
-        let delay = pts_base.saturating_sub(timeline_origin);
-        let Ok(delay) = u64::try_from(delay) else {
-            return Err(container_error(
-                target_path,
-                format!("track {index} starts at an unrepresentable negative offset"),
-            ));
-        };
-        if delay == 0 {
+        let delay = track_visible_start.saturating_sub(timeline_origin).max(0);
+        let media_start = track_visible_start.saturating_sub(pts_base).max(0);
+        let media_start_us = u64::try_from(media_start).unwrap_or(u64::MAX);
+        let available_duration = media_end[index].saturating_sub(media_start_us);
+        let explicit_duration = media.tracks[index]
+            .presentation_edit
+            .and_then(|edit| edit.duration_us);
+        let trimmed_end = explicit_duration.is_some_and(|dur| dur < available_duration);
+        let segment_duration =
+            explicit_duration.map_or(available_duration, |dur| dur.min(available_duration));
+        if delay == 0 && media_start == 0 && !trimmed_end {
             continue;
         }
-        // An empty edit delays the whole track; the following edit plays the
-        // media from its start. Asking the muxer to accept the list first makes
-        // an unsupported edit an explicit failure, not silent wrong timing.
+        let delay_us = u64::try_from(delay).unwrap_or(u64::MAX);
+        // `EditEntry.media_time` is expressed in the track's `mdhd` timescale
+        // (sample rate for audio, microseconds for video), while
+        // `segment_duration` is in `movie_timescale` (`US_TIMESCALE`).
+        let media_time_ticks = us_to_ticks(media_start, track_timescales[index]);
+        // An empty edit delays a track whose first visible presentation time is
+        // later than the movie origin. `media_time_ticks` skips B-frame DTS
+        // preroll, edit-list decode preroll, or audio priming samples so only
+        // the visible presentation interval is played.
+        let mut entries = Vec::with_capacity(2);
+        if delay > 0 {
+            entries.push(EditEntry {
+                segment_duration: delay_us,
+                media_time: EditEntry::EMPTY_MEDIA_TIME,
+                media_rate: EditEntry::NORMAL_RATE,
+            });
+        }
+        entries.push(EditEntry {
+            segment_duration,
+            media_time: media_time_ticks,
+            media_rate: EditEntry::NORMAL_RATE,
+        });
         let list = EditList {
             movie_timescale: US_TIMESCALE,
-            entries: vec![
-                EditEntry {
-                    segment_duration: delay,
-                    media_time: EditEntry::EMPTY_MEDIA_TIME,
-                    media_rate: EditEntry::NORMAL_RATE,
-                },
-                EditEntry {
-                    segment_duration: media_end[index],
-                    media_time: 0,
-                    media_rate: EditEntry::NORMAL_RATE,
-                },
-            ],
+            entries,
         };
         output
             .set_edit_list(*id, &list)
@@ -1029,14 +1271,6 @@ fn mux_mp4_into<W: Read + Write + Seek>(
     Ok(())
 }
 
-fn track_index(media: &ContainerMedia, track: &ContainerTrack) -> usize {
-    media
-        .tracks
-        .iter()
-        .position(|candidate| std::ptr::eq(candidate, track))
-        .unwrap_or(0)
-}
-
 fn track_duration(media: &ContainerMedia, index: usize) -> u64 {
     media
         .packets
@@ -1046,6 +1280,42 @@ fn track_duration(media: &ContainerMedia, index: usize) -> u64 {
         .max()
         .unwrap_or(1)
         .max(1)
+}
+
+/// Matroska has no edit list: a source edit whose visible window excludes
+/// packets would require hiding those packets or collapsing their timestamps
+/// onto a clamped base. Reject it explicitly instead of silently corrupting
+/// the timeline.
+fn validate_mkv_presentation_edits(
+    media: &ContainerMedia,
+    target_path: &Path,
+) -> Result<(), PipelineError> {
+    for (index, track) in media.tracks.iter().enumerate() {
+        let Some(edit) = track.presentation_edit else {
+            continue;
+        };
+        let visible_end = edit.duration_us.map(|duration| {
+            edit.start_us
+                .saturating_add(i64::try_from(duration).unwrap_or(i64::MAX))
+        });
+        let has_excluded_packet = media.packets.iter().any(|packet| {
+            let packet_end = packet
+                .pts
+                .saturating_add(i64::try_from(packet.duration).unwrap_or(i64::MAX));
+            packet.track == index
+                && (packet.pts < edit.start_us
+                    || visible_end.is_some_and(|end| packet.pts >= end || packet_end > end))
+        });
+        if has_excluded_packet {
+            return Err(container_error(
+                target_path,
+                format!(
+                    "track {index} has an MP4 presentation edit with preroll or a trimmed duration that Matroska cannot represent; use MP4/MOV output"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn mux_mkv(
@@ -1115,7 +1385,22 @@ fn mux_mkv(
                 .map_err(|err| containr_error(target_path, &err))?,
         );
     }
-    let base = media.packets.iter().map(|p| p.pts).min().unwrap_or(0);
+    validate_mkv_presentation_edits(media, target_path)?;
+    let earliest_pts = mp4_earliest_presentation_times(media);
+    let base = media
+        .tracks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, track)| {
+            let earliest = earliest_pts[index]?;
+            Some(
+                track
+                    .presentation_edit
+                    .map_or(earliest, |edit| edit.start_us),
+            )
+        })
+        .min()
+        .unwrap_or(0);
     for packet in &media.packets {
         let pts = packet.pts.saturating_sub(base).max(0);
         let input = containr::mkv::PacketIn {
@@ -1309,6 +1594,7 @@ mod tests {
                 sample_rate: None,
                 config,
                 timescale: US_TIMESCALE,
+                presentation_edit: None,
             }],
             packets: vec![ContainerPacket {
                 track: 0,
@@ -1405,6 +1691,7 @@ mod tests {
                 sample_rate: None,
                 config: Vec::new(),
                 timescale: US_TIMESCALE,
+                presentation_edit: None,
             }],
             packets: vec![packet(100_000), packet(200_000), packet(50_000)],
         };
@@ -1442,6 +1729,7 @@ mod tests {
                     sample_rate: Some(48_000),
                     config: vec![0x11, 0x90],
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::H264,
@@ -1454,6 +1742,7 @@ mod tests {
                     ])
                     .unwrap_or_default(),
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 },
             ],
             packets: vec![
@@ -1521,6 +1810,610 @@ mod tests {
             empty_duration, 50_000,
             "video track's early B-frame plays at movie time 50 ms"
         );
+        Ok(())
+    }
+
+    fn b_frame_preroll_media() -> ContainerMedia {
+        const D: u64 = 33_333;
+        const D_I64: i64 = 33_333;
+        let video = |pts: i64, dts: i64, keyframe: bool| ContainerPacket {
+            track: 1,
+            pts,
+            dts,
+            duration: D,
+            keyframe,
+            data: vec![0, 0, 0, 2, 0x65, 0x88],
+        };
+        ContainerMedia {
+            tracks: vec![
+                ContainerTrack {
+                    codec: VideoCodec::Aac,
+                    width: None,
+                    height: None,
+                    channels: Some(2),
+                    sample_rate: Some(48_000),
+                    config: vec![0x11, 0x90],
+                    timescale: US_TIMESCALE,
+                    presentation_edit: None,
+                },
+                ContainerTrack {
+                    codec: VideoCodec::H264,
+                    width: Some(320),
+                    height: Some(240),
+                    channels: None,
+                    sample_rate: None,
+                    config: extract_avcc_from_annex_b(&[
+                        0, 0, 1, 0x67, 0x42, 0x00, 0x1E, 0, 0, 1, 0x68, 0xCE,
+                    ])
+                    .unwrap_or_default(),
+                    timescale: US_TIMESCALE,
+                    presentation_edit: None,
+                },
+            ],
+            packets: vec![
+                ContainerPacket {
+                    track: 0,
+                    pts: 0,
+                    dts: 0,
+                    duration: 21_000,
+                    keyframe: true,
+                    data: vec![0xAA; 8],
+                },
+                video(0, -2 * D_I64, true),
+                video(2 * D_I64, -D_I64, false),
+                video(D_I64, 0, false),
+            ],
+        }
+    }
+
+    #[test]
+    fn mp4_b_frame_preroll_timestamps_stay_non_negative() {
+        const D_I64: i64 = 33_333;
+        let media = b_frame_preroll_media();
+        let origins = mp4_decode_origins(&media);
+        assert_eq!(origins, vec![Some(0), Some(-2 * D_I64)]);
+        let pts_bases = mp4_presentation_bases(&media, &origins);
+        assert_eq!(pts_bases, vec![Some(0), Some(-2 * D_I64)]);
+        let earliest_pts = mp4_earliest_presentation_times(&media);
+        assert_eq!(earliest_pts, vec![Some(0), Some(0)]);
+        let timeline_origin = earliest_pts.iter().flatten().copied().min().unwrap_or(0);
+        assert_eq!(timeline_origin, 0);
+        let timestamps = mp4_rebased_timestamps(&media, &origins, &pts_bases);
+        assert!(timestamps.iter().all(|&(_, pts)| pts >= 0));
+        assert_eq!(timestamps[1], (0, 2 * D_I64));
+        assert_eq!(timestamps[2], (D_I64, 4 * D_I64));
+        assert_eq!(timestamps[3], (2 * D_I64, 3 * D_I64));
+    }
+
+    #[test]
+    fn mp4_b_frame_preroll_edit_list_skips_negative_dts_without_delaying_audio()
+    -> Result<(), String> {
+        const D_U32: u32 = 33_333;
+        let media = b_frame_preroll_media();
+        let mut output = Cursor::new(Vec::new());
+        let options = MuxOptions {
+            brand: Brand::Isom,
+            faststart: true,
+            movie_timescale: US_TIMESCALE,
+            ..MuxOptions::default()
+        };
+        mux_mp4_into(&mut output, Path::new("bframes.mp4"), &media, options)
+            .map_err(|err| err.to_string())?;
+        let bytes = output.into_inner();
+        let elst_offsets: Vec<usize> = bytes
+            .windows(4)
+            .enumerate()
+            .filter_map(|(offset, window)| (window == b"elst").then_some(offset))
+            .collect();
+        assert_eq!(
+            elst_offsets.len(),
+            1,
+            "only the B-frame video track gets an elst"
+        );
+        let elst = elst_offsets[0];
+        let version = bytes[elst + 4];
+        let entries = u32::from_be_bytes([
+            bytes[elst + 8],
+            bytes[elst + 9],
+            bytes[elst + 10],
+            bytes[elst + 11],
+        ]);
+        assert_eq!(version, 0);
+        assert_eq!(entries, 1, "no empty edit: audio and video start together");
+        let segment_duration = u32::from_be_bytes([
+            bytes[elst + 12],
+            bytes[elst + 13],
+            bytes[elst + 14],
+            bytes[elst + 15],
+        ]);
+        let media_time = u32::from_be_bytes([
+            bytes[elst + 16],
+            bytes[elst + 17],
+            bytes[elst + 18],
+            bytes[elst + 19],
+        ]);
+        assert_eq!(media_time, 2 * D_U32, "elst skips the 2-frame DTS preroll");
+        assert_eq!(
+            segment_duration,
+            3 * D_U32,
+            "exact video presentation duration"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mp4_b_frame_preroll_roundtrips_through_demux_mp4_at_zero_origin() -> Result<(), String> {
+        const D_I64: i64 = 33_333;
+        let media = b_frame_preroll_media();
+        let dir = std::env::temp_dir().join(format!("fastconv-mp4-elst-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let path = dir.join("bframes.mp4");
+        let file = File::create(&path).map_err(|err| err.to_string())?;
+        mux_video(&file, &path, VideoContainerFormat::Mp4, &media)
+            .map_err(|err| err.to_string())?;
+        drop(file);
+        let reopened = demux_mp4(&path).map_err(|err| err.to_string())?;
+        std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
+        let audio_pts: Vec<i64> = reopened
+            .packets
+            .iter()
+            .filter(|packet| packet.track == 0)
+            .map(|packet| packet.pts)
+            .collect();
+        let video_stamps: Vec<(i64, i64)> = reopened
+            .packets
+            .iter()
+            .filter(|packet| packet.track == 1)
+            .map(|packet| (packet.pts, packet.dts))
+            .collect();
+        assert_eq!(audio_pts, vec![0]);
+        assert_eq!(
+            video_stamps,
+            vec![(0, -2 * D_I64), (2 * D_I64, -D_I64), (D_I64, 0)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mkv_b_frame_roundtrip_preserves_decode_order() -> Result<(), String> {
+        const D: u64 = 25_000;
+        let video = |pts: i64, dts: i64, keyframe: bool, tag: u8| ContainerPacket {
+            track: 0,
+            pts,
+            dts,
+            duration: D,
+            keyframe,
+            data: vec![0, 0, 0, 2, if keyframe { 0x65 } else { 0x41 }, tag],
+        };
+        let media = ContainerMedia {
+            tracks: vec![ContainerTrack {
+                codec: VideoCodec::H264,
+                width: Some(320),
+                height: Some(240),
+                channels: None,
+                sample_rate: None,
+                config: extract_avcc_from_annex_b(&[
+                    0, 0, 1, 0x67, 0x42, 0x00, 0x1E, 0, 0, 1, 0x68, 0xCE,
+                ])
+                .unwrap_or_default(),
+                timescale: US_TIMESCALE,
+                presentation_edit: None,
+            }],
+            // Decode order I0, P3, B1, B2.
+            packets: vec![
+                video(0, -25_000, true, 0),
+                video(75_000, 0, false, 3),
+                video(25_000, 25_000, false, 1),
+                video(50_000, 50_000, false, 2),
+            ],
+        };
+        let dir =
+            std::env::temp_dir().join(format!("fastconv-mkv-bframe-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let path = dir.join("bframes.mkv");
+        let file = File::create(&path).map_err(|err| err.to_string())?;
+        mux_video(&file, &path, VideoContainerFormat::Mkv, &media)
+            .map_err(|err| err.to_string())?;
+        drop(file);
+        let reopened = demux_mkv(&path).map_err(|err| err.to_string())?;
+        std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
+        let mut sorted: Vec<&ContainerPacket> = reopened.packets.iter().collect();
+        sorted.sort_by_key(|packet| (packet.dts, packet.pts));
+        let tags: Vec<u8> = sorted.iter().map(|packet| packet.data[5]).collect();
+        assert_eq!(
+            tags,
+            vec![0, 3, 1, 2],
+            "decode order I0, P3, B1, B2 must survive MKV reopen"
+        );
+        for (index, packet) in sorted.iter().enumerate() {
+            assert!(packet.dts <= packet.pts);
+            if index > 0 {
+                assert!(packet.dts > sorted[index - 1].dts);
+            }
+        }
+        Ok(())
+    }
+
+    fn write_edited_mp4(
+        path: &Path,
+        audio_packets: &[(i64, u64)],
+        audio_edit: Option<&EditList>,
+        video_packets: &[(i64, i64, u64, bool)],
+        video_edit: Option<&EditList>,
+    ) -> Result<(), String> {
+        let avcc =
+            extract_avcc_from_annex_b(&[0, 0, 1, 0x67, 0x42, 0x00, 0x1E, 0, 0, 1, 0x68, 0xCE])
+                .unwrap_or_default();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|err| err.to_string())?;
+        let options = MuxOptions {
+            brand: Brand::Isom,
+            faststart: true,
+            movie_timescale: US_TIMESCALE,
+            ..MuxOptions::default()
+        };
+        let mut muxer = containr::mp4::Muxer::new(file, options).map_err(|err| err.to_string())?;
+        let audio_id = muxer
+            .add_track(Mp4TrackSpec::new(
+                TrackKind::Audio,
+                US_TIMESCALE,
+                SampleEntrySpec::Audio {
+                    codec: AudioCodec::Aac,
+                    config: build_aac_esds(&[0x11, 0x90]),
+                    channels: 2,
+                    sample_rate: 48_000,
+                },
+            ))
+            .map_err(|err| err.to_string())?;
+        let video_id = muxer
+            .add_track(Mp4TrackSpec::new(
+                TrackKind::Video,
+                US_TIMESCALE,
+                SampleEntrySpec::Visual {
+                    codec: VisualCodec::Avc,
+                    config: avcc,
+                    width: 320,
+                    height: 240,
+                },
+            ))
+            .map_err(|err| err.to_string())?;
+        for &(pts, duration) in audio_packets {
+            muxer
+                .write_packet(
+                    audio_id,
+                    &containr::mp4::PacketIn {
+                        data: &[0xAA; 8],
+                        pts,
+                        dts: pts,
+                        duration: Some(duration),
+                        sync: true,
+                    },
+                )
+                .map_err(|err| err.to_string())?;
+        }
+        for &(dts, pts, duration, sync) in video_packets {
+            muxer
+                .write_packet(
+                    video_id,
+                    &containr::mp4::PacketIn {
+                        data: &[0, 0, 0, 2, if sync { 0x65 } else { 0x41 }, 0x88],
+                        pts,
+                        dts,
+                        duration: Some(duration),
+                        sync,
+                    },
+                )
+                .map_err(|err| err.to_string())?;
+        }
+        if let Some(list) = audio_edit {
+            muxer
+                .set_edit_list(audio_id, list)
+                .map_err(|err| err.to_string())?;
+        }
+        if let Some(list) = video_edit {
+            muxer
+                .set_edit_list(video_id, list)
+                .map_err(|err| err.to_string())?;
+        }
+        muxer.finish().map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn mp4_empty_edit_with_media_start_keeps_preroll_off_timeline_origin() -> Result<(), String> {
+        let dir = std::env::temp_dir().join(format!("fastconv-mp4-preroll-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let source = dir.join("in.mp4");
+        let remuxed = dir.join("out.mp4");
+
+        // Audio plays from 0; video has an 80 ms empty edit followed by a media
+        // edit starting at 120 ms, while raw video packets start at media time 0.
+        let audio: Vec<(i64, u64)> = (0_i64..8).map(|idx| (idx * 21_333, 21_333)).collect();
+        let video: Vec<(i64, i64, u64, bool)> = (0_i64..5)
+            .map(|idx| (idx * 40_000, idx * 40_000, 40_000, idx == 0))
+            .collect();
+        let video_edit = EditList {
+            movie_timescale: US_TIMESCALE,
+            entries: vec![
+                EditEntry {
+                    segment_duration: 80_000,
+                    media_time: EditEntry::EMPTY_MEDIA_TIME,
+                    media_rate: EditEntry::NORMAL_RATE,
+                },
+                EditEntry {
+                    segment_duration: 80_000,
+                    media_time: 120_000,
+                    media_rate: EditEntry::NORMAL_RATE,
+                },
+            ],
+        };
+        write_edited_mp4(&source, &audio, None, &video, Some(&video_edit))?;
+
+        let demuxed = demux_mp4(&source).map_err(|err| err.to_string())?;
+        assert_eq!(demuxed.tracks[0].presentation_edit, None);
+        assert_eq!(
+            demuxed.tracks[1].presentation_edit,
+            Some(TrackPresentation {
+                start_us: 80_000,
+                duration_us: Some(80_000),
+            })
+        );
+        let video_pts: Vec<i64> = demuxed
+            .packets
+            .iter()
+            .filter(|packet| packet.track == 1)
+            .map(|packet| packet.pts)
+            .collect();
+        assert_eq!(
+            video_pts,
+            vec![-40_000, 0, 40_000, 80_000, 120_000],
+            "preroll packets are retained for decode with negative/pre-edit PTS"
+        );
+
+        let out_file = File::create(&remuxed).map_err(|err| err.to_string())?;
+        mux_video(&out_file, &remuxed, VideoContainerFormat::Mp4, &demuxed)
+            .map_err(|err| err.to_string())?;
+        drop(out_file);
+
+        let reader = WindowedFileReader::open(&remuxed).map_err(|err| err.to_string())?;
+        let inspected = containr::mp4::Demuxer::open(reader).map_err(|err| err.to_string())?;
+        let audio_track = inspected
+            .tracks()
+            .iter()
+            .find(|t| t.kind == TrackKind::Audio)
+            .ok_or("missing audio track")?;
+        let video_track = inspected
+            .tracks()
+            .iter()
+            .find(|t| t.kind == TrackKind::Video)
+            .ok_or("missing video track")?;
+        assert!(
+            audio_track.edit_list.entries.is_empty(),
+            "audio must remain at movie time 0 without a spurious delay edit"
+        );
+        assert_eq!(video_track.edit_list.entries.len(), 2);
+        assert!(video_track.edit_list.entries[0].is_empty());
+        assert_eq!(video_track.edit_list.entries[0].segment_duration, 80_000);
+        assert_eq!(video_track.edit_list.entries[1].media_time, 120_000);
+        assert_eq!(video_track.edit_list.entries[1].segment_duration, 80_000);
+
+        std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn mp4_audio_priming_edit_roundtrips_through_demux_and_mux() -> Result<(), String> {
+        let dir =
+            std::env::temp_dir().join(format!("fastconv-mp4-audio-priming-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let source = dir.join("in.mp4");
+        let remuxed = dir.join("out.mp4");
+
+        let audio: Vec<(i64, u64)> = (0_i64..4).map(|idx| (idx * 21_333, 21_333)).collect();
+        let audio_edit = EditList {
+            movie_timescale: US_TIMESCALE,
+            entries: vec![EditEntry {
+                segment_duration: 63_999,
+                media_time: 21_333,
+                media_rate: EditEntry::NORMAL_RATE,
+            }],
+        };
+        let video = [
+            (0_i64, 66_666_i64, 33_333_u64, true),
+            (33_333, 133_332, 33_333, false),
+            (66_666, 99_999, 33_333, false),
+        ];
+        let video_edit = EditList {
+            movie_timescale: US_TIMESCALE,
+            entries: vec![EditEntry {
+                segment_duration: 99_999,
+                media_time: 66_666,
+                media_rate: EditEntry::NORMAL_RATE,
+            }],
+        };
+        write_edited_mp4(
+            &source,
+            &audio,
+            Some(&audio_edit),
+            &video,
+            Some(&video_edit),
+        )?;
+
+        let demuxed = demux_mp4(&source).map_err(|err| err.to_string())?;
+        let out_file = File::create(&remuxed).map_err(|err| err.to_string())?;
+        mux_video(&out_file, &remuxed, VideoContainerFormat::Mp4, &demuxed)
+            .map_err(|err| err.to_string())?;
+        drop(out_file);
+
+        let reader = WindowedFileReader::open(&remuxed).map_err(|err| err.to_string())?;
+        let inspected = containr::mp4::Demuxer::open(reader).map_err(|err| err.to_string())?;
+        let audio_track = inspected
+            .tracks()
+            .iter()
+            .find(|t| t.kind == TrackKind::Audio)
+            .ok_or("missing audio track")?;
+        let video_track = inspected
+            .tracks()
+            .iter()
+            .find(|t| t.kind == TrackKind::Video)
+            .ok_or("missing video track")?;
+        assert_eq!(audio_track.timebase.den, 48_000);
+        assert_eq!(audio_track.edit_list.entries.len(), 1);
+        assert_eq!(
+            audio_track.edit_list.entries[0].media_time, 1024,
+            "audio priming edit must use sample-rate mdhd ticks (1024 samples at 48 kHz)"
+        );
+        assert_eq!(audio_track.edit_list.entries[0].segment_duration, 63_999);
+        assert_eq!(video_track.edit_list.entries.len(), 1);
+        assert_eq!(video_track.edit_list.entries[0].media_time, 66_666);
+        assert_eq!(video_track.edit_list.entries[0].segment_duration, 99_999);
+
+        std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn mkv_dts_tie_repair_is_linear_and_rejects_signed_range_exhaustion() -> Result<(), String> {
+        let count = 20_000_usize;
+        let mut packets: Vec<ContainerPacket> = (0..count)
+            .map(|idx| {
+                let pts = if idx == 0 {
+                    20
+                } else if idx == 1 {
+                    0
+                } else {
+                    i64::try_from(idx / 2).unwrap_or(0).saturating_mul(10)
+                };
+                ContainerPacket {
+                    track: 0,
+                    pts,
+                    dts: pts,
+                    duration: 10,
+                    keyframe: idx == 0,
+                    data: Vec::new(),
+                }
+            })
+            .collect();
+        let original_pts: Vec<i64> = packets.iter().map(|p| p.pts).collect();
+        synthesize_mkv_decode_timestamps(Path::new("ties.mkv"), &mut packets, 1)
+            .map_err(|err| err.to_string())?;
+        for (index, packet) in packets.iter().enumerate() {
+            assert_eq!(packet.pts, original_pts[index]);
+            assert!(packet.dts <= packet.pts);
+            if index > 0 {
+                assert!(packet.dts > packets[index - 1].dts);
+            }
+        }
+
+        let mut exhausted = vec![
+            ContainerPacket {
+                track: 0,
+                pts: i64::MIN + 1,
+                dts: i64::MIN + 1,
+                duration: 1,
+                keyframe: true,
+                data: Vec::new(),
+            },
+            ContainerPacket {
+                track: 0,
+                pts: i64::MIN,
+                dts: i64::MIN,
+                duration: 1,
+                keyframe: false,
+                data: Vec::new(),
+            },
+            ContainerPacket {
+                track: 0,
+                pts: i64::MIN,
+                dts: i64::MIN,
+                duration: 1,
+                keyframe: false,
+                data: Vec::new(),
+            },
+        ];
+        let result = synthesize_mkv_decode_timestamps(Path::new("min.mkv"), &mut exhausted, 1);
+        assert!(matches!(result, Err(PipelineError::RemuxFailed { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn mux_mkv_rejects_unrepresentable_mp4_edit() -> Result<(), String> {
+        let dir =
+            std::env::temp_dir().join(format!("fastconv-mp4-edit-mkv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let source = dir.join("in.mp4");
+        let target = dir.join("out.mkv");
+
+        let audio: Vec<(i64, u64)> = (0_i64..8).map(|idx| (idx * 21_333, 21_333)).collect();
+        let video: Vec<(i64, i64, u64, bool)> = (0_i64..5)
+            .map(|idx| (idx * 40_000, idx * 40_000, 40_000, idx == 0))
+            .collect();
+        let video_edit = EditList {
+            movie_timescale: US_TIMESCALE,
+            entries: vec![
+                EditEntry {
+                    segment_duration: 80_000,
+                    media_time: EditEntry::EMPTY_MEDIA_TIME,
+                    media_rate: EditEntry::NORMAL_RATE,
+                },
+                EditEntry {
+                    segment_duration: 80_000,
+                    media_time: 120_000,
+                    media_rate: EditEntry::NORMAL_RATE,
+                },
+            ],
+        };
+        write_edited_mp4(&source, &audio, None, &video, Some(&video_edit))?;
+        let demuxed = demux_mp4(&source).map_err(|err| err.to_string())?;
+        let out_file = File::create(&target).map_err(|err| err.to_string())?;
+        let result = mux_video(&out_file, &target, VideoContainerFormat::Mkv, &demuxed);
+        drop(out_file);
+        assert!(
+            matches!(result, Err(PipelineError::RemuxFailed { .. })),
+            "an edit with preroll must be rejected instead of clamping timestamps"
+        );
+
+        std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn mux_mkv_rejects_edit_that_trims_a_packet_end() -> Result<(), String> {
+        let dir =
+            std::env::temp_dir().join(format!("fastconv-mp4-edit-end-mkv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let source = dir.join("in.mp4");
+        let target = dir.join("out.mkv");
+
+        // The edit covers [0, 60_000) but the packet at PTS 40_000 runs to
+        // 80_000, so Matroska would need discard padding to trim its end.
+        let audio: Vec<(i64, u64)> = (0_i64..2).map(|idx| (idx * 30_000, 30_000)).collect();
+        let video: Vec<(i64, i64, u64, bool)> =
+            vec![(0, 0, 40_000, true), (40_000, 40_000, 40_000, false)];
+        let video_edit = EditList {
+            movie_timescale: US_TIMESCALE,
+            entries: vec![EditEntry {
+                segment_duration: 60_000,
+                media_time: 0,
+                media_rate: EditEntry::NORMAL_RATE,
+            }],
+        };
+        write_edited_mp4(&source, &audio, None, &video, Some(&video_edit))?;
+        let demuxed = demux_mp4(&source).map_err(|err| err.to_string())?;
+        let out_file = File::create(&target).map_err(|err| err.to_string())?;
+        let result = mux_video(&out_file, &target, VideoContainerFormat::Mkv, &demuxed);
+        drop(out_file);
+        assert!(
+            matches!(result, Err(PipelineError::RemuxFailed { .. })),
+            "an edit ending inside a packet must be rejected explicitly"
+        );
+
+        std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
         Ok(())
     }
 }

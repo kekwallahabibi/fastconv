@@ -666,6 +666,7 @@ fn encode_aac_track(
             sample_rate: Some(rate),
             config,
             timescale: US_TIMESCALE,
+            presentation_edit: None,
         },
         packets,
     ))
@@ -753,6 +754,7 @@ fn encode_opus_track(
             sample_rate: Some(OPUS_RATE),
             config: default_opus_head(channels, pre_skip),
             timescale: US_TIMESCALE,
+            presentation_edit: None,
         },
         packets,
     ))
@@ -828,6 +830,7 @@ fn encode_mp3_track(
             sample_rate: Some(rate),
             config: Vec::new(),
             timescale: US_TIMESCALE,
+            presentation_edit: None,
         },
         packets,
     ))
@@ -944,6 +947,7 @@ impl StreamingAudioEncoder {
                     sample_rate: Some(rate),
                     config,
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 };
                 Ok((
                     Self::Aac {
@@ -985,6 +989,7 @@ impl StreamingAudioEncoder {
                     sample_rate: Some(OPUS_RATE),
                     config: default_opus_head(channels, pre_skip),
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 };
                 Ok((
                     Self::Opus {
@@ -1020,6 +1025,7 @@ impl StreamingAudioEncoder {
                     sample_rate: Some(rate),
                     config: Vec::new(),
                     timescale: US_TIMESCALE,
+                    presentation_edit: None,
                 };
                 Ok((
                     Self::Mp3 {
@@ -1398,7 +1404,14 @@ fn transcode_audio_track_streaming(
                     ));
                 }
                 let to_rate = target_audio_rate(target, rate);
-                let (built, track) = StreamingAudioEncoder::start(target, channels, to_rate)?;
+                let (built, mut track) = StreamingAudioEncoder::start(target, channels, to_rate)?;
+                track.presentation_edit = source_track.presentation_edit.map(|edit| {
+                    if let Some((_, origin)) = ctx.rebase {
+                        edit.shifted(origin.saturating_neg())
+                    } else {
+                        edit
+                    }
+                });
                 if ctx
                     .audio_tx
                     .send(AudioWorkerEvent::TrackHeader {
@@ -1580,6 +1593,24 @@ fn rebase_encoded_packets(packets: &mut [ContainerPacket], track_origin: i64, or
     }
 }
 
+/// For Opus tracks decoded from MP4 with an `elst` priming edit, the decoder
+/// already strips `OpusHead.pre_skip` samples from the PCM output, so the
+/// decoded stream begins after `pre_skip` rather than at the raw priming packet.
+fn audio_decoded_origin(source_track: &ContainerTrack, track_origin: i64) -> i64 {
+    if source_track.codec == VideoCodec::Opus
+        && source_track.presentation_edit.is_some()
+        && source_track.config.len() >= 12
+        && &source_track.config[..8] == b"OpusHead"
+    {
+        let pre_skip = u16::from_le_bytes([source_track.config[10], source_track.config[11]]);
+        if pre_skip > 0 {
+            let pre_skip_us = rescale_ticks(i64::from(pre_skip), 1, OPUS_RATE);
+            return track_origin.saturating_add(pre_skip_us);
+        }
+    }
+    track_origin
+}
+
 /// The packet-copy path shared by video, audio and timed-text tracks.
 fn copy_track(
     source_track: &ContainerTrack,
@@ -1598,14 +1629,18 @@ fn copy_track(
             path: target.to_path_buf(),
             reason: format!("track index {new_index} is out of range"),
         })?;
-    *slot = Some(source_track.clone());
+    let mut copied_track = source_track.clone();
     let mut copied = track_packets;
     for packet in &mut copied {
         packet.track = new_index;
     }
     if let Some(origin) = rebase {
         rebase_source_packets(&mut copied, origin);
+        copied_track.presentation_edit = copied_track
+            .presentation_edit
+            .map(|edit| edit.shifted(origin.saturating_neg()));
     }
+    *slot = Some(copied_track);
     packets.extend(copied);
     Ok(())
 }
@@ -1827,7 +1862,10 @@ fn transcode_file(
                                 }
                                 let ctx = AudioStreamContext {
                                     new_index: job.new_index,
-                                    rebase: needs_rebase.then_some((job.track_origin, origin)),
+                                    rebase: needs_rebase.then_some((
+                                        audio_decoded_origin(&job.source_track, job.track_origin),
+                                        origin,
+                                    )),
                                     cancelled,
                                     audio_tx: &audio_tx,
                                 };
@@ -1881,8 +1919,13 @@ fn transcode_file(
                                     break 'video;
                                 }
                             };
+                        stream.track.presentation_edit = job.source_track.presentation_edit;
                         if needs_rebase {
                             rebase_source_packets(&mut stream.packets, origin);
+                            stream.track.presentation_edit = stream
+                                .track
+                                .presentation_edit
+                                .map(|edit| edit.shifted(origin.saturating_neg()));
                         }
                         for packet in &mut stream.packets {
                             packet.track = job.new_index;
@@ -1953,8 +1996,13 @@ fn transcode_file(
                                 }
                             };
                         frames_processed = frames_processed.saturating_add(count);
+                        stream.track.presentation_edit = job.source_track.presentation_edit;
                         if needs_rebase {
                             rebase_encoded_packets(&mut stream.packets, job.track_origin, origin);
+                            stream.track.presentation_edit = stream
+                                .track
+                                .presentation_edit
+                                .map(|edit| edit.shifted(origin.saturating_neg()));
                         }
                         for packet in &mut stream.packets {
                             packet.track = job.new_index;
@@ -2658,6 +2706,7 @@ mod tests {
             sample_rate: None,
             config: Vec::new(),
             timescale: US_TIMESCALE,
+            presentation_edit: None,
         };
         let packets = vec![ContainerPacket {
             track: 0,
@@ -2953,6 +3002,408 @@ mod tests {
             "audio failure must not hang the video worker"
         );
         assert!(!target.exists());
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn nvenc_source_rebase_preserves_inter_track_presentation_offset() {
+        // MPEG-TS style timestamps: audio starts at 1.40 s, video presents 80 ms
+        // later (PTS 1.48 s) while its decode preroll starts at DTS 1.40 s.
+        // Rebasing both tracks by the same file-level origin must keep the
+        // 80 ms A/V presentation offset intact.
+        let mut audio = vec![ContainerPacket {
+            track: 1,
+            pts: 1_400_000,
+            dts: 1_400_000,
+            duration: 21_333,
+            keyframe: true,
+            data: Vec::new(),
+        }];
+        let mut nvenc_video = vec![ContainerPacket {
+            track: 0,
+            pts: 1_480_000,
+            dts: 1_446_667,
+            duration: 16_667,
+            keyframe: true,
+            data: Vec::new(),
+        }];
+        let origin = 1_400_000_i64;
+        rebase_source_packets(&mut audio, origin);
+        rebase_source_packets(&mut nvenc_video, origin);
+        assert_eq!(audio[0].pts, 0);
+        assert_eq!(nvenc_video[0].pts, 80_000);
+        assert_eq!(nvenc_video[0].dts, 46_667);
+    }
+
+    fn write_edited_h264_aac_mp4(
+        path: &Path,
+        video_edit: &containr::EditList,
+    ) -> Result<(), PipelineError> {
+        let map_err = |err: containr::Error| PipelineError::RemuxFailed {
+            path: path.to_path_buf(),
+            reason: err.to_string(),
+        };
+        let encoded_video = encode_video_cpu(
+            path,
+            &frames(12),
+            VideoEncodeMode::CpuH264 {
+                quality: fastconv_domain::VideoQuality::DEFAULT,
+            },
+            1,
+        )?;
+        let (audio_track, audio_packets) = encode_audio_track(
+            path,
+            &sine(19_200, 48_000, 2),
+            48_000,
+            2,
+            TargetAudioCodec::Aac,
+        )?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|err| PipelineError::Io {
+                path: path.to_path_buf(),
+                source: err,
+            })?;
+        let options = containr::mp4::MuxOptions {
+            brand: containr::mp4::Brand::Isom,
+            faststart: true,
+            movie_timescale: US_TIMESCALE,
+            ..containr::mp4::MuxOptions::default()
+        };
+        let mut muxer = containr::mp4::Muxer::new(file, options).map_err(map_err)?;
+        let audio_id = muxer
+            .add_track(containr::mp4::TrackSpec::new(
+                containr::TrackKind::Audio,
+                US_TIMESCALE,
+                containr::mp4::SampleEntrySpec::Audio {
+                    codec: containr::mp4::AudioCodec::Aac,
+                    config: crate::video_bitstream::build_aac_esds(&audio_track.config),
+                    channels: 2,
+                    sample_rate: 48_000,
+                },
+            ))
+            .map_err(map_err)?;
+        let video_id = muxer
+            .add_track(containr::mp4::TrackSpec::new(
+                containr::TrackKind::Video,
+                US_TIMESCALE,
+                containr::mp4::SampleEntrySpec::Visual {
+                    codec: containr::mp4::VisualCodec::Avc,
+                    config: encoded_video.track.config.clone(),
+                    width: encoded_video.track.width.unwrap_or(64),
+                    height: encoded_video.track.height.unwrap_or(64),
+                },
+            ))
+            .map_err(map_err)?;
+        for (id, list) in [
+            (audio_id, &audio_packets),
+            (video_id, &encoded_video.packets),
+        ] {
+            for packet in list {
+                muxer
+                    .write_packet(
+                        id,
+                        &containr::mp4::PacketIn {
+                            data: &packet.data,
+                            pts: packet.pts,
+                            dts: packet.dts,
+                            duration: Some(packet.duration),
+                            sync: packet.keyframe,
+                        },
+                    )
+                    .map_err(map_err)?;
+            }
+        }
+        muxer.set_edit_list(video_id, video_edit).map_err(map_err)?;
+        muxer.finish().map_err(map_err)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mp4_empty_edit_preroll_survives_transcode_rebase() -> Result<(), PipelineError> {
+        let dir = temp_dir("mp4-edit-rebase")?;
+        let source = dir.join("in.mp4");
+        let target = dir.join("out.mp4");
+
+        // Video carries an 80 ms empty edit plus a 120 ms media start while raw
+        // video packets begin at 0 (preroll).
+        let video_edit = containr::EditList {
+            movie_timescale: US_TIMESCALE,
+            entries: vec![
+                containr::EditEntry {
+                    segment_duration: 80_000,
+                    media_time: containr::EditEntry::EMPTY_MEDIA_TIME,
+                    media_rate: containr::EditEntry::NORMAL_RATE,
+                },
+                containr::EditEntry {
+                    segment_duration: 120_000,
+                    media_time: 120_000,
+                    media_rate: containr::EditEntry::NORMAL_RATE,
+                },
+            ],
+        };
+        write_edited_h264_aac_mp4(&source, &video_edit)?;
+
+        // Re-encoding audio triggers `needs_rebase = true` while video is copied
+        // with its negative-PTS preroll packets and edit interval.
+        transcode(
+            &source,
+            &target,
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            VideoTrackAction::Copy,
+            AudioTrackAction::Encode(TargetAudioCodec::Aac),
+        )?;
+
+        let out_file = File::open(&target).map_err(|err| PipelineError::Io {
+            path: target.clone(),
+            source: err,
+        })?;
+        let inspected =
+            containr::mp4::Demuxer::open(out_file).map_err(|err| PipelineError::RemuxFailed {
+                path: target.clone(),
+                reason: err.to_string(),
+            })?;
+        let out_audio = inspected
+            .tracks()
+            .iter()
+            .find(|t| t.kind == containr::TrackKind::Audio)
+            .ok_or_else(|| PipelineError::RemuxFailed {
+                path: target.clone(),
+                reason: "missing audio track".to_owned(),
+            })?;
+        let out_video = inspected
+            .tracks()
+            .iter()
+            .find(|t| t.kind == containr::TrackKind::Video)
+            .ok_or_else(|| PipelineError::RemuxFailed {
+                path: target.clone(),
+                reason: "missing video track".to_owned(),
+            })?;
+        assert!(
+            out_audio.edit_list.entries.is_empty(),
+            "audio must stay at movie time 0 after transcode rebase"
+        );
+        assert_eq!(out_video.edit_list.entries.len(), 2);
+        assert!(out_video.edit_list.entries[0].is_empty());
+        assert_eq!(out_video.edit_list.entries[0].segment_duration, 80_000);
+        assert_eq!(out_video.edit_list.entries[1].media_time, 120_000);
+        assert_eq!(out_video.edit_list.entries[1].segment_duration, 120_000);
+
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[cfg(feature = "nvenc")]
+    fn nvenc_sized_frames(width: u32, height: u32, count: usize) -> Vec<Yuv420Frame> {
+        let width_usize = usize::try_from(width).unwrap_or(0);
+        let height_usize = usize::try_from(height).unwrap_or(0);
+        (0..count)
+            .map(|index| {
+                let y = (0..width_usize.saturating_mul(height_usize))
+                    .map(|sample| {
+                        u8::try_from(24 + (sample + index.saturating_mul(11)) % 180).unwrap_or(24)
+                    })
+                    .collect();
+                let chroma = (width_usize / 2).saturating_mul(height_usize / 2);
+                Yuv420Frame {
+                    width,
+                    height,
+                    y,
+                    u: vec![110; chroma],
+                    v: vec![140; chroma],
+                    pts_us: i64::try_from(index).unwrap_or(0).saturating_mul(40_000),
+                    duration_us: 40_000,
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "nvenc")]
+    fn assert_forced_nvenc_mkv_b_frames_roundtrip(
+        source: &Path,
+        media: &ContainerMedia,
+        forced_target: &Path,
+        name: &str,
+        codec: VideoCodec,
+        mode: VideoEncodeMode,
+    ) -> Result<(), PipelineError> {
+        if !crate::gpu::nvenc::codec_supports_b_frames(codec)? {
+            return Ok(());
+        }
+        // Verify MKV mux + reopen deterministically with `disableBadapt = 1`
+        // so B-frame PTS inversions are guaranteed on B-frame-capable GPUs.
+        let (forced_stream, _, _) =
+            crate::gpu::nvenc::encode_video_nvenc_streaming_forced_b_frames(
+                source,
+                &media.tracks[0],
+                &media.packets,
+                mode,
+                0,
+                || Ok(()),
+            )?;
+        let forced_file = File::create(forced_target).map_err(|err| PipelineError::Io {
+            path: forced_target.to_path_buf(),
+            source: err,
+        })?;
+        let forced_media = ContainerMedia {
+            tracks: vec![forced_stream.track],
+            packets: forced_stream.packets,
+        };
+        mux_video(
+            &forced_file,
+            forced_target,
+            VideoContainerFormat::Mkv,
+            &forced_media,
+        )?;
+        drop(forced_file);
+        let forced_reopened = demux_video(forced_target, VideoContainerFormat::Mkv)?;
+        assert_eq!(forced_reopened.packets.len(), 24);
+        let mut forced_max_pts: Option<i64> = None;
+        let mut forced_inversion = false;
+        for (index, packet) in forced_reopened.packets.iter().enumerate() {
+            assert!(packet.dts <= packet.pts);
+            if index > 0 {
+                assert!(packet.dts > forced_reopened.packets[index - 1].dts);
+            }
+            if let Some(prev_max) = forced_max_pts
+                && packet.pts < prev_max
+            {
+                forced_inversion = true;
+            }
+            forced_max_pts = Some(forced_max_pts.map_or(packet.pts, |m| m.max(packet.pts)));
+        }
+        assert!(
+            forced_inversion,
+            "{name}: forced B-frame MKV must retain PTS inversions after reopen"
+        );
+        let forced_decoded = decode_video_track(
+            forced_target,
+            &forced_reopened.tracks[0],
+            &forced_reopened.packets,
+        )?;
+        assert_eq!(forced_decoded.len(), 24);
+        for (index, frame) in forced_decoded.iter().enumerate() {
+            if index > 0 {
+                assert!(
+                    frame.pts_us > forced_decoded[index - 1].pts_us,
+                    "{name}: forced B-frame MKV frames must decode in display order"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "nvenc")]
+    #[test]
+    fn nvenc_mkv_encode_and_reopen_preserves_decode_order() -> Result<(), PipelineError> {
+        if cudarc::driver::CudaContext::new(0).is_err() {
+            return Ok(());
+        }
+        let dir = temp_dir("nvenc-mkv-bframes")?;
+        let source = dir.join("in.mp4");
+        // NVENC HEVC requires at least 145x49; 256x144 with 24 frames exercises
+        // real B-frames across both H.264 and HEVC.
+        let video = nvenc_sized_frames(256, 144, 24);
+        let encoded = encode_video_cpu(
+            &source,
+            &video,
+            VideoEncodeMode::CpuH264 {
+                quality: fastconv_domain::VideoQuality::DEFAULT,
+            },
+            0,
+        )?;
+        let media = ContainerMedia {
+            tracks: vec![encoded.track],
+            packets: encoded.packets,
+        };
+        let file = File::create(&source).map_err(|err| PipelineError::Io {
+            path: source.clone(),
+            source: err,
+        })?;
+        mux_video(&file, &source, VideoContainerFormat::Mp4, &media)?;
+        drop(file);
+
+        for (name, codec, mode) in [
+            (
+                "out_h264.mkv",
+                VideoCodec::H264,
+                VideoEncodeMode::NvencH264 {
+                    quality: fastconv_domain::VideoQuality::DEFAULT,
+                },
+            ),
+            (
+                "out_hevc.mkv",
+                VideoCodec::Hevc,
+                VideoEncodeMode::NvencHevc {
+                    quality: fastconv_domain::VideoQuality::DEFAULT,
+                },
+            ),
+        ] {
+            let target = dir.join(name);
+            transcode(
+                &source,
+                &target,
+                VideoContainerFormat::Mp4,
+                VideoContainerFormat::Mkv,
+                VideoTrackAction::Encode(mode),
+                AudioTrackAction::Copy,
+            )?;
+            let reopened = demux_video(&target, VideoContainerFormat::Mkv)?;
+            assert_eq!(reopened.tracks.len(), 1);
+            assert_eq!(reopened.packets.len(), 24);
+            let mut max_pts_seen: Option<i64> = None;
+            let mut has_pts_inversion = false;
+            for (index, packet) in reopened.packets.iter().enumerate() {
+                assert!(packet.dts <= packet.pts);
+                if index > 0 {
+                    assert!(packet.dts > reopened.packets[index - 1].dts);
+                }
+                if let Some(prev_max) = max_pts_seen
+                    && packet.pts < prev_max
+                {
+                    has_pts_inversion = true;
+                }
+                max_pts_seen = Some(max_pts_seen.map_or(packet.pts, |m| m.max(packet.pts)));
+            }
+            let any_dts_lag = reopened
+                .packets
+                .iter()
+                .any(|packet| packet.dts < packet.pts);
+            assert_eq!(
+                any_dts_lag, has_pts_inversion,
+                "{name}: reopened MKV DTS lag must match actual PTS inversions"
+            );
+            let decoded = decode_video_track(&target, &reopened.tracks[0], &reopened.packets)?;
+            assert_eq!(decoded.len(), 24);
+            for (index, frame) in decoded.iter().enumerate() {
+                if index > 0 {
+                    assert!(
+                        frame.pts_us > decoded[index - 1].pts_us,
+                        "{name}: reopened MKV frames must decode in display order"
+                    );
+                }
+            }
+            assert_forced_nvenc_mkv_b_frames_roundtrip(
+                &source,
+                &media,
+                &dir.join(format!("forced_{name}")),
+                name,
+                codec,
+                mode,
+            )?;
+        }
         fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
             path: dir.clone(),
             source,
