@@ -29,6 +29,7 @@ jxl = "0.8.0"
 # It is dual-licensed BSD-3-Clause OR Apache-2.0.
 jixel = { version = "0.5.13", default-features = false, features = ["avx", "sse"] }
 nvidia-video-codec-sdk = "0.4"
+ogg = "0.9.2"
 opus-pure = "0.2.3"
 png = "0.18"
 pollster = "1"
