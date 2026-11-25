@@ -47,8 +47,6 @@ mod enabled {
     const VIDEO_RING_SLOTS: usize = 4;
     /// Device buffers registered with NVENC; three deep so upload, encode and drain overlap.
     const GPU_RING_SLOTS: usize = 3;
-    /// NVENC reads NV12 rows most efficiently from 256-byte-aligned pitches.
-    const NV12_PITCH_ALIGN: usize = 256;
 
     /// A fully decoded NV12 frame in a recyclable pinned host slot.
     struct FilledPinnedFrame {
@@ -132,15 +130,21 @@ mod enabled {
         cuda_ctx: &Arc<CudaContext>,
         len: usize,
     ) -> Result<PinnedHostSlice<u8>, PipelineError> {
+        // SAFETY: the caller frees this allocation through `PinnedHostSlice::drop`.
+        // `alloc_pinned` documents the memory as unset, so it must be initialized
+        // through a raw pointer before any `&mut [u8]` is created over it.
         let mut slice = unsafe { cuda_ctx.alloc_pinned::<u8>(len) }.map_err(|err| {
             video_error(format!(
                 "failed to allocate CUDA pinned buffer ({len} bytes): {err}"
             ))
         })?;
-        slice
-            .as_mut_slice()
-            .map_err(|err| video_error(format!("failed to access CUDA pinned buffer: {err}")))?
-            .fill(0);
+        // `as_mut_ptr` synchronizes the slice's event and yields the raw pointer.
+        // Writing all `len` bytes through it establishes the invariant required
+        // by every later `as_mut_slice()` call on this slot.
+        let ptr = slice
+            .as_mut_ptr()
+            .map_err(|err| video_error(format!("failed to access CUDA pinned buffer: {err}")))?;
+        unsafe { std::ptr::write_bytes(ptr, 0_u8, len) };
         Ok(slice)
     }
 
@@ -1130,7 +1134,7 @@ mod enabled {
             track: track_index,
             pts: frame.pts_us,
             dts: frame.pts_us,
-            duration: frame.duration_us,
+            duration: frame.duration_us.max(1),
             keyframe,
             data: payload,
         });
@@ -1198,26 +1202,13 @@ mod enabled {
         for _ in 0..GPU_RING_SLOTS {
             dev_bufs.push(DeviceBuffer::zeroed(cuda_ctx, &cuda_stream, slot_bytes)?);
         }
-        let mut reg_resources: Vec<RegisteredResource<'_, ()>> = Vec::with_capacity(GPU_RING_SLOTS);
-        for dev_buf in &dev_bufs {
-            let ptr = usize::try_from(dev_buf.ptr())
-                .map_err(|_| video_error("CUDA device pointer exceeds usize"))?
-                as *mut c_void;
-            reg_resources.push(
-                session
-                    .register_generic_resource(
-                        (),
-                        NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
-                        ptr,
-                        pitch,
-                    )
-                    .map_err(|err| {
-                        video_error(format!(
-                            "failed to register NVENC CUDA device buffer: {err}"
-                        ))
-                    })?,
-            );
-        }
+        // NVENC requires a mapped input resource to be unmapped once its
+        // bitstream has been locked, and forbids writing device memory while a
+        // mapping is active. Register (which also maps) a slot only after its
+        // upload is queued, then drop the mapping after the oldest picture has
+        // been drained. The map call also synchronizes the pending upload.
+        let mut reg_resources: Vec<Option<RegisteredResource<'_, ()>>> =
+            (0..GPU_RING_SLOTS).map(|_| None).collect();
         let mut bitstreams: Vec<Bitstream<'_>> = Vec::with_capacity(GPU_RING_SLOTS);
         for _ in 0..GPU_RING_SLOTS {
             bitstreams.push(session.create_output_bitstream().map_err(|err| {
@@ -1258,6 +1249,9 @@ mod enabled {
                     track_index,
                     on_frame_encoded,
                 )?;
+                // The bitstream is locked, so the encoder no longer reads this
+                // mapping. Unmap and unregister before the slot is reused.
+                reg_resources[oldest.slot] = None;
             }
 
             dma_pinned_to_device(&cuda_stream, &filled.pinned, &dev_bufs[slot])?;
@@ -1265,11 +1259,33 @@ mod enabled {
                 // The decode thread already exited; its error is surfaced after
                 // the join, and dropping the send error recycles this slot.
             }
+            if reg_resources[slot].is_none() {
+                let ptr = usize::try_from(dev_bufs[slot].ptr())
+                    .map_err(|_| video_error("CUDA device pointer exceeds usize"))?
+                    as *mut c_void;
+                reg_resources[slot] = Some(
+                    session
+                        .register_generic_resource(
+                            (),
+                            NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
+                            ptr,
+                            pitch,
+                        )
+                        .map_err(|err| {
+                            video_error(format!(
+                                "failed to register NVENC CUDA device buffer: {err}"
+                            ))
+                        })?,
+                );
+            }
+            let resource = reg_resources[slot]
+                .as_mut()
+                .ok_or_else(|| video_error("NVENC input slot was not registered"))?;
             let pts_us = filled.info.pts_us;
             let duration_us = filled.info.duration_us;
             session
                 .encode_picture(
-                    &mut reg_resources[slot],
+                    resource,
                     &mut bitstreams[slot],
                     EncodePictureParams {
                         input_timestamp: u64::try_from(pts_us.max(0)).unwrap_or(0),
@@ -1387,54 +1403,63 @@ mod enabled {
                                     "NVENC consumer stopped the decode pipeline",
                                 ));
                             }
-                            let (expected_w, expected_h, pitch_usize, pitch_u32) =
-                                if let Some(geometry) = ring_geometry {
-                                    geometry
-                                } else {
-                                    if info.width == 0
-                                        || info.height == 0
-                                        || !info.width.is_multiple_of(2)
-                                        || !info.height.is_multiple_of(2)
-                                    {
-                                        return Err(video_error(format!(
-                                            "NVENC requires even, non-zero dimensions; got {}x{}",
-                                            info.width, info.height
-                                        )));
-                                    }
-                                    let pitch_usize = usize::try_from(info.width)
-                                        .map_err(|_| {
-                                            video_error("NVENC frame width exceeds usize")
-                                        })?
-                                        .next_multiple_of(NV12_PITCH_ALIGN);
-                                    let pitch_u32 = u32::try_from(pitch_usize).map_err(|_| {
-                                        video_error("NVENC frame pitch exceeds u32")
+                            let (expected_w, expected_h, pitch_usize, pitch_u32) = if let Some(
+                                geometry,
+                            ) =
+                                ring_geometry
+                            {
+                                geometry
+                            } else {
+                                if info.width == 0
+                                    || info.height == 0
+                                    || !info.width.is_multiple_of(2)
+                                    || !info.height.is_multiple_of(2)
+                                {
+                                    return Err(video_error(format!(
+                                        "NVENC requires even, non-zero dimensions; got {}x{}",
+                                        info.width, info.height
+                                    )));
+                                }
+                                // CUDADEVICEPTR slots come from `cuMemAlloc`, so NVENC
+                                // requires the exact width in bytes as the registered
+                                // pitch (and that value must be a multiple of 4). Packing,
+                                // upload and registration all use this one stride.
+                                if !info.width.is_multiple_of(4) {
+                                    return Err(video_error(format!(
+                                        "NVENC NV12 input requires a width divisible by 4; got {}",
+                                        info.width
+                                    )));
+                                }
+                                let pitch_usize = usize::try_from(info.width)
+                                    .map_err(|_| video_error("NVENC frame width exceeds usize"))?;
+                                let pitch_u32 = u32::try_from(pitch_usize)
+                                    .map_err(|_| video_error("NVENC frame pitch exceeds u32"))?;
+                                let slot_bytes =
+                                    nv12_buffer_len(info.width, info.height, pitch_usize)?;
+                                let mut buffers = Vec::with_capacity(VIDEO_RING_SLOTS);
+                                for _ in 0..VIDEO_RING_SLOTS {
+                                    buffers.push(alloc_zeroed_pinned(&decode_ctx, slot_bytes)?);
+                                }
+                                let mut buffers = buffers.into_iter();
+                                let pinned = buffers.next().ok_or_else(|| {
+                                    video_error("internal pinned ring buffer underflow")
+                                })?;
+                                // Seed the free ring, then drop this sender so a GPU
+                                // failure closes `free_rx` and unblocks our `recv`.
+                                let seed = seed_free_tx.take().ok_or_else(|| {
+                                    video_error("internal pinned ring already seeded")
+                                })?;
+                                for buffer in buffers {
+                                    seed.send(buffer).map_err(|_| {
+                                        video_error("NVENC consumer stopped during ring setup")
                                     })?;
-                                    let slot_bytes =
-                                        nv12_buffer_len(info.width, info.height, pitch_usize)?;
-                                    let mut buffers = Vec::with_capacity(VIDEO_RING_SLOTS);
-                                    for _ in 0..VIDEO_RING_SLOTS {
-                                        buffers.push(alloc_zeroed_pinned(&decode_ctx, slot_bytes)?);
-                                    }
-                                    let mut buffers = buffers.into_iter();
-                                    let pinned = buffers.next().ok_or_else(|| {
-                                        video_error("internal pinned ring buffer underflow")
-                                    })?;
-                                    // Seed the free ring, then drop this sender so a GPU
-                                    // failure closes `free_rx` and unblocks our `recv`.
-                                    let seed = seed_free_tx.take().ok_or_else(|| {
-                                        video_error("internal pinned ring already seeded")
-                                    })?;
-                                    for buffer in buffers {
-                                        seed.send(buffer).map_err(|_| {
-                                            video_error("NVENC consumer stopped during ring setup")
-                                        })?;
-                                    }
-                                    drop(seed);
-                                    first_pinned = Some(pinned);
-                                    ring_geometry =
-                                        Some((info.width, info.height, pitch_usize, pitch_u32));
-                                    (info.width, info.height, pitch_usize, pitch_u32)
-                                };
+                                }
+                                drop(seed);
+                                first_pinned = Some(pinned);
+                                ring_geometry =
+                                    Some((info.width, info.height, pitch_usize, pitch_u32));
+                                (info.width, info.height, pitch_usize, pitch_u32)
+                            };
                             if info.width != expected_w || info.height != expected_h {
                                 return Err(video_error(
                                     "video frame dimensions change mid-stream",
@@ -1573,9 +1598,9 @@ pub fn execute_heic_batch(
 ///
 /// # Errors
 ///
-/// Returns [`PipelineError::GpuBackendFailed`] for missing hardware support,
-/// decode errors, or NVENC failures. `on_frame_encoded` may abort early with
-/// its own error, which is propagated after the decode thread is joined.
+/// Returns [`PipelineError::GpuBackendFailed`] for missing hardware support and
+/// NVENC failures. Source decode errors and errors returned by
+/// `on_frame_encoded` propagate unchanged after the decode thread is joined.
 pub(crate) fn encode_video_nvenc_streaming<F>(
     path: &Path,
     source_track: &ContainerTrack,
