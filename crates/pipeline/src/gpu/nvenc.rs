@@ -1694,7 +1694,18 @@ mod enabled {
         on_frame_encoded: &mut impl FnMut() -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError> {
         while let Some(bs_slot) = ready_bitstreams.pop_front() {
-            let (data, timestamp) = session.lock_bitstream(&mut bitstreams[bs_slot])?;
+            let (data, timestamp) = match session.lock_bitstream(&mut bitstreams[bs_slot]) {
+                Ok(result) => result,
+                Err(err) => {
+                    // A failed lock does not prove NVENC is done with this
+                    // picture. Keep the slot in a queue so
+                    // `abort_pending_nvenc_work` hands it to the blocking
+                    // discard before its bitstream and still-mapped input
+                    // surface are released.
+                    ready_bitstreams.push_front(bs_slot);
+                    return Err(err);
+                }
+            };
             if data.is_empty() {
                 return Err(video_error("NVENC produced an empty access unit"));
             }
@@ -2007,9 +2018,11 @@ mod enabled {
         )))
     }
 
-    /// True GPU-resident NVDEC -> NVENC path: each decoded surface is copied
-    /// device-to-device into a pre-registered NVENC slot and never touches host
-    /// memory. Any NVDEC setup or caps failure is a hard error (no CPU fallback).
+    /// GPU-resident NVDEC -> NVENC path: luma and chroma of each decoded surface
+    /// are copied device-to-device into a separate, pre-registered NVENC slot.
+    /// This avoids CPU readback and pinned host staging but does not directly
+    /// share the original NVDEC surface. Any NVDEC setup or caps failure is a
+    /// hard error (no CPU fallback).
     #[allow(clippy::too_many_lines)]
     pub(super) fn encode_video_nvdec_nvenc_streaming_enabled<F>(
         source_track: &ContainerTrack,
@@ -2696,12 +2709,15 @@ fn quality_to_nvenc_cq(quality: VideoQuality) -> (u8, u8) {
 /// produces inverted or equal DTS for B-frame/animation sources and is the root
 /// cause of `non monotonically increasing dts` warnings on GIF→MP4 NVENC output.
 ///
-/// The DTS sequence is the minimal strictly increasing sequence `g >= pts`,
-/// uniformly shifted back by the largest deficit `max(g - pts)`. This guarantees
-/// `dts[k] <= pts[k]` and strictly increasing DTS with one global reorder delay,
-/// including duplicate/variable GIF delays and MP4 timescale rounding.
+/// The DTS sequence advances by the frame cadence for reordered packets (and by
+/// 1 µs only to break a PTS tie), then is uniformly shifted back by the largest
+/// deficit `max(g - pts)`. This guarantees `dts[k] <= pts[k]`, strictly increasing
+/// DTS with one global reorder delay, and gaps wide enough to stay distinct after
+/// conversion to the 90 kHz timebase of MP4/MPEG-TS: there a 1 µs step rounds a
+/// reordered P/B group onto a single tick, making a decoder sort B-frames ahead
+/// of their reference.
 #[cfg(any(feature = "nvenc", test))]
-fn assign_reordered_timestamps(
+pub(crate) fn assign_reordered_timestamps(
     frame_timings: &[(i64, u64)],
     display_indices: &[usize],
 ) -> Result<Vec<(i64, i64, u64)>, PipelineError> {
@@ -2736,13 +2752,34 @@ fn assign_reordered_timestamps(
         durations.push(*duration);
     }
 
-    // Minimal strictly increasing sequence with g[k] >= pts[k].
+    // Decode-order cadence: the median frame duration. A reordered packet (PTS
+    // below the previous packet's) advances by one cadence instead of 1 µs so
+    // its DTS stays distinct once the container rescales to 90 kHz (~11.1 µs per
+    // tick). The 12 µs floor is `US_TIMESCALE / 90_000 + 1`, the smallest step
+    // that cannot round onto the neighbouring tick.
+    let mut sorted_durations = durations.clone();
+    sorted_durations.sort_unstable();
+    let cadence = i128::from(
+        sorted_durations
+            .get(sorted_durations.len() / 2)
+            .copied()
+            .unwrap_or(1)
+            .max(1),
+    )
+    .max(12);
+
+    // Strictly increasing sequence with g[k] >= pts[k]: keep each packet's own
+    // PTS when it moves forward, advance by `cadence` on a reorder, and bump by
+    // 1 µs only to break an exact PTS tie (the minimal repair for duplicate
+    // display delays).
     let mut increasing = Vec::with_capacity(pts.len());
     for &packet_pts in &pts {
-        let next = increasing
-            .last()
-            .map_or(packet_pts, |&prev: &i128| prev.saturating_add(1));
-        increasing.push(next.max(packet_pts));
+        let next = match increasing.last().copied() {
+            Some(prev) if packet_pts < prev => prev.saturating_add(cadence),
+            Some(prev) if packet_pts == prev => prev.saturating_add(1),
+            None | Some(_) => packet_pts,
+        };
+        increasing.push(next);
     }
     // Uniform delay covering every deficit keeps `dts <= pts` for all packets.
     let shift = increasing
@@ -2853,9 +2890,11 @@ where
     }
 }
 
-/// NVDEC hardware decode followed by a true zero-copy device-pointer handoff
-/// into NVENC. No CPU decode or pinned host staging is involved, and every
-/// hardware failure is returned instead of silently falling back.
+/// NVDEC hardware decode followed by a GPU-resident handoff into NVENC: luma and
+/// chroma are copied device-to-device into a separate NVENC slot. No CPU readback
+/// or pinned host staging is involved, but the original NVDEC surface is not
+/// directly shared. Every hardware failure is returned instead of a silent CPU
+/// fallback.
 ///
 /// # Errors
 ///
@@ -3086,14 +3125,15 @@ mod unit_tests {
             (75_000, 25_000),
         ];
         let result = assign_reordered_timestamps(&timings, &[0, 3, 1, 2])?;
-        // One uniform 50 ms delay (two B-frames) plus the 1 µs strictness bump.
+        // One uniform 75 ms reorder delay, then 25 ms of decode-order cadence
+        // between P3, B1 and B2 (no 1 µs bump that a 90 kHz tick would erase).
         assert_eq!(
             result,
             vec![
-                (0, -50_001, 25_000),
-                (75_000, 24_999, 25_000),
+                (0, -75_000, 25_000),
+                (75_000, 0, 25_000),
                 (25_000, 25_000, 25_000),
-                (50_000, 25_001, 25_000),
+                (50_000, 50_000, 25_000),
             ]
         );
         for (k, &(pts, dts, _)) in result.iter().enumerate() {
@@ -3105,6 +3145,20 @@ mod unit_tests {
                 assert!(dts > result[k - 1].1, "packet {k}: dts must increase");
             }
         }
+        // MPEG-TS/MP4 video uses 90 kHz (1 tick ≈ 11.1 µs): the reordered P3/B1/B2
+        // DTS must not collapse onto one tick, or a decoder sorts B1/B2 before
+        // their P3 reference.
+        let dts_90k = |dts: i64| -> i64 {
+            i64::try_from((i128::from(dts) * 90_000 + 500_000) / 1_000_000).unwrap_or(i64::MAX)
+        };
+        let ticks: Vec<i64> = result[1..]
+            .iter()
+            .map(|&(_, dts, _)| dts_90k(dts))
+            .collect();
+        assert!(
+            ticks.windows(2).all(|pair| pair[0] < pair[1]),
+            "reordered DTS collapsed at 90 kHz: {ticks:?}"
+        );
         Ok(())
     }
 

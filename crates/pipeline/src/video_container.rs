@@ -2072,6 +2072,83 @@ mod tests {
         Ok(())
     }
 
+    /// MPEG-TS rebases timestamps and rounds them to 90 kHz ticks (~11.1 µs).
+    /// One-microsecond DTS steps collapse onto a single tick; a decoder then
+    /// sorts the tied B-frames by PTS and decodes them before their P reference.
+    /// Feed the real NVENC DTS assignment through the TS muxer to prove the
+    /// reordered reference picture still decodes first after reopening.
+    #[test]
+    fn ts_b_frame_roundtrip_preserves_reference_decode_order() -> Result<(), String> {
+        let timings = [
+            (0_i64, 25_000_u64),
+            (25_000, 25_000),
+            (50_000, 25_000),
+            (75_000, 25_000),
+        ];
+        // Non-zero tags: the Annex-B helper trims trailing zero bytes, so a 0
+        // tag would be stripped from the NAL and lost on the TS round-trip.
+        let display_order: [u8; 4] = [1, 4, 2, 3]; // decode order I0, P3, B1, B2
+        let stamps = crate::gpu::nvenc::assign_reordered_timestamps(&timings, &[0, 3, 1, 2])
+            .map_err(|err| err.to_string())?;
+        let video = |pts: i64, dts: i64, duration: u64, keyframe: bool, tag: u8| ContainerPacket {
+            track: 0,
+            pts,
+            dts,
+            duration,
+            keyframe,
+            data: vec![0, 0, 0, 2, if keyframe { 0x65 } else { 0x41 }, tag],
+        };
+        let media = ContainerMedia {
+            tracks: vec![ContainerTrack {
+                codec: VideoCodec::H264,
+                width: Some(320),
+                height: Some(240),
+                channels: None,
+                sample_rate: None,
+                config: extract_avcc_from_annex_b(&[
+                    0, 0, 1, 0x67, 0x42, 0x00, 0x1E, 0, 0, 1, 0x68, 0xCE,
+                ])
+                .unwrap_or_default(),
+                timescale: US_TIMESCALE,
+                presentation_edit: None,
+            }],
+            packets: stamps
+                .into_iter()
+                .zip(display_order)
+                .map(|((pts, dts, duration), tag)| video(pts, dts, duration, tag == 1, tag))
+                .collect(),
+        };
+        let dir =
+            std::env::temp_dir().join(format!("fastconv-ts-bframe-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let path = dir.join("bframes.ts");
+        let file = File::create(&path).map_err(|err| err.to_string())?;
+        mux_video(&file, &path, VideoContainerFormat::Ts, &media).map_err(|err| err.to_string())?;
+        drop(file);
+        let reopened =
+            demux_video(&path, VideoContainerFormat::Ts).map_err(|err| err.to_string())?;
+        std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
+        let mut sorted: Vec<&ContainerPacket> = reopened.packets.iter().collect();
+        // The TS demuxer prepends an access-unit delimiter and parameter sets,
+        // so the frame tag is the final byte of each demuxed AVCC access unit.
+        sorted.sort_by_key(|packet| (packet.dts, packet.pts));
+        let tags: Vec<u8> = sorted
+            .iter()
+            .map(|packet| packet.data.last().copied().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            tags, display_order,
+            "decode order I0, P3, B1, B2 must survive MPEG-TS reopen"
+        );
+        for (index, packet) in sorted.iter().enumerate() {
+            assert!(packet.dts <= packet.pts);
+            if index > 0 {
+                assert!(packet.dts > sorted[index - 1].dts);
+            }
+        }
+        Ok(())
+    }
+
     fn write_edited_mp4(
         path: &Path,
         audio_packets: &[(i64, u64)],
