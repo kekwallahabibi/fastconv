@@ -220,6 +220,21 @@
 - **Signalchecks**: FLAC/AIFF/ALAC je 5.760.000 Samples bit-identisch; Opus 37.1 dB, Ogg 35.8 dB, MP3 64.3 dB, AAC 26.4 dB (Lag 1024 Frames dank ADTS-Primer-Suche), M4A 26.4 dB. Batch: WAV/FLAC/ALAC/AIFF bit-identisch, Opus 111.9 dB, Ogg 111.0 dB, MP3 104.3 dB, AAC 109.7 dB, M4A 109.0 dB.
 - **Fehlerpfade (Release-Binary)**: `--backend nvenc` bei Audio bricht mit `UnsupportedAudioPipeline` ab (kein CPU-Fallback), fehlende Quelle meldet sauber `No such file or directory`, `out.m4a --to alac` erzeugt nachweislich `codec_name=alac / 48000 Hz / 2ch / 60.000s`.
 
+## Binary-Größe & Release-Profil (2026-11-25)
+- **Kontext**: Nach Merge #18 (`zenwebp` 0.4.6, `yuv` 0.8.20, `libloading` 0.8, `ogg` 0.9.2, NVDEC→NVENC-Pfad) neu gemessen. Host i7-6700, `rustc`/`cargo` 1.100.0, `cargo build -p fastconv-cli --release`, seriell. Durchsatz-Stichprobe: 23,27 MB WAV → Opus, 1 CPU-Thread (identische Eingabe, identisches Zielformat). Referenz ffmpeg n9.1 inkl. 7 `libav*`/`libsw*`-Shared-Libs.
+- **Messwerte**:
+
+| Variante | Bytes | MiB | Build-Zeit | WAV→Opus | Durchsatz |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| Release-Default (`lto=thin`, unstripped) | 40.830.424 | 38,94 | 188 s | 439,6 ms | 52,95 MB/s |
+| + `strip --strip-symbols` (Post-Step) | 34.088.032 | 32,52 | — | 428,2 ms | 54,35 MB/s |
+| + `lto="fat"`, `codegen-units=1`, `panic="abort"`, `strip="symbols"` | 27.661.328 | 26,39 | 344 s | 431,2 ms | 53,97 MB/s |
+| + `opt-level="z"` (zusätzlich) | 18.584.752 | 17,72 | 210 s | 769,3 ms | 30,25 MB/s |
+| ffmpeg (Binaries + 7 Libs, Referenz) | ~38 MB | ~36,6 | — | — | — |
+
+- **Befund**: Das Default-Binary ist mit ~39 MB praktisch so gross wie ffmpeg samt Bibliotheken (~38 MB), obwohl alle Codec-Abhängigkeiten statisch gelinkt sind (nur `libc`, `libm`, `libgcc_s` bleiben dynamisch). `strip` spart 6,7 MB ohne messbaren Durchsatzverlust. `lto="fat"` + `codegen-units=1` + `panic="abort"` spart weitere 6,4 MB auf **26,39 MiB** bei unverändertem Durchsatz (431,2 vs. 428,2 ms – innerhalb der Laufzeitstreuung), kostet aber 83 % mehr Build-Zeit (188 → 344 s). `opt-level="z"` spart nochmals 9,1 MB auf 17,72 MiB, halbiert aber den Durchsatz (30,25 vs. 53,97 MB/s, 1,8x längere Wandzeit) und widerspricht damit den oben belegten Performance-Zielen.
+- **Entscheidung/Einschränkung**: Das Default-Profil bleibt unverändert; die Size-Varianten sind dokumentierte Optionen, keine Zustimmung zum Default. `panic="abort"` ändert das Absturzverhalten (kein Unwinding) und ist für Release-Tests ungeeignet. Die Durchsatz-Zahlen stammen aus einer Single-File-Audio-Stichprobe, nicht aus `cargo xtask bench`; vor einer dauerhaften Profiländerung wäre die vollständige Benchmark-Matrix nötig.
+
 ## Crate-Wahl und Lizenzen
 - **WebP**: `zenwebp = "=0.2.0"` (pure Rust, `MIT OR Apache-2.0`) – bewusst permissiv gepinned; Lizenz ist mit der AGPL-3.0-only des Projekts kompatibel.
 - **TIFF**: `tiff = "0.11.3"` (pure Rust, MIT) mit `Compressor::Deflate(DeflateLevel::Fast)`; Decoder akzeptiert Gray/GrayA/RGB/RGBA mit 1..=16 Bit und konvertiert auf 8 Bit.
