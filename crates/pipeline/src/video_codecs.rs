@@ -42,6 +42,15 @@ pub(crate) struct Yuv420Frame {
     pub(crate) duration_us: u64,
 }
 
+/// Geometry and timing metadata for one decoded 8-bit 4:2:0 video frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecodedFrameInfo {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pts_us: i64,
+    pub(crate) duration_us: u64,
+}
+
 /// One encoded video track with canonical container packets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EncodedVideoStream {
@@ -591,6 +600,810 @@ pub(crate) fn decode_video_track(
         )),
     }
 }
+
+/// Streaming NV12 decode path feeding the NVENC backend. Without the `nvenc`
+/// feature the helpers are only reachable from tests.
+#[cfg_attr(not(feature = "nvenc"), allow(dead_code))]
+mod streaming {
+    use super::{
+        Av1Decoder, Av1Planes, ContainerPacket, ContainerTrack, DecodedFrameInfo, H264Decoder,
+        H264YuvFrame, HevcDecoder, Path, PipelineError, PixelLayout, VideoCodec, Vp9DecodedFrame,
+        Vp9Decoder, Vp9Error, avcc_to_annex_b, decode_error, decode_order, hevc_picture_duration,
+        hevc_picture_pts, hevc_pts_to_packet, hvcc_to_annex_b, median_duration,
+    };
+
+    /// Estimates the frame rate implied by the median packet duration.
+    ///
+    /// Kept as a pure helper so the streaming GPU path and CPU path share one
+    /// definition of "fps" derived from container timing.
+    pub(crate) fn estimate_video_fps_from_packets(packets: &[ContainerPacket]) -> u32 {
+        let fps = 1_000_000_u64 / median_duration(packets).max(1);
+        u32::try_from(fps.clamp(1, 240)).unwrap_or(30)
+    }
+
+    /// Byte length of one pitched NV12 frame (Y plane then interleaved UV plane).
+    ///
+    /// Validates even, non-zero dimensions and that `pitch` can hold a full row.
+    pub(crate) fn nv12_buffer_len(
+        width: u32,
+        height: u32,
+        pitch: usize,
+    ) -> Result<usize, PipelineError> {
+        let path = Path::new("nv12-buffer");
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(decode_error(
+                path,
+                format!("NV12 requires even, non-zero dimensions; got {width}x{height}"),
+            ));
+        }
+        let w = usize::try_from(width).map_err(|_| decode_error(path, "NV12 width overflow"))?;
+        let h = usize::try_from(height).map_err(|_| decode_error(path, "NV12 height overflow"))?;
+        if pitch < w {
+            return Err(decode_error(
+                path,
+                format!("NV12 pitch {pitch} is smaller than width {w}"),
+            ));
+        }
+        let rows = h
+            .checked_add(h / 2)
+            .ok_or_else(|| decode_error(path, "NV12 row count overflow"))?;
+        pitch
+            .checked_mul(rows)
+            .ok_or_else(|| decode_error(path, "NV12 buffer length overflow"))
+    }
+
+    /// Writes one decoded frame into a caller-owned NV12 buffer.
+    ///
+    /// Rows are written sequentially into `dst` and padding bytes past `width`
+    /// are never touched; the caller zeroes the buffer once at allocation. Every
+    /// row writer receives a slice covering exactly `width` bytes.
+    fn write_nv12<FY, FUV>(
+        dst: &mut [u8],
+        pitch: usize,
+        width: usize,
+        height: usize,
+        path: &Path,
+        write_y: &mut FY,
+        write_uv: &mut FUV,
+    ) -> Result<(), PipelineError>
+    where
+        FY: FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        FUV: FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+    {
+        if pitch < width {
+            return Err(decode_error(
+                path,
+                format!("NV12 pitch {pitch} is smaller than width {width}"),
+            ));
+        }
+        let uv_rows = height / 2;
+        let plane_rows = height
+            .checked_add(uv_rows)
+            .ok_or_else(|| decode_error(path, "NV12 row count overflow"))?;
+        let required = pitch
+            .checked_mul(plane_rows)
+            .ok_or_else(|| decode_error(path, "NV12 buffer size overflow"))?;
+        if dst.len() < required {
+            return Err(decode_error(
+                path,
+                format!(
+                    "NV12 buffer of {} bytes is smaller than required {required}",
+                    dst.len()
+                ),
+            ));
+        }
+        for row in 0..height {
+            let start = row * pitch;
+            write_y(&mut dst[start..start + width], row)?;
+        }
+        let uv_base = height * pitch;
+        for row in 0..uv_rows {
+            let start = uv_base + row * pitch;
+            write_uv(&mut dst[start..start + width], row)?;
+        }
+        Ok(())
+    }
+
+    /// Validates a decoded plane is large enough for the requested crop window.
+    fn require_plane_dims(
+        path: &Path,
+        name: &str,
+        (need_w, need_h): (usize, usize),
+        (got_w, got_h): (usize, usize),
+    ) -> Result<(), PipelineError> {
+        if got_w < need_w || got_h < need_h {
+            return Err(decode_error(
+                path,
+                format!("AV1 {name} plane {got_w}x{got_h} is smaller than {need_w}x{need_h}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Packs one decoded frame through the caller's callback. Geometry is checked
+    /// once here so every codec's row writer can rely on even, non-zero dimensions.
+    fn emit_nv12_frame<FY, FUV>(
+        path: &Path,
+        on_frame: &mut impl FnMut(
+            DecodedFrameInfo,
+            &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        ) -> Result<(), PipelineError>,
+        info: DecodedFrameInfo,
+        mut write_y: FY,
+        mut write_uv: FUV,
+    ) -> Result<(), PipelineError>
+    where
+        FY: FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        FUV: FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+    {
+        let w =
+            usize::try_from(info.width).map_err(|_| decode_error(path, "frame width overflow"))?;
+        let h = usize::try_from(info.height)
+            .map_err(|_| decode_error(path, "frame height overflow"))?;
+        if w == 0 || h == 0 || !w.is_multiple_of(2) || !h.is_multiple_of(2) {
+            return Err(decode_error(
+                path,
+                format!(
+                    "decoded 4:2:0 frame has odd or zero dimensions: {}x{}",
+                    info.width, info.height
+                ),
+            ));
+        }
+        let mut pack = |dst: &mut [u8], pitch: usize| -> Result<(), PipelineError> {
+            write_nv12(dst, pitch, w, h, path, &mut write_y, &mut write_uv)
+        };
+        on_frame(info, &mut pack)
+    }
+
+    fn emit_av1_depth8<F>(
+        path: &Path,
+        planes: &rav1d_safe::src::managed::Planes8<'_>,
+        info: DecodedFrameInfo,
+        width: usize,
+        height: usize,
+        on_frame: &mut F,
+    ) -> Result<(), PipelineError>
+    where
+        F: FnMut(
+            DecodedFrameInfo,
+            &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        ) -> Result<(), PipelineError>,
+    {
+        let y_plane = planes.y();
+        let u_plane = planes
+            .u()
+            .ok_or_else(|| decode_error(path, "AV1 frame has no U plane"))?;
+        let v_plane = planes
+            .v()
+            .ok_or_else(|| decode_error(path, "AV1 frame has no V plane"))?;
+        require_plane_dims(
+            path,
+            "Y",
+            (width, height),
+            (y_plane.width(), y_plane.height()),
+        )?;
+        let cw = width / 2;
+        require_plane_dims(
+            path,
+            "U",
+            (cw, height / 2),
+            (u_plane.width(), u_plane.height()),
+        )?;
+        require_plane_dims(
+            path,
+            "V",
+            (cw, height / 2),
+            (v_plane.width(), v_plane.height()),
+        )?;
+        let write_y = |dst_row: &mut [u8], row: usize| {
+            let src = y_plane
+                .row(row)
+                .get(..width)
+                .ok_or_else(|| decode_error(path, "AV1 Y row is too short"))?;
+            dst_row.copy_from_slice(src);
+            Ok(())
+        };
+        let write_uv = |dst_row: &mut [u8], row: usize| {
+            let u_src = u_plane
+                .row(row)
+                .get(..cw)
+                .ok_or_else(|| decode_error(path, "AV1 U row is too short"))?;
+            let v_src = v_plane
+                .row(row)
+                .get(..cw)
+                .ok_or_else(|| decode_error(path, "AV1 V row is too short"))?;
+            for (pair, (&u, &v)) in dst_row
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(u_src.iter().zip(v_src.iter()))
+            {
+                pair[0] = u;
+                pair[1] = v;
+            }
+            Ok(())
+        };
+        emit_nv12_frame(path, on_frame, info, write_y, write_uv)
+    }
+
+    fn emit_av1_depth16<F>(
+        path: &Path,
+        planes: &rav1d_safe::src::managed::Planes16<'_>,
+        shift: u8,
+        info: DecodedFrameInfo,
+        width: usize,
+        height: usize,
+        on_frame: &mut F,
+    ) -> Result<(), PipelineError>
+    where
+        F: FnMut(
+            DecodedFrameInfo,
+            &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        ) -> Result<(), PipelineError>,
+    {
+        let y_plane = planes.y();
+        let u_plane = planes
+            .u()
+            .ok_or_else(|| decode_error(path, "AV1 frame has no U plane"))?;
+        let v_plane = planes
+            .v()
+            .ok_or_else(|| decode_error(path, "AV1 frame has no V plane"))?;
+        require_plane_dims(
+            path,
+            "Y",
+            (width, height),
+            (y_plane.width(), y_plane.height()),
+        )?;
+        let cw = width / 2;
+        require_plane_dims(
+            path,
+            "U",
+            (cw, height / 2),
+            (u_plane.width(), u_plane.height()),
+        )?;
+        require_plane_dims(
+            path,
+            "V",
+            (cw, height / 2),
+            (v_plane.width(), v_plane.height()),
+        )?;
+        let write_y = |dst_row: &mut [u8], row: usize| {
+            let src = y_plane
+                .row(row)
+                .get(..width)
+                .ok_or_else(|| decode_error(path, "AV1 Y row is too short"))?;
+            for (slot, &sample) in dst_row.iter_mut().zip(src.iter()) {
+                *slot = u8::try_from(sample >> shift).unwrap_or(u8::MAX);
+            }
+            Ok(())
+        };
+        let write_uv = |dst_row: &mut [u8], row: usize| {
+            let u_src = u_plane
+                .row(row)
+                .get(..cw)
+                .ok_or_else(|| decode_error(path, "AV1 U row is too short"))?;
+            let v_src = v_plane
+                .row(row)
+                .get(..cw)
+                .ok_or_else(|| decode_error(path, "AV1 V row is too short"))?;
+            for (pair, (&u, &v)) in dst_row
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(u_src.iter().zip(v_src.iter()))
+            {
+                pair[0] = u8::try_from(u >> shift).unwrap_or(u8::MAX);
+                pair[1] = u8::try_from(v >> shift).unwrap_or(u8::MAX);
+            }
+            Ok(())
+        };
+        emit_nv12_frame(path, on_frame, info, write_y, write_uv)
+    }
+
+    fn emit_av1_frame<F>(
+        path: &Path,
+        frame: &rav1d_safe::src::managed::Frame,
+        pts_us: i64,
+        duration_us: u64,
+        on_frame: &mut F,
+    ) -> Result<(), PipelineError>
+    where
+        F: FnMut(
+            DecodedFrameInfo,
+            &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        ) -> Result<(), PipelineError>,
+    {
+        let width = usize::try_from(frame.width()).map_err(|_| decode_error(path, "AV1 width"))?;
+        let height =
+            usize::try_from(frame.height()).map_err(|_| decode_error(path, "AV1 height"))?;
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(decode_error(
+                path,
+                format!("AV1 decoded odd or zero dimensions: {width}x{height}"),
+            ));
+        }
+        let layout = frame.pixel_layout();
+        if layout != PixelLayout::I420 {
+            return Err(decode_error(
+                path,
+                format!("AV1 chroma layout {layout:?} is not 4:2:0"),
+            ));
+        }
+        let info = DecodedFrameInfo {
+            width: frame.width(),
+            height: frame.height(),
+            pts_us,
+            duration_us,
+        };
+        match frame.planes() {
+            Av1Planes::Depth8(planes) => {
+                emit_av1_depth8(path, &planes, info, width, height, on_frame)
+            }
+            Av1Planes::Depth16(planes) => emit_av1_depth16(
+                path,
+                &planes,
+                frame.bit_depth().saturating_sub(8),
+                info,
+                width,
+                height,
+                on_frame,
+            ),
+        }
+    }
+
+    fn emit_h264_frame<F>(
+        path: &Path,
+        frame: &H264YuvFrame,
+        pts_us: i64,
+        duration_us: u64,
+        on_frame: &mut F,
+    ) -> Result<(), PipelineError>
+    where
+        F: FnMut(
+            DecodedFrameInfo,
+            &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        ) -> Result<(), PipelineError>,
+    {
+        let width = frame.width;
+        let height = frame.height;
+        let cw = width / 2;
+        let info = DecodedFrameInfo {
+            width: u32::try_from(width).unwrap_or(u32::MAX),
+            height: u32::try_from(height).unwrap_or(u32::MAX),
+            pts_us,
+            duration_us,
+        };
+        let write_y = |dst_row: &mut [u8], row: usize| {
+            let start = row
+                .checked_mul(width)
+                .ok_or_else(|| decode_error(path, "H.264 Y row offset overflow"))?;
+            let end = start
+                .checked_add(width)
+                .ok_or_else(|| decode_error(path, "H.264 Y row offset overflow"))?;
+            let src = frame
+                .y
+                .get(start..end)
+                .ok_or_else(|| decode_error(path, "H.264 Y row out of bounds"))?;
+            dst_row.copy_from_slice(src);
+            Ok(())
+        };
+        let write_uv = |dst_row: &mut [u8], row: usize| {
+            let start = row
+                .checked_mul(cw)
+                .ok_or_else(|| decode_error(path, "H.264 chroma row offset overflow"))?;
+            let end = start
+                .checked_add(cw)
+                .ok_or_else(|| decode_error(path, "H.264 chroma row offset overflow"))?;
+            let u_src = frame
+                .u
+                .get(start..end)
+                .ok_or_else(|| decode_error(path, "H.264 U row out of bounds"))?;
+            let v_src = frame
+                .v
+                .get(start..end)
+                .ok_or_else(|| decode_error(path, "H.264 V row out of bounds"))?;
+            for (pair, (&u, &v)) in dst_row
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(u_src.iter().zip(v_src.iter()))
+            {
+                pair[0] = u;
+                pair[1] = v;
+            }
+            Ok(())
+        };
+        emit_nv12_frame(path, on_frame, info, write_y, write_uv)
+    }
+
+    fn emit_hevc_frame<F>(
+        path: &Path,
+        frame: &rusty_h265::Frame,
+        pts_us: i64,
+        duration_us: u64,
+        on_frame: &mut F,
+    ) -> Result<(), PipelineError>
+    where
+        F: FnMut(
+            DecodedFrameInfo,
+            &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        ) -> Result<(), PipelineError>,
+    {
+        let width = frame.width;
+        let height = frame.height;
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(decode_error(
+                path,
+                format!("HEVC decoded odd or zero dimensions: {width}x{height}"),
+            ));
+        }
+        let picture = &frame.picture;
+        let (crop_x, crop_y) = (picture.crop.0, picture.crop.1);
+        if picture.chroma_format_idc != 1 {
+            return Err(decode_error(
+                path,
+                format!(
+                    "HEVC chroma format {} is not 4:2:0",
+                    picture.chroma_format_idc
+                ),
+            ));
+        }
+        let cw = width / 2;
+        let shift_y = picture.bit_depth_luma.saturating_sub(8);
+        let shift_c = picture.bit_depth_chroma.saturating_sub(8);
+        let info = DecodedFrameInfo {
+            width: u32::try_from(width).unwrap_or(u32::MAX),
+            height: u32::try_from(height).unwrap_or(u32::MAX),
+            pts_us,
+            duration_us,
+        };
+        let write_y = |dst_row: &mut [u8], row: usize| {
+            let plane = &picture.planes[0];
+            let start = row
+                .checked_add(crop_y)
+                .and_then(|r| r.checked_mul(plane.stride))
+                .and_then(|s| s.checked_add(crop_x))
+                .ok_or_else(|| decode_error(path, "HEVC Y row offset overflow"))?;
+            let end = start
+                .checked_add(width)
+                .ok_or_else(|| decode_error(path, "HEVC Y row offset overflow"))?;
+            let src = plane
+                .data
+                .get(start..end)
+                .ok_or_else(|| decode_error(path, "HEVC Y row out of bounds"))?;
+            for (slot, &sample) in dst_row.iter_mut().zip(src.iter()) {
+                *slot = u8::try_from(sample >> shift_y).unwrap_or(u8::MAX);
+            }
+            Ok(())
+        };
+        let write_uv = |dst_row: &mut [u8], row: usize| {
+            let u_plane = &picture.planes[1];
+            let v_plane = &picture.planes[2];
+            let (cx, cy) = (crop_x / 2, crop_y / 2);
+            let u_start = row
+                .checked_add(cy)
+                .and_then(|r| r.checked_mul(u_plane.stride))
+                .and_then(|s| s.checked_add(cx))
+                .ok_or_else(|| decode_error(path, "HEVC U row offset overflow"))?;
+            let v_start = row
+                .checked_add(cy)
+                .and_then(|r| r.checked_mul(v_plane.stride))
+                .and_then(|s| s.checked_add(cx))
+                .ok_or_else(|| decode_error(path, "HEVC V row offset overflow"))?;
+            let u_src = u_plane
+                .data
+                .get(u_start..u_start.saturating_add(cw))
+                .ok_or_else(|| decode_error(path, "HEVC U row out of bounds"))?;
+            let v_src = v_plane
+                .data
+                .get(v_start..v_start.saturating_add(cw))
+                .ok_or_else(|| decode_error(path, "HEVC V row out of bounds"))?;
+            for (pair, (&u, &v)) in dst_row
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(u_src.iter().zip(v_src.iter()))
+            {
+                pair[0] = u8::try_from(u >> shift_c).unwrap_or(u8::MAX);
+                pair[1] = u8::try_from(v >> shift_c).unwrap_or(u8::MAX);
+            }
+            Ok(())
+        };
+        emit_nv12_frame(path, on_frame, info, write_y, write_uv)
+    }
+
+    fn vp9_sample(
+        plane: &[u8],
+        stride: usize,
+        row: usize,
+        x: usize,
+        bit_depth: u32,
+        path: &Path,
+    ) -> Result<u8, PipelineError> {
+        if bit_depth <= 8 {
+            let index = row
+                .checked_mul(stride)
+                .and_then(|v| v.checked_add(x))
+                .ok_or_else(|| decode_error(path, "VP9 sample offset overflow"))?;
+            plane
+                .get(index)
+                .copied()
+                .ok_or_else(|| decode_error(path, "VP9 8-bit sample out of bounds"))
+        } else {
+            let shift = bit_depth.saturating_sub(8);
+            let x2 = x
+                .checked_mul(2)
+                .ok_or_else(|| decode_error(path, "VP9 sample offset overflow"))?;
+            let index = row
+                .checked_mul(stride)
+                .and_then(|v| v.checked_add(x2))
+                .ok_or_else(|| decode_error(path, "VP9 sample offset overflow"))?;
+            let bytes = plane
+                .get(index..index.saturating_add(2))
+                .ok_or_else(|| decode_error(path, "VP9 10-bit sample out of bounds"))?;
+            Ok(u8::try_from(u16::from_le_bytes([bytes[0], bytes[1]]) >> shift).unwrap_or(u8::MAX))
+        }
+    }
+
+    fn emit_vp9_frame<F>(
+        path: &Path,
+        frame: &Vp9DecodedFrame,
+        duration_us: u64,
+        on_frame: &mut F,
+    ) -> Result<(), PipelineError>
+    where
+        F: FnMut(
+            DecodedFrameInfo,
+            &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        ) -> Result<(), PipelineError>,
+    {
+        let width = usize::try_from(frame.width).map_err(|_| decode_error(path, "VP9 width"))?;
+        let height = usize::try_from(frame.height).map_err(|_| decode_error(path, "VP9 height"))?;
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(decode_error(
+                path,
+                format!("VP9 decoded odd or zero dimensions: {width}x{height}"),
+            ));
+        }
+        let planes = &frame.planes;
+        let strides = &frame.strides;
+        let plane = |index: usize| {
+            planes
+                .get(index)
+                .map(Vec::as_slice)
+                .ok_or_else(|| decode_error(path, "VP9 frame is missing a plane"))
+        };
+        let stride = |index: usize| {
+            strides
+                .get(index)
+                .copied()
+                .ok_or_else(|| decode_error(path, "VP9 frame is missing a stride"))
+        };
+        let y_plane = plane(0)?;
+        let y_stride = stride(0)?;
+        let u_plane = plane(1)?;
+        let u_stride = stride(1)?;
+        let v_plane = plane(2)?;
+        let v_stride = stride(2)?;
+        let bit_depth = frame.bit_depth;
+        let write_y = |dst_row: &mut [u8], row: usize| {
+            for (x, slot) in dst_row.iter_mut().enumerate() {
+                *slot = vp9_sample(y_plane, y_stride, row, x, bit_depth, path)?;
+            }
+            Ok(())
+        };
+        let write_uv = |dst_row: &mut [u8], row: usize| {
+            for (x, pair) in dst_row.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                pair[0] = vp9_sample(u_plane, u_stride, row, x, bit_depth, path)?;
+                pair[1] = vp9_sample(v_plane, v_stride, row, x, bit_depth, path)?;
+            }
+            Ok(())
+        };
+        let info = DecodedFrameInfo {
+            width: u32::try_from(width).unwrap_or(u32::MAX),
+            height: u32::try_from(height).unwrap_or(u32::MAX),
+            pts_us: frame.pts.unwrap_or(0),
+            duration_us,
+        };
+        emit_nv12_frame(path, on_frame, info, write_y, write_uv)
+    }
+
+    fn stream_h264(
+        path: &Path,
+        track: &ContainerTrack,
+        ordered: &[&ContainerPacket],
+        on_frame: &mut impl FnMut(
+            DecodedFrameInfo,
+            &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        ) -> Result<(), PipelineError>,
+    ) -> Result<(), PipelineError> {
+        let mut decoder = H264Decoder::new();
+        for packet in ordered {
+            let annex_b = avcc_to_annex_b(&track.config, &packet.data, true)
+                .map_err(|reason| decode_error(path, reason))?;
+            let frame = decoder
+                .decode(&annex_b)
+                .map_err(|err| decode_error(path, format!("H.264 decode failed: {err}")))?;
+            if let Some(frame) = frame {
+                emit_h264_frame(path, &frame, packet.pts, packet.duration, on_frame)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn stream_hevc(
+        path: &Path,
+        track: &ContainerTrack,
+        ordered: &[&ContainerPacket],
+        packets: &[ContainerPacket],
+        on_frame: &mut impl FnMut(
+            DecodedFrameInfo,
+            &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        ) -> Result<(), PipelineError>,
+    ) -> Result<(), PipelineError> {
+        let mut decoder = HevcDecoder::new();
+        let mapping = hevc_pts_to_packet(packets);
+        let fallback_dur = median_duration(packets);
+        let mut last_pts_dur: Option<(i64, u64)> = None;
+        for packet in ordered {
+            let annex_b = hvcc_to_annex_b(&track.config, &packet.data, true)
+                .map_err(|reason| decode_error(path, reason))?;
+            decoder
+                .push_annexb(&annex_b, Some(packet.pts))
+                .map_err(|err| decode_error(path, format!("HEVC decode failed: {err}")))?;
+            loop {
+                match decoder.next_frame() {
+                    Ok(frame) => {
+                        let pts = hevc_picture_pts(&frame, packet.pts);
+                        let duration = hevc_picture_duration(pts, packets, &mapping, fallback_dur);
+                        emit_hevc_frame(path, &frame, pts, duration, on_frame)?;
+                        last_pts_dur = Some((pts, duration));
+                    }
+                    Err(rusty_h265::Error::Again | rusty_h265::Error::Eof) => break,
+                    Err(err) => {
+                        return Err(decode_error(path, format!("HEVC drain failed: {err}")));
+                    }
+                }
+            }
+        }
+        decoder.flush();
+        loop {
+            match decoder.next_frame() {
+                Ok(frame) => {
+                    let fallback_pts = last_pts_dur.map_or(0, |(pts, duration)| {
+                        pts.saturating_add(i64::try_from(duration).unwrap_or(1))
+                    });
+                    let pts = hevc_picture_pts(&frame, fallback_pts);
+                    let duration = hevc_picture_duration(pts, packets, &mapping, fallback_dur);
+                    emit_hevc_frame(path, &frame, pts, duration, on_frame)?;
+                    last_pts_dur = Some((pts, duration));
+                }
+                Err(rusty_h265::Error::Again | rusty_h265::Error::Eof) => break,
+                Err(err) => return Err(decode_error(path, format!("HEVC flush failed: {err}"))),
+            }
+        }
+        Ok(())
+    }
+
+    fn stream_av1(
+        path: &Path,
+        ordered: &[&ContainerPacket],
+        packets: &[ContainerPacket],
+        on_frame: &mut impl FnMut(
+            DecodedFrameInfo,
+            &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        ) -> Result<(), PipelineError>,
+    ) -> Result<(), PipelineError> {
+        let mut decoder = Av1Decoder::new().map_err(|err| decode_error(path, format!("{err}")))?;
+        let mut emitted = 0_usize;
+        for packet in ordered {
+            if let Some(frame) = decoder
+                .decode(&packet.data)
+                .map_err(|err| decode_error(path, format!("AV1 decode failed: {err}")))?
+            {
+                emit_av1_frame(path, &frame, packet.pts, packet.duration, on_frame)?;
+                emitted = emitted.saturating_add(1);
+            }
+            while let Some(frame) = decoder
+                .get_frame()
+                .map_err(|err| decode_error(path, format!("AV1 drain failed: {err}")))?
+            {
+                emit_av1_frame(path, &frame, packet.pts, packet.duration, on_frame)?;
+                emitted = emitted.saturating_add(1);
+            }
+        }
+        let median = median_duration(packets);
+        for frame in decoder
+            .flush()
+            .map_err(|err| decode_error(path, format!("AV1 flush failed: {err}")))?
+        {
+            let pts = u64::try_from(emitted)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(median);
+            emit_av1_frame(
+                path,
+                &frame,
+                i64::try_from(pts).unwrap_or(i64::MAX),
+                median,
+                on_frame,
+            )?;
+            emitted = emitted.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn stream_vp9(
+        path: &Path,
+        ordered: &[&ContainerPacket],
+        packets: &[ContainerPacket],
+        on_frame: &mut impl FnMut(
+            DecodedFrameInfo,
+            &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        ) -> Result<(), PipelineError>,
+    ) -> Result<(), PipelineError> {
+        let mut decoder = Vp9Decoder::new();
+        for packet in ordered {
+            decoder
+                .push(&packet.data, Some(packet.pts))
+                .map_err(|err| decode_error(path, format!("VP9 push failed: {err}")))?;
+            loop {
+                match decoder.next_frame() {
+                    Ok(frame) => emit_vp9_frame(path, &frame, packet.duration, on_frame)?,
+                    Err(Vp9Error::Again | Vp9Error::Eof) => break,
+                    Err(err) => return Err(decode_error(path, format!("VP9 drain failed: {err}"))),
+                }
+            }
+        }
+        decoder.flush();
+        loop {
+            match decoder.next_frame() {
+                Ok(frame) => emit_vp9_frame(path, &frame, median_duration(packets), on_frame)?,
+                Err(Vp9Error::Again | Vp9Error::Eof) => break,
+                Err(err) => return Err(decode_error(path, format!("VP9 flush failed: {err}"))),
+            }
+        }
+        Ok(())
+    }
+
+    /// Decodes one canonical video track and streams each frame straight into a
+    /// caller-provided NV12 buffer via `on_frame`. No `Yuv420Frame` is ever built.
+    ///
+    /// The callback receives frame metadata plus a `pack_nv12` closure with the
+    /// signature `FnMut(&mut [u8], usize)`. It supplies the destination buffer and
+    /// pitch; the closure writes one NV12 frame directly into it. Returning `Err`
+    /// from the callback aborts decoding immediately.
+    // One branch per codec keeps decode-order and timestamp handling explicit.
+    pub(crate) fn decode_video_track_streaming<F>(
+        path: &Path,
+        track: &ContainerTrack,
+        packets: &[ContainerPacket],
+        mut on_frame: F,
+    ) -> Result<(), PipelineError>
+    where
+        F: FnMut(
+            DecodedFrameInfo,
+            &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        ) -> Result<(), PipelineError>,
+    {
+        let ordered = decode_order(packets);
+        match track.codec {
+            VideoCodec::H264 => stream_h264(path, track, &ordered, &mut on_frame),
+            VideoCodec::Hevc => stream_hevc(path, track, &ordered, packets, &mut on_frame),
+            VideoCodec::Av1 => stream_av1(path, &ordered, packets, &mut on_frame),
+            VideoCodec::Vp9 => stream_vp9(path, &ordered, packets, &mut on_frame),
+            other => Err(decode_error(
+                path,
+                format!("codec {other} is not a supported video decoder"),
+            )),
+        }
+    }
+} // mod streaming
+
+// Re-exports preserve the `video_codecs` API path for the upcoming NVENC stage.
+#[allow(unused_imports)]
+pub(crate) use streaming::{
+    decode_video_track_streaming, estimate_video_fps_from_packets, nv12_buffer_len,
+};
 
 /// Splits an Annex-B byte stream into one packet per coded access unit,
 /// grouping parameter sets and SEI with the VCL NAL that follows them.
@@ -1193,7 +2006,15 @@ mod tests {
     #[test]
     fn nvenc_video_fails_explicitly_without_feature() {
         use fastconv_domain::GpuBackend;
-        let frames = synthetic_frames(256, 144, 2);
+        let track = ContainerTrack {
+            codec: VideoCodec::H264,
+            width: Some(256),
+            height: Some(144),
+            channels: None,
+            sample_rate: None,
+            config: Vec::new(),
+            timescale: US_TIMESCALE,
+        };
         for mode in [
             VideoEncodeMode::NvencH264 {
                 quality: VideoQuality::DEFAULT,
@@ -1202,8 +2023,14 @@ mod tests {
                 quality: VideoQuality::DEFAULT,
             },
         ] {
-            let result =
-                crate::gpu::nvenc::encode_video_nvenc(Path::new("nvenc.mp4"), &frames, mode, 0);
+            let result = crate::gpu::nvenc::encode_video_nvenc_streaming(
+                Path::new("nvenc.mp4"),
+                &track,
+                &[],
+                mode,
+                0,
+                || Ok(()),
+            );
             assert!(matches!(
                 result,
                 Err(PipelineError::GpuBackendFailed {
@@ -1238,7 +2065,22 @@ mod tests {
                 VideoCodec::Hevc,
             ),
         ] {
-            let (stream, _device) = crate::gpu::nvenc::encode_video_nvenc(path, &frames, mode, 0)?;
+            let source = encode_video_cpu(
+                path,
+                &frames,
+                VideoEncodeMode::CpuH264 {
+                    quality: VideoQuality::DEFAULT,
+                },
+                0,
+            )?;
+            let (stream, _, _device) = crate::gpu::nvenc::encode_video_nvenc_streaming(
+                path,
+                &source.track,
+                &source.packets,
+                mode,
+                0,
+                || Ok(()),
+            )?;
             assert_eq!(stream.track.codec, codec);
             let decoded = decode_video_track(path, &stream.track, &stream.packets)?;
             assert_eq!(decoded.len(), 4);
@@ -1247,5 +2089,172 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// Packs a streamed NV12 frame back into `Yuv420Frame` so the two decode
+    /// paths can be compared byte-for-byte, including row padding.
+    fn unpack_streamed_frame(
+        path: &Path,
+        info: DecodedFrameInfo,
+        nv12: &[u8],
+        pitch: usize,
+    ) -> Result<Yuv420Frame, PipelineError> {
+        let frame_width = usize::try_from(info.width).unwrap_or(0);
+        let frame_height = usize::try_from(info.height).unwrap_or(0);
+        let chroma_width = frame_width / 2;
+        let chroma_height = frame_height / 2;
+        let mut y_plane = vec![0_u8; frame_width.saturating_mul(frame_height)];
+        let mut u_plane = vec![0_u8; chroma_width.saturating_mul(chroma_height)];
+        let mut v_plane = vec![0_u8; chroma_width.saturating_mul(chroma_height)];
+        for row in 0..frame_height {
+            let start = row * pitch;
+            let src = nv12
+                .get(start..start.saturating_add(frame_width))
+                .ok_or_else(|| decode_error(path, "streamed Y row out of bounds"))?;
+            let y_row = y_plane
+                .get_mut(row * frame_width..row * frame_width + frame_width)
+                .ok_or_else(|| decode_error(path, "streamed Y destination out of bounds"))?;
+            y_row.copy_from_slice(src);
+            let padding = nv12
+                .get(start.saturating_add(frame_width)..start.saturating_add(pitch))
+                .ok_or_else(|| decode_error(path, "streamed Y padding out of bounds"))?;
+            assert!(
+                padding.iter().all(|&byte| byte == 0),
+                "streaming decoder touched row padding"
+            );
+        }
+        for row in 0..chroma_height {
+            let start = frame_height * pitch + row * pitch;
+            let src = nv12
+                .get(start..start.saturating_add(frame_width))
+                .ok_or_else(|| decode_error(path, "streamed UV row out of bounds"))?;
+            for (sample_index, pair) in src.as_chunks::<2>().0.iter().enumerate() {
+                u_plane[row * chroma_width + sample_index] = pair[0];
+                v_plane[row * chroma_width + sample_index] = pair[1];
+            }
+            let padding = nv12
+                .get(start.saturating_add(frame_width)..start.saturating_add(pitch))
+                .ok_or_else(|| decode_error(path, "streamed UV padding out of bounds"))?;
+            assert!(
+                padding.iter().all(|&byte| byte == 0),
+                "streaming decoder touched chroma padding"
+            );
+        }
+        Ok(Yuv420Frame {
+            width: info.width,
+            height: info.height,
+            y: y_plane,
+            u: u_plane,
+            v: v_plane,
+            pts_us: info.pts_us,
+            duration_us: info.duration_us,
+        })
+    }
+
+    #[test]
+    fn streaming_nv12_matches_buffered_decode_for_av1_h264_vp9() -> Result<(), PipelineError> {
+        let path = Path::new("video-codec-streaming-test");
+        let (width, height) = (64_u32, 48_u32);
+        let pitch = usize::try_from(width).unwrap_or(0) + 64;
+        let frames = synthetic_frames(width, height, 4);
+        for mode in [
+            VideoEncodeMode::CpuAv1 {
+                quality: VideoQuality::DEFAULT,
+            },
+            VideoEncodeMode::CpuH264 {
+                quality: VideoQuality::DEFAULT,
+            },
+            VideoEncodeMode::CpuVp9 {
+                quality: VideoQuality::DEFAULT,
+            },
+        ] {
+            let stream = encode_video_cpu(path, &frames, mode, 0)?;
+            let buffered = decode_video_track(path, &stream.track, &stream.packets)?;
+            let mut streamed = Vec::new();
+            decode_video_track_streaming(path, &stream.track, &stream.packets, |info, pack| {
+                let length = nv12_buffer_len(info.width, info.height, pitch)?;
+                let mut dst = vec![0_u8; length];
+                pack(&mut dst, pitch)?;
+                streamed.push(unpack_streamed_frame(path, info, &dst, pitch)?);
+                Ok(())
+            })?;
+            assert_eq!(streamed, buffered);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_decode_stops_immediately_on_callback_error() -> Result<(), PipelineError> {
+        let path = Path::new("video-codec-streaming-error");
+        let frames = synthetic_frames(64, 48, 4);
+        let stream = encode_video_cpu(
+            path,
+            &frames,
+            VideoEncodeMode::CpuH264 {
+                quality: VideoQuality::DEFAULT,
+            },
+            0,
+        )?;
+        let mut calls = 0_usize;
+        let result = decode_video_track_streaming(path, &stream.track, &stream.packets, |_, _| {
+            calls = calls.saturating_add(1);
+            Err(PipelineError::EncodeFailed {
+                path: path.to_path_buf(),
+                reason: "stop decoding".to_string(),
+            })
+        });
+        assert!(matches!(result, Err(PipelineError::EncodeFailed { .. })));
+        assert_eq!(calls, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_nv12_rejects_insufficient_pitch_or_buffer() -> Result<(), PipelineError> {
+        let path = Path::new("video-codec-streaming-bounds");
+        let frames = synthetic_frames(64, 48, 2);
+        let stream = encode_video_cpu(
+            path,
+            &frames,
+            VideoEncodeMode::CpuH264 {
+                quality: VideoQuality::DEFAULT,
+            },
+            0,
+        )?;
+        let mut checked = 0_usize;
+        decode_video_track_streaming(path, &stream.track, &stream.packets, |info, pack| {
+            let width = usize::try_from(info.width).unwrap_or(0);
+            let valid_pitch = width + 8;
+            let valid_len = nv12_buffer_len(info.width, info.height, valid_pitch)?;
+
+            let mut short_pitch = vec![0_u8; valid_len];
+            let invalid = pack(&mut short_pitch, width.saturating_sub(2));
+            assert!(matches!(invalid, Err(PipelineError::DecodeFailed { .. })));
+
+            let mut short_buffer = vec![0_u8; valid_len.saturating_sub(1)];
+            let invalid = pack(&mut short_buffer, valid_pitch);
+            assert!(matches!(invalid, Err(PipelineError::DecodeFailed { .. })));
+
+            let mut valid = vec![0_u8; valid_len];
+            assert!(pack(&mut valid, valid_pitch).is_ok());
+            checked = checked.saturating_add(1);
+            Ok(())
+        })?;
+        assert!(checked > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn estimates_fps_from_packet_durations() {
+        let packet = |duration: u64| ContainerPacket {
+            track: 0,
+            pts: 0,
+            dts: 0,
+            duration,
+            keyframe: true,
+            data: Vec::new(),
+        };
+        assert_eq!(estimate_video_fps_from_packets(&[packet(40_000)]), 25);
+        assert_eq!(estimate_video_fps_from_packets(&[]), 30);
+        assert_eq!(estimate_video_fps_from_packets(&[packet(1)]), 240);
     }
 }
