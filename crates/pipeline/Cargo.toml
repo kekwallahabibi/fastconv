@@ -44,6 +44,7 @@ zenavif.workspace = true
 zenavif-parse.workspace = true
 zenwebp.workspace = true
 zune-jpeg.workspace = true
+yuv.workspace = true
 
 [lints.rust]
 # Default builds enforce `#![forbid(unsafe_code)]` via `src/lib.rs`.

@@ -323,6 +323,14 @@ mod enabled {
                 let status = unsafe { (api.memcpy2d)(&raw const copy, stream.cu_stream()) };
                 cu_result(status, "cuMemcpy2DAsync (NVDEC -> NVENC) failed")?;
             }
+            // NVENC runs on a separate hardware engine that does not order
+            // against CUDA streams; synchronize before mapping/encoding the
+            // slot or unmapping the NVDEC surface.
+            stream.synchronize().map_err(|err| {
+                nvdec_error(format!(
+                    "CUDA stream synchronize after NVDEC -> NVENC copy failed: {err}"
+                ))
+            })?;
             Ok(())
         }
     }
@@ -396,6 +404,7 @@ mod enabled {
         geometry: Option<Geometry>,
         error: Option<PipelineError>,
         durations: HashMap<i64, u64>,
+        displayed_frames: u64,
         on_frame: FrameCallback<'a>,
     }
 
@@ -606,7 +615,10 @@ mod enabled {
                 // the surface is unmapped even when the consumer fails.
                 let result = (state.on_frame)(frame, pts, duration);
                 return match result {
-                    Ok(()) => 1,
+                    Ok(()) => {
+                        state.displayed_frames = state.displayed_frames.saturating_add(1);
+                        1
+                    }
                     Err(err) => state.fail(err),
                 };
             }
@@ -670,6 +682,7 @@ mod enabled {
             geometry: None,
             error: None,
             durations,
+            displayed_frames: 0,
             on_frame: &mut on_frame,
         };
         let mut parser = ptr::null_mut();
@@ -746,7 +759,7 @@ mod enabled {
             return Err(err);
         }
 
-        let frames = state.durations.len() as u64;
+        let frames = state.displayed_frames;
         // Explicit drop order: parser -> state/decoder -> ctx lock (while caller's
         // shared CUDA context remains alive).
         drop(parser);
