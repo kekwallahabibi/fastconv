@@ -1417,11 +1417,13 @@ mod enabled {
                                             info.width, info.height
                                         )));
                                     }
-                                    // CUDADEVICEPTR slots come from `cuMemAlloc`, so the
-                                    // registered pitch must be the row width in bytes and a
-                                    // multiple of 4. Round only the stride, not the frame
-                                    // width: even widths like 854 or 1366 still encode.
-                                    // Packing, upload and registration all use this one stride.
+                                    // CUDADEVICEPTR slots come from `cuMemAlloc`, so NVENC
+                                    // needs the allocation's row width in bytes, which must
+                                    // be a multiple of 4. The allocation is pitched at
+                                    // `width.next_multiple_of(4)`, so that is its row width:
+                                    // padding only the stride keeps 2-mod-4 picture widths
+                                    // (854, 1366, ...) encodable. Packing, upload and
+                                    // registration all use this one stride.
                                     let pitch_usize = usize::try_from(info.width)
                                         .map_err(|_| {
                                             video_error("NVENC frame width exceeds usize")
@@ -1775,6 +1777,51 @@ mod tests {
                     "NVENC produced a blank or corrupted frame"
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// A width congruent to 2 mod 4 must still encode: the registered pitch
+    /// is the row width of the `cuMemAlloc` allocation (rounded to a multiple
+    /// of 4), not the coded picture width.
+    #[test]
+    fn streaming_nvenc_roundtrip_at_width_854() -> Result<(), PipelineError> {
+        if cudarc::driver::CudaContext::new(0).is_err() {
+            return Ok(());
+        }
+        let path = Path::new("nvenc-streaming-width-854");
+        let frames = synthetic_frames(854, 480, 6);
+        let source = encode_video_cpu(
+            path,
+            &frames,
+            VideoEncodeMode::CpuH264 {
+                quality: VideoQuality::DEFAULT,
+            },
+            0,
+        )?;
+        let expected = decode_video_track(path, &source.track, &source.packets)?;
+        assert_eq!(expected.len(), 6);
+        let (stream, frames_encoded, _) = encode_video_nvenc_streaming(
+            path,
+            &source.track,
+            &source.packets,
+            VideoEncodeMode::NvencHevc {
+                quality: VideoQuality::DEFAULT,
+            },
+            0,
+            || Ok(()),
+        )?;
+        assert_eq!(frames_encoded, 6);
+        let decoded = decode_video_track(path, &stream.track, &stream.packets)?;
+        assert_eq!(decoded.len(), 6);
+        for frame in &decoded {
+            assert_eq!((frame.width, frame.height), (854, 480));
+            let min = frame.y.iter().copied().min().unwrap_or(0);
+            let max = frame.y.iter().copied().max().unwrap_or(0);
+            assert!(
+                max.saturating_sub(min) > 8,
+                "NVENC produced a blank or corrupted frame at width 854"
+            );
         }
         Ok(())
     }
