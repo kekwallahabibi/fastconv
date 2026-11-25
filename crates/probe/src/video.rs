@@ -2014,12 +2014,25 @@ pub fn prepare_video_transcode_batch_with_decode(
     for (input, output) in specs {
         reject_alias_collision(&input, &output)?;
         let probed = probe_video(&input)?;
-        let source_codec = probed
+        let video_streams: Vec<&VideoStreamInfo> = probed
             .streams
             .iter()
-            .find(|s| s.kind() == VideoStreamKind::Video)
-            .map_or(VideoCodec::Unknown, VideoStreamInfo::codec);
-        let decode_mode = decode_backend.resolve(source_codec, video_action.backend())?;
+            .filter(|s| s.kind() == VideoStreamKind::Video)
+            .collect();
+        let source_codec = video_streams
+            .first()
+            .map_or(VideoCodec::Unknown, |s| s.codec());
+        // One decode mode is stored per item, so `auto` may only pick NVDEC when
+        // every video track is decodable; a single unsupported track forces CPU
+        // decode for the whole item. Forced NVDEC must stay a hard error.
+        let resolved_backend = if decode_backend == HardwareDecodeBackend::Auto
+            && !video_streams.iter().all(|s| s.codec().nvdec_decodable())
+        {
+            HardwareDecodeBackend::Cpu
+        } else {
+            decode_backend
+        };
+        let decode_mode = resolved_backend.resolve(source_codec, video_action.backend())?;
         items.push(VideoTranscodeItem::new(
             input,
             output,
@@ -2892,6 +2905,117 @@ mod tests {
         assert_eq!(plan.items()[0].target(), &target_dir.join("a.webm"));
         assert_eq!(plan.items()[1].target(), &target_dir.join("b.webm"));
         assert!(target_dir.is_dir());
+        Ok(())
+    }
+
+    /// Minimal TS with two video tracks; each flag marks an AV1 track (else H.264).
+    fn two_video_track_ts(tracks: [bool; 2]) -> Vec<u8> {
+        let mut association_body = vec![0x00, 0x01, 0xC1, 0x00, 0x00];
+        association_body.extend_from_slice(&[0x00, 0x01, 0xF0, 0x00]);
+        let mut program_map_body = vec![0x00, 0x01, 0xC1, 0x00, 0x00, 0xF0, 0x00, 0xF0, 0x00];
+        for (index, av1) in tracks.into_iter().enumerate() {
+            let pid = 0x0100_u16.saturating_add(u16::try_from(index).unwrap_or(0));
+            if av1 {
+                program_map_body.extend_from_slice(&ts_es(0x06, pid, &ts_desc(0x05, b"AV01")));
+            } else {
+                program_map_body.extend_from_slice(&ts_es(0x1B, pid, &[]));
+            }
+        }
+        let pat = ts_section(0x00, &association_body);
+        let pmt = ts_section(0x02, &program_map_body);
+        let mut bytes = ts_packet(0, true, &[&[0_u8][..], pat.as_slice()].concat());
+        bytes.extend_from_slice(&ts_packet(
+            0x1000,
+            true,
+            &[&[0_u8][..], pmt.as_slice()].concat(),
+        ));
+        // MPEG-TS detection needs three sync bytes.
+        bytes.extend_from_slice(&ts_packet(0x1FFF, false, &[]));
+        bytes
+    }
+
+    #[test]
+    fn auto_decode_resolves_against_all_video_tracks() -> Result<(), Box<dyn std::error::Error>> {
+        let quality = VideoQuality::DEFAULT;
+        let nvenc = HardwareBackend::Gpu(fastconv_domain::GpuBackend::Nvenc);
+
+        for tracks in [
+            [false, true], // H.264 then AV1
+            [true, false], // AV1 then H.264
+        ] {
+            let source = temp_file("auto-decode-mixed", &two_video_track_ts(tracks))?;
+            let probed = probe_video(&source)?;
+            assert_eq!(probed.streams.len(), 2);
+            for (stream, av1) in probed.streams.iter().zip(tracks) {
+                assert_eq!(
+                    stream.codec(),
+                    if av1 {
+                        VideoCodec::Av1
+                    } else {
+                        VideoCodec::H264
+                    }
+                );
+            }
+
+            let target = temp_path("auto-decode-mixed-target").with_extension("mp4");
+            let plan = prepare_video_transcode_batch_with_decode(
+                &source,
+                &target,
+                Some(VideoContainerFormat::Mp4),
+                None,
+                None,
+                quality,
+                nvenc,
+                HardwareDecodeBackend::Auto,
+                Some(plan_threads()),
+            )?;
+            assert_eq!(plan.items().len(), 1);
+            assert_eq!(
+                plan.items()[0].decode_mode(),
+                fastconv_domain::VideoDecodeMode::Cpu
+            );
+
+            let forced_target = temp_path("forced-nvdec-mixed-target").with_extension("mp4");
+            let forced = prepare_video_transcode_batch_with_decode(
+                &source,
+                &forced_target,
+                Some(VideoContainerFormat::Mp4),
+                None,
+                None,
+                quality,
+                nvenc,
+                HardwareDecodeBackend::Nvdec,
+                Some(plan_threads()),
+            );
+            match forced {
+                Err(ProbeError::InvalidDomain(DomainError::UnsupportedVideoPipeline {
+                    reason,
+                    ..
+                })) => assert!(reason.contains("NVDEC"), "reason: {reason}"),
+                other => return Err(format!("forced NVDEC must be rejected: {other:?}").into()),
+            }
+            fs::remove_file(&source)?;
+        }
+
+        // Every track qualifies: `auto` must keep the NVDEC path.
+        let source = temp_file("auto-decode-all-nvdec", &two_video_track_ts([false, false]))?;
+        let target = temp_path("auto-decode-all-nvdec-target").with_extension("mp4");
+        let plan = prepare_video_transcode_batch_with_decode(
+            &source,
+            &target,
+            Some(VideoContainerFormat::Mp4),
+            None,
+            None,
+            quality,
+            nvenc,
+            HardwareDecodeBackend::Auto,
+            Some(plan_threads()),
+        )?;
+        assert_eq!(
+            plan.items()[0].decode_mode(),
+            fastconv_domain::VideoDecodeMode::Nvdec
+        );
+        fs::remove_file(&source)?;
         Ok(())
     }
 
