@@ -24,7 +24,7 @@ use zenwebp::{EncodeRequest, LosslessConfig, LossyConfig, PixelLayout};
 
 use crate::PipelineError;
 use crate::avif::encode_avif_into;
-use crate::bmp::encode_bmp_into_frame;
+use crate::bmp::{BmpFrameScratch, encode_bmp_into_frame};
 use crate::decode::{
     DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat, decode_image_into,
     precreate_target_directories,
@@ -227,6 +227,7 @@ struct WorkerScratch {
     pixel_buf: Vec<u8>,
     encoded_buf: Vec<u8>,
     aux_buf: Vec<u8>,
+    bmp_frame: BmpFrameScratch,
 }
 
 impl WorkerScratch {
@@ -236,6 +237,7 @@ impl WorkerScratch {
             pixel_buf: Vec::new(),
             encoded_buf: Vec::new(),
             aux_buf: Vec::new(),
+            bmp_frame: BmpFrameScratch::new(),
         }
     }
 }
@@ -454,7 +456,7 @@ fn convert_single_item(
             item.target(),
             pixels,
             decoded,
-            &mut scratch.aux_buf,
+            &mut scratch.bmp_frame,
             bmp_write_lock,
         )?,
         CpuImageEncoder::Tiff => {
@@ -629,10 +631,10 @@ fn encode_bmp_streaming(
     target: &Path,
     pixels: &[u8],
     decoded: DecodedFrameMeta,
-    frame_buf: &mut Vec<u8>,
+    frame: &mut BmpFrameScratch,
     write_lock: &Mutex<()>,
 ) -> Result<u64, PipelineError> {
-    let bytes = encode_bmp_into_frame(target, pixels, decoded, frame_buf)?;
+    let bytes = encode_bmp_into_frame(target, pixels, decoded, frame)?;
     let len =
         usize::try_from(bytes).map_err(|_| PipelineError::EmptyOutput(target.to_path_buf()))?;
     if len == 0 {
@@ -648,7 +650,7 @@ fn encode_bmp_streaming(
         source,
     })?;
     let mut file = file;
-    file.write_all(&frame_buf[..len])
+    file.write_all(&frame.bytes()[..len])
         .map_err(|source| PipelineError::Io {
             path: target.to_path_buf(),
             source,
@@ -935,6 +937,7 @@ fn encode_jxl_into(
 mod tests {
     use super::{encode_bmp_streaming, encode_png_streaming, encode_png_to_writer};
     use crate::PipelineError;
+    use crate::bmp::BmpFrameScratch;
     use crate::decode::{DecodedFrameMeta, DecodedPixelFormat};
     use std::env;
     use std::fs;
@@ -1061,7 +1064,7 @@ mod tests {
         fs::set_permissions(&bmp_target, fs::Permissions::from_mode(0o600))?;
 
         encode_png_streaming(&png_target, &pixels, meta)?;
-        let mut scratch = Vec::new();
+        let mut scratch = BmpFrameScratch::new();
         encode_bmp_streaming(&bmp_target, &pixels, meta, &mut scratch, &Mutex::new(()))?;
 
         assert_eq!(
@@ -1101,7 +1104,7 @@ mod tests {
             has_non_opaque_native_alpha: false,
         };
         assert!(encode_png_streaming(&png_target, &bad_pixels, meta).is_err());
-        let mut scratch = Vec::new();
+        let mut scratch = BmpFrameScratch::new();
         assert!(
             encode_bmp_streaming(
                 &bmp_target,

@@ -1,4 +1,3 @@
-use std::cell::Cell;
 #[cfg(test)]
 use std::io::Write;
 use std::path::Path;
@@ -24,11 +23,66 @@ const BMP_FRAME_SCRATCH_SLACK_BYTES: usize = 1024 * 1024;
 static BMP_FRAME_BUFFER_RESERVED: Mutex<usize> = Mutex::new(0);
 static BMP_FRAME_BUFFER_FREED: Condvar = Condvar::new();
 
-struct FrameReservation(Cell<usize>);
+/// Reusable BMP frame buffer whose process-wide budget reservation is owned by
+/// the allocation it guards. Dropping the scratch (sequential batch end, worker
+/// exit, or error unwind) returns the budget; tying it to a thread instead would
+/// let a stale reservation survive into the next batch and deadlock other workers.
+pub(crate) struct BmpFrameScratch {
+    bytes: Vec<u8>,
+    reserved_bytes: usize,
+}
 
-impl FrameReservation {
-    fn release(&self) {
-        let bytes = self.0.replace(0);
+impl BmpFrameScratch {
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            reserved_bytes: 0,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Reserves `total_bytes` of the process-wide BMP scratch budget before growing
+    /// the reusable allocation. Any previous reservation held by this scratch is
+    /// released first: the buffer is still live here, and this is the only place
+    /// we can observe that the earlier frame has been consumed.
+    fn reserve(&mut self, total_bytes: usize) -> Result<(), PipelineError> {
+        if self.bytes.capacity().saturating_sub(total_bytes) > BMP_FRAME_SCRATCH_SLACK_BYTES {
+            // A prior frame left a much larger allocation behind; return it before
+            // reserving again so the steady-state path keeps its reusable buffer.
+            self.bytes.clear();
+            self.bytes.shrink_to(total_bytes);
+        }
+        self.release();
+
+        let mut reserved = BMP_FRAME_BUFFER_RESERVED
+            .lock()
+            .map_err(|_| PipelineError::WorkerPanicked)?;
+        loop {
+            let current = *reserved;
+            // A single frame larger than the budget still has to run; let it take the
+            // budget exclusively instead of waiting forever for other workers.
+            if current == 0 || current.saturating_add(total_bytes) <= BMP_FRAME_BUFFER_BUDGET_BYTES
+            {
+                break;
+            }
+            reserved = BMP_FRAME_BUFFER_FREED
+                .wait(reserved)
+                .map_err(|_| PipelineError::WorkerPanicked)?;
+        }
+        *reserved = reserved.saturating_add(total_bytes);
+        drop(reserved);
+
+        self.reserved_bytes = total_bytes;
+        Ok(())
+    }
+
+    fn release(&mut self) {
+        let bytes = std::mem::replace(&mut self.reserved_bytes, 0);
         if bytes == 0 {
             return;
         }
@@ -41,50 +95,16 @@ impl FrameReservation {
     }
 }
 
-impl Drop for FrameReservation {
+impl Default for BmpFrameScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for BmpFrameScratch {
     fn drop(&mut self) {
-        // A worker may exit while holding a reservation (e.g. it processed no
-        // further BMP items); without this the budget would never be returned.
         self.release();
     }
-}
-
-thread_local! {
-    static BMP_FRAME_RESERVATION: FrameReservation = const { FrameReservation(Cell::new(0)) };
-}
-
-/// Reserves `total_bytes` of the process-wide BMP scratch budget before the caller
-/// grows its reusable frame buffer. The previous reservation for this thread is
-/// released first: the scratch Vec is still live at that point, and is the only
-/// place we can observe that the earlier frame has been consumed.
-fn reserve_frame_bytes(frame_buf: &mut Vec<u8>, total_bytes: usize) -> Result<(), PipelineError> {
-    if frame_buf.capacity().saturating_sub(total_bytes) > BMP_FRAME_SCRATCH_SLACK_BYTES {
-        // A prior frame (possibly a different encoder using the same scratch Vec)
-        // left a much larger allocation behind; return it before reserving again.
-        frame_buf.clear();
-        frame_buf.shrink_to(total_bytes);
-    }
-    BMP_FRAME_RESERVATION.with(FrameReservation::release);
-
-    let mut reserved = BMP_FRAME_BUFFER_RESERVED
-        .lock()
-        .map_err(|_| PipelineError::WorkerPanicked)?;
-    loop {
-        let current = *reserved;
-        // A single frame larger than the budget still has to run; let it take the
-        // budget exclusively instead of waiting forever for other workers.
-        if current == 0 || current.saturating_add(total_bytes) <= BMP_FRAME_BUFFER_BUDGET_BYTES {
-            break;
-        }
-        reserved = BMP_FRAME_BUFFER_FREED
-            .wait(reserved)
-            .map_err(|_| PipelineError::WorkerPanicked)?;
-    }
-    *reserved = reserved.saturating_add(total_bytes);
-    drop(reserved);
-
-    BMP_FRAME_RESERVATION.with(|reservation| reservation.0.set(total_bytes));
-    Ok(())
 }
 
 #[inline]
@@ -126,7 +146,7 @@ fn flush_slice<W: Write>(target: &Path, bytes: &[u8], writer: &mut W) -> Result<
     Ok(())
 }
 
-/// Builds a complete, contiguous BMP (header + bottom-up scanlines) in `frame_buf`.
+/// Builds a complete, contiguous BMP (header + bottom-up scanlines) in `frame`.
 ///
 /// This is deliberately independent of any sink: callers may prepare frames in
 /// parallel and hand the finished bytes to one serialized writer, so no filesystem
@@ -137,7 +157,7 @@ pub(crate) fn encode_bmp_into_frame(
     target: &Path,
     pixels: &[u8],
     decoded: DecodedFrameMeta,
-    frame_buf: &mut Vec<u8>,
+    frame: &mut BmpFrameScratch,
 ) -> Result<u64, PipelineError> {
     let width_i32 = i32::try_from(decoded.width).map_err(|_| PipelineError::EncodeFailed {
         path: target.to_path_buf(),
@@ -157,17 +177,17 @@ pub(crate) fn encode_bmp_into_frame(
     })?;
 
     match decoded.format {
-        DecodedPixelFormat::Rgb8 => encode_bmp_rgb24(
-            target, pixels, width, height, width_i32, height_i32, frame_buf,
-        ),
+        DecodedPixelFormat::Rgb8 => {
+            encode_bmp_rgb24(target, pixels, width, height, width_i32, height_i32, frame)
+        }
         DecodedPixelFormat::Rgba8 => encode_bmp_bgra32(
-            target, pixels, width, height, width_i32, height_i32, false, frame_buf,
+            target, pixels, width, height, width_i32, height_i32, false, frame,
         ),
-        DecodedPixelFormat::L8 => encode_bmp_gray8(
-            target, pixels, width, height, width_i32, height_i32, frame_buf,
-        ),
+        DecodedPixelFormat::L8 => {
+            encode_bmp_gray8(target, pixels, width, height, width_i32, height_i32, frame)
+        }
         DecodedPixelFormat::La8 => encode_bmp_bgra32(
-            target, pixels, width, height, width_i32, height_i32, true, frame_buf,
+            target, pixels, width, height, width_i32, height_i32, true, frame,
         ),
     }
 }
@@ -178,15 +198,15 @@ fn encode_bmp_to_writer<W: Write>(
     target: &Path,
     pixels: &[u8],
     decoded: DecodedFrameMeta,
-    frame_buf: &mut Vec<u8>,
+    frame: &mut BmpFrameScratch,
     writer: &mut W,
 ) -> Result<u64, PipelineError> {
-    let bytes = encode_bmp_into_frame(target, pixels, decoded, frame_buf)?;
+    let bytes = encode_bmp_into_frame(target, pixels, decoded, frame)?;
     let len = usize::try_from(bytes).map_err(|_| PipelineError::EncodeFailed {
         path: target.to_path_buf(),
         reason: "BMP encoded size exceeds addressable memory".to_owned(),
     })?;
-    flush_slice(target, &frame_buf[..len], writer)?;
+    flush_slice(target, &frame.bytes()[..len], writer)?;
     Ok(bytes)
 }
 
@@ -198,7 +218,7 @@ fn encode_bmp_rgb24(
     height: usize,
     width_i32: i32,
     height_i32: i32,
-    frame_buf: &mut Vec<u8>,
+    frame: &mut BmpFrameScratch,
 ) -> Result<u64, PipelineError> {
     let src_row_bytes = width
         .checked_mul(3)
@@ -259,11 +279,11 @@ fn encode_bmp_rgb24(
     header[26..28].copy_from_slice(&1_u16.to_le_bytes());
     header[28..30].copy_from_slice(&24_u16.to_le_bytes());
     header[34..38].copy_from_slice(&image_size_u32.to_le_bytes());
-    reserve_frame_bytes(frame_buf, total_bytes)?;
-    if frame_buf.len() < total_bytes {
-        frame_buf.resize(total_bytes, 0);
+    frame.reserve(total_bytes)?;
+    if frame.bytes.len() < total_bytes {
+        frame.bytes.resize(total_bytes, 0);
     }
-    let buf = &mut frame_buf[..total_bytes];
+    let buf = &mut frame.bytes[..total_bytes];
     buf[..header_len].copy_from_slice(&header);
     let mut cursor = header_len;
 
@@ -288,7 +308,7 @@ fn encode_bmp_bgra32(
     width_i32: i32,
     height_i32: i32,
     from_la8: bool,
-    frame_buf: &mut Vec<u8>,
+    frame: &mut BmpFrameScratch,
 ) -> Result<u64, PipelineError> {
     let src_bpp = if from_la8 { 2_usize } else { 4_usize };
     let src_row_bytes = width
@@ -362,11 +382,11 @@ fn encode_bmp_bgra32(
     header[62..66].copy_from_slice(&0x0000_00FF_u32.to_le_bytes()); // B
     header[66..70].copy_from_slice(&0xFF00_0000_u32.to_le_bytes()); // A
     header[70..74].copy_from_slice(b"BGRs"); // LCS_sRGB
-    reserve_frame_bytes(frame_buf, total_bytes)?;
-    if frame_buf.len() < total_bytes {
-        frame_buf.resize(total_bytes, 0);
+    frame.reserve(total_bytes)?;
+    if frame.bytes.len() < total_bytes {
+        frame.bytes.resize(total_bytes, 0);
     }
-    let buf = &mut frame_buf[..total_bytes];
+    let buf = &mut frame.bytes[..total_bytes];
     buf[..header_len].copy_from_slice(&header);
     let mut cursor = header_len;
 
@@ -398,7 +418,7 @@ fn encode_bmp_gray8(
     height: usize,
     width_i32: i32,
     height_i32: i32,
-    frame_buf: &mut Vec<u8>,
+    frame: &mut BmpFrameScratch,
 ) -> Result<u64, PipelineError> {
     let expected_len = width
         .checked_mul(height)
@@ -455,11 +475,11 @@ fn encode_bmp_gray8(
     header[28..30].copy_from_slice(&8_u16.to_le_bytes());
     header[34..38].copy_from_slice(&image_size_u32.to_le_bytes());
     header[46..50].copy_from_slice(&256_u32.to_le_bytes());
-    reserve_frame_bytes(frame_buf, total_bytes)?;
-    if frame_buf.len() < total_bytes {
-        frame_buf.resize(total_bytes, 0);
+    frame.reserve(total_bytes)?;
+    if frame.bytes.len() < total_bytes {
+        frame.bytes.resize(total_bytes, 0);
     }
-    let buf = &mut frame_buf[..total_bytes];
+    let buf = &mut frame.bytes[..total_bytes];
     let header_len = BMP_FILE_HEADER_LEN + BMP_INFO_HEADER_LEN;
     buf[..header_len].copy_from_slice(&header);
     for i in 0_usize..256 {
@@ -1285,7 +1305,7 @@ fn decode_bmp_indexed(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_bmp_slice_into, encode_bmp_to_writer};
+    use super::{BmpFrameScratch, decode_bmp_slice_into, encode_bmp_to_writer};
     use crate::decode::{DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat};
     use std::path::Path;
 
@@ -1305,7 +1325,7 @@ mod tests {
             }
         }
 
-        let mut row_scratch = Vec::new();
+        let mut row_scratch = BmpFrameScratch::new();
         let mut encoded = Vec::new();
         let written = encode_bmp_to_writer(
             p,
