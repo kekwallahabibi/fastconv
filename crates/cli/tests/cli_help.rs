@@ -1,0 +1,294 @@
+use std::process::{Command, Output};
+
+const BIN: &str = env!("CARGO_BIN_EXE_fastconv");
+
+fn run(args: &[&str]) -> Result<Output, String> {
+    Command::new(BIN)
+        .args(args)
+        .output()
+        .map_err(|err| format!("failed to run fastconv: {err}"))
+}
+
+fn stdout(args: &[&str]) -> Result<String, String> {
+    let output = run(args)?;
+    if !output.status.success() {
+        return Err(format!(
+            "fastconv {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|err| format!("stdout is not UTF-8: {err}"))
+}
+
+fn failure(args: &[&str]) -> Result<String, String> {
+    let output = run(args)?;
+    if output.status.success() {
+        return Err(format!(
+            "fastconv {} unexpectedly succeeded",
+            args.join(" ")
+        ));
+    }
+    String::from_utf8(output.stderr).map_err(|err| format!("stderr is not UTF-8: {err}"))
+}
+
+#[test]
+fn global_help_is_available_through_all_entry_points() -> Result<(), String> {
+    let baseline = stdout(&["--help"])?;
+    let variants: [&[&str]; 5] = [
+        &[],
+        &["-h"],
+        &["help"],
+        &["help", "-h"],
+        &["help", "--help"],
+    ];
+    for args in variants {
+        assert_eq!(stdout(args)?, baseline, "help differs for {args:?}");
+    }
+    for needle in [
+        "Commands:",
+        "probe ",
+        "convert ",
+        "audio ",
+        "remux ",
+        "video ",
+        "help ",
+        "-h, --help",
+        "-V, --version",
+        "--hwdecode <auto|cpu|nvdec>",
+        "fastconv <command> --help",
+        "fastconv help <command>",
+    ] {
+        assert!(baseline.contains(needle), "global help missing '{needle}'");
+    }
+    Ok(())
+}
+
+#[test]
+fn version_flag_reports_version() -> Result<(), String> {
+    let expected = format!("fastconv {}", env!("CARGO_PKG_VERSION"));
+    for args in [&["-V"][..], &["--version"][..]] {
+        assert_eq!(stdout(args)?.trim(), expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn every_subcommand_has_dedicated_help() -> Result<(), String> {
+    let global = stdout(&["--help"])?;
+    for command in ["probe", "convert", "audio", "remux", "video"] {
+        let by_flag = stdout(&[command, "--help"])?;
+        assert_eq!(stdout(&[command, "-h"])?, by_flag, "{command} -h differs");
+        assert_eq!(
+            stdout(&["help", command])?,
+            by_flag,
+            "help {command} differs"
+        );
+        assert!(
+            by_flag.contains("Usage:\n  fastconv"),
+            "{command} lacks usage"
+        );
+        assert!(
+            !by_flag.contains("Commands:\n"),
+            "{command} fell back to global help"
+        );
+        assert_ne!(by_flag, global, "{command} printed global help");
+    }
+    Ok(())
+}
+
+#[test]
+fn probe_help_documents_detected_hardware() -> Result<(), String> {
+    let text = stdout(&["probe", "--help"])?;
+    for needle in [
+        "model",
+        "architecture",
+        "physical cores",
+        "logical threads",
+        "SIMD",
+        "memory",
+        "wgpu",
+        "nvenc",
+        "vaapi",
+        "qsv",
+        "amf",
+        "videotoolbox",
+        "vulkan",
+        "-h, --help",
+    ] {
+        assert!(text.contains(needle), "probe help missing '{needle}'");
+    }
+    Ok(())
+}
+
+#[test]
+fn convert_help_documents_accepted_flags_and_rules() -> Result<(), String> {
+    let text = stdout(&["convert", "--help"])?;
+    for needle in [
+        "fastconv convert <source> <target> [--to <format>] [--quality <0..=100> | --lossless] [--threads <N>] [--backend <name>]",
+        "<source>",
+        "<target>",
+        "--to <format>",
+        "--quality <0..=100>",
+        "--lossless",
+        "--threads <N>",
+        "--backend <name>",
+        "-h, --help",
+        "webp",
+        "heic",
+        "jpeg",
+        "png",
+        "bmp",
+        "qoi",
+        "tiff",
+        "jxl",
+        "avif",
+        "gif",
+        "ico",
+        "pnm",
+        "default 80",
+        "mutually exclusive",
+        "jpg -> jpeg",
+        "tif -> tiff",
+        "ppm/pgm/pbm/pam -> pnm",
+        "256-color",
+        "HEIC",
+        "no silent CPU fallback",
+        "directory batches default to webp",
+        "vaapi",
+        "qsv",
+        "amf",
+        "videotoolbox",
+        "vulkan",
+    ] {
+        assert!(text.contains(needle), "convert help missing '{needle}'");
+    }
+    assert!(
+        !text.contains("required for directory batches"),
+        "convert --to is optional for directory batches (defaults to webp)"
+    );
+    Ok(())
+}
+
+#[test]
+fn audio_help_documents_only_implemented_flags() -> Result<(), String> {
+    let text = stdout(&["audio", "--help"])?;
+    for needle in [
+        "fastconv audio <source> <target> [--to <format>] [--threads <N>] [--backend <name>]",
+        "<source>",
+        "<target>",
+        "--to <format>",
+        "--threads <N>",
+        "--backend <name>",
+        "-h, --help",
+        "flac",
+        "wav",
+        "opus",
+        "ogg",
+        "mp3",
+        "aac",
+        "m4a",
+        "alac",
+        "aiff",
+        "wave -> wav",
+        "oga -> ogg",
+        "aif/aifc -> aiff",
+        "Lossless outputs: wav, flac, alac, aiff",
+        "ALAC writes an M4A container",
+        ".m4a",
+        ".alac",
+        "CPU only",
+        "no silent CPU fallback",
+        "directory batches default to flac",
+        "nvenc",
+        "vaapi",
+        "qsv",
+        "amf",
+        "videotoolbox",
+        "vulkan",
+    ] {
+        assert!(text.contains(needle), "audio help missing '{needle}'");
+    }
+    assert!(
+        !text.contains("--quality"),
+        "audio help must not claim --quality"
+    );
+    assert!(
+        !text.contains("--lossless"),
+        "audio help must not claim --lossless"
+    );
+    assert!(
+        !text.contains("required for directory batches"),
+        "audio --to is optional for directory batches (defaults to flac)"
+    );
+    Ok(())
+}
+
+#[test]
+fn remux_and_video_help_cover_their_constraints() -> Result<(), String> {
+    let remux = stdout(&["remux", "--help"])?;
+    for needle in [
+        "--to <mp4|mkv|webm|mov|avi|ts>",
+        "--threads <N>",
+        "-h, --help",
+        "mp4 (m4v)",
+        "qt",
+        "m2ts",
+        "GIF and WebP cannot be remuxed",
+        "fastconv video",
+    ] {
+        assert!(remux.contains(needle), "remux help missing '{needle}'");
+    }
+
+    let video = stdout(&["video", "--help"])?;
+    for needle in [
+        "--hwdecode <auto|cpu|nvdec>",
+        "--vcodec",
+        "--acodec",
+        "--quality <0..=100>",
+        "default 80",
+        "software -> cpu",
+        "cuda/gpu -> nvdec",
+        "hard error",
+        "GIF",
+        "webp",
+        "HEVC has no CPU encoder",
+    ] {
+        assert!(video.contains(needle), "video help missing '{needle}'");
+    }
+    assert!(
+        !video.contains("all codecs") && !video.contains("every codec"),
+        "video help must not claim the CPU backend supports HEVC"
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_help_topics_and_extra_arguments_fail() -> Result<(), String> {
+    let cases: [&[&str]; 3] = [
+        &["help", "magic"],
+        &["help", "probe", "extra"],
+        &["help", "--to"],
+    ];
+    for args in cases {
+        let stderr = failure(args)?;
+        assert!(stderr.contains("error:"), "no error for {args:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn invalid_probe_arguments_fail() -> Result<(), String> {
+    let cases: [&[&str]; 3] = [
+        &["probe", "magic"],
+        &["probe", "--threads", "4"],
+        &["probe", "--help", "extra"],
+    ];
+    for args in cases {
+        let stderr = failure(args)?;
+        assert!(stderr.contains("error:"), "no error for {args:?}");
+    }
+    assert!(failure(&["probe", "magic"])?.contains("expected `fastconv probe`"));
+    assert!(failure(&["probe", "--verbose"])?.contains("unknown flag '--verbose'"));
+    Ok(())
+}

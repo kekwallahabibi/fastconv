@@ -11,25 +11,118 @@ use fastconv_domain::{
     GpuBackend, HardwareBackend, ImageCompression, ImageOutputFormat, ImageQuality,
 };
 
-fn print_usage() {
+const GLOBAL_HELP: &str = r"Usage:
+  fastconv probe
+  fastconv convert <source> <target> [--to <format>] [--quality <0..=100> | --lossless] [--threads <N>] [--backend <name>]
+  fastconv audio <source> <target> [--to <format>] [--threads <N>] [--backend <name>]
+  fastconv remux <source> <target> [--to <mp4|mkv|webm|mov|avi|ts>] [--threads <N>]
+  fastconv video <source> <target> [--to <format>] [--vcodec <codec>]
+                 [--acodec <codec>] [--quality <0..=100>] [--threads <N>]
+                 [--backend <name>] [--hwdecode <auto|cpu|nvdec>]
+  fastconv help [command]
+  fastconv -V, --version
+  fastconv -h, --help
+
+Commands:
+  probe    Inspect CPU, wgpu adapters, and GPU media backends
+  convert  Convert still images (lossy/lossless; CPU or NVENC HEIC)
+  audio    Convert audio files (CPU encoders only)
+  remux    Losslessly remux video containers (no re-encoding)
+  video    Transcode audio/video tracks between containers
+  help     Print this help or detailed help for one command
+
+Options:
+  -h, --help     Print this help
+  -V, --version  Print version
+
+Run `fastconv <command> --help` or `fastconv help <command>` for detailed help.";
+
+const PROBE_HELP: &str = r"fastconv probe - inspect detected host hardware
+
+Usage:
+  fastconv probe
+  fastconv probe -h | --help
+
+Prints the hardware available to conversion pipelines:
+
+  CPU        model, architecture, physical cores / logical threads, SIMD level,
+             and total memory
+  wgpu       graphics adapters (name, graphics API, device type, vendor, device
+             id, and driver)
+  GPU media  detected media backends with capability and device name: nvenc,
+             vaapi, qsv, amf, videotoolbox, vulkan
+
+Options:
+  -h, --help  Print this help";
+
+const CONVERT_HELP: &str = r"fastconv convert - convert still images
+
+Usage:
+  fastconv convert <source> <target> [--to <format>] [--quality <0..=100> | --lossless] [--threads <N>] [--backend <name>]
+
+Arguments:
+  <source>              Source image file or directory
+  <target>              Target file or directory
+
+Options:
+  --to <format>         Output format; directory batches default to webp, single
+                        files infer it from the target extension: webp, heic,
+                        jpeg, png, bmp, qoi, tiff, jxl, avif, gif, ico, pnm
+  --quality <0..=100>   Lossy encoding quality (default 80); mutually exclusive
+                        with --lossless. Supported: webp, jpeg, jxl, avif, heic.
+                        Rejected: png, bmp, qoi, tiff, ico, pnm (lossless-only)
+                        and gif.
+  --lossless            Lossless encoding; mutually exclusive with --quality.
+                        Supported: webp, jxl, and the lossless-only formats
+                        png, bmp, qoi, tiff, ico, pnm (lossless by default).
+                        Rejected: jpeg, avif, heic, gif.
+  --threads <N>         Number of parallel workers
+  --backend <name>      cpu (default) or nvenc (HEIC only; CPU has no native
+                        HEIC encoder). vaapi, qsv, amf, videotoolbox, and vulkan
+                        are rejected explicitly - no silent CPU fallback.
+  -h, --help            Print this help
+
+Supported input formats:
+  png, jpeg, webp, bmp, qoi, tiff, jxl, avif, gif, ico, pnm
+  Aliases: jpg -> jpeg, tif -> tiff, ppm/pgm/pbm/pam -> pnm
+  GIF uses a fixed 256-color palette quantization and accepts neither --quality
+  nor --lossless.";
+
+fn print_global_help() {
     println!("fastconv {}", env!("CARGO_PKG_VERSION"));
     println!();
-    println!("Usage:");
-    println!("  fastconv probe");
-    println!(
-        "  fastconv convert <source> <target> [--quality <0..=100> | --lossless] [--to <webp|heic|jpeg|png|bmp|qoi|tiff|jxl|avif|gif|ico|pnm>] [--threads <N>] [--backend <cpu|nvenc|vaapi|qsv|amf|videotoolbox|vulkan>]"
-    );
-    println!(
-        "  fastconv audio <source> <target> [--to <flac|wav|opus|ogg|mp3|aac|m4a|alac|aiff>] [--threads <N>] [--backend <cpu|...>]"
-    );
-    println!("  fastconv remux <source> <target> [--to <mp4|mkv|webm|mov|avi|ts>] [--threads <N>]");
-    println!(
-        "  fastconv video <source> <target> [--to <mp4|mkv|webm|mov|avi|ts|gif|webp>] [--vcodec <h264|hevc|h265|av1|vp9|gif|webp|copy>] [--acodec <aac|opus|mp3|none|copy>] [--quality <0..=100>] [--threads <N>] [--backend <cpu|nvenc>]"
-    );
-    println!("    video backends: cpu (all codecs and copy), nvenc (H.264/HEVC encoding only)");
-    println!("    animated GIF/WebP encode on CPU only; audio tracks are dropped by default");
-    println!("  fastconv --version");
-    println!("  fastconv --help");
+    println!("{GLOBAL_HELP}");
+}
+
+fn print_probe_help() {
+    println!("{PROBE_HELP}");
+}
+
+fn print_convert_help() {
+    println!("{CONVERT_HELP}");
+}
+
+#[must_use]
+fn help_text(topic: &str) -> Option<&'static str> {
+    match topic {
+        "probe" => Some(PROBE_HELP),
+        "convert" => Some(CONVERT_HELP),
+        "audio" => Some(audio::AUDIO_HELP),
+        "remux" => Some(video::REMUX_HELP),
+        "video" => Some(video::VIDEO_HELP),
+        _ => None,
+    }
+}
+
+/// Prints the dedicated help for one command and reports whether the topic exists.
+fn print_help_topic(topic: &str) -> bool {
+    match help_text(topic) {
+        Some(text) => {
+            println!("{text}");
+            true
+        }
+        None => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +139,27 @@ struct ConvertArgs {
 enum ConvertCommand {
     Help,
     Run(ConvertArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeCommand {
+    Help,
+    Run,
+}
+
+/// Parses `fastconv probe` arguments without probing hardware.
+///
+/// # Errors
+///
+/// Returns a diagnostic for positional arguments or unknown flags.
+pub(crate) fn parse_probe_args(args: &[&str]) -> Result<ProbeCommand, String> {
+    match args {
+        [] => Ok(ProbeCommand::Run),
+        ["-h" | "--help"] => Ok(ProbeCommand::Help),
+        ["-h" | "--help", ..] => Err("expected `fastconv probe`".to_owned()),
+        [flag, ..] if flag.starts_with('-') => Err(format!("unknown flag '{flag}'")),
+        _ => Err("expected `fastconv probe`".to_owned()),
+    }
 }
 
 pub(crate) fn parse_backend(value: &str) -> Result<HardwareBackend, String> {
@@ -286,6 +400,24 @@ pub(crate) fn u64_to_f64(value: u64) -> f64 {
     f64::from(hi) * 4_294_967_296.0 + f64::from(lo)
 }
 
+fn fail(message: &str) -> ExitCode {
+    eprintln!("error: {message}");
+    ExitCode::FAILURE
+}
+
+fn fail_with_hint(message: &str, hint: &str) -> ExitCode {
+    eprintln!("error: {message}");
+    eprintln!("{hint}");
+    ExitCode::FAILURE
+}
+
+fn run_with_failure(result: Result<(), String>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => fail(&message),
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
 
@@ -295,105 +427,118 @@ fn main() -> ExitCode {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        [] | ["-h" | "--help"] => {
-            print_usage();
+        [] | ["-h" | "--help" | "help"] | ["help", "-h" | "--help"] => {
+            print_global_help();
             ExitCode::SUCCESS
         }
+        ["help", topic] => {
+            if print_help_topic(topic) {
+                ExitCode::SUCCESS
+            } else {
+                fail_with_hint(
+                    &format!("unknown help topic '{topic}'"),
+                    "Run `fastconv help` to list commands.",
+                )
+            }
+        }
+        ["help", ..] => fail_with_hint(
+            "expected at most one help topic",
+            "Run `fastconv help` to list commands.",
+        ),
         ["-V" | "--version"] => {
             println!("fastconv {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        ["probe"] => match run_probe() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(message) => {
-                eprintln!("error: {message}");
-                ExitCode::FAILURE
+        ["probe", rest @ ..] => match parse_probe_args(rest) {
+            Ok(ProbeCommand::Help) => {
+                print_probe_help();
+                ExitCode::SUCCESS
             }
+            Ok(ProbeCommand::Run) => run_with_failure(run_probe()),
+            Err(message) => fail(&message),
         },
         ["audio", rest @ ..] => match audio::parse_audio_args(rest) {
             Ok(audio::AudioCommand::Help) => {
-                print_usage();
+                audio::print_audio_help();
                 ExitCode::SUCCESS
             }
-            Ok(audio::AudioCommand::Run(parsed)) => match audio::run_audio(&parsed) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(message) => {
-                    eprintln!("error: {message}");
-                    ExitCode::FAILURE
-                }
-            },
-            Err(message) => {
-                eprintln!("error: {message}");
-                ExitCode::FAILURE
-            }
+            Ok(audio::AudioCommand::Run(parsed)) => run_with_failure(audio::run_audio(&parsed)),
+            Err(message) => fail(&message),
         },
         ["remux", rest @ ..] => match video::parse_remux_args(rest) {
             Ok(video::RemuxCommand::Help) => {
                 video::print_remux_help();
                 ExitCode::SUCCESS
             }
-            Ok(video::RemuxCommand::Run(parsed)) => match video::run_remux(&parsed) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(message) => {
-                    eprintln!("error: {message}");
-                    ExitCode::FAILURE
-                }
-            },
-            Err(message) => {
-                eprintln!("error: {message}");
-                ExitCode::FAILURE
-            }
+            Ok(video::RemuxCommand::Run(parsed)) => run_with_failure(video::run_remux(&parsed)),
+            Err(message) => fail(&message),
         },
         ["video", rest @ ..] => match video::parse_video_args(rest) {
             Ok(video::VideoCommand::Help) => {
                 video::print_video_help();
                 ExitCode::SUCCESS
             }
-            Ok(video::VideoCommand::Run(parsed)) => match video::run_video(&parsed) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(message) => {
-                    eprintln!("error: {message}");
-                    ExitCode::FAILURE
-                }
-            },
-            Err(message) => {
-                eprintln!("error: {message}");
-                ExitCode::FAILURE
-            }
+            Ok(video::VideoCommand::Run(parsed)) => run_with_failure(video::run_video(&parsed)),
+            Err(message) => fail(&message),
         },
         ["convert", rest @ ..] => match parse_convert_args(rest) {
             Ok(ConvertCommand::Help) => {
-                print_usage();
+                print_convert_help();
                 ExitCode::SUCCESS
             }
-            Ok(ConvertCommand::Run(parsed)) => match run_convert(&parsed) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(message) => {
-                    eprintln!("error: {message}");
-                    ExitCode::FAILURE
-                }
-            },
-            Err(message) => {
-                eprintln!("error: {message}");
-                ExitCode::FAILURE
-            }
+            Ok(ConvertCommand::Run(parsed)) => run_with_failure(run_convert(&parsed)),
+            Err(message) => fail(&message),
         },
-        _ => {
-            eprintln!("error: invalid arguments");
-            eprintln!("Run `fastconv --help` for usage.");
-            ExitCode::FAILURE
-        }
+        _ => fail_with_hint("invalid arguments", "Run `fastconv --help` for usage."),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ConvertArgs, ConvertCommand, parse_convert_args};
+    use super::{
+        ConvertArgs, ConvertCommand, ProbeCommand, help_text, parse_convert_args, parse_probe_args,
+    };
     use fastconv_domain::{
         GpuBackend, HardwareBackend, ImageCompression, ImageOutputFormat, ImageQuality,
     };
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
+
+    #[test]
+    fn parses_probe_args() -> Result<(), String> {
+        assert_eq!(parse_probe_args(&[])?, ProbeCommand::Run);
+        assert_eq!(parse_probe_args(&["-h"])?, ProbeCommand::Help);
+        assert_eq!(parse_probe_args(&["--help"])?, ProbeCommand::Help);
+
+        assert_eq!(
+            parse_probe_args(&["magic"]),
+            Err("expected `fastconv probe`".to_owned())
+        );
+        assert_eq!(
+            parse_probe_args(&["--threads", "4"]),
+            Err("unknown flag '--threads'".to_owned())
+        );
+        assert_eq!(
+            parse_probe_args(&["--help", "extra"]),
+            Err("expected `fastconv probe`".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_command_has_dedicated_help_text() -> Result<(), String> {
+        for topic in ["probe", "convert", "audio", "remux", "video"] {
+            let text = help_text(topic).ok_or_else(|| format!("missing help for {topic}"))?;
+            assert!(text.contains("Usage:"), "missing usage for {topic}");
+            assert!(
+                !text.contains("Commands:"),
+                "{topic} help fell back to global usage"
+            );
+        }
+        assert_eq!(help_text("magic"), None);
+        assert_eq!(help_text(""), None);
+        Ok(())
+    }
 
     #[test]
     fn parses_default_flagged_and_help_convert_arguments() -> Result<(), String> {
