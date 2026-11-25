@@ -1177,13 +1177,19 @@ fn probe_gif_video(path: &Path, file: File) -> Result<Vec<VideoStreamInfo>, Prob
         return Err(invalid_video(path, "GIF contains no frames"));
     }
 
-    // GIF has a one-bit transparency mask per frame. A GIF without a
-    // NETSCAPE2.0 extension reports `Repeat::Finite(0)` and is conventionally
-    // played once (`Times(1)`).
+    // GIF has a one-bit transparency mask per frame. A NETSCAPE2.0 repeat
+    // count is the number of *replays* after the first play, while
+    // `AnimationLoop::Times` counts total plays. No extension means one play.
     let loop_count = match decoder.repeat() {
         gif::Repeat::Infinite => AnimationLoop::Infinite,
         gif::Repeat::Finite(count) => {
-            AnimationLoop::Times(NonZeroU16::new(count).unwrap_or(NonZeroU16::MIN))
+            let plays = count.checked_add(1).ok_or_else(|| {
+                invalid_video(path, "GIF loop count exceeds the maximum play count")
+            })?;
+            AnimationLoop::Times(
+                NonZeroU16::new(plays)
+                    .ok_or_else(|| invalid_video(path, "GIF loop count is zero"))?,
+            )
         }
     };
     let animation = AnimationMeta::new(loop_count, true);
@@ -1275,7 +1281,16 @@ fn anmf_has_bitstream(
     payload_end: u64,
 ) -> Result<bool, ProbeError> {
     let mut pos = payload_start.saturating_add(16);
-    while pos.saturating_add(8) <= payload_end {
+    let mut found_image = false;
+    // RFC 9649 defines the ANMF payload as a sequence of complete padded
+    // subchunks; an overrun after the image chunk still invalidates the frame.
+    while pos < payload_end {
+        if payload_end.saturating_sub(pos) < 8 {
+            return Err(invalid_video(
+                path,
+                "WebP ANMF subchunk header is truncated",
+            ));
+        }
         let mut header = [0_u8; 8];
         read_chunk_at(path, file, pos, &mut header)?;
         let id = [header[0], header[1], header[2], header[3]];
@@ -1300,11 +1315,11 @@ fn anmf_has_bitstream(
             ));
         }
         if (id == *b"VP8 " || id == *b"VP8L") && size > 0 {
-            return Ok(true);
+            found_image = true;
         }
         pos = padded;
     }
-    Ok(false)
+    Ok(found_image)
 }
 
 /// Visits RIFF chunks with fixed-size reads, skipping `ANMF` payloads.
@@ -3021,8 +3036,19 @@ mod tests {
         let meta = probed.streams[0]
             .animation()
             .ok_or("GIF must carry animation metadata")?;
-        let times = NonZeroU16::new(3).unwrap_or(NonZeroU16::MIN);
+        // NETSCAPE count 3 means three replays after the first play: four total plays.
+        let times = NonZeroU16::new(4).unwrap_or(NonZeroU16::MIN);
         assert_eq!(meta.loop_count(), AnimationLoop::Times(times));
+
+        // 65,535 replays would be 65,536 total plays and cannot be represented.
+        let overflow = temp_file(
+            "gif-loop-overflow",
+            &synthetic_gif_with_loop(8, 6, &[(5, 8, 6)], Some(u16::MAX)),
+        )?;
+        assert!(matches!(
+            probe_video(&overflow),
+            Err(ProbeError::InvalidVideo { .. })
+        ));
 
         let infinite = temp_file(
             "gif-infinite-loop",
@@ -3211,6 +3237,30 @@ mod tests {
                 assert!(reason.contains("padding"), "unexpected reason: {reason}");
             }
             other => return Err(format!("expected padding error, got {other:?}").into()),
+        }
+
+        // A valid image followed by a truncated subchunk header must still be rejected.
+        let mut anmf_payload = vec![0_u8; 16];
+        anmf_payload[6..9].copy_from_slice(&le24(15));
+        anmf_payload[9..12].copy_from_slice(&le24(15));
+        anmf_payload[12..15].copy_from_slice(&le24(20));
+        anmf_payload.extend_from_slice(b"VP8L");
+        anmf_payload.extend_from_slice(&5_u32.to_le_bytes());
+        anmf_payload.extend_from_slice(&[0x2F, 0, 0, 0, 0]);
+        anmf_payload.extend_from_slice(&[0xAB, 0xCD, 0xEF]);
+        let mut body = b"WEBP".to_vec();
+        body.extend_from_slice(&synthetic_webp_header(16, 16, true));
+        body.extend_from_slice(&riff_chunk(*b"ANIM", &[0_u8; 6]));
+        body.extend_from_slice(&riff_chunk(*b"ANMF", &anmf_payload));
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&u32::try_from(body.len()).unwrap_or(0).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        let path = temp_file("webp-anmf-trailing-header", &bytes)?;
+        match probe_video(&path) {
+            Err(ProbeError::InvalidVideo { reason, .. }) => {
+                assert!(reason.contains("header"), "unexpected reason: {reason}");
+            }
+            other => return Err(format!("expected truncated-header error, got {other:?}").into()),
         }
 
         // An odd-sized RIFF chunk must have its pad byte inside the container.

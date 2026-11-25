@@ -260,16 +260,24 @@ pub(crate) fn write_nv12(
 /// Limited range expands luma by 255/219 and chroma by 255/224; full range
 /// uses the raw matrix coefficients. BT.601 is only the explicit default for
 /// sources that signal no matrix.
-fn inverse_coeffs(color: YuvColor) -> (i32, i32, i32, i32, i32, i32) {
+fn inverse_coeffs(color: YuvColor) -> Result<(i32, i32, i32, i32, i32, i32), PipelineError> {
+    let path = Path::new("animation-nv12-to-rgb8");
     let limited = color.range == YuvRange::Limited;
-    match (color.matrix, limited) {
+    let coeffs = match (color.matrix, limited) {
         (YuvMatrix::Bt709, true) => (298, 16, 459, -55, -137, 541),
         (YuvMatrix::Bt709, false) => (256, 0, 403, -48, -120, 475),
         (YuvMatrix::Bt2020, true) => (298, 16, 430, -48, -166, 548),
         (YuvMatrix::Bt2020, false) => (256, 0, 377, -42, -146, 482),
         (YuvMatrix::Bt601, true) => (298, 16, 409, -100, -208, 516),
         (YuvMatrix::Bt601, false) => (256, 0, 359, -88, -183, 454),
-    }
+        (YuvMatrix::Unsupported(code), _) => {
+            return Err(decode_error(
+                path,
+                format!("YUV→RGB conversion for matrix coefficient {code} is not supported"),
+            ));
+        }
+    };
+    Ok(coeffs)
 }
 
 /// Inverse conversion of pitched NV12 into packed RGB8 using the source's
@@ -308,7 +316,7 @@ pub(crate) fn nv12_to_rgb8(
             format!("NV12 buffer is {} bytes, needs {needed}", nv12.len()),
         ));
     }
-    let (y_gain, y_offset, r_v, g_u, g_v, b_u) = inverse_coeffs(color);
+    let (y_gain, y_offset, r_v, g_u, g_v, b_u) = inverse_coeffs(color)?;
     let mut rgb = vec![0_u8; byte_len(width, height, 3)?];
     for row_y in 0..frame_h {
         let chroma_y = row_y / 2;
@@ -1611,9 +1619,11 @@ fn init_animation_writer<'a>(
         (VideoContainerFormat::Gif, PreparedFrame::Gif(_)) => {
             let mut encoder = gif::Encoder::new(BufWriter::new(file), width, height, &[])
                 .map_err(|err| encode_error(path, format!("GIF encoder failed: {err}")))?;
+            // `Times` counts total plays; the GIF repeat extension counts
+            // replays after the first one (`Finite(0)` means play once).
             let repeat = match loop_count {
                 AnimationLoop::Infinite => gif::Repeat::Infinite,
-                AnimationLoop::Times(times) => gif::Repeat::Finite(times.get()),
+                AnimationLoop::Times(times) => gif::Repeat::Finite(times.get().saturating_sub(1)),
             };
             encoder
                 .set_repeat(repeat)
@@ -2034,6 +2044,24 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn nv12_rejects_unsupported_rgb_matrix_at_the_conversion_boundary() {
+        let nv12 = [117_u8, 117, 117, 117, 96, 178, 96, 178];
+        for code in [4_u8, 7, 10, 14] {
+            let result = nv12_to_rgb8(
+                &nv12,
+                2,
+                2,
+                2,
+                YuvColor::specified(YuvMatrix::Unsupported(code), YuvRange::Limited),
+            );
+            assert!(
+                matches!(result, Err(PipelineError::DecodeFailed { .. })),
+                "matrix coefficient {code} must be rejected only where RGB is produced"
+            );
+        }
+    }
+
     fn temp_anim_dir(label: &str) -> Result<std::path::PathBuf, PipelineError> {
         let dir =
             std::env::temp_dir().join(format!("fastconv-anim-{label}-{}", std::process::id()));
@@ -2169,8 +2197,8 @@ mod tests {
             "GIF must carry a Netscape loop extension"
         );
         assert!(
-            bytes.windows(2).any(|w| w == [3, 0]),
-            "GIF loop count must be finite"
+            bytes.windows(2).any(|w| w == [2, 0]),
+            "GIF repeat count must be total plays minus one"
         );
         fs::remove_dir_all(&dir).map_err(|source| io_error(&dir, source))?;
         Ok(())

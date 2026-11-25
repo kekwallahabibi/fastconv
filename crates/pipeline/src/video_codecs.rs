@@ -43,14 +43,17 @@ pub(crate) struct Yuv420Frame {
 }
 
 /// YUV→RGB matrix signalled by the source bitstream. BT.601 is the explicit
-/// default only for sources that signal no matrix. `Bt2020` covers non-constant
-/// luminance (H.273 matrix coefficient 9); constant luminance (10) is rejected.
+/// default only for sources that signal no usable matrix. `Bt2020` covers
+/// non-constant luminance (H.273 coefficient 9); signalled matrices without an
+/// RGB converter are carried as `Unsupported` and rejected only where RGB is
+/// actually produced, so NV12 video-to-video paths stay unaffected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum YuvMatrix {
     #[default]
     Bt601,
     Bt709,
     Bt2020,
+    Unsupported(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1068,13 +1071,13 @@ mod streaming {
             rav1d_safe::src::managed::MatrixCoefficients::BT2020NCL => {
                 YuvColor::specified(YuvMatrix::Bt2020, range)
             }
-            rav1d_safe::src::managed::MatrixCoefficients::BT2020CL => {
-                return Err(decode_error(
-                    path,
-                    "AV1 BT.2020 constant luminance (matrix coefficient 10) is not supported",
-                ));
+            rav1d_safe::src::managed::MatrixCoefficients::BT470BG
+            | rav1d_safe::src::managed::MatrixCoefficients::BT601 => {
+                YuvColor::specified(YuvMatrix::Bt601, range)
             }
-            _ => YuvColor::specified(YuvMatrix::Bt601, range),
+            rav1d_safe::src::managed::MatrixCoefficients::Unspecified
+            | rav1d_safe::src::managed::MatrixCoefficients::Reserved => YuvColor::default(),
+            other => YuvColor::specified(YuvMatrix::Unsupported(other as u8), range),
         };
         let info = DecodedFrameInfo {
             width: frame.width(),
@@ -1611,7 +1614,7 @@ mod streaming {
         // decoder signals its own colour (AV1) keep that; everything else gets
         // the signalled track value, or the explicit BT.601 default only when
         // the bitstream carries no colour description at all.
-        let track_color = source_color(path, track, &ordered)?;
+        let track_color = source_color(track, &ordered);
         let mut deliver =
             |mut info: DecodedFrameInfo, pack: &mut PackFn<'_>| -> Result<(), PipelineError> {
                 if !info.color.signalled {
@@ -1662,14 +1665,11 @@ mod streaming {
 
 /// Reads the source colour description from canonical codec configuration.
 /// Unparseable or absent VUI data means "not signalled", never a silent guess.
-/// Preserves `full_range` even when matrix coefficients are absent/unspecified,
-/// and explicitly rejects BT.2020 constant luminance (matrix coefficient 10).
-fn source_color(
-    path: &Path,
-    track: &ContainerTrack,
-    packets: &[&ContainerPacket],
-) -> Result<YuvColor, PipelineError> {
-    let resolve = |matrix: Option<u8>, full_range: bool| -> Result<YuvColor, PipelineError> {
+/// Preserves `full_range` independently of matrix availability. Signalled
+/// matrices without an RGB converter (constant luminance 10, SMPTE 240M, ...)
+/// are carried as `Unsupported` so only the RGB conversion rejects them.
+fn source_color(track: &ContainerTrack, packets: &[&ContainerPacket]) -> YuvColor {
+    let resolve = |matrix: Option<u8>, full_range: bool| -> YuvColor {
         let range = if full_range {
             YuvRange::Full
         } else {
@@ -1678,29 +1678,24 @@ fn source_color(
         let matrix = match matrix {
             Some(1) => YuvMatrix::Bt709,
             Some(9) => YuvMatrix::Bt2020,
-            Some(10) => {
-                return Err(decode_error(
-                    path,
-                    "BT.2020 constant luminance (matrix coefficient 10) is not supported",
-                ));
-            }
+            Some(code @ (10 | 4 | 7 | 8 | 11..=14)) => YuvMatrix::Unsupported(code),
             _ => YuvMatrix::Bt601,
         };
-        Ok(YuvColor::specified(matrix, range))
+        YuvColor::specified(matrix, range)
     };
     match track.codec {
         VideoCodec::H264 => {
             let annex_b = avcc_to_annex_b(&track.config, &[], true).unwrap_or_default();
             match crate::video_bitstream::h264_color_from_annex_b(&annex_b) {
                 Some(color) => resolve(color.matrix, color.full_range),
-                None => Ok(YuvColor::default()),
+                None => YuvColor::default(),
             }
         }
         VideoCodec::Hevc => {
             let annex_b = hvcc_to_annex_b(&track.config, &[], true).unwrap_or_default();
             match crate::video_bitstream::hevc_color_from_annex_b(&annex_b) {
                 Some(color) => resolve(color.matrix, color.full_range),
-                None => Ok(YuvColor::default()),
+                None => YuvColor::default(),
             }
         }
         VideoCodec::Vp9 => match packets
@@ -1708,11 +1703,11 @@ fn source_color(
             .find_map(|packet| crate::video_bitstream::vp9_color_from_keyframe(&packet.data))
         {
             Some(color) => resolve(Some(color.matrix), color.full_range),
-            None => Ok(YuvColor::default()),
+            None => YuvColor::default(),
         },
         // AV1 frames signal their own colour; leave it unsignalled here so the
         // per-frame decoder metadata wins.
-        _ => Ok(YuvColor::default()),
+        _ => YuvColor::default(),
     }
 }
 
@@ -2871,8 +2866,7 @@ mod tests {
     }
 
     #[test]
-    fn source_color_preserves_full_range_and_rejects_bt2020_cl() -> Result<(), PipelineError> {
-        let path = Path::new("color-test.mp4");
+    fn source_color_preserves_range_and_flags_unsupported_rgb_matrices() {
         let make_track = |config| ContainerTrack {
             codec: VideoCodec::H264,
             width: Some(16),
@@ -2887,23 +2881,28 @@ mod tests {
         // Full range without colour_description keeps BT.601 default matrix + Full range.
         let full_only = make_track(h264_avcc_with_vui(true, None));
         assert_eq!(
-            source_color(path, &full_only, &[])?,
+            source_color(&full_only, &[]),
             YuvColor::specified(YuvMatrix::Bt601, YuvRange::Full)
         );
 
         // Matrix coefficient 9 stays on BT.2020 non-constant luminance.
         let bt2020_ncl = make_track(h264_avcc_with_vui(false, Some(9)));
         assert_eq!(
-            source_color(path, &bt2020_ncl, &[])?,
+            source_color(&bt2020_ncl, &[]),
             YuvColor::specified(YuvMatrix::Bt2020, YuvRange::Limited)
         );
 
-        // Matrix coefficient 10 (BT.2020 constant luminance) is rejected explicitly.
+        // Unsupported matrices are carried (with their range) past NV12 delivery;
+        // only the RGB conversion rejects them.
         let constant_luminance = make_track(h264_avcc_with_vui(false, Some(10)));
-        assert!(matches!(
-            source_color(path, &constant_luminance, &[]),
-            Err(PipelineError::DecodeFailed { .. })
-        ));
-        Ok(())
+        assert_eq!(
+            source_color(&constant_luminance, &[]),
+            YuvColor::specified(YuvMatrix::Unsupported(10), YuvRange::Limited)
+        );
+        let smpte_240m = make_track(h264_avcc_with_vui(true, Some(7)));
+        assert_eq!(
+            source_color(&smpte_240m, &[]),
+            YuvColor::specified(YuvMatrix::Unsupported(7), YuvRange::Full)
+        );
     }
 }
