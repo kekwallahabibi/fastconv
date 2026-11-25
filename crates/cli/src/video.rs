@@ -27,19 +27,27 @@ fn parse_target_format(value: &str) -> Result<VideoContainerFormat, String> {
     })
 }
 
+pub(crate) const REMUX_HELP: &str = r"fastconv remux - losslessly remux video containers
+
+Usage:
+  fastconv remux <source> <target> [--to <mp4|mkv|webm|mov|avi|ts>] [--threads <N>]
+
+Remux across MP4/MOV, MKV, WebM, AVI, and TS without re-encoding.
+
+Arguments:
+  <source>              Source video file or directory
+  <target>              Target file or directory
+
+Options:
+  --to <mp4|mkv|webm|mov|avi|ts>  Output container (required for directory batches)
+  --threads <N>         Number of parallel workers
+  -h, --help            Print this help
+
+Supported containers: mp4 (m4v), mkv, webm, mov (qt), avi, ts (m2ts, mts)
+GIF and WebP cannot be remuxed; use `fastconv video` to encode them.";
+
 pub(crate) fn print_remux_help() {
-    println!(
-        "Usage: fastconv remux <source> <target> [--to <mp4|mkv|webm|mov|avi|ts>] [--threads <N>]\n\n\
-         Lossless container remuxing across MP4/MOV, MKV, WebM, AVI, and TS without re-encoding.\n\n\
-         Arguments:\n  \
-           <source>              Source video file or directory\n  \
-           <target>              Target file or directory\n\n\
-         Options:\n  \
-           --to <mp4|mkv|webm|mov|avi|ts>  Output container (required for directory batches)\n  \
-           --threads <N>         Number of parallel workers\n  \
-           -h, --help            Print this help\n\n\
-         Supported containers: mp4 (m4v), mkv, webm, mov (qt), avi, ts (m2ts, mts)"
-    );
+    println!("{REMUX_HELP}");
 }
 
 /// Parses `fastconv remux` arguments without touching the file system.
@@ -159,29 +167,45 @@ pub(crate) enum VideoCommand {
     Run(VideoArgs),
 }
 
+pub(crate) const VIDEO_HELP: &str = r"fastconv video - transcode audio/video tracks
+
+Usage:
+  fastconv video <source> <target> [--to <format>] [--vcodec <codec>]
+                 [--acodec <codec>] [--quality <0..=100>] [--threads <N>]
+                 [--backend <name>] [--hwdecode <auto|cpu|nvdec>]
+
+Transcode audio/video tracks while converting between MP4/MOV, MKV, WebM, AVI,
+TS, GIF, and WebP containers.
+
+Arguments:
+  <source>              Source video file or directory
+  <target>              Target file or directory
+
+Options:
+  --to <format>         Output container (required for directory batches): mp4,
+                        mkv, webm, mov, avi, ts, gif, webp
+  --vcodec <codec>      Video codec: h264, hevc (h265), av1, vp9, gif, webp, copy
+  --acodec <codec>      Audio codec: aac, opus, mp3, none (drop), copy
+  --quality <0..=100>   Encoding quality (default 80; cannot be combined with
+                        --vcodec copy)
+  --threads <N>         Number of parallel workers
+  --backend <name>      cpu (default: H.264/AV1/VP9/GIF/WebP and copy) or nvenc
+                        (H.264/HEVC only; HEVC has no CPU encoder)
+  --hwdecode <name>     auto (default), cpu, or nvdec (NVDEC + NVENC zero-copy).
+                        Aliases: software -> cpu, cuda/gpu -> nvdec. A failed
+                        NVDEC setup is a hard error, never a CPU fallback.
+  -h, --help            Print this help
+
+Backends: cpu encodes H.264/AV1/VP9/GIF/WebP and --vcodec copy; nvenc encodes
+          H.264/HEVC only. HEVC requires nvenc; AV1/VP9 require cpu.
+Decode: --hwdecode auto uses NVDEC for H.264/HEVC/VP9 with --backend nvenc;
+        --hwdecode cpu forces CPU decode; --hwdecode nvdec requires --backend
+        nvenc and a hardware-decodable source.
+Animated GIF/WebP encoding runs on CPU only and drops audio tracks by default.
+Container aliases: m4v -> mp4, qt -> mov, m2ts/mts -> ts";
+
 pub(crate) fn print_video_help() {
-    println!(
-        "Usage: fastconv video <source> <target> [--to <mp4|mkv|webm|mov|avi|ts|gif|webp>] [--vcodec <h264|hevc|h265|av1|vp9|gif|webp|copy>] [--acodec <aac|opus|mp3|none|copy>] [--quality <0..=100>] [--threads <N>] [--backend <cpu|nvenc>] [--hwdecode <auto|cpu|nvdec>]\n\n\
-         Transcode audio/video tracks while converting between MP4/MOV, MKV, WebM, AVI, TS, GIF, and WebP containers.\n\n\
-         Backends: cpu runs every codec and --vcodec copy; nvenc encodes H.264/HEVC only.\n\
-         Decode: --hwdecode auto (default) uses NVDEC for H.264/HEVC/VP9 with --backend nvenc;\n\
-                 --hwdecode cpu forces CPU decode; --hwdecode nvdec requires --backend nvenc and\n\
-                 a hardware-decodable source. A failed NVDEC setup is a hard error, never a CPU fallback.\n\
-         Animated GIF/WebP encoding runs on CPU only and drops audio tracks by default.\n\n\
-         Arguments:\n  \
-           <source>              Source video file or directory\n  \
-           <target>              Target file or directory\n\n\
-         Options:\n  \
-           --to <mp4|mkv|webm|mov|avi|ts|gif|webp>  Output container (required for directory batches)\n  \
-           --vcodec <codec>      Video codec: h264, hevc (h265), av1, vp9, gif, webp, or copy\n  \
-           --acodec <codec>      Audio codec: aac, opus, mp3, none (drop), or copy\n  \
-           --quality <0..=100>   Encoding quality (cannot be combined with --vcodec copy)\n  \
-           --threads <N>         Number of parallel workers\n  \
-           --backend <name>      cpu (default) or nvenc (H.264/HEVC encoding only)\n  \
-           --hwdecode <name>     auto (default), cpu, or nvdec (NVDEC + NVENC zero-copy)\n  \
-           -h, --help            Print this help\n\n\
-         Container aliases: m4v -> mp4, qt -> mov, m2ts/mts -> ts"
-    );
+    println!("{VIDEO_HELP}");
 }
 
 fn flag_value<'a>(args: &'a [&str], index: usize, flag: &str) -> Result<&'a str, String> {
@@ -403,6 +427,39 @@ pub(crate) fn run_video(args: &VideoArgs) -> Result<(), String> {
 mod tests {
     use super::*;
     use fastconv_domain::GpuBackend;
+
+    #[test]
+    fn remux_and_video_help_use_uniform_layout() {
+        for (text, flags) in [
+            (REMUX_HELP, &["--to", "--threads", "-h, --help"][..]),
+            (
+                VIDEO_HELP,
+                &[
+                    "--to",
+                    "--vcodec",
+                    "--acodec",
+                    "--quality",
+                    "--threads",
+                    "--backend",
+                    "--hwdecode",
+                    "-h, --help",
+                ][..],
+            ),
+        ] {
+            assert!(text.contains("Arguments:"));
+            assert!(text.contains("Options:"));
+            assert!(text.contains("Usage:\n  fastconv "));
+            assert!(!text.contains("Commands:"));
+            for flag in flags {
+                assert!(text.contains(flag), "missing {flag} in help");
+            }
+        }
+        assert!(REMUX_HELP.contains("GIF and WebP cannot be remuxed"));
+        assert!(REMUX_HELP.contains("use `fastconv video` to encode them"));
+        assert!(VIDEO_HELP.contains("default 80"));
+        assert!(VIDEO_HELP.contains("software -> cpu"));
+        assert!(VIDEO_HELP.contains("cuda/gpu -> nvdec"));
+    }
 
     #[test]
     fn parses_default_and_flagged_args() -> Result<(), String> {

@@ -3,6 +3,35 @@ use std::path::PathBuf;
 
 use fastconv_domain::{AudioOutputFormat, HardwareBackend};
 
+pub(crate) const AUDIO_HELP: &str = r"fastconv audio - convert audio files
+
+Usage:
+  fastconv audio <source> <target> [--to <format>] [--threads <N>] [--backend <name>]
+
+Arguments:
+  <source>              Source audio file or directory
+  <target>              Target file or directory
+
+Options:
+  --to <format>         Output format; required for directory batches, inferred
+                        from the target extension for single files: flac, wav,
+                        opus, ogg, mp3, aac, m4a, alac, aiff
+  --threads <N>         Number of parallel workers
+  --backend <name>      cpu (default). Audio runs on CPU only; GPU backends
+                        nvenc, vaapi, qsv, amf, videotoolbox, and vulkan are
+                        rejected explicitly - no silent CPU fallback.
+  -h, --help            Print this help
+
+Supported input formats:
+  wav, flac, mp3, ogg (Vorbis), opus, aac (ADTS), m4a, alac, aiff
+  Output aliases: wave -> wav, oga -> ogg, aif/aifc -> aiff
+  Lossless outputs: wav, flac, alac, aiff
+  ALAC writes an M4A container; use a .m4a or .alac target extension.";
+
+pub(crate) fn print_audio_help() {
+    println!("{AUDIO_HELP}");
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AudioArgs {
     source: PathBuf,
@@ -141,6 +170,27 @@ pub(crate) fn run_audio(args: &AudioArgs) -> Result<(), String> {
 mod tests {
     use super::*;
     use fastconv_domain::GpuBackend;
+
+    #[test]
+    fn help_is_dedicated_and_documents_only_implemented_flags() {
+        assert!(AUDIO_HELP.contains("Usage:\n  fastconv audio <source> <target>"));
+        for flag in ["--to", "--threads", "--backend", "-h, --help"] {
+            assert!(AUDIO_HELP.contains(flag), "missing {flag} in audio help");
+        }
+        for format in [
+            "flac", "wav", "opus", "ogg", "mp3", "aac", "m4a", "alac", "aiff",
+        ] {
+            assert!(
+                AUDIO_HELP.contains(format),
+                "missing {format} in audio help"
+            );
+        }
+        assert!(AUDIO_HELP.contains("no silent CPU fallback"));
+        assert!(AUDIO_HELP.contains("ALAC writes an M4A container"));
+        assert!(!AUDIO_HELP.contains("--quality"));
+        assert!(!AUDIO_HELP.contains("--lossless"));
+        assert!(!AUDIO_HELP.contains("Commands:"));
+    }
 
     #[test]
     fn parses_default_and_flagged_args() -> Result<(), String> {
