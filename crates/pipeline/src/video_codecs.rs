@@ -669,6 +669,14 @@ pub(crate) fn decode_video_track(
             }
             Ok(frames)
         }
+        VideoCodec::Gif => crate::video_anim::decode_gif_frames_yuv420(
+            path,
+            crate::video_anim::ANIM_DECODED_BUDGET,
+        ),
+        VideoCodec::Webp => crate::video_anim::decode_webp_frames_yuv420(
+            path,
+            crate::video_anim::ANIM_DECODED_BUDGET,
+        ),
         other => Err(decode_error(
             path,
             format!("codec {other} is not a supported video decoder"),
@@ -676,9 +684,8 @@ pub(crate) fn decode_video_track(
     }
 }
 
-/// Streaming NV12 decode path feeding the NVENC backend. Without the `nvenc`
-/// feature the helpers are only reachable from tests.
-#[cfg_attr(not(feature = "nvenc"), allow(dead_code))]
+/// Streaming NV12 decode path shared by the CPU animation pipeline and the
+/// NVENC backend.
 mod streaming {
     use super::{
         Av1Decoder, Av1Planes, ContainerPacket, ContainerTrack, DecodedFrameInfo, H264Decoder,
@@ -692,7 +699,9 @@ mod streaming {
     /// to the nearest integer so 16,666 µs and 16,667 µs both resolve to 60 fps.
     ///
     /// Kept as a pure helper so the streaming GPU path and CPU path share one
-    /// definition of "fps" derived from container timing.
+    /// definition of "fps" derived from container timing. Only the optional
+    /// NVENC backend consumes it in a non-test build.
+    #[cfg_attr(not(any(feature = "nvenc", test)), allow(dead_code))]
     pub(crate) fn estimate_video_fps_from_packets(packets: &[ContainerPacket]) -> u32 {
         let duration = median_duration(packets).max(1);
         let fps = 1_000_000_u64.saturating_add(duration / 2) / duration;
@@ -1539,6 +1548,32 @@ mod streaming {
             VideoCodec::Hevc => stream_hevc(path, track, &ordered, packets, &mut on_frame),
             VideoCodec::Av1 => stream_av1(path, &ordered, packets, &mut on_frame),
             VideoCodec::Vp9 => stream_vp9(path, &ordered, packets, &mut on_frame),
+            VideoCodec::Gif => {
+                crate::video_anim::decode_gif_frames_streaming_nv12(path, |info, pack| {
+                    on_frame(
+                        DecodedFrameInfo {
+                            width: info.width,
+                            height: info.height,
+                            pts_us: info.pts_us,
+                            duration_us: info.duration_us,
+                        },
+                        pack,
+                    )
+                })
+            }
+            VideoCodec::Webp => {
+                crate::video_anim::decode_webp_frames_streaming_nv12(path, |info, pack| {
+                    on_frame(
+                        DecodedFrameInfo {
+                            width: info.width,
+                            height: info.height,
+                            pts_us: info.pts_us,
+                            duration_us: info.duration_us,
+                        },
+                        pack,
+                    )
+                })
+            }
             other => Err(decode_error(
                 path,
                 format!("codec {other} is not a supported video decoder"),
@@ -1547,11 +1582,9 @@ mod streaming {
     }
 } // mod streaming
 
-// Re-exports preserve the `video_codecs` API path for the upcoming NVENC stage.
-#[allow(unused_imports)]
-pub(crate) use streaming::{
-    decode_video_track_streaming, estimate_video_fps_from_packets, nv12_buffer_len,
-};
+#[cfg(any(feature = "nvenc", test))]
+pub(crate) use streaming::estimate_video_fps_from_packets;
+pub(crate) use streaming::{decode_video_track_streaming, nv12_buffer_len};
 
 /// Splits an Annex-B byte stream into one packet per coded access unit,
 /// grouping parameter sets and SEI with the VCL NAL that follows them.
@@ -2008,7 +2041,7 @@ pub(crate) fn encode_video_cpu(
         }
         VideoEncodeMode::CpuGif { .. } | VideoEncodeMode::CpuWebp { .. } => Err(encode_error(
             path,
-            "animated GIF/WebP encoding is not implemented yet (Stage 2 pending)",
+            "animated GIF/WebP frames must be encoded by the animation path, not the frame encoder",
         )),
         VideoEncodeMode::NvencH264 { .. } | VideoEncodeMode::NvencHevc { .. } => Err(encode_error(
             path,

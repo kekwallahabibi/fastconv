@@ -16,8 +16,9 @@ use std::thread;
 use std::time::Instant;
 
 use fastconv_domain::{
-    AudioTrackAction, GpuBackend, HardwareBackend, TargetAudioCodec, VideoCodec, VideoEncodeMode,
-    VideoTrackAction, VideoTranscodeItem, VideoTranscodePlan, VideoTranscodeReport,
+    AudioTrackAction, GpuBackend, HardwareBackend, TargetAudioCodec, VideoCodec,
+    VideoContainerFormat, VideoEncodeMode, VideoTrackAction, VideoTranscodeItem,
+    VideoTranscodePlan, VideoTranscodeReport,
 };
 use opus_pure::{Application, MAX_PACKET_BYTES, OpusEncoder};
 use rubato::{FftFixedInOut, Resampler};
@@ -29,8 +30,12 @@ use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 
 use crate::PipelineError;
+use crate::video_anim::{self, AnimFrameInfo};
 use crate::video_bitstream::{default_opus_head, wrap_adts};
-use crate::video_codecs::{Yuv420Frame, decode_video_track, encode_video_cpu};
+use crate::video_codecs::{
+    Yuv420Frame, decode_video_track, decode_video_track_streaming, encode_video_cpu,
+    nv12_buffer_len,
+};
 use crate::video_container::{
     ContainerPacket, ContainerTrack, US_TIMESCALE, demux_video, mux_video, rescale_ticks,
 };
@@ -1708,15 +1713,99 @@ fn drain_audio_nonblocking(
     Ok(())
 }
 
+/// Encodes an animation container directly from decoded frames: audio is
+/// dropped and the video frames bypass 4:2:0 entirely for animation sources.
+fn transcode_to_animation(
+    item: &VideoTranscodeItem,
+    tag: usize,
+    frame_workers: usize,
+) -> Result<(u64, u64, u64, Option<String>), PipelineError> {
+    let source = item.source();
+    let target = item.target();
+    let format = item.output_format();
+    let VideoTrackAction::Encode(mode) = item.video_action() else {
+        return Err(encode_error(
+            source,
+            "animation output requires video re-encoding",
+        ));
+    };
+    if !matches!(
+        mode,
+        VideoEncodeMode::CpuGif { .. } | VideoEncodeMode::CpuWebp { .. }
+    ) {
+        return Err(encode_error(
+            source,
+            "animation output only supports CPU GIF/WebP encoding",
+        ));
+    }
+    let quality = mode.quality();
+    let media = demux_video(source, item.input_format())?;
+    let video_index = media
+        .tracks
+        .iter()
+        .position(|track| track.codec.is_video())
+        .ok_or_else(|| decode_error(source, "source has no video track to encode"))?;
+    let track = &media.tracks[video_index];
+    let mut packets: Vec<ContainerPacket> = media
+        .packets
+        .iter()
+        .filter(|packet| packet.track == video_index)
+        .cloned()
+        .collect();
+    packets.sort_by_key(|packet| (packet.dts, packet.pts));
+
+    let staging = StagingTarget::new(target, tag)?;
+    let written = video_anim::encode_animation_stream(
+        format,
+        quality,
+        frame_workers,
+        staging.file()?,
+        |sink| match item.input_format() {
+            VideoContainerFormat::Gif => {
+                video_anim::decode_gif_frames_streaming_rgb(source, |info, rgb| sink(info, rgb))
+            }
+            VideoContainerFormat::Webp => {
+                video_anim::decode_webp_frames_streaming_rgb(source, |info, rgb| sink(info, rgb))
+            }
+            _ => decode_video_track_streaming(source, track, &packets, |info, pack| {
+                let pitch = usize::try_from(info.width)
+                    .map_err(|_| decode_error(source, "video frame width overflows usize"))?;
+                let length = nv12_buffer_len(info.width, info.height, pitch)?;
+                let mut nv12 = vec![0_u8; length];
+                pack(&mut nv12, pitch)?;
+                let rgb = video_anim::nv12_to_rgb8(&nv12, pitch, info.width, info.height)?;
+                sink(
+                    AnimFrameInfo {
+                        width: info.width,
+                        height: info.height,
+                        pts_us: info.pts_us,
+                        duration_us: info.duration_us,
+                    },
+                    &rgb,
+                )
+            }),
+        },
+    )?;
+    staging.commit()?;
+    Ok((written, input_size(source), input_size(target), None))
+}
+
 // Track-by-track dispatch keeps copy/encode decisions explicit per codec.
 #[allow(clippy::too_many_lines)]
 fn transcode_file(
     item: &VideoTranscodeItem,
     tag: usize,
+    frame_workers: usize,
 ) -> Result<(u64, u64, u64, Option<String>), PipelineError> {
     let source = item.source();
     let target = item.target();
     let format = item.output_format();
+    if matches!(
+        format,
+        VideoContainerFormat::Gif | VideoContainerFormat::Webp
+    ) {
+        return transcode_to_animation(item, tag, frame_workers);
+    }
     let media = demux_video(source, item.input_format())?;
     // One file-level origin for every track: copied/NVENC packets carry source
     // timestamps, while CPU-encoded video and decoded audio start at zero
@@ -1944,7 +2033,7 @@ fn transcode_file(
                     VideoEncodeMode::CpuGif { .. } | VideoEncodeMode::CpuWebp { .. } => {
                         video_error = Some(encode_error(
                             source,
-                            "animated GIF/WebP encoding is not implemented yet (Stage 2 pending)",
+                            "animation output must be encoded before container muxing",
                         ));
                         break 'video;
                     }
@@ -2157,10 +2246,16 @@ pub fn execute_video_transcode_batch(
             )
         )
     });
+    let configured_threads = plan.worker_threads().get();
     let workers = if uses_nvenc {
         1
     } else {
         plan.effective_workers().get().min(MAX_CPU_FILE_WORKERS)
+    };
+    let frame_workers = if items.len() == 1 {
+        configured_threads
+    } else {
+        configured_threads.div_ceil(workers.max(1)).max(1)
     };
     let admission = Mutex::new(BatchAdmission::default());
     let frames = AtomicU64::new(0);
@@ -2168,7 +2263,7 @@ pub fn execute_video_transcode_batch(
     let tag = AtomicUsize::new(0);
 
     if items.len() == 1 {
-        let (processed, _in, _out, hw) = transcode_file(&items[0], 0)?;
+        let (processed, _in, _out, hw) = transcode_file(&items[0], 0, frame_workers)?;
         frames.store(processed, Ordering::Relaxed);
         if let Some(hw) = hw
             && let Ok(mut guard) = device.lock()
@@ -2189,7 +2284,7 @@ pub fn execute_video_transcode_batch(
                         {
                             let Some(item) = items.get(index) else { break };
                             let my_tag = tag.fetch_add(1, Ordering::Relaxed);
-                            match transcode_file(item, my_tag) {
+                            match transcode_file(item, my_tag, frame_workers) {
                                 Ok((processed, _in, _out, hw)) => {
                                     frames.fetch_add(processed, Ordering::Relaxed);
                                     if let Some(hw) = hw
@@ -3548,6 +3643,314 @@ mod tests {
                 codec,
                 mode,
             )?;
+        }
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    fn make_animation_source(
+        path: &Path,
+        format: VideoContainerFormat,
+        width: u32,
+        height: u32,
+        count: u32,
+    ) -> Result<(), PipelineError> {
+        let quality = fastconv_domain::VideoQuality::DEFAULT;
+        let file = File::create(path).map_err(|source| PipelineError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        crate::video_anim::encode_animation_stream(format, quality, 2, &file, |sink| {
+            for index in 0..count {
+                let color: [u8; 3] = match index % 3 {
+                    0 => [220, 24, 24],
+                    1 => [24, 220, 24],
+                    _ => [24, 24, 220],
+                };
+                let rgb = color.repeat(
+                    usize::try_from(width).unwrap_or(0) * usize::try_from(height).unwrap_or(0),
+                );
+                sink(
+                    AnimFrameInfo {
+                        width,
+                        height,
+                        pts_us: i64::from(index).saturating_mul(100_000),
+                        duration_us: 100_000,
+                    },
+                    &rgb,
+                )?;
+            }
+            Ok(())
+        })?;
+        drop(file);
+        Ok(())
+    }
+
+    fn assert_animation(
+        path: &Path,
+        format: VideoContainerFormat,
+        width: u32,
+        height: u32,
+        count: usize,
+        expected_duration: u64,
+    ) -> Result<(), PipelineError> {
+        let (media_codec, media_width, media_height, packets) = match format {
+            VideoContainerFormat::Gif => {
+                let media = crate::video_anim::demux_gif_metadata(path)?;
+                (
+                    media.tracks[0].codec,
+                    media.tracks[0].width,
+                    media.tracks[0].height,
+                    media.packets,
+                )
+            }
+            VideoContainerFormat::Webp => {
+                let media = crate::video_anim::demux_webp_metadata(path)?;
+                (
+                    media.tracks[0].codec,
+                    media.tracks[0].width,
+                    media.tracks[0].height,
+                    media.packets,
+                )
+            }
+            _ => return Err(decode_error(path, "expected an animation container")),
+        };
+        assert_eq!(media_codec, format.default_video_codec().as_video_codec());
+        assert_eq!(media_width, u16::try_from(width).ok());
+        assert_eq!(media_height, u16::try_from(height).ok());
+        assert_eq!(packets.len(), count, "animation packet count");
+        let durations: Vec<u64> = packets.iter().map(|p| p.duration).collect();
+        assert!(
+            durations.iter().all(|&d| d == expected_duration),
+            "unexpected animation frame durations: {durations:?}"
+        );
+
+        let mut decoded = 0_usize;
+        match format {
+            VideoContainerFormat::Gif => {
+                crate::video_anim::decode_gif_frames_streaming_rgb(path, |info, rgb| {
+                    assert_eq!((info.width, info.height), (width, height));
+                    assert_eq!(
+                        rgb.len(),
+                        usize::try_from(width).unwrap_or(0)
+                            * usize::try_from(height).unwrap_or(0)
+                            * 3
+                    );
+                    decoded = decoded.saturating_add(1);
+                    Ok(())
+                })?;
+            }
+            VideoContainerFormat::Webp => {
+                crate::video_anim::decode_webp_frames_streaming_rgb(path, |info, rgb| {
+                    assert_eq!((info.width, info.height), (width, height));
+                    assert_eq!(
+                        rgb.len(),
+                        usize::try_from(width).unwrap_or(0)
+                            * usize::try_from(height).unwrap_or(0)
+                            * 3
+                    );
+                    decoded = decoded.saturating_add(1);
+                    Ok(())
+                })?;
+            }
+            _ => return Err(decode_error(path, "expected an animation container")),
+        }
+        assert_eq!(decoded, count, "decoded animation frame count");
+        Ok(())
+    }
+
+    fn cpu_video_mode(container: VideoContainerFormat) -> VideoEncodeMode {
+        let quality = fastconv_domain::VideoQuality::DEFAULT;
+        if container == VideoContainerFormat::Webm {
+            VideoEncodeMode::CpuVp9 { quality }
+        } else {
+            VideoEncodeMode::CpuH264 { quality }
+        }
+    }
+
+    #[test]
+    fn all_video_containers_to_gif_and_webp_drop_audio() -> Result<(), PipelineError> {
+        let dir = temp_dir("anim-targets")?;
+        for container in [
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Webm,
+            VideoContainerFormat::Mov,
+            VideoContainerFormat::Avi,
+            VideoContainerFormat::Ts,
+        ] {
+            let source = dir.join(format!("src.{}", container.extension()));
+            let audio = if container == VideoContainerFormat::Webm {
+                TargetAudioCodec::Opus
+            } else {
+                TargetAudioCodec::Aac
+            };
+            make_source(&source, container, cpu_video_mode(container), audio)?;
+            for (format, mode) in [
+                (
+                    VideoContainerFormat::Gif,
+                    VideoEncodeMode::CpuGif {
+                        quality: fastconv_domain::VideoQuality::DEFAULT,
+                    },
+                ),
+                (
+                    VideoContainerFormat::Webp,
+                    VideoEncodeMode::CpuWebp {
+                        quality: fastconv_domain::VideoQuality::DEFAULT,
+                    },
+                ),
+            ] {
+                let target = dir.join(format!(
+                    "{}_to.{}",
+                    container.extension(),
+                    format.extension()
+                ));
+                transcode(
+                    &source,
+                    &target,
+                    container,
+                    format,
+                    VideoTrackAction::Encode(mode),
+                    AudioTrackAction::Drop,
+                )?;
+                assert_animation(&target, format, 64, 48, 4, 20_000)?;
+            }
+        }
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn animations_to_all_video_containers_on_cpu() -> Result<(), PipelineError> {
+        let dir = temp_dir("anim-sources")?;
+        for input in [VideoContainerFormat::Gif, VideoContainerFormat::Webp] {
+            let source = dir.join(format!("anim.{}", input.extension()));
+            make_animation_source(&source, input, 64, 48, 3)?;
+            for container in [
+                VideoContainerFormat::Mp4,
+                VideoContainerFormat::Mkv,
+                VideoContainerFormat::Webm,
+                VideoContainerFormat::Mov,
+                VideoContainerFormat::Avi,
+                VideoContainerFormat::Ts,
+            ] {
+                let mode = cpu_video_mode(container);
+                let target = dir.join(format!(
+                    "{}_to.{}",
+                    input.extension(),
+                    container.extension()
+                ));
+                transcode(
+                    &source,
+                    &target,
+                    input,
+                    container,
+                    VideoTrackAction::Encode(mode),
+                    AudioTrackAction::Drop,
+                )?;
+                let media = demux_video(&target, container)?;
+                assert_eq!(media.tracks.len(), 1, "audio must not appear");
+                assert_eq!(media.tracks[0].codec, mode.codec().as_video_codec());
+                let frames = media.packets.iter().filter(|p| p.track == 0).count();
+                assert!(
+                    frames >= 3,
+                    "expected decoded animation frames, got {frames}"
+                );
+            }
+        }
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn gif_and_webp_bidirectional_roundtrip() -> Result<(), PipelineError> {
+        let dir = temp_dir("anim-bidirectional")?;
+        for (input, output, mode) in [
+            (
+                VideoContainerFormat::Gif,
+                VideoContainerFormat::Webp,
+                VideoEncodeMode::CpuWebp {
+                    quality: fastconv_domain::VideoQuality::DEFAULT,
+                },
+            ),
+            (
+                VideoContainerFormat::Webp,
+                VideoContainerFormat::Gif,
+                VideoEncodeMode::CpuGif {
+                    quality: fastconv_domain::VideoQuality::DEFAULT,
+                },
+            ),
+        ] {
+            let source = dir.join(format!("src.{}", input.extension()));
+            make_animation_source(&source, input, 32, 24, 3)?;
+            let target = dir.join(format!("out.{}", output.extension()));
+            transcode(
+                &source,
+                &target,
+                input,
+                output,
+                VideoTrackAction::Encode(mode),
+                AudioTrackAction::Drop,
+            )?;
+            assert_animation(&target, output, 32, 24, 3, 100_000)?;
+        }
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[cfg(feature = "nvenc")]
+    #[test]
+    fn animation_sources_use_real_nvenc_hardware() -> Result<(), PipelineError> {
+        if cudarc::driver::CudaContext::new(0).is_err() {
+            return Ok(());
+        }
+        let dir = temp_dir("anim-nvenc")?;
+        for (input, container, mode) in [
+            (
+                VideoContainerFormat::Gif,
+                VideoContainerFormat::Mp4,
+                VideoEncodeMode::NvencH264 {
+                    quality: fastconv_domain::VideoQuality::DEFAULT,
+                },
+            ),
+            (
+                VideoContainerFormat::Webp,
+                VideoContainerFormat::Mkv,
+                VideoEncodeMode::NvencHevc {
+                    quality: fastconv_domain::VideoQuality::DEFAULT,
+                },
+            ),
+        ] {
+            let source = dir.join(format!("src.{}", input.extension()));
+            make_animation_source(&source, input, 256, 144, 3)?;
+            let target = dir.join(format!("out.{}", container.extension()));
+            let report = transcode(
+                &source,
+                &target,
+                input,
+                container,
+                VideoTrackAction::Encode(mode),
+                AudioTrackAction::Drop,
+            )?;
+            assert!(
+                report.hardware_device().is_some(),
+                "NVENC must report the actual hardware device"
+            );
+            let media = demux_video(&target, container)?;
+            assert_eq!(media.tracks[0].codec, mode.codec().as_video_codec());
+            assert!(media.packets.len() >= 3);
         }
         fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
             path: dir.clone(),

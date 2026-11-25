@@ -15,6 +15,7 @@ mod mpegts;
 mod pnm;
 mod qoi;
 pub mod remux;
+mod video_anim;
 mod video_bitstream;
 pub(crate) mod video_codecs;
 mod video_container;

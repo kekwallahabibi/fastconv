@@ -874,10 +874,8 @@ pub(crate) fn demux_video(
         VideoContainerFormat::Mkv | VideoContainerFormat::Webm => demux_mkv(path),
         VideoContainerFormat::Avi => crate::avi::demux_avi(path),
         VideoContainerFormat::Ts => crate::mpegts::demux_ts(path),
-        VideoContainerFormat::Gif | VideoContainerFormat::Webp => Err(container_error(
-            path,
-            "animated GIF/WebP demuxing is not implemented yet (Stage 2 pending)",
-        )),
+        VideoContainerFormat::Gif => crate::video_anim::demux_gif_metadata(path),
+        VideoContainerFormat::Webp => crate::video_anim::demux_webp_metadata(path),
     }
 }
 
@@ -1487,7 +1485,7 @@ pub(crate) fn mux_video(
         VideoContainerFormat::Ts => crate::mpegts::mux_ts(target, target_path, media),
         VideoContainerFormat::Gif | VideoContainerFormat::Webp => Err(container_error(
             target_path,
-            "animated GIF/WebP muxing is not implemented yet (Stage 2 pending)",
+            "animated GIF/WebP frames must be written by the animation path, not the generic muxer",
         )),
     }
 }
