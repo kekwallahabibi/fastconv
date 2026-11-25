@@ -1355,17 +1355,31 @@ mod enabled {
     struct RawBitstream<'a> {
         ptr: *mut c_void,
         encoder_ptr: *mut c_void,
+        /// Set between a successful `NvEncLockBitstream` and a successful
+        /// `NvEncUnlockBitstream`. A locked bitstream must never be destroyed.
+        locked: Cell<bool>,
         _session: std::marker::PhantomData<&'a RawNvencSession>,
     }
 
     impl Drop for RawBitstream<'_> {
         #[allow(unsafe_code)]
         fn drop(&mut self) {
-            if !self.ptr.is_null() {
-                // SAFETY: `self.ptr` was allocated by `create_bitstream_buffer` on `encoder_ptr`.
-                let _status =
-                    unsafe { (ENCODE_API.destroy_bitstream_buffer)(self.encoder_ptr, self.ptr) };
+            if self.ptr.is_null() {
+                return;
             }
+            if self.locked.get() {
+                // Retry the unlock while the encoder is still alive. If the
+                // driver keeps refusing, leak this buffer rather than destroy
+                // one it may still consider locked.
+                let status = unsafe { (ENCODE_API.unlock_bitstream)(self.encoder_ptr, self.ptr) };
+                if status != NVENCSTATUS::NV_ENC_SUCCESS {
+                    return;
+                }
+                self.locked.set(false);
+            }
+            // SAFETY: `self.ptr` was allocated by `create_bitstream_buffer` on `encoder_ptr`.
+            let _status =
+                unsafe { (ENCODE_API.destroy_bitstream_buffer)(self.encoder_ptr, self.ptr) };
         }
     }
 
@@ -1416,6 +1430,7 @@ mod enabled {
             Ok(RawBitstream {
                 ptr: params.bitstreamBuffer,
                 encoder_ptr: self.encoder.ptr,
+                locked: Cell::new(false),
                 _session: std::marker::PhantomData,
             })
         }
@@ -1555,6 +1570,7 @@ mod enabled {
                 unsafe { (ENCODE_API.lock_bitstream)(self.encoder.ptr, &raw mut lock_params) },
                 "failed to lock NVENC bitstream",
             )?;
+            bitstream.locked.set(true);
             let size = usize::try_from(lock_params.bitstreamSizeInBytes).unwrap_or(0);
             let data = if size == 0 || lock_params.bitstreamBufferPtr.is_null() {
                 Vec::new()
@@ -1566,11 +1582,15 @@ mod enabled {
                 .to_vec()
             };
             let timestamp = lock_params.outputTimeStamp;
-            nvenc_check(
+            let unlock = nvenc_check(
                 self.encoder.ptr,
                 unsafe { (ENCODE_API.unlock_bitstream)(self.encoder.ptr, bitstream.ptr) },
                 "failed to unlock NVENC bitstream",
-            )?;
+            );
+            if unlock.is_ok() {
+                bitstream.locked.set(false);
+            }
+            unlock?;
             Ok((data, timestamp))
         }
 
@@ -1590,11 +1610,16 @@ mod enabled {
                 unsafe { (ENCODE_API.lock_bitstream)(self.encoder.ptr, &raw mut lock_params) },
                 "failed to lock NVENC bitstream during abort",
             )?;
-            nvenc_check(
+            bitstream.locked.set(true);
+            let unlock = nvenc_check(
                 self.encoder.ptr,
                 unsafe { (ENCODE_API.unlock_bitstream)(self.encoder.ptr, bitstream.ptr) },
                 "failed to unlock NVENC bitstream during abort",
-            )
+            );
+            if unlock.is_ok() {
+                bitstream.locked.set(false);
+            }
+            unlock
         }
     }
 

@@ -1282,6 +1282,38 @@ fn track_duration(media: &ContainerMedia, index: usize) -> u64 {
         .max(1)
 }
 
+/// Matroska has no edit list: a source edit whose visible window excludes
+/// packets would require hiding those packets or collapsing their timestamps
+/// onto a clamped base. Reject it explicitly instead of silently corrupting
+/// the timeline.
+fn validate_mkv_presentation_edits(
+    media: &ContainerMedia,
+    target_path: &Path,
+) -> Result<(), PipelineError> {
+    for (index, track) in media.tracks.iter().enumerate() {
+        let Some(edit) = track.presentation_edit else {
+            continue;
+        };
+        let visible_end = edit.duration_us.map(|duration| {
+            edit.start_us
+                .saturating_add(i64::try_from(duration).unwrap_or(i64::MAX))
+        });
+        let has_excluded_packet = media.packets.iter().any(|packet| {
+            packet.track == index
+                && (packet.pts < edit.start_us || visible_end.is_some_and(|end| packet.pts >= end))
+        });
+        if has_excluded_packet {
+            return Err(container_error(
+                target_path,
+                format!(
+                    "track {index} has an MP4 presentation edit with preroll or a trimmed duration that Matroska cannot represent; use MP4/MOV output"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn mux_mkv(
     target: &File,
     target_path: &Path,
@@ -1349,6 +1381,7 @@ fn mux_mkv(
                 .map_err(|err| containr_error(target_path, &err))?,
         );
     }
+    validate_mkv_presentation_edits(media, target_path)?;
     let earliest_pts = mp4_earliest_presentation_times(media);
     let base = media
         .tracks
@@ -2301,6 +2334,47 @@ mod tests {
         ];
         let result = synthesize_mkv_decode_timestamps(Path::new("min.mkv"), &mut exhausted, 1);
         assert!(matches!(result, Err(PipelineError::RemuxFailed { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn mux_mkv_rejects_unrepresentable_mp4_edit() -> Result<(), String> {
+        let dir =
+            std::env::temp_dir().join(format!("fastconv-mp4-edit-mkv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let source = dir.join("in.mp4");
+        let target = dir.join("out.mkv");
+
+        let audio: Vec<(i64, u64)> = (0_i64..8).map(|idx| (idx * 21_333, 21_333)).collect();
+        let video: Vec<(i64, i64, u64, bool)> = (0_i64..5)
+            .map(|idx| (idx * 40_000, idx * 40_000, 40_000, idx == 0))
+            .collect();
+        let video_edit = EditList {
+            movie_timescale: US_TIMESCALE,
+            entries: vec![
+                EditEntry {
+                    segment_duration: 80_000,
+                    media_time: EditEntry::EMPTY_MEDIA_TIME,
+                    media_rate: EditEntry::NORMAL_RATE,
+                },
+                EditEntry {
+                    segment_duration: 80_000,
+                    media_time: 120_000,
+                    media_rate: EditEntry::NORMAL_RATE,
+                },
+            ],
+        };
+        write_edited_mp4(&source, &audio, None, &video, Some(&video_edit))?;
+        let demuxed = demux_mp4(&source).map_err(|err| err.to_string())?;
+        let out_file = File::create(&target).map_err(|err| err.to_string())?;
+        let result = mux_video(&out_file, &target, VideoContainerFormat::Mkv, &demuxed);
+        drop(out_file);
+        assert!(
+            matches!(result, Err(PipelineError::RemuxFailed { .. })),
+            "an edit with preroll must be rejected instead of clamping timestamps"
+        );
+
+        std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
         Ok(())
     }
 }

@@ -475,13 +475,15 @@ fn suffix_min_pts(ordered: &[&ContainerPacket]) -> Vec<i64> {
 }
 
 /// Drains buffered H.264 frames whose presentation time cannot be preceded by
-/// any remaining decode-order packet (or when the 16-frame H.264 DPB cap is
-/// exceeded).
+/// any remaining decode-order packet. At the 16-frame DPB cap an unproven
+/// order is rejected explicitly instead of emitting a frame a later picture
+/// could still precede.
 fn drain_ready_h264_reorder_vec(
+    path: &Path,
     reorder: &mut Vec<Yuv420Frame>,
     future_min_pts: Option<i64>,
     frames: &mut Vec<Yuv420Frame>,
-) {
+) -> Result<(), PipelineError> {
     while !reorder.is_empty() {
         let earliest = reorder
             .iter()
@@ -490,12 +492,18 @@ fn drain_ready_h264_reorder_vec(
             .map_or(0, |(index, _)| index);
         let safe_to_emit =
             future_min_pts.is_none_or(|future_min| reorder[earliest].pts_us <= future_min);
-        if safe_to_emit || reorder.len() > 16 {
+        if safe_to_emit {
             frames.push(reorder.remove(earliest));
+        } else if reorder.len() > 16 {
+            return Err(decode_error(
+                path,
+                "H.264 reorder buffer exceeded 16 frames before presentation order was provable",
+            ));
         } else {
             break;
         }
     }
+    Ok(())
 }
 
 /// Emits remaining buffered H.264 frames in presentation order at EOF.
@@ -541,7 +549,7 @@ pub(crate) fn decode_video_track(
                     if needs_reorder {
                         reorder.push(yuv);
                         let future_min = future_mins.get(index + 1).copied();
-                        drain_ready_h264_reorder_vec(&mut reorder, future_min, &mut frames);
+                        drain_ready_h264_reorder_vec(path, &mut reorder, future_min, &mut frames)?;
                     } else {
                         frames.push(yuv);
                     }
@@ -1298,9 +1306,14 @@ mod streaming {
                 .map_or(0, |(index, _)| index);
             let safe_to_emit =
                 future_min_pts.is_none_or(|future_min| reorder[earliest].1 <= future_min);
-            if safe_to_emit || reorder.len() > 16 {
+            if safe_to_emit {
                 let (frame, pts, duration) = reorder.remove(earliest);
                 emit_h264_frame(path, &frame, pts, duration, on_frame)?;
+            } else if reorder.len() > 16 {
+                return Err(decode_error(
+                    path,
+                    "H.264 reorder buffer exceeded 16 frames before presentation order was provable",
+                ));
             } else {
                 break;
             }
@@ -2370,7 +2383,8 @@ mod tests {
     }
 
     #[test]
-    fn h264_reorder_preserves_presentation_order_for_open_gop_leading_pictures() {
+    fn h264_reorder_preserves_presentation_order_for_open_gop_leading_pictures()
+    -> Result<(), PipelineError> {
         // Open-GOP sequence where a sync-marked picture (PTS 200) is followed in
         // decode order by a leading picture (PTS 110) earlier than a previously
         // decoded frame (PTS 120). A keyframe-triggered flush would emit 120
@@ -2408,11 +2422,44 @@ mod tests {
                 duration_us: packet.duration,
             });
             let future_min = future_mins.get(index + 1).copied();
-            drain_ready_h264_reorder_vec(&mut reorder, future_min, &mut emitted);
+            drain_ready_h264_reorder_vec(
+                Path::new("open-gop.mkv"),
+                &mut reorder,
+                future_min,
+                &mut emitted,
+            )?;
         }
         flush_h264_reorder_vec(&mut reorder, &mut emitted);
         let pts_out: Vec<i64> = emitted.iter().map(|frame| frame.pts_us).collect();
         assert_eq!(pts_out, vec![0, 40, 80, 110, 120, 160, 200]);
+        Ok(())
+    }
+
+    #[test]
+    fn h264_reorder_rejects_unprovable_order_at_dpb_cap() {
+        // 17 buffered frames with a later decode-order PTS of 0: the earliest
+        // buffered frame (10) is not yet provably in presentation order, so the
+        // DPB cap must produce an explicit decode error instead of emitting it.
+        let mut reorder: Vec<Yuv420Frame> = (1_i64..=17)
+            .map(|index| Yuv420Frame {
+                width: 2,
+                height: 2,
+                y: vec![0; 4],
+                u: vec![128; 1],
+                v: vec![128; 1],
+                pts_us: index * 10,
+                duration_us: 10,
+            })
+            .collect();
+        let mut emitted = Vec::new();
+        let result = drain_ready_h264_reorder_vec(
+            Path::new("dpb-cap.mkv"),
+            &mut reorder,
+            Some(0),
+            &mut emitted,
+        );
+        assert!(matches!(result, Err(PipelineError::DecodeFailed { .. })));
+        assert_eq!(emitted.len(), 0);
     }
 
     /// Packs a streamed NV12 frame back into `Yuv420Frame` so the two decode
