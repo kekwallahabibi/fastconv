@@ -1,6 +1,8 @@
+use std::cell::Cell;
 #[cfg(test)]
 use std::io::Write;
 use std::path::Path;
+use std::sync::{Condvar, Mutex};
 
 use crate::PipelineError;
 use crate::decode::{DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat};
@@ -8,6 +10,82 @@ use crate::decode::{DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat};
 const BMP_FILE_HEADER_LEN: usize = 14;
 const BMP_INFO_HEADER_LEN: usize = 40;
 const BMP_V4_HEADER_LEN: usize = 108;
+
+// WHY: each worker keeps its fully prepared BMP in a reusable scratch Vec until
+// the next item overwrites it, so the write mutex does not bound output memory.
+// Eight 8192x8192 BGRA frames would retain ~2 GiB on top of the decoded pixels.
+// Cap the aggregate at two such frames: ordinary frames never contend, while a
+// pathological batch serializes instead of exhausting RAM.
+const BMP_FRAME_BUFFER_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+// Allocator round-up in a reused Vec is negligible; only reclaim genuinely stale
+// allocations so the steady-state path never reallocates for a few spare bytes.
+const BMP_FRAME_SCRATCH_SLACK_BYTES: usize = 1024 * 1024;
+
+static BMP_FRAME_BUFFER_RESERVED: Mutex<usize> = Mutex::new(0);
+static BMP_FRAME_BUFFER_FREED: Condvar = Condvar::new();
+
+struct FrameReservation(Cell<usize>);
+
+impl FrameReservation {
+    fn release(&self) {
+        let bytes = self.0.replace(0);
+        if bytes == 0 {
+            return;
+        }
+        let mut reserved = BMP_FRAME_BUFFER_RESERVED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *reserved = reserved.saturating_sub(bytes);
+        drop(reserved);
+        BMP_FRAME_BUFFER_FREED.notify_all();
+    }
+}
+
+impl Drop for FrameReservation {
+    fn drop(&mut self) {
+        // A worker may exit while holding a reservation (e.g. it processed no
+        // further BMP items); without this the budget would never be returned.
+        self.release();
+    }
+}
+
+thread_local! {
+    static BMP_FRAME_RESERVATION: FrameReservation = const { FrameReservation(Cell::new(0)) };
+}
+
+/// Reserves `total_bytes` of the process-wide BMP scratch budget before the caller
+/// grows its reusable frame buffer. The previous reservation for this thread is
+/// released first: the scratch Vec is still live at that point, and is the only
+/// place we can observe that the earlier frame has been consumed.
+fn reserve_frame_bytes(frame_buf: &mut Vec<u8>, total_bytes: usize) -> Result<(), PipelineError> {
+    if frame_buf.capacity().saturating_sub(total_bytes) > BMP_FRAME_SCRATCH_SLACK_BYTES {
+        // A prior frame (possibly a different encoder using the same scratch Vec)
+        // left a much larger allocation behind; return it before reserving again.
+        frame_buf.clear();
+        frame_buf.shrink_to(total_bytes);
+    }
+    BMP_FRAME_RESERVATION.with(FrameReservation::release);
+
+    let mut reserved = BMP_FRAME_BUFFER_RESERVED
+        .lock()
+        .map_err(|_| PipelineError::WorkerPanicked)?;
+    loop {
+        let current = *reserved;
+        // A single frame larger than the budget still has to run; let it take the
+        // budget exclusively instead of waiting forever for other workers.
+        if current == 0 || current.saturating_add(total_bytes) <= BMP_FRAME_BUFFER_BUDGET_BYTES {
+            break;
+        }
+        reserved = BMP_FRAME_BUFFER_FREED
+            .wait(reserved)
+            .map_err(|_| PipelineError::WorkerPanicked)?;
+    }
+    *reserved = reserved.saturating_add(total_bytes);
+    drop(reserved);
+
+    BMP_FRAME_RESERVATION.with(|reservation| reservation.0.set(total_bytes));
+    Ok(())
+}
 
 #[inline]
 const fn is_contiguous_mask(mask: u32) -> bool {
@@ -52,7 +130,9 @@ fn flush_slice<W: Write>(target: &Path, bytes: &[u8], writer: &mut W) -> Result<
 ///
 /// This is deliberately independent of any sink: callers may prepare frames in
 /// parallel and hand the finished bytes to one serialized writer, so no filesystem
-/// contention slows down parallel decoding or swizzling.
+/// contention slows down parallel decoding or swizzling. A process-wide budget
+/// bounds the full-frame buffers retained across all workers; frames that exceed
+/// it wait here (before allocating) until an earlier frame buffer is reused.
 pub(crate) fn encode_bmp_into_frame(
     target: &Path,
     pixels: &[u8],
@@ -179,6 +259,7 @@ fn encode_bmp_rgb24(
     header[26..28].copy_from_slice(&1_u16.to_le_bytes());
     header[28..30].copy_from_slice(&24_u16.to_le_bytes());
     header[34..38].copy_from_slice(&image_size_u32.to_le_bytes());
+    reserve_frame_bytes(frame_buf, total_bytes)?;
     if frame_buf.len() < total_bytes {
         frame_buf.resize(total_bytes, 0);
     }
@@ -281,6 +362,7 @@ fn encode_bmp_bgra32(
     header[62..66].copy_from_slice(&0x0000_00FF_u32.to_le_bytes()); // B
     header[66..70].copy_from_slice(&0xFF00_0000_u32.to_le_bytes()); // A
     header[70..74].copy_from_slice(b"BGRs"); // LCS_sRGB
+    reserve_frame_bytes(frame_buf, total_bytes)?;
     if frame_buf.len() < total_bytes {
         frame_buf.resize(total_bytes, 0);
     }
@@ -373,6 +455,7 @@ fn encode_bmp_gray8(
     header[28..30].copy_from_slice(&8_u16.to_le_bytes());
     header[34..38].copy_from_slice(&image_size_u32.to_le_bytes());
     header[46..50].copy_from_slice(&256_u32.to_le_bytes());
+    reserve_frame_bytes(frame_buf, total_bytes)?;
     if frame_buf.len() < total_bytes {
         frame_buf.resize(total_bytes, 0);
     }
