@@ -16,9 +16,8 @@ use std::thread;
 use std::time::Instant;
 
 use fastconv_domain::{
-    AudioTrackAction, GpuBackend, HardwareBackend, TargetAudioCodec, VideoCodec,
-    VideoContainerFormat, VideoEncodeMode, VideoTrackAction, VideoTranscodeItem,
-    VideoTranscodePlan, VideoTranscodeReport,
+    AudioTrackAction, GpuBackend, HardwareBackend, TargetAudioCodec, VideoCodec, VideoEncodeMode,
+    VideoTrackAction, VideoTranscodeItem, VideoTranscodePlan, VideoTranscodeReport,
 };
 use opus_pure::{Application, MAX_PACKET_BYTES, OpusEncoder};
 use rubato::{FftFixedInOut, Resampler};
@@ -294,6 +293,16 @@ impl StreamingResampler {
             return Ok(Vec::new());
         };
         let block_frames = resampler.input_frames_next();
+        // Cap the whole tail (padded block + drain) at the remaining output
+        // budget. Capping only the drain lets the padded block overshoot the
+        // whole-track resampler and stretch the audio timeline.
+        let expected = self.total_in_frames.saturating_mul(u64::from(self.to_rate))
+            / u64::from(self.from_rate.max(1));
+        let remaining_frames = expected.saturating_sub(self.emitted_out_frames);
+        let allowed = usize::try_from(
+            remaining_frames.saturating_mul(u64::try_from(self.channels).unwrap_or(u64::MAX)),
+        )
+        .unwrap_or(usize::MAX);
         let mut out = Vec::new();
         if self.staging.first().is_some_and(|plane| !plane.is_empty()) {
             let mut block = Vec::with_capacity(self.channels);
@@ -304,12 +313,7 @@ impl StreamingResampler {
             let processed = resampler.process(&block, None).map_err(|err| {
                 encode_error(Path::new("resampler"), format!("resampling failed: {err}"))
             })?;
-            Self::emit(
-                &mut out,
-                &processed,
-                self.channels,
-                &mut self.emitted_out_frames,
-            );
+            out.extend(Self::interleave(&processed));
         }
         let drained = resampler
             .process_partial::<Vec<f32>>(None, None)
@@ -319,19 +323,11 @@ impl StreamingResampler {
                     format!("resampler drain failed: {err}"),
                 )
             })?;
-        let expected = self.total_in_frames.saturating_mul(u64::from(self.to_rate))
-            / u64::from(self.from_rate.max(1));
-        let remaining_frames = expected.saturating_sub(self.emitted_out_frames);
-        let mut tail = Self::interleave(&drained);
-        let allowed = usize::try_from(
-            remaining_frames.saturating_mul(u64::try_from(self.channels).unwrap_or(u64::MAX)),
-        )
-        .unwrap_or(usize::MAX);
-        tail.truncate(allowed);
+        out.extend(Self::interleave(&drained));
+        out.truncate(allowed);
         self.emitted_out_frames = self
             .emitted_out_frames
-            .saturating_add(u64::try_from(tail.len() / self.channels).unwrap_or(0));
-        out.extend(tail);
+            .saturating_add(u64::try_from(out.len() / self.channels).unwrap_or(0));
         Ok(out)
     }
 
@@ -909,6 +905,9 @@ enum StreamingAudioEncoder {
         encoder: Box<rusty_mp3::Mp3Encoder>,
         sample_offset: u64,
         frame_samples: u64,
+        // The first packet is the LAME Info tag; its counts are only final
+        // after `finish()`, so hold it back until the tag is completed.
+        held_tag: Option<ContainerPacket>,
     },
 }
 
@@ -1025,6 +1024,7 @@ impl StreamingAudioEncoder {
                         encoder: mp3_encoder,
                         sample_offset: 0,
                         frame_samples: if rate >= 32_000 { 1_152 } else { 576 },
+                        held_tag: None,
                     },
                     track,
                 ))
@@ -1086,6 +1086,7 @@ impl StreamingAudioEncoder {
                 encoder,
                 sample_offset,
                 frame_samples,
+                held_tag,
             } => {
                 encoder.push_pcm_f32(pcm, *channels, *rate).map_err(|err| {
                     encode_error(Path::new("mp3"), format!("MP3 encoding failed: {err}"))
@@ -1099,15 +1100,21 @@ impl StreamingAudioEncoder {
                             let duration = u64::try_from(next_pts.saturating_sub(pts))
                                 .unwrap_or(1)
                                 .max(1);
+                            let first = *sample_offset == 0 && held_tag.is_none();
                             *sample_offset = sample_offset.saturating_add(*frame_samples);
-                            out.push(ContainerPacket {
+                            let packet = ContainerPacket {
                                 track: 0,
                                 pts,
                                 dts: pts,
                                 duration,
                                 keyframe: true,
                                 data,
-                            });
+                            };
+                            if first {
+                                *held_tag = Some(packet);
+                            } else {
+                                out.push(packet);
+                            }
                         }
                         Err(rusty_mp3::Error::Eof | rusty_mp3::Error::Again) => break,
                         Err(err) => {
@@ -1221,10 +1228,17 @@ impl StreamingAudioEncoder {
                 encoder,
                 sample_offset,
                 frame_samples,
+                held_tag,
                 ..
             } => {
                 encoder.finish();
                 let mut out = Vec::new();
+                // `finish()` finalizes the Info tag's frame and byte counts.
+                // Replace the held placeholder before the muxer sees it.
+                if let (Some(tag), Some(mut held)) = (encoder.lame_tag_frame(), held_tag.take()) {
+                    held.data = tag.to_vec();
+                    out.push(held);
+                }
                 loop {
                     match encoder.next_packet() {
                         Ok(data) => {
@@ -1563,27 +1577,17 @@ fn rebase_encoded_packets(packets: &mut [ContainerPacket], track_origin: i64, or
 }
 
 /// The packet-copy path shared by video, audio and timed-text tracks.
-#[allow(clippy::too_many_arguments)]
 fn copy_track(
     source_track: &ContainerTrack,
     track_packets: Vec<ContainerPacket>,
     new_index: usize,
     rebase: Option<i64>,
-    format: VideoContainerFormat,
     target: &Path,
     tracks: &mut [Option<ContainerTrack>],
     packets: &mut Vec<ContainerPacket>,
 ) -> Result<(), PipelineError> {
-    if !source_track.codec.supported_in(format) {
-        return Err(PipelineError::RemuxFailed {
-            path: target.to_path_buf(),
-            reason: format!(
-                "codec {} cannot be carried by {}",
-                source_track.codec,
-                format.label()
-            ),
-        });
-    }
+    // Compatibility was already checked in `transcode_file` before any worker
+    // started; do not validate the same codec/format pair twice here.
     let slot = tracks
         .get_mut(new_index)
         .ok_or_else(|| PipelineError::RemuxFailed {
@@ -1746,7 +1750,6 @@ fn transcode_file(
                     track_packets,
                     new_index,
                     rebase,
-                    format,
                     target,
                     &mut tracks,
                     &mut packets,
@@ -1767,7 +1770,6 @@ fn transcode_file(
                     track_packets,
                     new_index,
                     rebase,
-                    format,
                     target,
                     &mut tracks,
                     &mut packets,
@@ -1789,7 +1791,6 @@ fn transcode_file(
                 track_packets,
                 new_index,
                 rebase,
-                format,
                 target,
                 &mut tracks,
                 &mut packets,
@@ -1903,26 +1904,50 @@ fn transcode_file(
                             video_error = Some(err);
                             break 'video;
                         }
-                        let cpu_result = (|| -> Result<(u64, crate::video_codecs::EncodedVideoStream), PipelineError> {
-                            enforce_decoded_budget(
-                                source,
-                                estimated_decoded_bytes(&job.source_track, job.track_packets.len()),
-                            )?;
-                            let frames =
-                                decode_video_track(source, &job.source_track, &job.track_packets)?;
-                            enforce_decoded_budget(source, decoded_bytes(&frames))?;
-                            let count = u64::try_from(frames.len()).unwrap_or(u64::MAX);
-                            let stream =
-                                encode_video_cpu(source, &frames, job.mode, job.new_index)?;
-                            Ok((count, stream))
-                        })();
-                        let (count, mut stream) = match cpu_result {
-                            Ok(result) => result,
+                        let decoded =
+                            (|| -> Result<Vec<crate::video_codecs::Yuv420Frame>, PipelineError> {
+                                enforce_decoded_budget(
+                                    source,
+                                    estimated_decoded_bytes(
+                                        &job.source_track,
+                                        job.track_packets.len(),
+                                    ),
+                                )?;
+                                let frames = decode_video_track(
+                                    source,
+                                    &job.source_track,
+                                    &job.track_packets,
+                                )?;
+                                enforce_decoded_budget(source, decoded_bytes(&frames))?;
+                                Ok(frames)
+                            })();
+                        let frames = match decoded {
+                            Ok(frames) => frames,
                             Err(err) => {
                                 video_error = Some(err);
                                 break 'video;
                             }
                         };
+                        // An audio worker failure during decode must stop the job
+                        // before the (much longer) CPU encode starts.
+                        if let Err(err) = drain_audio_nonblocking(
+                            audio_rx.as_ref(),
+                            &audio_failed,
+                            &mut tracks,
+                            &mut packets,
+                        ) {
+                            video_error = Some(err);
+                            break 'video;
+                        }
+                        let count = u64::try_from(frames.len()).unwrap_or(u64::MAX);
+                        let mut stream =
+                            match encode_video_cpu(source, &frames, job.mode, job.new_index) {
+                                Ok(stream) => stream,
+                                Err(err) => {
+                                    video_error = Some(err);
+                                    break 'video;
+                                }
+                            };
                         frames_processed = frames_processed.saturating_add(count);
                         if needs_rebase {
                             rebase_encoded_packets(&mut stream.packets, job.track_origin, origin);
@@ -2516,6 +2541,31 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn streaming_resampler_tail_matches_whole_track_frame_count() -> Result<(), PipelineError> {
+        // A final partial block just past a block boundary must not extend the
+        // audio timeline beyond the whole-track resampler's exact frame count.
+        let input_frames = 209_920_usize;
+        let samples = vec![0.25_f32; input_frames.saturating_mul(2)];
+        let mut streaming = StreamingResampler::new(2, 44_100, 48_000)?;
+        let mut out = streaming.push(&samples)?;
+        out.extend(streaming.finish()?);
+        let expected = usize::try_from(
+            u64::try_from(input_frames)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(48_000)
+                .saturating_div(44_100)
+                .saturating_mul(2),
+        )
+        .unwrap_or(usize::MAX);
+        assert_eq!(out.len(), expected);
+        assert_eq!(
+            resample_interleaved(&samples, 2, 44_100, 48_000)?.len(),
+            expected
+        );
+        Ok(())
+    }
+
     // Non-empty PCM assertion documents the successful decode roundtrip.
     #[allow(clippy::assert_is_empty)]
     #[test]
@@ -2602,16 +2652,7 @@ mod tests {
         }];
         let mut tracks = vec![None];
         let mut out = Vec::new();
-        copy_track(
-            &track,
-            packets,
-            0,
-            None,
-            VideoContainerFormat::Mov,
-            &target,
-            &mut tracks,
-            &mut out,
-        )?;
+        copy_track(&track, packets, 0, None, &target, &mut tracks, &mut out)?;
         assert_eq!(tracks.len(), 1);
         assert_eq!(
             tracks[0].as_ref().map(|track| track.codec),
@@ -2861,6 +2902,22 @@ mod tests {
         mux_video(&file, &source, VideoContainerFormat::Mp4, &media)?;
         drop(file);
 
+        // An in-process watchdog turns a deadlock into a bounded, reported
+        // failure instead of hanging the whole test runner until it is killed.
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let watchdog = std::sync::Arc::clone(&finished);
+        std::thread::spawn(move || {
+            for _ in 0..30 {
+                if watchdog.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            if !watchdog.load(Ordering::Acquire) {
+                eprintln!("audio failure deadlocked the video worker; aborting test");
+                std::process::abort();
+            }
+        });
         let started = Instant::now();
         let result = transcode(
             &source,
@@ -2872,6 +2929,7 @@ mod tests {
             }),
             AudioTrackAction::Encode(TargetAudioCodec::Opus),
         );
+        finished.store(true, Ordering::Release);
         assert!(result.is_err(), "unsupported channel count must fail");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(30),
