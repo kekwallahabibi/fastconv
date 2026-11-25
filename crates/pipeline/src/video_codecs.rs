@@ -1030,6 +1030,24 @@ mod streaming {
         emit_nv12_frame(path, on_frame, info, write_y, write_uv)
     }
 
+    /// Maps the AV1 signal description onto our RGB matrix/range model. The
+    /// range is independent of the matrix: an AV1 frame can be full range with
+    /// no matrix description at all.
+    pub(super) fn av1_color(
+        matrix: rav1d_safe::src::managed::MatrixCoefficients,
+        range: YuvRange,
+    ) -> YuvColor {
+        use rav1d_safe::src::managed::MatrixCoefficients as Mc;
+        match matrix {
+            Mc::BT709 => YuvColor::specified(YuvMatrix::Bt709, range),
+            Mc::BT2020NCL => YuvColor::specified(YuvMatrix::Bt2020, range),
+            Mc::BT470BG | Mc::BT601 | Mc::Unspecified | Mc::Reserved => {
+                YuvColor::specified(YuvMatrix::Bt601, range)
+            }
+            other => YuvColor::specified(YuvMatrix::Unsupported(other as u8), range),
+        }
+    }
+
     fn emit_av1_frame<F>(
         path: &Path,
         frame: &rav1d_safe::src::managed::Frame,
@@ -1064,21 +1082,7 @@ mod streaming {
             rav1d_safe::src::managed::ColorRange::Full => YuvRange::Full,
             rav1d_safe::src::managed::ColorRange::Limited => YuvRange::Limited,
         };
-        let color = match infos.matrix_coefficients {
-            rav1d_safe::src::managed::MatrixCoefficients::BT709 => {
-                YuvColor::specified(YuvMatrix::Bt709, range)
-            }
-            rav1d_safe::src::managed::MatrixCoefficients::BT2020NCL => {
-                YuvColor::specified(YuvMatrix::Bt2020, range)
-            }
-            rav1d_safe::src::managed::MatrixCoefficients::BT470BG
-            | rav1d_safe::src::managed::MatrixCoefficients::BT601 => {
-                YuvColor::specified(YuvMatrix::Bt601, range)
-            }
-            rav1d_safe::src::managed::MatrixCoefficients::Unspecified
-            | rav1d_safe::src::managed::MatrixCoefficients::Reserved => YuvColor::default(),
-            other => YuvColor::specified(YuvMatrix::Unsupported(other as u8), range),
-        };
+        let color = av1_color(infos.matrix_coefficients, range);
         let info = DecodedFrameInfo {
             width: frame.width(),
             height: frame.height(),
@@ -2903,6 +2907,25 @@ mod tests {
         assert_eq!(
             source_color(&smpte_240m, &[]),
             YuvColor::specified(YuvMatrix::Unsupported(7), YuvRange::Full)
+        );
+    }
+
+    #[test]
+    fn av1_color_preserves_range_when_matrix_is_unspecified() {
+        use rav1d_safe::src::managed::MatrixCoefficients as Mc;
+        for matrix in [Mc::Unspecified, Mc::Reserved] {
+            assert_eq!(
+                streaming::av1_color(matrix, YuvRange::Full),
+                YuvColor::specified(YuvMatrix::Bt601, YuvRange::Full)
+            );
+            assert_eq!(
+                streaming::av1_color(matrix, YuvRange::Limited),
+                YuvColor::specified(YuvMatrix::Bt601, YuvRange::Limited)
+            );
+        }
+        assert_eq!(
+            streaming::av1_color(Mc::BT709, YuvRange::Full),
+            YuvColor::specified(YuvMatrix::Bt709, YuvRange::Full)
         );
     }
 }
