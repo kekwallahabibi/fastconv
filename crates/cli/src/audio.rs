@@ -13,8 +13,8 @@ Arguments:
   <target>              Target file or directory
 
 Options:
-  --to <format>         Output format; required for directory batches, inferred
-                        from the target extension for single files: flac, wav,
+  --to <format>         Output format; directory batches default to flac, single
+                        files infer it from the target extension: flac, wav,
                         opus, ogg, mp3, aac, m4a, alac, aiff
   --threads <N>         Number of parallel workers
   --backend <name>      cpu (default). Audio runs on CPU only; GPU backends

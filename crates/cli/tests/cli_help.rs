@@ -154,6 +154,7 @@ fn convert_help_documents_accepted_flags_and_rules() -> Result<(), String> {
         "256-color",
         "HEIC",
         "no silent CPU fallback",
+        "directory batches default to webp",
         "vaapi",
         "qsv",
         "amf",
@@ -162,6 +163,10 @@ fn convert_help_documents_accepted_flags_and_rules() -> Result<(), String> {
     ] {
         assert!(text.contains(needle), "convert help missing '{needle}'");
     }
+    assert!(
+        !text.contains("required for directory batches"),
+        "convert --to is optional for directory batches (defaults to webp)"
+    );
     Ok(())
 }
 
@@ -194,6 +199,7 @@ fn audio_help_documents_only_implemented_flags() -> Result<(), String> {
         ".alac",
         "CPU only",
         "no silent CPU fallback",
+        "directory batches default to flac",
         "nvenc",
         "vaapi",
         "qsv",
@@ -210,6 +216,10 @@ fn audio_help_documents_only_implemented_flags() -> Result<(), String> {
     assert!(
         !text.contains("--lossless"),
         "audio help must not claim --lossless"
+    );
+    assert!(
+        !text.contains("required for directory batches"),
+        "audio --to is optional for directory batches (defaults to flac)"
     );
     Ok(())
 }

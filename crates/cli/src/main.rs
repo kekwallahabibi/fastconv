@@ -65,8 +65,8 @@ Arguments:
   <target>              Target file or directory
 
 Options:
-  --to <format>         Output format; required for directory batches, inferred
-                        from the target extension for single files: webp, heic,
+  --to <format>         Output format; directory batches default to webp, single
+                        files infer it from the target extension: webp, heic,
                         jpeg, png, bmp, qoi, tiff, jxl, avif, gif, ico, pnm
   --quality <0..=100>   Lossy encoding quality (default 80); mutually exclusive
                         with --lossless. Supported: webp, jpeg, jxl, avif, heic.
