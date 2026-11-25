@@ -283,6 +283,7 @@ mod enabled {
                     .unwrap_or(u64::MAX),
             );
             let api = self.decoder.api;
+            let mut copy_accepted = false;
             for (src, dst_ptr, width_bytes, height) in [
                 (
                     self.ptr,
@@ -321,7 +322,23 @@ mod enabled {
                 // SAFETY: both rectangles stay inside their respective NV12
                 // allocations; the stream remains valid for the stage lifetime.
                 let status = unsafe { (api.memcpy2d)(&raw const copy, stream.cu_stream()) };
-                cu_result(status, "cuMemcpy2DAsync (NVDEC -> NVENC) failed")?;
+                if let Err(err) = cu_result(status, "cuMemcpy2DAsync (NVDEC -> NVENC) failed") {
+                    if copy_accepted {
+                        // The earlier copy is already queued on this stream. Drain
+                        // it before the caller unmaps the NVDEC surface; the
+                        // submission error stays the authoritative cause.
+                        let drained = stream.synchronize().map_err(|sync| {
+                            nvdec_error(format!(
+                                "CUDA stream synchronize after failed NVDEC -> NVENC copy: {sync}"
+                            ))
+                        });
+                        if let Err(sync_err) = drained {
+                            return Err(nvdec_error(format!("{err}; {sync_err}")));
+                        }
+                    }
+                    return Err(err);
+                }
+                copy_accepted = true;
             }
             // NVENC runs on a separate hardware engine that does not order
             // against CUDA streams; synchronize before mapping/encoding the
@@ -638,6 +655,113 @@ mod enabled {
         check_caps(codec_type(codec)?, bit_depth, width, height).map(|_| ())
     }
 
+    /// Byte ranges of one Annex-B NAL unit inside the original packet.
+    struct NalRange {
+        start: usize,
+        payload_start: usize,
+        end: usize,
+    }
+
+    fn annex_b_nal_ranges(data: &[u8]) -> Vec<NalRange> {
+        let mut starts = Vec::new();
+        let mut idx = 0_usize;
+        while idx.saturating_add(2) < data.len() {
+            if data[idx] == 0 && data[idx + 1] == 0 && data[idx + 2] == 1 {
+                starts.push((idx, idx + 3));
+                idx = idx.saturating_add(3);
+            } else {
+                idx = idx.saturating_add(1);
+            }
+        }
+        let mut ranges = Vec::with_capacity(starts.len());
+        for (position, &(start, payload_start)) in starts.iter().enumerate() {
+            let next = starts
+                .get(position + 1)
+                .map_or(data.len(), |&(next_start, _)| next_start);
+            let mut end = next;
+            while end > payload_start && data[end - 1] == 0 {
+                end -= 1;
+            }
+            if end > payload_start {
+                ranges.push(NalRange {
+                    start,
+                    payload_start,
+                    end,
+                });
+            }
+        }
+        ranges
+    }
+
+    /// MSB of the first RBSP byte, skipping emulation-prevention bytes. Both
+    /// H.264 `first_mb_in_slice` and HEVC `first_slice_segment_in_pic_flag` are
+    /// the first Exp-Golomb / u(1) value, so a set MSB marks a picture start.
+    fn rbsp_starts_with_one(nal: &[u8], header_len: usize) -> bool {
+        let mut zeros = 0_u8;
+        for &byte in nal.iter().skip(header_len) {
+            if zeros >= 2 && byte == 0x03 {
+                zeros = 0;
+                continue;
+            }
+            return byte & 0x80 != 0;
+        }
+        false
+    }
+
+    /// `(is_vcl, starts_access_unit, starts_picture)` for one NAL unit.
+    fn nal_role(nal: &[u8], codec: VideoCodec) -> (bool, bool, bool) {
+        match codec {
+            VideoCodec::H264 => {
+                let kind = nal.first().copied().unwrap_or(0) & 0x1F;
+                let first = rbsp_starts_with_one(nal, 1);
+                let vcl = (1..=5).contains(&kind);
+                (vcl, matches!(kind, 6..=9) || (vcl && first), vcl && first)
+            }
+            VideoCodec::Hevc => {
+                let kind = nal
+                    .first()
+                    .copied()
+                    .map_or(0, |header| (header >> 1) & 0x3F);
+                let first = rbsp_starts_with_one(nal, 2);
+                let vcl = kind <= 31;
+                (
+                    vcl,
+                    matches!(kind, 32..=35 | 39) || (vcl && first),
+                    vcl && first,
+                )
+            }
+            _ => (false, false, false),
+        }
+    }
+
+    /// Splits Annex-B H.264/HEVC into access units. A unit is marked complete
+    /// only when it contains the first slice of a picture; that is the only
+    /// case where `CUVID_PKT_ENDOFPICTURE` is legal for the submitted packet.
+    fn annex_b_access_units(data: &[u8], codec: VideoCodec) -> Vec<(&[u8], bool)> {
+        let mut units = Vec::new();
+        let mut au_start = 0_usize;
+        let mut au_end = 0_usize;
+        let mut has_picture_start = false;
+        let mut has_vcl = false;
+        for range in annex_b_nal_ranges(data) {
+            let nal = &data[range.payload_start..range.end];
+            let (is_vcl, starts_au, starts_picture) = nal_role(nal, codec);
+            if starts_au && has_vcl {
+                units.push((&data[au_start..au_end], has_picture_start));
+                au_start = range.start;
+                has_picture_start = false;
+                has_vcl = false;
+            }
+            au_end = range.end;
+            has_picture_start |= starts_picture;
+            has_vcl |= is_vcl;
+        }
+        if au_end > au_start {
+            units.push((&data[au_start..au_end], has_picture_start));
+        }
+        units
+    }
+
     /// Decodes `packets` with NVDEC and invokes `on_frame` once per displayed
     /// frame while its GPU surface is still mapped. Copying into NVENC here
     /// keeps the frame resident in VRAM: no CUDA host staging and no CPU decode.
@@ -726,21 +850,51 @@ mod enabled {
                 VideoCodec::H264 | VideoCodec::Hevc | VideoCodec::Vp9 => packet.data.clone(),
                 other => return Err(nvdec_error(format!("NVDEC cannot decode {other}"))),
             };
-            let flags = nvcuvid::CUvideopacketflags::CUVID_PKT_TIMESTAMP as u32
-                | nvcuvid::CUvideopacketflags::CUVID_PKT_ENDOFPICTURE as u32;
-            let mut data = nvcuvid::CUVIDSOURCEDATAPACKET {
-                flags: u64::from(flags),
-                payload_size: u64::try_from(payload.len())
-                    .map_err(|_| nvdec_error("NVDEC packet exceeds u64 size"))?,
-                payload: payload.as_ptr(),
-                timestamp: packet.pts,
+            // MPEG-TS reassembles a whole PES into one ContainerPacket, which
+            // may hold several access units. Submit each one separately so
+            // ENDOFPICTURE only marks a packet with exactly one complete
+            // frame/field, as NVCUVID requires.
+            let units: Vec<(&[u8], bool)> = match state.source {
+                VideoCodec::H264 | VideoCodec::Hevc => {
+                    let split = annex_b_access_units(&payload, state.source);
+                    if split.is_empty() && !payload.is_empty() {
+                        // Unparsable Annex-B cannot be proven complete; never
+                        // claim an end-of-picture boundary for it.
+                        vec![(payload.as_slice(), false)]
+                    } else {
+                        split
+                    }
+                }
+                VideoCodec::Vp9 => vec![(payload.as_slice(), true)],
+                other => return Err(nvdec_error(format!("NVDEC cannot decode {other}"))),
             };
-            // SAFETY: `parser` outlives the call and `payload` is valid for it.
-            #[allow(unsafe_code)]
-            let status = unsafe { (api.parse_data)(parser.handle, &raw mut data) };
-            cu_result(status, "cuvidParseVideoData failed")?;
-            if let Some(err) = state.error.take() {
-                return Err(err);
+            let step = packet.duration.max(1);
+            let step_us = i64::try_from(step).unwrap_or(i64::MAX);
+            for (index, (bytes, complete)) in units.into_iter().enumerate() {
+                let offset = step_us.saturating_mul(i64::try_from(index).unwrap_or(i64::MAX));
+                let timestamp = packet.pts.saturating_add(offset);
+                state.durations.insert(timestamp, step);
+                let mut flags = nvcuvid::CUvideopacketflags::CUVID_PKT_TIMESTAMP as u32;
+                if complete {
+                    flags |= nvcuvid::CUvideopacketflags::CUVID_PKT_ENDOFPICTURE as u32;
+                }
+                let mut data = nvcuvid::CUVIDSOURCEDATAPACKET {
+                    flags: u64::from(flags),
+                    payload_size: u64::try_from(bytes.len())
+                        .map_err(|_| nvdec_error("NVDEC packet exceeds u64 size"))?,
+                    payload: bytes.as_ptr(),
+                    timestamp,
+                };
+                // SAFETY: `parser` outlives the call and `bytes` stays alive in
+                // `payload` for the duration of this submission.
+                #[allow(unsafe_code)]
+                let status = unsafe { (api.parse_data)(parser.handle, &raw mut data) };
+                // NVCUVID propagates callback failures, so surface the specific
+                // cause recorded by the callback before the parser status.
+                if let Some(err) = state.error.take() {
+                    return Err(err);
+                }
+                cu_result(status, "cuvidParseVideoData failed")?;
             }
         }
 
@@ -754,10 +908,10 @@ mod enabled {
         // SAFETY: the empty EOS packet is valid and the parser is still alive.
         #[allow(unsafe_code)]
         let status = unsafe { (api.parse_data)(parser.handle, &raw mut eos) };
-        cu_result(status, "cuvidParseVideoData EOS failed")?;
         if let Some(err) = state.error.take() {
             return Err(err);
         }
+        cu_result(status, "cuvidParseVideoData EOS failed")?;
 
         let frames = state.displayed_frames;
         // Explicit drop order: parser -> state/decoder -> ctx lock (while caller's
@@ -851,7 +1005,10 @@ mod tests {
             },
             0,
         )?;
-        let mut seen = 0_usize;
+        // Assertions must live outside the `extern "C"` display callback: a
+        // panic there aborts the whole test process instead of failing this
+        // test, so record the timings and compare them after decoding.
+        let mut displayed: Vec<(i64, u64)> = Vec::new();
         decode_packets_to_gpu(
             &ctx,
             &stream,
@@ -859,16 +1016,22 @@ mod tests {
             &source.track.config,
             &source.packets,
             |_frame, pts_us, duration_us| {
-                assert!(pts_us >= 0, "NVDEC timestamp must not be negative");
-                assert!(duration_us >= 1, "NVDEC duration must be positive");
-                seen = seen.saturating_add(1);
+                displayed.push((pts_us, duration_us));
                 Ok(())
             },
         )?;
+        let expected: Vec<(i64, u64)> = frames
+            .iter()
+            .map(|frame| (frame.pts_us, frame.duration_us))
+            .collect();
         assert_eq!(
-            seen,
-            frames.len(),
+            displayed.len(),
+            expected.len(),
             "every H.264 frame must be displayed once"
+        );
+        assert_eq!(
+            displayed, expected,
+            "NVDEC must preserve every distinct timestamp and 40,000 µs duration"
         );
         Ok(())
     }
