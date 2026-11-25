@@ -762,6 +762,20 @@ mod enabled {
         units
     }
 
+    /// Splits one PES presentation interval evenly across its access units.
+    ///
+    /// MPEG-TS reassembles a PES carrying several pictures into one packet with
+    /// a single timestamp. Stamping every picture with the whole interval pushes
+    /// the last picture onto the next PES's timestamp; dividing instead keeps
+    /// every picture distinct and ordered. A one-AU packet keeps its interval.
+    pub(super) fn au_timing(pts: i64, duration: u64, au_count: usize, index: usize) -> (i64, u64) {
+        let divisor = u64::try_from(au_count).unwrap_or(u64::MAX).max(1);
+        let per_au = (duration / divisor).max(1);
+        let step_us = i64::try_from(per_au).unwrap_or(i64::MAX);
+        let offset = step_us.saturating_mul(i64::try_from(index).unwrap_or(i64::MAX));
+        (pts.saturating_add(offset), per_au)
+    }
+
     /// Decodes `packets` with NVDEC and invokes `on_frame` once per displayed
     /// frame while its GPU surface is still mapped. Copying into NVENC here
     /// keeps the frame resident in VRAM: no CUDA host staging and no CPU decode.
@@ -868,11 +882,9 @@ mod enabled {
                 VideoCodec::Vp9 => vec![(payload.as_slice(), true)],
                 other => return Err(nvdec_error(format!("NVDEC cannot decode {other}"))),
             };
-            let step = packet.duration.max(1);
-            let step_us = i64::try_from(step).unwrap_or(i64::MAX);
+            let au_count = units.len();
             for (index, (bytes, complete)) in units.into_iter().enumerate() {
-                let offset = step_us.saturating_mul(i64::try_from(index).unwrap_or(i64::MAX));
-                let timestamp = packet.pts.saturating_add(offset);
+                let (timestamp, step) = au_timing(packet.pts, packet.duration, au_count, index);
                 state.durations.insert(timestamp, step);
                 let mut flags = nvcuvid::CUvideopacketflags::CUVID_PKT_TIMESTAMP as u32;
                 if complete {
@@ -932,6 +944,7 @@ mod tests {
     use cudarc::driver::CudaContext;
     use fastconv_domain::{VideoCodec, VideoEncodeMode, VideoQuality};
 
+    use super::enabled::au_timing;
     use super::{decode_packets_to_gpu, validate_decode_caps};
     use crate::PipelineError;
     use crate::gpu::nvenc::{encode_video_nvdec_nvenc_streaming, encode_video_nvenc_streaming};
@@ -955,6 +968,21 @@ mod tests {
                 duration_us: 40_000,
             })
             .collect()
+    }
+
+    #[test]
+    fn two_access_units_share_the_pes_interval_without_duplicate_pts() {
+        // 25 fps with two pictures per PES: consecutive PES timestamps are
+        // 80 ms apart. Each PES's pictures must land 40 ms apart so the last
+        // picture does not collide with the next PES's first picture.
+        let first: Vec<(i64, u64)> = (0..2).map(|index| au_timing(0, 80_000, 2, index)).collect();
+        assert_eq!(first, [(0_i64, 40_000_u64), (40_000, 40_000)]);
+        let second: Vec<(i64, u64)> = (0..2)
+            .map(|index| au_timing(80_000, 80_000, 2, index))
+            .collect();
+        assert_eq!(second, [(80_000, 40_000), (120_000, 40_000)]);
+        // A packet holding a single AU keeps its timestamp and duration exactly.
+        assert_eq!(au_timing(80_000, 40_000, 1, 0), (80_000, 40_000));
     }
 
     #[test]
