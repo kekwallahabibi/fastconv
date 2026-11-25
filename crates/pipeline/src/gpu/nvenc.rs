@@ -1740,20 +1740,23 @@ mod enabled {
         if ready_bitstreams.is_empty() && pending_bitstreams.is_empty() {
             return;
         }
-        let can_drain_pending = if eos_flushed {
-            true
-        } else if !session.eos_sent.get() {
-            session.flush_eos().is_ok()
-        } else {
-            false
-        };
-        if can_drain_pending {
-            ready_bitstreams.extend(pending_bitstreams.drain(..));
+        if !eos_flushed && let Err(_err) = session.flush_eos() {
+            // `flush_eos` sets `eos_sent` before submitting, so a failed
+            // attempt leaves a stale flag. Retry regardless: the blocking
+            // discards below still wait for each queued picture, and the
+            // caller returns the original stage error rather than masking it.
         }
+        // Hand every submitted slot to the blocking discard. Leaving pending
+        // slots here would drop their bitstreams and mapped input surfaces
+        // while NVENC can still access them.
+        ready_bitstreams.extend(pending_bitstreams.drain(..));
         while let Some(bs_slot) = ready_bitstreams.pop_front() {
-            if session.discard_bitstream(&mut bitstreams[bs_slot]).is_err() {
-                break;
-            }
+            // Best-effort: each lock is independent, so a failure on one slot
+            // must not abandon the slots behind it — the caller drops every
+            // buffer as soon as this returns. The original stage error stays
+            // the one surfaced to the caller.
+            let discard_result = session.discard_bitstream(&mut bitstreams[bs_slot]);
+            drop(discard_result);
         }
     }
 
