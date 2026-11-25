@@ -928,10 +928,14 @@ impl StreamingAudioEncoder {
                     ));
                 }
                 let config = aac_config(rate, channels)?.to_vec();
-                let encoder = rusty_aac::AacEncoder::new(rusty_aac::AacEncoderConfig {
+                let mut encoder = rusty_aac::AacEncoder::new(rusty_aac::AacEncoderConfig {
                     bitrate_bps: AAC_BITRATE_BPS,
                     ..rusty_aac::AacEncoderConfig::default()
                 });
+                // Without this the encoder buffers the whole track and emits no
+                // packet until `finish()`, defeating the bounded audio queue.
+                // Must be set before the first `push_pcm`.
+                encoder.set_streaming(true);
                 let track = ContainerTrack {
                     codec: VideoCodec::Aac,
                     width: None,
@@ -2525,6 +2529,19 @@ mod tests {
             path: dir.clone(),
             source,
         })?;
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_aac_emits_packets_before_finish() -> Result<(), PipelineError> {
+        let samples = sine(20_000, 48_000, 2);
+        let (mut encoder, _) = StreamingAudioEncoder::start(TargetAudioCodec::Aac, 2, 48_000)?;
+        let packets = encoder.push(&samples)?;
+        assert!(
+            !packets.is_empty(),
+            "streaming AAC must emit packets before finish so the bounded queue bounds memory"
+        );
+        assert!(packets.iter().all(|packet| packet.duration > 0));
         Ok(())
     }
 
