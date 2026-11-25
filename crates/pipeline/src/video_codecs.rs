@@ -43,7 +43,8 @@ pub(crate) struct Yuv420Frame {
 }
 
 /// YUV→RGB matrix signalled by the source bitstream. BT.601 is the explicit
-/// default only for sources that signal no matrix.
+/// default only for sources that signal no matrix. `Bt2020` covers non-constant
+/// luminance (H.273 matrix coefficient 9); constant luminance (10) is rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum YuvMatrix {
     #[default]
@@ -1056,31 +1057,24 @@ mod streaming {
             ));
         }
         let infos = frame.color_info();
+        let range = match infos.color_range {
+            rav1d_safe::src::managed::ColorRange::Full => YuvRange::Full,
+            rav1d_safe::src::managed::ColorRange::Limited => YuvRange::Limited,
+        };
         let color = match infos.matrix_coefficients {
-            rav1d_safe::src::managed::MatrixCoefficients::BT709 => YuvColor::specified(
-                YuvMatrix::Bt709,
-                match infos.color_range {
-                    rav1d_safe::src::managed::ColorRange::Full => YuvRange::Full,
-                    rav1d_safe::src::managed::ColorRange::Limited => YuvRange::Limited,
-                },
-            ),
-            rav1d_safe::src::managed::MatrixCoefficients::BT2020NCL
-            | rav1d_safe::src::managed::MatrixCoefficients::BT2020CL => YuvColor::specified(
-                YuvMatrix::Bt2020,
-                match infos.color_range {
-                    rav1d_safe::src::managed::ColorRange::Full => YuvRange::Full,
-                    rav1d_safe::src::managed::ColorRange::Limited => YuvRange::Limited,
-                },
-            ),
-            rav1d_safe::src::managed::MatrixCoefficients::BT601
-            | rav1d_safe::src::managed::MatrixCoefficients::BT470BG => YuvColor::specified(
-                YuvMatrix::Bt601,
-                match infos.color_range {
-                    rav1d_safe::src::managed::ColorRange::Full => YuvRange::Full,
-                    rav1d_safe::src::managed::ColorRange::Limited => YuvRange::Limited,
-                },
-            ),
-            _ => YuvColor::default(),
+            rav1d_safe::src::managed::MatrixCoefficients::BT709 => {
+                YuvColor::specified(YuvMatrix::Bt709, range)
+            }
+            rav1d_safe::src::managed::MatrixCoefficients::BT2020NCL => {
+                YuvColor::specified(YuvMatrix::Bt2020, range)
+            }
+            rav1d_safe::src::managed::MatrixCoefficients::BT2020CL => {
+                return Err(decode_error(
+                    path,
+                    "AV1 BT.2020 constant luminance (matrix coefficient 10) is not supported",
+                ));
+            }
+            _ => YuvColor::specified(YuvMatrix::Bt601, range),
         };
         let info = DecodedFrameInfo {
             width: frame.width(),
@@ -1617,7 +1611,7 @@ mod streaming {
         // decoder signals its own colour (AV1) keep that; everything else gets
         // the signalled track value, or the explicit BT.601 default only when
         // the bitstream carries no colour description at all.
-        let track_color = source_color(track, &ordered);
+        let track_color = source_color(path, track, &ordered)?;
         let mut deliver =
             |mut info: DecodedFrameInfo, pack: &mut PackFn<'_>| -> Result<(), PipelineError> {
                 if !info.color.signalled {
@@ -1668,45 +1662,57 @@ mod streaming {
 
 /// Reads the source colour description from canonical codec configuration.
 /// Unparseable or absent VUI data means "not signalled", never a silent guess.
-fn source_color(track: &ContainerTrack, packets: &[&ContainerPacket]) -> YuvColor {
-    let from_matrix = |matrix: u8, full_range: bool| {
-        let matrix = match matrix {
-            1 => YuvMatrix::Bt709,
-            9 | 10 => YuvMatrix::Bt2020,
-            5 | 6 => YuvMatrix::Bt601,
-            _ => return YuvColor::default(),
-        };
+/// Preserves `full_range` even when matrix coefficients are absent/unspecified,
+/// and explicitly rejects BT.2020 constant luminance (matrix coefficient 10).
+fn source_color(
+    path: &Path,
+    track: &ContainerTrack,
+    packets: &[&ContainerPacket],
+) -> Result<YuvColor, PipelineError> {
+    let resolve = |matrix: Option<u8>, full_range: bool| -> Result<YuvColor, PipelineError> {
         let range = if full_range {
             YuvRange::Full
         } else {
             YuvRange::Limited
         };
-        YuvColor::specified(matrix, range)
+        let matrix = match matrix {
+            Some(1) => YuvMatrix::Bt709,
+            Some(9) => YuvMatrix::Bt2020,
+            Some(10) => {
+                return Err(decode_error(
+                    path,
+                    "BT.2020 constant luminance (matrix coefficient 10) is not supported",
+                ));
+            }
+            _ => YuvMatrix::Bt601,
+        };
+        Ok(YuvColor::specified(matrix, range))
     };
     match track.codec {
         VideoCodec::H264 => {
             let annex_b = avcc_to_annex_b(&track.config, &[], true).unwrap_or_default();
-            crate::video_bitstream::h264_color_from_annex_b(&annex_b)
-                .map_or(YuvColor::default(), |(matrix, full)| {
-                    from_matrix(matrix, full)
-                })
+            match crate::video_bitstream::h264_color_from_annex_b(&annex_b) {
+                Some(color) => resolve(color.matrix, color.full_range),
+                None => Ok(YuvColor::default()),
+            }
         }
         VideoCodec::Hevc => {
             let annex_b = hvcc_to_annex_b(&track.config, &[], true).unwrap_or_default();
-            crate::video_bitstream::hevc_color_from_annex_b(&annex_b)
-                .map_or(YuvColor::default(), |(matrix, full)| {
-                    from_matrix(matrix, full)
-                })
+            match crate::video_bitstream::hevc_color_from_annex_b(&annex_b) {
+                Some(color) => resolve(color.matrix, color.full_range),
+                None => Ok(YuvColor::default()),
+            }
         }
-        VideoCodec::Vp9 => packets
+        VideoCodec::Vp9 => match packets
             .iter()
             .find_map(|packet| crate::video_bitstream::vp9_color_from_keyframe(&packet.data))
-            .map_or(YuvColor::default(), |color| {
-                from_matrix(color.matrix, color.full_range)
-            }),
+        {
+            Some(color) => resolve(Some(color.matrix), color.full_range),
+            None => Ok(YuvColor::default()),
+        },
         // AV1 frames signal their own colour; leave it unsignalled here so the
         // per-frame decoder metadata wins.
-        _ => YuvColor::default(),
+        _ => Ok(YuvColor::default()),
     }
 }
 
@@ -2797,5 +2803,107 @@ mod tests {
         assert_eq!(estimate_video_fps_from_packets(&[packet(41_667)]), 24);
         assert_eq!(estimate_video_fps_from_packets(&[]), 30);
         assert_eq!(estimate_video_fps_from_packets(&[packet(1)]), 240);
+    }
+
+    fn h264_avcc_with_vui(full_range: bool, matrix: Option<u8>) -> Vec<u8> {
+        // Minimal baseline 16x16 SPS + VUI colour fields packed MSB-first.
+        let mut bits: Vec<u8> = Vec::new();
+        let mut push_bits = |value: u32, count: usize| {
+            for shift in (0..count).rev() {
+                bits.push(u8::try_from((value >> shift) & 1).unwrap_or(0));
+            }
+        };
+        let push_ue = |bits: &mut Vec<u8>, value: u32| {
+            let code = value.saturating_add(1);
+            let bit_len = usize::try_from(32 - code.leading_zeros()).unwrap_or(1);
+            for _ in 0..bit_len.saturating_sub(1) {
+                bits.push(0);
+            }
+            for shift in (0..bit_len).rev() {
+                bits.push(u8::try_from((code >> shift) & 1).unwrap_or(0));
+            }
+        };
+        push_bits(0x42, 8); // profile_idc
+        push_bits(0, 8); // constraints
+        push_bits(30, 8); // level_idc
+        push_ue(&mut bits, 0); // sps_id
+        push_ue(&mut bits, 4); // log2_max_frame_num_minus4
+        push_ue(&mut bits, 0); // pic_order_cnt_type
+        push_ue(&mut bits, 4); // log2_max_pic_order_cnt_lsb_minus4
+        push_ue(&mut bits, 1); // max_num_ref_frames
+        bits.push(0); // gaps_in_frame_num_value_allowed_flag
+        push_ue(&mut bits, 0); // width_mbs_minus1
+        push_ue(&mut bits, 0); // height_map_units_minus1
+        bits.push(1); // frame_mbs_only_flag
+        bits.push(1); // direct_8x8_inference_flag
+        bits.push(0); // frame_cropping_flag
+        bits.push(1); // vui_parameters_present_flag
+        bits.push(0); // aspect_ratio_info_present_flag
+        bits.push(0); // overscan_info_present_flag
+        bits.push(1); // video_signal_type_present_flag
+        for bit in [1_u8, 0, 1] {
+            bits.push(bit); // video_format = 5 (unspecified)
+        }
+        bits.push(u8::from(full_range));
+        if let Some(matrix_coeffs) = matrix {
+            bits.push(1); // colour_description_present_flag
+            for byte in [2_u8, 2, matrix_coeffs] {
+                for shift in (0..8).rev() {
+                    bits.push((byte >> shift) & 1);
+                }
+            }
+        } else {
+            bits.push(0); // colour_description_present_flag
+        }
+        bits.push(1); // rbsp_stop_one_bit
+        let mut sps_rbsp = Vec::new();
+        for chunk in bits.chunks(8) {
+            let mut byte = 0_u8;
+            for (i, &bit) in chunk.iter().enumerate() {
+                byte |= bit << (7 - i);
+            }
+            sps_rbsp.push(byte);
+        }
+        let mut annex_b = vec![0, 0, 0, 1, 0x67];
+        annex_b.extend_from_slice(&sps_rbsp);
+        annex_b.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xCE]);
+        extract_avcc_from_annex_b(&annex_b).unwrap_or_default()
+    }
+
+    #[test]
+    fn source_color_preserves_full_range_and_rejects_bt2020_cl() -> Result<(), PipelineError> {
+        let path = Path::new("color-test.mp4");
+        let make_track = |config| ContainerTrack {
+            codec: VideoCodec::H264,
+            width: Some(16),
+            height: Some(16),
+            channels: None,
+            sample_rate: None,
+            config,
+            timescale: US_TIMESCALE,
+            presentation_edit: None,
+        };
+
+        // Full range without colour_description keeps BT.601 default matrix + Full range.
+        let full_only = make_track(h264_avcc_with_vui(true, None));
+        assert_eq!(
+            source_color(path, &full_only, &[])?,
+            YuvColor::specified(YuvMatrix::Bt601, YuvRange::Full)
+        );
+
+        // Matrix coefficient 9 stays on BT.2020 non-constant luminance.
+        let bt2020_ncl = make_track(h264_avcc_with_vui(false, Some(9)));
+        assert_eq!(
+            source_color(path, &bt2020_ncl, &[])?,
+            YuvColor::specified(YuvMatrix::Bt2020, YuvRange::Limited)
+        );
+
+        // Matrix coefficient 10 (BT.2020 constant luminance) is rejected explicitly.
+        let constant_luminance = make_track(h264_avcc_with_vui(false, Some(10)));
+        assert!(matches!(
+            source_color(path, &constant_luminance, &[]),
+            Err(PipelineError::DecodeFailed { .. })
+        ));
+        Ok(())
     }
 }

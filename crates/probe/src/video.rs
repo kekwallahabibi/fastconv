@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
 use containr::CodecConfig;
@@ -1177,9 +1177,16 @@ fn probe_gif_video(path: &Path, file: File) -> Result<Vec<VideoStreamInfo>, Prob
         return Err(invalid_video(path, "GIF contains no frames"));
     }
 
-    // GIF has a one-bit transparency mask per frame; a plain GIF without a
-    // Netscape extension plays forever.
-    let animation = AnimationMeta::new(AnimationLoop::Infinite, true);
+    // GIF has a one-bit transparency mask per frame. A GIF without a
+    // NETSCAPE2.0 extension reports `Repeat::Finite(0)` and is conventionally
+    // played once (`Times(1)`).
+    let loop_count = match decoder.repeat() {
+        gif::Repeat::Infinite => AnimationLoop::Infinite,
+        gif::Repeat::Finite(count) => {
+            AnimationLoop::Times(NonZeroU16::new(count).unwrap_or(NonZeroU16::MIN))
+        }
+    };
+    let animation = AnimationMeta::new(loop_count, true);
     Ok(vec![
         VideoStreamInfo::new(
             VideoCodec::Gif,
@@ -1283,15 +1290,17 @@ fn anmf_has_bitstream(
         if end > payload_end {
             return Err(invalid_video(path, "WebP ANMF subchunk is truncated"));
         }
-        if (id == *b"VP8 " || id == *b"VP8L") && size > 0 {
-            return Ok(true);
-        }
-        let padded = end.saturating_add(size & 1);
+        let padded = end
+            .checked_add(size & 1)
+            .ok_or_else(|| invalid_video(path, "WebP ANMF subchunk padding overflows"))?;
         if padded > payload_end {
             return Err(invalid_video(
                 path,
                 "WebP ANMF subchunk padding is truncated",
             ));
+        }
+        if (id == *b"VP8 " || id == *b"VP8L") && size > 0 {
+            return Ok(true);
         }
         pos = padded;
     }
@@ -1354,7 +1363,8 @@ fn scan_webp_chunks(
                     .ok_or_else(|| invalid_video(path, "WebP VP8X height is truncated"))?
                     .saturating_add(1);
                 scan.extended = Some((prefix[0] & 0x02 != 0, width, height));
-                scan.alpha = prefix[0] & 0x04 != 0;
+                // RFC 9649 VP8X flags: 0x20 ICC, 0x10 alpha, 0x08 EXIF, 0x04 XMP, 0x02 animation.
+                scan.alpha = prefix[0] & 0x10 != 0;
             }
             b"ANIM" => {
                 if size < 6 {
@@ -1364,11 +1374,10 @@ fn scan_webp_chunks(
                     ));
                 }
                 scan.animated = true;
-                if size >= 8 {
-                    let mut loop_bytes = [0_u8; 2];
-                    read_chunk_at(path, file, payload_start.saturating_add(6), &mut loop_bytes)?;
-                    scan.loop_count = u16::from_le_bytes(loop_bytes);
-                }
+                // RFC 9649 ANIM payload: 4-byte background color followed by 2-byte LE loop count.
+                let mut loop_bytes = [0_u8; 2];
+                read_chunk_at(path, file, payload_start.saturating_add(4), &mut loop_bytes)?;
+                scan.loop_count = u16::from_le_bytes(loop_bytes);
             }
             b"ANMF" => {
                 let mut duration = [0_u8; 3];
@@ -2836,8 +2845,13 @@ mod tests {
         [bytes[0], bytes[1], bytes[2]]
     }
 
-    /// Minimal animated GIF: one palette, then one graphic-control + image per frame.
-    fn synthetic_gif(width: u16, height: u16, frames: &[(u16, u16, u16)]) -> Vec<u8> {
+    /// Minimal animated GIF with an optional `NETSCAPE2.0` application extension.
+    fn synthetic_gif_with_loop(
+        width: u16,
+        height: u16,
+        frames: &[(u16, u16, u16)],
+        netscape_loop: Option<u16>,
+    ) -> Vec<u8> {
         let mut bytes = b"GIF89a".to_vec();
         bytes.extend_from_slice(&width.to_le_bytes());
         bytes.extend_from_slice(&height.to_le_bytes());
@@ -2845,6 +2859,13 @@ mod tests {
         bytes.push(0);
         bytes.push(0);
         bytes.extend_from_slice(&[0, 0, 0, 0xFF, 0xFF, 0xFF]);
+        if let Some(count) = netscape_loop {
+            bytes.extend_from_slice(&[0x21, 0xFF, 11]);
+            bytes.extend_from_slice(b"NETSCAPE2.0");
+            bytes.extend_from_slice(&[3, 1]);
+            bytes.extend_from_slice(&count.to_le_bytes());
+            bytes.push(0);
+        }
         for &(delay, frame_width, frame_height) in frames {
             bytes.extend_from_slice(&[0x21, 0xF9, 0x04, 0x00]);
             bytes.extend_from_slice(&delay.to_le_bytes());
@@ -2859,6 +2880,11 @@ mod tests {
         }
         bytes.push(0x3B);
         bytes
+    }
+
+    /// Minimal animated GIF: one palette, then one graphic-control + image per frame.
+    fn synthetic_gif(width: u16, height: u16, frames: &[(u16, u16, u16)]) -> Vec<u8> {
+        synthetic_gif_with_loop(width, height, frames, None)
     }
 
     fn synthetic_webp_header(width: u32, height: u32, animated: bool) -> Vec<u8> {
@@ -2884,14 +2910,14 @@ mod tests {
 
     fn synthetic_webp_with_loop(delays: &[u32], loop_count: u16, alpha: bool) -> Vec<u8> {
         let mut body = b"WEBP".to_vec();
-        let mut flags = vec![u8::from(alpha) << 2];
-        flags[0] |= 0x02; // animation flag
+        // RFC 9649 VP8X flags: alpha is bit 4 (0x10), animation is bit 1 (0x02).
+        let mut flags = vec![(u8::from(alpha) << 4) | 0x02];
         flags.extend_from_slice(&[0, 0, 0]);
         flags.extend_from_slice(&le24(7));
         flags.extend_from_slice(&le24(7));
         body.extend_from_slice(&riff_chunk(*b"VP8X", &flags));
-        let mut anim = [0_u8; 8];
-        anim[6..8].copy_from_slice(&loop_count.to_le_bytes());
+        let mut anim = [0_u8; 6];
+        anim[4..6].copy_from_slice(&loop_count.to_le_bytes());
         body.extend_from_slice(&riff_chunk(*b"ANIM", &anim));
         for &delay in delays {
             body.extend_from_slice(&synthetic_webp_frame(8, 8, delay));
@@ -2982,6 +3008,31 @@ mod tests {
         let still = temp_file("still-gif", &synthetic_gif(8, 6, &[(5, 8, 6)]))?;
         let probed = probe_video(&still)?;
         assert_eq!(probed.streams[0].duration(), Some(5));
+        let once = probed.streams[0]
+            .animation()
+            .ok_or("GIF must carry animation metadata")?;
+        assert_eq!(once.loop_count(), AnimationLoop::Times(NonZeroU16::MIN));
+
+        let finite = temp_file(
+            "gif-finite-loop",
+            &synthetic_gif_with_loop(8, 6, &[(5, 8, 6)], Some(3)),
+        )?;
+        let probed = probe_video(&finite)?;
+        let meta = probed.streams[0]
+            .animation()
+            .ok_or("GIF must carry animation metadata")?;
+        let times = NonZeroU16::new(3).unwrap_or(NonZeroU16::MIN);
+        assert_eq!(meta.loop_count(), AnimationLoop::Times(times));
+
+        let infinite = temp_file(
+            "gif-infinite-loop",
+            &synthetic_gif_with_loop(8, 6, &[(5, 8, 6)], Some(0)),
+        )?;
+        let probed = probe_video(&infinite)?;
+        let meta = probed.streams[0]
+            .animation()
+            .ok_or("GIF must carry animation metadata")?;
+        assert_eq!(meta.loop_count(), AnimationLoop::Infinite);
         Ok(())
     }
 
@@ -3110,6 +3161,16 @@ mod tests {
             .ok_or("animated WebP must carry animation metadata")?;
         assert_eq!(meta.loop_count(), AnimationLoop::Infinite);
         assert!(!meta.has_alpha());
+
+        // Setting the XMP flag (0x04) without the alpha flag (0x10) must not report alpha.
+        let mut xmp_only = synthetic_webp_with_loop(&[10], 0, false);
+        xmp_only[20] |= 0x04;
+        let path = temp_file("webp-xmp-no-alpha", &xmp_only)?;
+        let probed = probe_video(&path)?;
+        let meta = probed.streams[0]
+            .animation()
+            .ok_or("animated WebP must carry animation metadata")?;
+        assert!(!meta.has_alpha());
         Ok(())
     }
 
@@ -3129,22 +3190,47 @@ mod tests {
             Err(ProbeError::InvalidVideo { .. })
         ));
 
+        // An ANMF with an odd-sized nested VP8L subchunk missing its pad byte must fail.
+        let mut anmf_payload = vec![0_u8; 16];
+        anmf_payload[6..9].copy_from_slice(&le24(15));
+        anmf_payload[9..12].copy_from_slice(&le24(15));
+        anmf_payload[12..15].copy_from_slice(&le24(20));
+        anmf_payload.extend_from_slice(b"VP8L");
+        anmf_payload.extend_from_slice(&5_u32.to_le_bytes());
+        anmf_payload.extend_from_slice(&[0x2F, 0, 0, 0, 0]);
+        let mut body = b"WEBP".to_vec();
+        body.extend_from_slice(&synthetic_webp_header(16, 16, true));
+        body.extend_from_slice(&riff_chunk(*b"ANIM", &[0_u8; 6]));
+        body.extend_from_slice(&riff_chunk(*b"ANMF", &anmf_payload));
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&(u32::try_from(body.len()).unwrap_or(0)).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        let path = temp_file("webp-anmf-missing-subchunk-pad", &bytes)?;
+        match probe_video(&path) {
+            Err(ProbeError::InvalidVideo { reason, .. }) => {
+                assert!(reason.contains("padding"), "unexpected reason: {reason}");
+            }
+            other => return Err(format!("expected padding error, got {other:?}").into()),
+        }
+
         // An odd-sized RIFF chunk must have its pad byte inside the container.
         let mut body = b"WEBP".to_vec();
         body.extend_from_slice(&synthetic_webp_header(16, 16, false));
         let mut odd = b"VP8L".to_vec();
-        odd.extend_from_slice(&3_u32.to_le_bytes());
+        odd.extend_from_slice(&5_u32.to_le_bytes());
         odd.extend_from_slice(&[0x2F, 0, 0, 0, 0]);
         body.extend_from_slice(&odd);
         let mut bytes = b"RIFF".to_vec();
-        bytes.extend_from_slice(&(u32::try_from(body.len()).unwrap_or(0) - 2).to_le_bytes());
+        bytes.extend_from_slice(&u32::try_from(body.len()).unwrap_or(0).to_le_bytes());
         bytes.extend_from_slice(&body);
         bytes.push(0);
         let path = temp_file("webp-missing-pad", &bytes)?;
-        assert!(matches!(
-            probe_video(&path),
-            Err(ProbeError::InvalidVideo { .. })
-        ));
+        match probe_video(&path) {
+            Err(ProbeError::InvalidVideo { reason, .. }) => {
+                assert!(reason.contains("padding"), "unexpected reason: {reason}");
+            }
+            other => return Err(format!("expected padding error, got {other:?}").into()),
+        }
 
         // Trailing bytes after a complete RIFF container are still accepted.
         let valid = synthetic_still_webp(16, 16, true, false);

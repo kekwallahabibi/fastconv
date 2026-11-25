@@ -264,11 +264,11 @@ fn inverse_coeffs(color: YuvColor) -> (i32, i32, i32, i32, i32, i32) {
     let limited = color.range == YuvRange::Limited;
     match (color.matrix, limited) {
         (YuvMatrix::Bt709, true) => (298, 16, 459, -55, -137, 541),
-        (YuvMatrix::Bt709, false) => (256, 0, 364, -48, -120, 519),
+        (YuvMatrix::Bt709, false) => (256, 0, 403, -48, -120, 475),
         (YuvMatrix::Bt2020, true) => (298, 16, 430, -48, -166, 548),
         (YuvMatrix::Bt2020, false) => (256, 0, 377, -42, -146, 482),
         (YuvMatrix::Bt601, true) => (298, 16, 409, -100, -208, 516),
-        (YuvMatrix::Bt601, false) => (256, 0, 403, -88, -183, 454),
+        (YuvMatrix::Bt601, false) => (256, 0, 359, -88, -183, 454),
     }
 }
 
@@ -539,15 +539,17 @@ fn anmf_has_bitstream(
         if end > payload_end {
             return Err(decode_error(path, "WebP ANMF subchunk is truncated"));
         }
-        if (id == *b"VP8 " || id == *b"VP8L") && size > 0 {
-            return Ok(true);
-        }
-        let padded = end.saturating_add(size & 1);
+        let padded = end
+            .checked_add(size & 1)
+            .ok_or_else(|| decode_error(path, "WebP ANMF subchunk padding overflows"))?;
         if padded > payload_end {
             return Err(decode_error(
                 path,
                 "WebP ANMF subchunk padding is truncated",
             ));
+        }
+        if (id == *b"VP8 " || id == *b"VP8L") && size > 0 {
+            return Ok(true);
         }
         pos = padded;
     }
@@ -1156,9 +1158,9 @@ fn gif_speed(quality: VideoQuality) -> i32 {
 }
 
 /// Extracts the nested image chunks (including even-padding bytes) for an
-/// RFC 9649 `ANMF` frame. An `ALPH` chunk precedes `VP8 `/`VP8L` and must be
-/// carried along or the frame's transparency would be silently dropped.
-fn extract_inner_vp8_chunk(bytes: &[u8]) -> Result<Vec<u8>, PipelineError> {
+/// RFC 9649 `ANMF` frame and reports whether the parsed chunks carry alpha
+/// (via an `ALPH` chunk or the `VP8L` bitstream alpha bit).
+fn extract_inner_vp8_chunk(bytes: &[u8]) -> Result<(Vec<u8>, bool), PipelineError> {
     let path = Path::new("webp-encoder");
     if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
         return Err(encode_error(
@@ -1168,6 +1170,7 @@ fn extract_inner_vp8_chunk(bytes: &[u8]) -> Result<Vec<u8>, PipelineError> {
     }
     let mut pos = 12_usize;
     let mut inner = Vec::new();
+    let mut has_alpha = false;
     while pos.saturating_add(8) <= bytes.len() {
         let id = &bytes[pos..pos + 4];
         let size = usize::try_from(le_u32_at(&bytes[pos + 4..pos + 8]).unwrap_or(0))
@@ -1183,10 +1186,19 @@ fn extract_inner_vp8_chunk(bytes: &[u8]) -> Result<Vec<u8>, PipelineError> {
             return Err(encode_error(path, "WebP chunk padding is truncated"));
         }
         if id == b"ALPH" {
+            has_alpha = true;
             inner.extend_from_slice(&bytes[pos..end]);
         } else if id == b"VP8 " || id == b"VP8L" {
+            if id == b"VP8L"
+                && size >= 5
+                && bytes[payload_start] == 0x2F
+                && le_u32_at(&bytes[payload_start + 1..payload_start + 5])
+                    .is_some_and(|packed| (packed >> 28) & 1 != 0)
+            {
+                has_alpha = true;
+            }
             inner.extend_from_slice(&bytes[pos..end]);
-            return Ok(inner);
+            return Ok((inner, has_alpha));
         }
         pos = payload_end.saturating_add(size & 1);
     }
@@ -1205,7 +1217,11 @@ struct AnimJob {
 
 enum PreparedFrame {
     Gif(gif::Frame<'static>),
-    Webp { inner: Vec<u8>, delay_ms: u32 },
+    Webp {
+        inner: Vec<u8>,
+        delay_ms: u32,
+        has_alpha: bool,
+    },
     Failed(String),
 }
 
@@ -1226,7 +1242,14 @@ fn prepare_frame(
             gif::Frame::from_rgb_speed(w, h, &job.rgb, gif_speed(quality))
         };
         frame.delay = u16::try_from(job.delay).unwrap_or(u16::MAX);
-        frame.dispose = gif::DisposalMethod::Keep;
+        // Each RGBA frame is an independent full-canvas snapshot; clearing to
+        // background prevents prior opaque pixels from showing through later
+        // transparent pixels.
+        frame.dispose = if job.info.channels == 4 {
+            gif::DisposalMethod::Background
+        } else {
+            gif::DisposalMethod::Keep
+        };
         Ok(PreparedFrame::Gif(frame))
     } else {
         let path = Path::new("webp-encoder");
@@ -1240,10 +1263,11 @@ fn prepare_frame(
             .method(4)
             .encode()
             .map_err(|err| encode_error(path, format!("WebP encoding failed: {err}")))?;
-        let inner = extract_inner_vp8_chunk(&webp_bytes)?;
+        let (inner, has_alpha) = extract_inner_vp8_chunk(&webp_bytes)?;
         Ok(PreparedFrame::Webp {
             inner,
             delay_ms: job.delay,
+            has_alpha,
         })
     }
 }
@@ -1309,10 +1333,16 @@ fn spawn_animation_workers<'scope>(
                         };
                         let index = job.index;
                         let info = job.info;
-                        let prepared = match prepare_frame(format, quality, &job) {
-                            Ok(frame) => frame,
-                            Err(err) => PreparedFrame::Failed(err.to_string()),
-                        };
+                        let prepared =
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                prepare_frame(format, quality, &job)
+                            })) {
+                                Ok(Ok(frame)) => frame,
+                                Ok(Err(err)) => PreparedFrame::Failed(err.to_string()),
+                                Err(_) => PreparedFrame::Failed(
+                                    "animation frame preparation panicked".to_owned(),
+                                ),
+                            };
                         if ready_tx.send((index, info, prepared)).is_err() {
                             // The writer is gone; intentionally keep draining jobs so a producer
                             // blocked on a full job channel can reach its next admission token
@@ -1549,6 +1579,7 @@ struct AnimationWriters<'a> {
     gif: Option<gif::Encoder<BufWriter<&'a File>>>,
     webp: Option<BufWriter<&'a File>>,
     riff_len: u64,
+    webp_has_alpha: bool,
 }
 
 impl AnimationWriters<'_> {
@@ -1557,6 +1588,7 @@ impl AnimationWriters<'_> {
             gif: None,
             webp: None,
             riff_len: 0,
+            webp_has_alpha: false,
         }
     }
 
@@ -1590,22 +1622,18 @@ fn init_animation_writer<'a>(
                 gif: Some(encoder),
                 webp: None,
                 riff_len: 0,
+                webp_has_alpha: false,
             })
         }
-        (VideoContainerFormat::Webp, PreparedFrame::Webp { inner, .. }) => {
+        (VideoContainerFormat::Webp, PreparedFrame::Webp { has_alpha, .. }) => {
             let mut out = BufWriter::new(file);
-            write_webp_header(
-                &mut out,
-                width,
-                height,
-                loop_count,
-                inner.windows(4).any(|w| w == b"ALPH"),
-            )?;
+            write_webp_header(&mut out, width, height, loop_count, *has_alpha)?;
             // 12-byte RIFF/WEBP prefix + 18-byte VP8X + 14-byte ANIM.
             Ok(AnimationWriters {
                 gif: None,
                 webp: Some(out),
                 riff_len: 44_u64,
+                webp_has_alpha: *has_alpha,
             })
         }
         _ => Err(encode_error(path, "animation encoder/format mismatch")),
@@ -1637,6 +1665,13 @@ fn finish_animation_writer(
         file.seek(SeekFrom::Start(4))
             .map_err(|source| io_error(path, source))?;
         file.write_all(&size)
+            .map_err(|source| io_error(path, source))?;
+        // RFC 9649: VP8X flags live at byte 20 (12-byte RIFF/WEBP + 8-byte VP8X header).
+        // Patch the alpha bit from all written frames so later alpha frames are signalled.
+        let vp8x_flags = [0x02 | if writers.webp_has_alpha { 0x10 } else { 0 }];
+        file.seek(SeekFrom::Start(20))
+            .map_err(|source| io_error(path, source))?;
+        file.write_all(&vp8x_flags)
             .map_err(|source| io_error(path, source))?;
         file.flush().map_err(|source| io_error(path, source))?;
     }
@@ -1672,7 +1707,16 @@ fn write_animation_frames(
                         .write_frame(&frame)
                         .map_err(|err| encode_error(path, format!("GIF encode failed: {err}")))?;
                 }
-                (_, Some(out), PreparedFrame::Webp { inner, delay_ms }) => {
+                (
+                    _,
+                    Some(out),
+                    PreparedFrame::Webp {
+                        inner,
+                        delay_ms,
+                        has_alpha,
+                    },
+                ) => {
+                    writers.webp_has_alpha |= has_alpha;
                     webp_bytes = write_webp_frame(out, frame_info, &inner, delay_ms)?;
                 }
                 (_, _, PreparedFrame::Failed(reason)) => {
@@ -2275,6 +2319,199 @@ mod tests {
             .map_err(|_| encode_error(&path, "producer was not woken by writer failure"))?;
         handle.join().map_err(|_| PipelineError::WorkerPanicked)?;
         assert!(failed, "a read-only output must fail the encode");
+        fs::remove_dir_all(&dir).map_err(|source| io_error(&dir, source))?;
+        Ok(())
+    }
+
+    #[test]
+    fn gif_rgba_clears_canvas_between_independent_frames() -> Result<(), PipelineError> {
+        let dir = temp_anim_dir("gif-dispose")?;
+        let path = dir.join("opaque-to-transparent.gif");
+        let quality = VideoQuality::new(90).map_err(|_| encode_error(&path, "quality"))?;
+        let mut frame0 = vec![0_u8; 4 * 2 * 2];
+        for px in frame0.as_chunks_mut::<4>().0 {
+            px.copy_from_slice(&[220, 20, 20, 255]);
+        }
+        let mut frame1 = vec![0_u8; 4 * 2 * 2];
+        frame1[0..4].copy_from_slice(&[0, 0, 0, 0]);
+        frame1[4..8].copy_from_slice(&[20, 220, 20, 255]);
+        frame1[8..12].copy_from_slice(&[20, 20, 220, 255]);
+        frame1[12..16].copy_from_slice(&[220, 220, 20, 255]);
+        let mut frame_info = info(2, 2);
+        frame_info.channels = 4;
+
+        let file = File::create(&path).map_err(|source| io_error(&path, source))?;
+        encode_animation_stream(
+            VideoContainerFormat::Gif,
+            quality,
+            1,
+            AnimationLoop::Infinite,
+            &file,
+            |sink| {
+                sink(frame_info, &frame0)?;
+                let mut second = frame_info;
+                second.pts_us = 100_000;
+                sink(second, &frame1)?;
+                Ok(())
+            },
+        )?;
+        drop(file);
+
+        let mut decoded = Vec::new();
+        decode_gif_frames_streaming_pixels(&path, |_, pixels| {
+            decoded.push(pixels.to_vec());
+            Ok(())
+        })?;
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0][3], 255, "frame 0 top-left must be opaque");
+        assert_eq!(
+            decoded[1][3], 0,
+            "frame 1 top-left must be cleared to transparent, not retain frame 0 red"
+        );
+        fs::remove_dir_all(&dir).map_err(|source| io_error(&dir, source))?;
+        Ok(())
+    }
+
+    #[test]
+    fn webp_vp8x_alpha_tracks_all_frames_by_chunk_boundaries() -> Result<(), PipelineError> {
+        let dir = temp_anim_dir("webp-late-alpha")?;
+        let quality = VideoQuality::new(90).map_err(|_| encode_error(&dir, "quality"))?;
+
+        // Frame 0 is fully opaque; frame 1 introduces transparency. VP8X alpha must be set.
+        let mut frame0 = vec![0_u8; 4 * 4 * 4];
+        for px in frame0.as_chunks_mut::<4>().0 {
+            px.copy_from_slice(&[200, 80, 40, 255]);
+        }
+        let mut frame1 = frame0.clone();
+        frame1[0..4].copy_from_slice(&[0, 0, 0, 0]);
+        let mut frame_info = info(4, 4);
+        frame_info.channels = 4;
+
+        let late_alpha = dir.join("late-alpha.webp");
+        let file = File::create(&late_alpha).map_err(|source| io_error(&late_alpha, source))?;
+        encode_animation_stream(
+            VideoContainerFormat::Webp,
+            quality,
+            1,
+            AnimationLoop::Infinite,
+            &file,
+            |sink| {
+                sink(frame_info, &frame0)?;
+                let mut second = frame_info;
+                second.pts_us = 100_000;
+                sink(second, &frame1)?;
+                Ok(())
+            },
+        )?;
+        drop(file);
+        let bytes = fs::read(&late_alpha).map_err(|source| io_error(&late_alpha, source))?;
+        assert_ne!(
+            bytes[20] & 0x10,
+            0,
+            "VP8X alpha bit must be set when a later frame has alpha"
+        );
+        let mut decoded = Vec::new();
+        decode_webp_frames_streaming_pixels(&late_alpha, |_, pixels| {
+            decoded.push(pixels.to_vec());
+            Ok(())
+        })?;
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[1][3], 0, "frame 1 transparent pixel must survive");
+
+        // Opaque RGB animation must leave the VP8X alpha bit clear.
+        let opaque = dir.join("opaque.webp");
+        let file = File::create(&opaque).map_err(|source| io_error(&opaque, source))?;
+        encode_animation_stream(
+            VideoContainerFormat::Webp,
+            quality,
+            1,
+            AnimationLoop::Infinite,
+            &file,
+            |sink| {
+                sink(info(4, 4), &[120_u8; 3 * 4 * 4])?;
+                let mut second = info(4, 4);
+                second.pts_us = 100_000;
+                sink(second, &[140_u8; 3 * 4 * 4])?;
+                Ok(())
+            },
+        )?;
+        drop(file);
+        let bytes = fs::read(&opaque).map_err(|source| io_error(&opaque, source))?;
+        assert_eq!(
+            bytes[20] & 0x10,
+            0,
+            "opaque WebP must leave VP8X alpha bit clear"
+        );
+
+        // Literal "ALPH" bytes inside a VP8 payload must not trigger alpha detection.
+        let mut fake_vp8 = b"RIFF".to_vec();
+        let vp8_payload = b"xxALPHxx";
+        let riff_size = u32::try_from(4 + 8 + vp8_payload.len()).unwrap_or(0);
+        fake_vp8.extend_from_slice(&riff_size.to_le_bytes());
+        fake_vp8.extend_from_slice(b"WEBP");
+        fake_vp8.extend_from_slice(b"VP8 ");
+        fake_vp8.extend_from_slice(&u32::try_from(vp8_payload.len()).unwrap_or(0).to_le_bytes());
+        fake_vp8.extend_from_slice(vp8_payload);
+        let (_, has_alpha) = extract_inner_vp8_chunk(&fake_vp8)?;
+        assert!(
+            !has_alpha,
+            "ALPH bytes inside VP8 payload must not be treated as an ALPH chunk"
+        );
+
+        // VP8L bit 28 signals lossless alpha without a separate ALPH chunk.
+        let mut vp8l_alpha = b"RIFF".to_vec();
+        vp8l_alpha.extend_from_slice(&(4_u32 + 8 + 6).to_le_bytes());
+        vp8l_alpha.extend_from_slice(b"WEBP");
+        vp8l_alpha.extend_from_slice(b"VP8L");
+        vp8l_alpha.extend_from_slice(&5_u32.to_le_bytes());
+        vp8l_alpha.push(0x2F);
+        vp8l_alpha.extend_from_slice(&(1_u32 << 28).to_le_bytes());
+        vp8l_alpha.push(0); // odd-chunk pad
+        let (_, has_alpha) = extract_inner_vp8_chunk(&vp8l_alpha)?;
+        assert!(has_alpha, "VP8L alpha_is_used bit must be detected");
+
+        fs::remove_dir_all(&dir).map_err(|source| io_error(&dir, source))?;
+        Ok(())
+    }
+
+    #[test]
+    fn anmf_demux_rejects_unpadded_odd_subchunk() -> Result<(), PipelineError> {
+        let dir = temp_anim_dir("anmf-unpadded")?;
+        let path = dir.join("unpadded.webp");
+        let mut frame = vec![0_u8; 16];
+        frame[6..9].copy_from_slice(&[1, 0, 0]);
+        frame[9..12].copy_from_slice(&[1, 0, 0]);
+        frame[12..15].copy_from_slice(&[20, 0, 0]);
+        // Odd 5-byte VP8L subchunk with NO pad byte inside ANMF payload.
+        frame.extend_from_slice(b"VP8L");
+        frame.extend_from_slice(&5_u32.to_le_bytes());
+        frame.extend_from_slice(&[0x2F, 0, 0, 0, 0]);
+        let mut body = b"WEBP".to_vec();
+        body.extend_from_slice(b"VP8X");
+        body.extend_from_slice(&10_u32.to_le_bytes());
+        body.extend_from_slice(&[0x02, 0, 0, 0, 1, 0, 0, 1, 0, 0]);
+        body.extend_from_slice(b"ANIM");
+        body.extend_from_slice(&6_u32.to_le_bytes());
+        body.extend_from_slice(&[0; 6]);
+        body.extend_from_slice(b"ANMF");
+        body.extend_from_slice(&u32::try_from(frame.len()).unwrap_or(0).to_le_bytes());
+        body.extend_from_slice(&frame);
+        body.push(0); // outer ANMF pad byte (ANMF payload length is odd: 16 + 8 + 5 = 29)
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&u32::try_from(body.len()).unwrap_or(0).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        fs::write(&path, &bytes).map_err(|source| io_error(&path, source))?;
+        match demux_webp_metadata(&path) {
+            Err(PipelineError::DecodeFailed { reason, .. }) => {
+                assert!(reason.contains("padding"), "unexpected reason: {reason}");
+            }
+            other => {
+                return Err(decode_error(
+                    &path,
+                    format!("expected padding error, got {other:?}"),
+                ));
+            }
+        }
         fs::remove_dir_all(&dir).map_err(|source| io_error(&dir, source))?;
         Ok(())
     }

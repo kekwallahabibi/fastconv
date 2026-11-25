@@ -33,8 +33,8 @@ use crate::PipelineError;
 use crate::video_anim::{self, AnimFrameInfo};
 use crate::video_bitstream::{default_opus_head, wrap_adts};
 use crate::video_codecs::{
-    Yuv420Frame, decode_video_track, decode_video_track_streaming, encode_video_cpu,
-    nv12_buffer_len,
+    DecodedFrameInfo, Yuv420Frame, decode_video_track, decode_video_track_streaming,
+    encode_video_cpu, nv12_buffer_len,
 };
 use crate::video_container::{
     ContainerPacket, ContainerTrack, TrackPresentation, US_TIMESCALE, demux_video, mux_video,
@@ -1714,22 +1714,83 @@ fn drain_audio_nonblocking(
     Ok(())
 }
 
-/// Drops frames outside a source edit interval and rebases retained timestamps
-/// to the interval start, matching the visible timeline of the source.
-fn apply_presentation_edit(edit: Option<TrackPresentation>, packets: &mut Vec<ContainerPacket>) {
-    let Some(edit) = edit else {
-        return;
-    };
-    let end_us = edit.duration_us.map(|duration| {
+fn presentation_edit_end(edit: TrackPresentation) -> Option<i64> {
+    edit.duration_us.map(|duration| {
         edit.start_us
             .saturating_add(i64::try_from(duration).unwrap_or(i64::MAX))
-    });
-    packets
-        .retain(|packet| packet.pts >= edit.start_us && end_us.is_none_or(|end| packet.pts < end));
-    for packet in packets {
-        packet.pts = packet.pts.saturating_sub(edit.start_us);
-        packet.dts = packet.dts.saturating_sub(edit.start_us);
+    })
+}
+
+/// Selects the decode-ordered packet span needed to decode every visible frame
+/// in `edit`, including preceding reference frames back to the governing
+/// keyframe so inter-frame decoders (H.264/HEVC/AV1/VP9) never start mid-GOP.
+fn select_packets_for_presentation_edit(
+    edit: Option<TrackPresentation>,
+    packets: &[ContainerPacket],
+) -> &[ContainerPacket] {
+    let Some(edit) = edit else {
+        return packets;
+    };
+    let end_us = presentation_edit_end(edit);
+    let is_visible = |packet: &ContainerPacket| {
+        packet.pts >= edit.start_us && end_us.is_none_or(|end| packet.pts < end)
+    };
+    let Some(first_visible) = packets.iter().position(is_visible) else {
+        return &[];
+    };
+    let last_visible = packets
+        .iter()
+        .rposition(is_visible)
+        .unwrap_or(first_visible);
+    let mut decode_start = packets[..=first_visible]
+        .iter()
+        .rposition(|packet| packet.keyframe)
+        .unwrap_or(0);
+    // Open GOP: if a later B-frame in the visible window displays earlier than
+    // the chosen keyframe, back up to the preceding keyframe too.
+    if let Some(min_visible_pts) = packets[first_visible..=last_visible]
+        .iter()
+        .filter(|packet| is_visible(packet))
+        .map(|packet| packet.pts)
+        .min()
+    {
+        while decode_start > 0 && packets[decode_start].pts > min_visible_pts {
+            decode_start = packets[..decode_start]
+                .iter()
+                .rposition(|packet| packet.keyframe)
+                .unwrap_or(0);
+        }
     }
+    &packets[decode_start..=last_visible]
+}
+
+/// Filters one decoded frame against `edit`, clips its duration to a bounded
+/// edit end, and rebases PTS to the edit interval start.
+fn apply_frame_presentation_edit(
+    edit: Option<TrackPresentation>,
+    info: DecodedFrameInfo,
+) -> Option<DecodedFrameInfo> {
+    let Some(edit) = edit else {
+        return Some(info);
+    };
+    let end_us = presentation_edit_end(edit);
+    if info.pts_us < edit.start_us || end_us.is_some_and(|end| info.pts_us >= end) {
+        return None;
+    }
+    let mut duration_us = info.duration_us;
+    if let Some(end) = end_us {
+        let frame_end = info
+            .pts_us
+            .saturating_add(i64::try_from(duration_us).unwrap_or(i64::MAX));
+        if frame_end > end {
+            duration_us = u64::try_from(end.saturating_sub(info.pts_us)).unwrap_or(0);
+        }
+    }
+    Some(DecodedFrameInfo {
+        pts_us: info.pts_us.saturating_sub(edit.start_us),
+        duration_us,
+        ..info
+    })
 }
 
 /// Encodes an animation container directly from decoded frames: audio is
@@ -1772,7 +1833,7 @@ fn transcode_to_animation(
         .cloned()
         .collect();
     packets.sort_by_key(|packet| (packet.dts, packet.pts));
-    apply_presentation_edit(track.presentation_edit, &mut packets);
+    let decode_packets = select_packets_for_presentation_edit(track.presentation_edit, &packets);
 
     // Loop count and alpha support were validated at the probe boundary;
     // plain video sources keep infinite playback and opaque pixels.
@@ -1797,7 +1858,11 @@ fn transcode_to_animation(
             VideoContainerFormat::Webp => {
                 video_anim::decode_webp_frames_streaming_pixels(source, |info, rgb| sink(info, rgb))
             }
-            _ => decode_video_track_streaming(source, track, &packets, |info, pack| {
+            _ => decode_video_track_streaming(source, track, decode_packets, |info, pack| {
+                let Some(info) = apply_frame_presentation_edit(track.presentation_edit, info)
+                else {
+                    return Ok(());
+                };
                 let pitch = usize::try_from(info.width)
                     .map_err(|_| decode_error(source, "video frame width overflows usize"))?;
                 let length = nv12_buffer_len(info.width, info.height, pitch)?;
@@ -4000,73 +4065,125 @@ mod tests {
     }
 
     #[test]
-    fn presentation_edit_filters_and_rebases_animation_frames() {
-        let packet = |pts: i64| ContainerPacket {
-            track: 0,
-            pts,
-            dts: pts,
-            duration: 40_000,
-            keyframe: true,
-            data: Vec::new(),
+    fn presentation_edit_filters_clips_and_rebases_animation_frames() {
+        let frame = |pts_us: i64| DecodedFrameInfo {
+            width: 16,
+            height: 16,
+            pts_us,
+            duration_us: 40_000,
+            color: crate::video_codecs::YuvColor::default(),
         };
-        let mut packets = vec![packet(0), packet(40_000), packet(80_000), packet(120_000)];
-        apply_presentation_edit(
-            Some(TrackPresentation {
-                start_us: 40_000,
-                duration_us: Some(80_000),
-            }),
-            &mut packets,
-        );
+        let bounded = Some(TrackPresentation {
+            start_us: 0,
+            duration_us: Some(50_000),
+        });
+        let kept: Vec<DecodedFrameInfo> = [0, 40_000, 80_000]
+            .into_iter()
+            .filter_map(|pts| apply_frame_presentation_edit(bounded, frame(pts)))
+            .collect();
         assert_eq!(
-            packets.iter().map(|p| p.pts).collect::<Vec<_>>(),
-            [0, 40_000],
+            kept.iter()
+                .map(|f| (f.pts_us, f.duration_us))
+                .collect::<Vec<_>>(),
+            vec![(0, 40_000), (40_000, 10_000)],
+            "last retained frame duration must be clipped to the edit end"
+        );
+
+        let shifted = Some(TrackPresentation {
+            start_us: 40_000,
+            duration_us: Some(80_000),
+        });
+        let kept: Vec<DecodedFrameInfo> = [0, 40_000, 80_000, 120_000]
+            .into_iter()
+            .filter_map(|pts| apply_frame_presentation_edit(shifted, frame(pts)))
+            .collect();
+        assert_eq!(
+            kept.iter()
+                .map(|f| (f.pts_us, f.duration_us))
+                .collect::<Vec<_>>(),
+            vec![(0, 40_000), (40_000, 40_000)],
             "frames outside the visible interval must be dropped and rebased"
         );
-        assert_eq!(packets[0].dts, 0);
-        assert_eq!(packets[1].dts, 40_000);
 
-        let mut open_ended = vec![packet(0), packet(40_000)];
-        apply_presentation_edit(
-            Some(TrackPresentation {
-                start_us: 40_000,
-                duration_us: None,
-            }),
-            &mut open_ended,
-        );
-        assert_eq!(open_ended.len(), 1);
-        assert_eq!(open_ended[0].pts, 0);
+        let open_ended = Some(TrackPresentation {
+            start_us: 40_000,
+            duration_us: None,
+        });
+        let kept: Vec<DecodedFrameInfo> = [0, 40_000]
+            .into_iter()
+            .filter_map(|pts| apply_frame_presentation_edit(open_ended, frame(pts)))
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].pts_us, 0);
+        assert_eq!(kept[0].duration_us, 40_000);
     }
 
     #[test]
-    fn presentation_edit_reaches_animation_transcode() {
-        // The edit list filter is shared by all animation conversions; a
-        // truncated interval must leave fewer frames than the source track.
-        let mut packets = vec![
-            ContainerPacket {
-                track: 0,
-                pts: 0,
-                dts: 0,
-                duration: 100_000,
-                keyframe: true,
-                data: Vec::new(),
+    fn presentation_edit_keeps_pre_edit_h264_reference_packets_for_decoding()
+    -> Result<(), PipelineError> {
+        let path = Path::new("h264-edit-p-frame.mp4");
+        let frames: Vec<Yuv420Frame> = (0..4_u8)
+            .map(|idx| Yuv420Frame {
+                width: 32,
+                height: 32,
+                y: vec![40_u8.saturating_add(idx * 40); 32 * 32],
+                u: vec![128; 16 * 16],
+                v: vec![128; 16 * 16],
+                pts_us: i64::from(idx) * 40_000,
+                duration_us: 40_000,
+            })
+            .collect();
+        let stream = encode_video_cpu(
+            path,
+            &frames,
+            VideoEncodeMode::CpuH264 {
+                quality: fastconv_domain::VideoQuality::DEFAULT,
             },
-            ContainerPacket {
-                track: 0,
-                pts: 100_000,
-                dts: 100_000,
-                duration: 100_000,
-                keyframe: true,
-                data: Vec::new(),
-            },
-        ];
-        apply_presentation_edit(
-            Some(TrackPresentation {
-                start_us: 100_000,
-                duration_us: None,
-            }),
-            &mut packets,
+            0,
+        )?;
+        assert!(stream.packets[0].keyframe, "first H.264 packet must be IDR");
+        assert!(
+            !stream.packets[1].keyframe,
+            "second H.264 packet must be a P-frame referencing frame 0"
         );
-        assert_eq!(packets.len(), 1);
-        assert_eq!(packets[0].pts, 0);
+
+        // Edit starts on P-frame at 40 ms and ends at 90 ms (clipping frame 2 to 10 ms).
+        let edit = Some(TrackPresentation {
+            start_us: 40_000,
+            duration_us: Some(50_000),
+        });
+        let selected = select_packets_for_presentation_edit(edit, &stream.packets);
+        assert_eq!(
+            selected.iter().map(|p| p.pts).collect::<Vec<_>>(),
+            vec![0, 40_000, 80_000],
+            "pre-edit keyframe must stay in the decode span while post-edit tail is excluded"
+        );
+
+        let mut emitted = Vec::new();
+        decode_video_track_streaming(path, &stream.track, selected, |info, pack| {
+            let Some(edited) = apply_frame_presentation_edit(edit, info) else {
+                return Ok(());
+            };
+            let pitch = usize::try_from(edited.width).unwrap_or(0);
+            let mut nv12 = vec![0_u8; nv12_buffer_len(edited.width, edited.height, pitch)?];
+            pack(&mut nv12, pitch)?;
+            emitted.push((edited.pts_us, edited.duration_us, nv12[0]));
+            Ok(())
+        })?;
+
+        assert_eq!(
+            emitted.len(),
+            2,
+            "pre-edit reference frame must not be emitted"
+        );
+        assert_eq!(emitted[0].0, 0);
+        assert_eq!(emitted[0].1, 40_000);
+        assert_eq!(emitted[1].0, 40_000);
+        assert_eq!(emitted[1].1, 10_000);
+        assert!(
+            emitted[0].2.abs_diff(80) <= 10 && emitted[1].2.abs_diff(120) <= 10,
+            "decoded P-frames must carry frames 1 and 2 luma, got {emitted:?}"
+        );
+        Ok(())
     }
 }
