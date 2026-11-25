@@ -1676,9 +1676,11 @@ mod enabled {
         dma.map_err(|err| video_error(format!("failed to upload NV12 frame to GPU: {err}")))
     }
 
-    /// Drains every bitstream slot confirmed eligible in `ready_bitstreams`
-    /// using a blocking synchronous lock, releasing each completed picture's
-    /// input surface only once its own output timestamp has been retrieved.
+    /// Drains the bitstream slots whose output is *confirmed* signalled in
+    /// `ready_bitstreams` using a blocking synchronous lock, releasing each
+    /// completed picture's input surface only once its own output timestamp has
+    /// been retrieved. Slots that have not been signalled stay in
+    /// `pending_bitstreams` so teardown never blocks on deferred NVENC output.
     #[allow(clippy::too_many_arguments)]
     fn drain_ready_bitstreams(
         session: &RawNvencSession,
@@ -1686,6 +1688,7 @@ mod enabled {
         bitstreams: &mut [RawBitstream<'_>],
         mapped: &mut [Option<RawMappedResource<'_>>],
         ready_bitstreams: &mut VecDeque<usize>,
+        pending_bitstreams: &mut VecDeque<usize>,
         free_bitstreams: &mut VecDeque<usize>,
         free_inputs: &mut VecDeque<usize>,
         frame_to_input_slot: &mut HashMap<usize, usize>,
@@ -1698,11 +1701,13 @@ mod enabled {
                 Ok(result) => result,
                 Err(err) => {
                     // A failed lock does not prove NVENC is done with this
-                    // picture. Keep the slot in a queue so
-                    // `abort_pending_nvenc_work` hands it to the blocking
-                    // discard before its bitstream and still-mapped input
-                    // surface are released.
-                    ready_bitstreams.push_front(bs_slot);
+                    // picture, so it must not stay in the confirmed-ready queue.
+                    // Keep it tracked in the deferred queue instead (the earlier
+                    // fix pushed it back into `ready_bitstreams`): the slot is
+                    // never dropped here, and `abort_pending_nvenc_work` either
+                    // blocking-discards it after a confirmed EOS or quarantines
+                    // its buffers when no successful submission is available.
+                    pending_bitstreams.push_back(bs_slot);
                     return Err(err);
                 }
             };
@@ -1738,37 +1743,63 @@ mod enabled {
         Ok(())
     }
 
-    /// Completes any queued NVENC pictures before `bitstreams`, `mapped`,
-    /// `reg_resources`, and `dev_bufs` drop on an early stage error so the
-    /// driver never accesses freed bitstream or CUDA surface memory.
+    /// Completes every NVENC picture whose output is confirmed before the ring
+    /// buffers drop on an early stage error, and reports whether deferred work
+    /// had to be quarantined instead.
+    ///
+    /// `ready_bitstreams` holds slots whose output was signalled by a
+    /// successfully submitted later picture (the SDK's output-delay contract),
+    /// so a synchronous lock on them is safe. `pending_bitstreams` holds
+    /// submitted but unsignalled slots — including any picture that returned
+    /// `NV_ENC_ERR_NEED_MORE_INPUT` and any slot whose earlier lock failed. If
+    /// EOS was never confirmed, no further picture will be submitted, so a
+    /// blocking `NvEncLockBitstream` on those slots would wait forever. They
+    /// are handed to the caller's bounded quarantine rather than freed while
+    /// the driver can still write into them.
+    ///
+    /// Returns `true` when at least one slot was quarantined, i.e. the caller
+    /// must leak the owning buffers instead of dropping them.
     fn abort_pending_nvenc_work(
         session: &RawNvencSession,
         eos_flushed: bool,
         bitstreams: &mut [RawBitstream<'_>],
         ready_bitstreams: &mut VecDeque<usize>,
         pending_bitstreams: &mut VecDeque<usize>,
-    ) {
+    ) -> bool {
         if ready_bitstreams.is_empty() && pending_bitstreams.is_empty() {
-            return;
+            return false;
         }
-        if !eos_flushed && let Err(_err) = session.flush_eos() {
-            // `flush_eos` sets `eos_sent` before submitting, so a failed
-            // attempt leaves a stale flag. Retry regardless: the blocking
-            // discards below still wait for each queued picture, and the
-            // caller returns the original stage error rather than masking it.
+        let mut eos_confirmed = eos_flushed;
+        if !eos_confirmed {
+            // `flush_eos` sets `eos_sent` before submitting, so a failed attempt
+            // leaves a stale flag. Retry regardless: a successful EOS signals
+            // all deferred output, which makes the blocking discards safe.
+            eos_confirmed = session.flush_eos().is_ok();
         }
-        // Hand every submitted slot to the blocking discard. Leaving pending
-        // slots here would drop their bitstreams and mapped input surfaces
-        // while NVENC can still access them.
-        ready_bitstreams.extend(pending_bitstreams.drain(..));
+
+        // Best-effort: each lock is independent, so a failure on one slot must
+        // not abandon the slots behind it. The caller returns the original
+        // stage error rather than masking it.
         while let Some(bs_slot) = ready_bitstreams.pop_front() {
-            // Best-effort: each lock is independent, so a failure on one slot
-            // must not abandon the slots behind it — the caller drops every
-            // buffer as soon as this returns. The original stage error stays
-            // the one surfaced to the caller.
             let discard_result = session.discard_bitstream(&mut bitstreams[bs_slot]);
             drop(discard_result);
         }
+
+        if eos_confirmed {
+            while let Some(bs_slot) = pending_bitstreams.pop_front() {
+                let discard_result = session.discard_bitstream(&mut bitstreams[bs_slot]);
+                drop(discard_result);
+            }
+            return false;
+        }
+
+        // EOS was never confirmed: NVENC requires a successful submission
+        // before it signals deferred output, and none is coming. Do not block
+        // on these slots and do not destroy their bitstreams; the caller keeps
+        // every owning buffer alive in a bounded quarantine instead.
+        let quarantined = !pending_bitstreams.is_empty();
+        pending_bitstreams.clear();
+        quarantined
     }
 
     /// GPU side of the streaming pipeline. Runs on the calling thread while the
@@ -1940,6 +1971,7 @@ mod enabled {
                         &mut bitstreams,
                         &mut mapped,
                         &mut ready_bitstreams,
+                        &mut pending_bitstreams,
                         &mut free_bitstreams,
                         &mut free_inputs,
                         &mut frame_to_input_slot,
@@ -1959,6 +1991,7 @@ mod enabled {
                 &mut bitstreams,
                 &mut mapped,
                 &mut ready_bitstreams,
+                &mut pending_bitstreams,
                 &mut free_bitstreams,
                 &mut free_inputs,
                 &mut frame_to_input_slot,
@@ -1969,8 +2002,9 @@ mod enabled {
             Ok(())
         })();
 
+        let mut quarantined = false;
         if stage_result.is_err() {
-            abort_pending_nvenc_work(
+            quarantined = abort_pending_nvenc_work(
                 &session,
                 eos_flushed,
                 &mut bitstreams,
@@ -1978,11 +2012,24 @@ mod enabled {
                 &mut pending_bitstreams,
             );
         }
+        if quarantined {
+            // WHY: EOS was never confirmed, so NVENC may still write into the
+            // deferred pictures' bitstreams and mapped input surfaces. Keep this
+            // bounded set — one ring's buffers, registrations, the VRAM slab and
+            // the encoder handle — alive until process teardown instead of
+            // destroying memory the driver may still access.
+            std::mem::forget(bitstreams);
+            std::mem::forget(mapped);
+            std::mem::forget(reg_resources);
+            std::mem::forget(vram_slab);
+            std::mem::forget(session);
+        }
 
         // Reverse declaration order drops bitstreams, live mappings,
         // registrations and device buffers before the NVENC session on every
-        // exit path, including early `?` errors. Explicit drops are avoided
-        // because `mapped` borrows `reg_resources`, which borrows `session`.
+        // normal exit path, including early `?` errors. Explicit drops are
+        // avoided because `mapped` borrows `reg_resources`, which borrows
+        // `session`; the quarantine above is the only exception.
         stage_result?;
 
         if encoded_units.len() != frame_timings.len() {
@@ -2199,6 +2246,7 @@ mod enabled {
                         &mut bitstreams,
                         &mut mapped,
                         &mut ready_bitstreams,
+                        &mut pending_bitstreams,
                         &mut free_bitstreams,
                         &mut free_inputs,
                         &mut frame_to_input_slot,
@@ -2245,6 +2293,7 @@ mod enabled {
                         &mut bitstreams,
                         &mut mapped,
                         &mut ready_bitstreams,
+                        &mut pending_bitstreams,
                         &mut free_bitstreams,
                         &mut free_inputs,
                         &mut frame_to_input_slot,
@@ -2267,6 +2316,7 @@ mod enabled {
                 &mut bitstreams,
                 &mut mapped,
                 &mut ready_bitstreams,
+                &mut pending_bitstreams,
                 &mut free_bitstreams,
                 &mut free_inputs,
                 &mut frame_to_input_slot,
@@ -2275,14 +2325,27 @@ mod enabled {
                 &mut on_frame_encoded,
             )
         });
+        let mut quarantined = false;
         if stage_result.is_err() {
-            abort_pending_nvenc_work(
+            quarantined = abort_pending_nvenc_work(
                 &session,
                 eos_flushed,
                 &mut bitstreams,
                 &mut ready_bitstreams,
                 &mut pending_bitstreams,
             );
+        }
+        if quarantined {
+            // WHY: EOS was never confirmed, so NVENC may still write into the
+            // deferred pictures' bitstreams and mapped input surfaces. Keep this
+            // bounded set — one ring's buffers, registrations, the VRAM slab and
+            // the encoder handle — alive until process teardown instead of
+            // destroying memory the driver may still access.
+            std::mem::forget(bitstreams);
+            std::mem::forget(mapped);
+            std::mem::forget(reg_resources);
+            std::mem::forget(vram_slab);
+            std::mem::forget(session);
         }
         stage_result?;
 
@@ -2709,13 +2772,16 @@ fn quality_to_nvenc_cq(quality: VideoQuality) -> (u8, u8) {
 /// produces inverted or equal DTS for B-frame/animation sources and is the root
 /// cause of `non monotonically increasing dts` warnings on GIF→MP4 NVENC output.
 ///
-/// The DTS sequence advances by the frame cadence for reordered packets (and by
-/// 1 µs only to break a PTS tie), then is uniformly shifted back by the largest
-/// deficit `max(g - pts)`. This guarantees `dts[k] <= pts[k]`, strictly increasing
-/// DTS with one global reorder delay, and gaps wide enough to stay distinct after
-/// conversion to the 90 kHz timebase of MP4/MPEG-TS: there a 1 µs step rounds a
-/// reordered P/B group onto a single tick, making a decoder sort B-frames ahead
-/// of their reference.
+/// The DTS sequence advances by the *current packet's own* duration-derived
+/// cadence for reordered packets (and by 1 µs only to break a PTS tie), then is
+/// uniformly shifted back by the largest deficit `max(g - pts)`. Taking the
+/// cadence from the current packet rather than a global median matters when a
+/// later segment is faster: a median cadence would keep applying the old, wider
+/// frame spacing on every reorder, growing an unbounded decode lead. This still
+/// guarantees `dts[k] <= pts[k]` and strictly increasing DTS with one global
+/// reorder delay, and gaps wide enough to stay distinct after conversion to the
+/// 90 kHz timebase of MP4/MPEG-TS: there a 1 µs step rounds a reordered P/B group
+/// onto a single tick, making a decoder sort B-frames ahead of their reference.
 #[cfg(any(feature = "nvenc", test))]
 pub(crate) fn assign_reordered_timestamps(
     frame_timings: &[(i64, u64)],
@@ -2752,30 +2818,23 @@ pub(crate) fn assign_reordered_timestamps(
         durations.push(*duration);
     }
 
-    // Decode-order cadence: the median frame duration. A reordered packet (PTS
-    // below the previous packet's) advances by one cadence instead of 1 µs so
+    // Per-packet decode-order cadence: a reordered packet (PTS below the
+    // previous packet's) advances by its own frame duration instead of 1 µs so
     // its DTS stays distinct once the container rescales to 90 kHz (~11.1 µs per
-    // tick). The 12 µs floor is `US_TIMESCALE / 90_000 + 1`, the smallest step
-    // that cannot round onto the neighbouring tick.
-    let mut sorted_durations = durations.clone();
-    sorted_durations.sort_unstable();
-    let cadence = i128::from(
-        sorted_durations
-            .get(sorted_durations.len() / 2)
-            .copied()
-            .unwrap_or(1)
-            .max(1),
-    )
-    .max(12);
-
+    // tick). A global median would keep the slower cadence of an earlier
+    // segment in a later, faster one and stretch the decode timeline. The 12 µs
+    // floor is `US_TIMESCALE / 90_000 + 1`, the smallest step that cannot round
+    // onto the neighbouring tick.
+    //
     // Strictly increasing sequence with g[k] >= pts[k]: keep each packet's own
-    // PTS when it moves forward, advance by `cadence` on a reorder, and bump by
-    // 1 µs only to break an exact PTS tie (the minimal repair for duplicate
-    // display delays).
+    // PTS when it moves forward, advance by that packet's cadence on a reorder,
+    // and bump by 1 µs only to break an exact PTS tie (the minimal repair for
+    // duplicate display delays).
     let mut increasing = Vec::with_capacity(pts.len());
-    for &packet_pts in &pts {
+    for (k, &packet_pts) in pts.iter().enumerate() {
+        let packet_cadence = i128::from(durations[k]).max(12);
         let next = match increasing.last().copied() {
-            Some(prev) if packet_pts < prev => prev.saturating_add(cadence),
+            Some(prev) if packet_pts < prev => prev.saturating_add(packet_cadence),
             Some(prev) if packet_pts == prev => prev.saturating_add(1),
             None | Some(_) => packet_pts,
         };
@@ -3158,6 +3217,39 @@ mod unit_tests {
         assert!(
             ticks.windows(2).all(|pair| pair[0] < pair[1]),
             "reordered DTS collapsed at 90 kHz: {ticks:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reordered_timestamps_cadence_change_bounds_decode_lead() -> Result<(), PipelineError> {
+        const SLOW: i64 = 40_000;
+        const FAST: i64 = 10_000;
+        let mut timings: Vec<(i64, u64)> = (0..1_000_i64).map(|k| (k * SLOW, 40_000)).collect();
+        let fast_start = 1_000_i64 * SLOW;
+        timings.extend((0..600_i64).map(|k| (fast_start + k * FAST, 10_000)));
+
+        let mut display_indices: Vec<usize> = (0..timings.len()).collect();
+        // One swapped pair inside the fast segment: packet 1_500 presents frame
+        // 1_501, then 98 more 10 ms frames follow in presentation order.
+        display_indices.swap(1_500, 1_501);
+
+        let result = assign_reordered_timestamps(&timings, &display_indices)?;
+        assert_eq!(result.len(), timings.len());
+        for (k, &(pts, dts, _)) in result.iter().enumerate() {
+            assert!(dts <= pts, "packet {k}: dts {dts} > pts {pts}");
+            if k > 0 {
+                assert!(dts > result[k - 1].1, "packet {k}: dts must increase");
+            }
+        }
+
+        // A global 40 ms median keeps applying the old cadence to every later
+        // 10 ms packet, adding 30 ms of decode lead per frame. Using the current
+        // packet's own cadence settles at two fast frames instead.
+        let lead = result[result.len() - 1].0 - result[result.len() - 1].1;
+        assert!(
+            (2 * FAST..=3 * FAST).contains(&lead),
+            "decode lead {lead} us escaped the 10 ms segment cadence"
         );
         Ok(())
     }
