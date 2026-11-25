@@ -2774,10 +2774,16 @@ mod tests {
         Ok(packets)
     }
 
-    fn best_snr_db(reference: &[f32], decoded: &[f32], max_lag: isize) -> f64 {
+    fn best_snr_db(reference: &[f32], decoded: &[f32], max_lag: isize, channels: usize) -> f64 {
+        // Interleaved samples carry channel identity in index parity, so only
+        // whole-frame shifts may be searched. Odd shifts would line a channel up
+        // with its neighbour and let swapped stereo pass the fidelity check.
+        let channels = isize::try_from(channels.max(1)).unwrap_or(1);
+        let max_frames = max_lag / channels;
         let count = 4096.min(reference.len()).min(decoded.len());
         let mut best = f64::NEG_INFINITY;
-        for lag in -max_lag..=max_lag {
+        for frame_lag in -max_frames..=max_frames {
+            let lag = frame_lag.saturating_mul(channels);
             let mut signal = 0.0_f64;
             let mut error = 0.0_f64;
             for (index, &decoded_value) in decoded.iter().enumerate().take(count) {
@@ -2873,8 +2879,26 @@ mod tests {
                 .all(|value| value.is_finite() && value.abs() <= 1.05),
             "decoded Vorbis samples must be finite and unclipped"
         );
-        let snr = best_snr_db(&encoder_buf.samples_f32, &decoded_buf.samples_f32, 2048);
+        let snr = best_snr_db(
+            &encoder_buf.samples_f32,
+            &decoded_buf.samples_f32,
+            2048,
+            channels,
+        );
         assert!(snr > 25.0, "Vorbis q4 SNR too low: {snr:.1} dB");
+
+        // Negative control: swapping left/right must not pass, because a whole-frame
+        // lag keeps each decoded sample on its original channel.
+        let swapped: Vec<f32> = encoder_buf
+            .samples_f32
+            .chunks_exact(channels)
+            .flat_map(|frame| [frame[1], frame[0]])
+            .collect();
+        let swapped_snr = best_snr_db(&swapped, &decoded_buf.samples_f32, 2048, channels);
+        assert!(
+            swapped_snr < 25.0,
+            "swapped stereo placement must be rejected: {swapped_snr:.1} dB"
+        );
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
