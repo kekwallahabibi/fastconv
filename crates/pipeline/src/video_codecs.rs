@@ -459,9 +459,46 @@ fn vp9_frame(
     })
 }
 
-/// Emits buffered H.264 frames in presentation order. `rusty_h264` decodes in
-/// bitstream (decode) order, so B-frames must be held until a newer keyframe or
-/// EOF proves no earlier presentation time can still arrive.
+/// Minimum presentation time at or after each decode-order index.
+///
+/// Used by the H.264 reorder buffer so a buffered frame is emitted only once no
+/// later decode-order packet (including open-GOP leading pictures after a
+/// sync-marked frame) can precede it in presentation order.
+fn suffix_min_pts(ordered: &[&ContainerPacket]) -> Vec<i64> {
+    let mut suffix = vec![0_i64; ordered.len()];
+    let mut running_min = i64::MAX;
+    for (index, packet) in ordered.iter().enumerate().rev() {
+        running_min = running_min.min(packet.pts);
+        suffix[index] = running_min;
+    }
+    suffix
+}
+
+/// Drains buffered H.264 frames whose presentation time cannot be preceded by
+/// any remaining decode-order packet (or when the 16-frame H.264 DPB cap is
+/// exceeded).
+fn drain_ready_h264_reorder_vec(
+    reorder: &mut Vec<Yuv420Frame>,
+    future_min_pts: Option<i64>,
+    frames: &mut Vec<Yuv420Frame>,
+) {
+    while !reorder.is_empty() {
+        let earliest = reorder
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, frame)| frame.pts_us)
+            .map_or(0, |(index, _)| index);
+        let safe_to_emit =
+            future_min_pts.is_none_or(|future_min| reorder[earliest].pts_us <= future_min);
+        if safe_to_emit || reorder.len() > 16 {
+            frames.push(reorder.remove(earliest));
+        } else {
+            break;
+        }
+    }
+}
+
+/// Emits remaining buffered H.264 frames in presentation order at EOF.
 fn flush_h264_reorder_vec(reorder: &mut Vec<Yuv420Frame>, frames: &mut Vec<Yuv420Frame>) {
     reorder.sort_by_key(|frame| frame.pts_us);
     frames.append(reorder);
@@ -486,12 +523,14 @@ pub(crate) fn decode_video_track(
             let mut decoder = H264Decoder::new();
             let mut frames = Vec::with_capacity(ordered.len());
             let needs_reorder = has_b_frame_reordering(&ordered);
+            let future_mins = if needs_reorder {
+                suffix_min_pts(&ordered)
+            } else {
+                Vec::new()
+            };
             let mut reorder: Vec<Yuv420Frame> =
                 Vec::with_capacity(if needs_reorder { 16 } else { 0 });
-            for packet in ordered {
-                if needs_reorder && packet.keyframe {
-                    flush_h264_reorder_vec(&mut reorder, &mut frames);
-                }
+            for (index, packet) in ordered.iter().enumerate() {
                 let annex_b = avcc_to_annex_b(&track.config, &packet.data, true)
                     .map_err(|reason| decode_error(path, reason))?;
                 let frame = decoder
@@ -501,14 +540,8 @@ pub(crate) fn decode_video_track(
                     let yuv = h264_frame(frame, packet.pts, packet.duration);
                     if needs_reorder {
                         reorder.push(yuv);
-                        if reorder.len() > 16 {
-                            let earliest = reorder
-                                .iter()
-                                .enumerate()
-                                .min_by_key(|(_, frame)| frame.pts_us)
-                                .map_or(0, |(index, _)| index);
-                            frames.push(reorder.remove(earliest));
-                        }
+                        let future_min = future_mins.get(index + 1).copied();
+                        drain_ready_h264_reorder_vec(&mut reorder, future_min, &mut frames);
                     } else {
                         frames.push(yuv);
                     }
@@ -1245,6 +1278,36 @@ mod streaming {
         emit_nv12_frame(path, on_frame, info, write_y, write_uv)
     }
 
+    fn drain_ready_stream_h264_reorder<F>(
+        path: &Path,
+        reorder: &mut Vec<(H264YuvFrame, i64, u64)>,
+        future_min_pts: Option<i64>,
+        on_frame: &mut F,
+    ) -> Result<(), PipelineError>
+    where
+        F: FnMut(
+            DecodedFrameInfo,
+            &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        ) -> Result<(), PipelineError>,
+    {
+        while !reorder.is_empty() {
+            let earliest = reorder
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, pts, _))| *pts)
+                .map_or(0, |(index, _)| index);
+            let safe_to_emit =
+                future_min_pts.is_none_or(|future_min| reorder[earliest].1 <= future_min);
+            if safe_to_emit || reorder.len() > 16 {
+                let (frame, pts, duration) = reorder.remove(earliest);
+                emit_h264_frame(path, &frame, pts, duration, on_frame)?;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn flush_stream_h264_reorder<F>(
         path: &Path,
         reorder: &mut Vec<(H264YuvFrame, i64, u64)>,
@@ -1274,12 +1337,14 @@ mod streaming {
     ) -> Result<(), PipelineError> {
         let mut decoder = H264Decoder::new();
         let needs_reorder = has_b_frame_reordering(ordered);
+        let future_mins = if needs_reorder {
+            super::suffix_min_pts(ordered)
+        } else {
+            Vec::new()
+        };
         let mut reorder: Vec<(H264YuvFrame, i64, u64)> =
             Vec::with_capacity(if needs_reorder { 16 } else { 0 });
-        for packet in ordered {
-            if needs_reorder && packet.keyframe {
-                flush_stream_h264_reorder(path, &mut reorder, on_frame)?;
-            }
+        for (index, packet) in ordered.iter().enumerate() {
             let annex_b = avcc_to_annex_b(&track.config, &packet.data, true)
                 .map_err(|reason| decode_error(path, reason))?;
             let frame = decoder
@@ -1288,15 +1353,8 @@ mod streaming {
             if let Some(frame) = frame {
                 if needs_reorder {
                     reorder.push((frame, packet.pts, packet.duration));
-                    if reorder.len() > 16 {
-                        let earliest = reorder
-                            .iter()
-                            .enumerate()
-                            .min_by_key(|(_, (_, pts, _))| *pts)
-                            .map_or(0, |(index, _)| index);
-                        let (frame, pts, duration) = reorder.remove(earliest);
-                        emit_h264_frame(path, &frame, pts, duration, on_frame)?;
-                    }
+                    let future_min = future_mins.get(index + 1).copied();
+                    drain_ready_stream_h264_reorder(path, &mut reorder, future_min, on_frame)?;
                 } else {
                     emit_h264_frame(path, &frame, packet.pts, packet.duration, on_frame)?;
                 }
@@ -1573,6 +1631,7 @@ fn make_stream(
         sample_rate: None,
         config,
         timescale: US_TIMESCALE,
+        presentation_edit: None,
     };
     let mut packets = Vec::with_capacity(units.len());
     let base_pts = frames
@@ -2091,6 +2150,7 @@ mod tests {
             sample_rate: None,
             config: Vec::new(),
             timescale: US_TIMESCALE,
+            presentation_edit: None,
         };
         for mode in [
             VideoEncodeMode::NvencH264 {
@@ -2152,6 +2212,63 @@ mod tests {
             high_bytes > low_bytes,
             "{codec}: quality 90 ({high_bytes} bytes) must exceed quality 40 ({low_bytes} bytes)"
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "nvenc")]
+    fn assert_forced_nvenc_b_frames_roundtrip(
+        path: &Path,
+        source: &EncodedVideoStream,
+        mode: VideoEncodeMode,
+        codec: VideoCodec,
+        frame_count: usize,
+    ) -> Result<(), PipelineError> {
+        if !crate::gpu::nvenc::codec_supports_b_frames(codec)? {
+            return Ok(());
+        }
+        // With `disableBadapt = 1`, NVENC guarantees B-frame placement on
+        // B-frame-capable GPUs, so decode-order PTS inversions and display-order
+        // decode reordering are deterministically verified.
+        let (forced_stream, forced_count, _) =
+            crate::gpu::nvenc::encode_video_nvenc_streaming_forced_b_frames(
+                path,
+                &source.track,
+                &source.packets,
+                mode,
+                0,
+                || Ok(()),
+            )?;
+        assert_eq!(forced_count, u64::try_from(frame_count).unwrap_or(0));
+        assert_eq!(forced_stream.packets.len(), frame_count);
+        let mut forced_max_pts: Option<i64> = None;
+        let mut forced_inversion = false;
+        for (index, packet) in forced_stream.packets.iter().enumerate() {
+            assert!(packet.dts <= packet.pts);
+            if index > 0 {
+                assert!(packet.dts > forced_stream.packets[index - 1].dts);
+            }
+            if let Some(prev_max) = forced_max_pts
+                && packet.pts < prev_max
+            {
+                forced_inversion = true;
+            }
+            forced_max_pts = Some(forced_max_pts.map_or(packet.pts, |m| m.max(packet.pts)));
+        }
+        assert!(
+            forced_inversion,
+            "{codec}: forced B-frame mode (`disableBadapt = 1`) must emit PTS inversions in decode order"
+        );
+        let forced_decoded =
+            decode_video_track(path, &forced_stream.track, &forced_stream.packets)?;
+        assert_eq!(forced_decoded.len(), frame_count);
+        for (index, frame) in forced_decoded.iter().enumerate() {
+            if index > 0 {
+                assert!(
+                    frame.pts_us > forced_decoded[index - 1].pts_us,
+                    "{codec}: forced B-frame decoded frames must be in display order"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -2227,12 +2344,14 @@ mod tests {
                 }
                 max_pts_seen = Some(max_pts_seen.map_or(packet.pts, |m| m.max(packet.pts)));
             }
-            if crate::gpu::nvenc::codec_supports_b_frames(codec)? {
-                assert!(
-                    has_pts_inversion,
-                    "{codec}: B-frame reordering must place a lower PTS after a higher PTS in decode order"
-                );
-            }
+            // Production NVENC leaves adaptive B-frame placement enabled under
+            // lookahead, so an inversion is optional here, but DTS may lag PTS
+            // only when an actual presentation-order inversion occurred.
+            let any_dts_lag = stream.packets.iter().any(|packet| packet.dts < packet.pts);
+            assert_eq!(
+                any_dts_lag, has_pts_inversion,
+                "{codec}: DTS lag must match actual PTS inversions"
+            );
             let decoded = decode_video_track(path, &stream.track, &stream.packets)?;
             assert_eq!(decoded.len(), frames.len());
             for (index, frame) in decoded.iter().enumerate() {
@@ -2244,9 +2363,56 @@ mod tests {
                     );
                 }
             }
+            assert_forced_nvenc_b_frames_roundtrip(path, &source, mode, codec, frames.len())?;
             assert_nvenc_quality_scales_bitrate(path, &source, codec)?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn h264_reorder_preserves_presentation_order_for_open_gop_leading_pictures() {
+        // Open-GOP sequence where a sync-marked picture (PTS 200) is followed in
+        // decode order by a leading picture (PTS 110) earlier than a previously
+        // decoded frame (PTS 120). A keyframe-triggered flush would emit 120
+        // before 110; suffix-min-PTS holds 120 until 110 arrives.
+        let pkt = |pts: i64, dts: i64, keyframe: bool| ContainerPacket {
+            track: 0,
+            pts,
+            dts,
+            duration: 40_000,
+            keyframe,
+            data: Vec::new(),
+        };
+        let packets = vec![
+            pkt(0, 0, true),
+            pkt(120, 40, false),
+            pkt(40, 80, false),
+            pkt(80, 120, false),
+            pkt(200, 160, true),
+            pkt(110, 200, false),
+            pkt(160, 240, false),
+        ];
+        let ordered = decode_order(&packets);
+        assert!(has_b_frame_reordering(&ordered));
+        let future_mins = suffix_min_pts(&ordered);
+        let mut reorder = Vec::new();
+        let mut emitted = Vec::new();
+        for (index, packet) in ordered.iter().enumerate() {
+            reorder.push(Yuv420Frame {
+                width: 2,
+                height: 2,
+                y: vec![0; 4],
+                u: vec![128; 1],
+                v: vec![128; 1],
+                pts_us: packet.pts,
+                duration_us: packet.duration,
+            });
+            let future_min = future_mins.get(index + 1).copied();
+            drain_ready_h264_reorder_vec(&mut reorder, future_min, &mut emitted);
+        }
+        flush_h264_reorder_vec(&mut reorder, &mut emitted);
+        let pts_out: Vec<i64> = emitted.iter().map(|frame| frame.pts_us).collect();
+        assert_eq!(pts_out, vec![0, 40, 80, 110, 120, 160, 200]);
     }
 
     /// Packs a streamed NV12 frame back into `Yuv420Frame` so the two decode
