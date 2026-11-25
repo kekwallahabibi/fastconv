@@ -140,6 +140,16 @@ fn us_to_ticks(value_us: i64, timescale: u32) -> i64 {
     i64::try_from(rounded).unwrap_or(if numerator >= 0 { i64::MAX } else { i64::MIN })
 }
 
+/// MP4 requires strictly increasing DTS ticks. A 1 µs step can round to zero
+/// ticks at 90 kHz (or any timescale above 1 MHz), so the tick-domain bump is
+/// authoritative: apply it after rescaling, never only in microseconds.
+fn monotonic_dts_ticks(raw_ticks: i64, previous: Option<i64>) -> i64 {
+    match previous {
+        None => 0,
+        Some(previous) => raw_ticks.max(previous.saturating_add(1)),
+    }
+}
+
 /// A windowed reader that keeps containr's absolute seeks cheap.
 struct WindowedFileReader {
     file: File,
@@ -1189,10 +1199,7 @@ fn mux_mp4_into<W: Read + Write + Seek>(
         media_end[packet.track] =
             media_end[packet.track].max(u64::try_from(end).unwrap_or(u64::MAX));
         let raw_dts_ticks = us_to_ticks(dts, track_timescale);
-        let dts_ticks = match prev_dts_ticks[packet.track] {
-            None => 0,
-            Some(prev) => raw_dts_ticks.max(prev.saturating_add(1)),
-        };
+        let dts_ticks = monotonic_dts_ticks(raw_dts_ticks, prev_dts_ticks[packet.track]);
         prev_dts_ticks[packet.track] = Some(dts_ticks);
         let pts_ticks = us_to_ticks(pts, track_timescale);
         let final_duration_ticks = (last_packet_for_track[packet.track] == Some(packet_index))
@@ -1716,6 +1723,31 @@ mod tests {
     }
 
     #[test]
+    fn mp4_dts_stays_strictly_increasing_when_microseconds_collapse_to_ticks() {
+        // At the common 90 kHz MP4 timescale one tick is ~11 µs: GIF delays
+        // rounded to whole centiseconds and 1 µs DTS backoffs map to equal
+        // ticks unless the bump happens in tick space.
+        let timescale = 90_000_u32;
+        let microseconds = [0_i64, 1, 2, 70_000, 70_001, 140_000];
+        let mut previous = None;
+        for value in microseconds {
+            let ticks = monotonic_dts_ticks(us_to_ticks(value, timescale), previous);
+            if let Some(previous) = previous {
+                assert!(
+                    ticks > previous,
+                    "{value} µs collapsed to non-monotonic DTS tick {ticks} <= {previous}"
+                );
+            }
+            previous = Some(ticks);
+        }
+        assert_eq!(us_to_ticks(1, timescale), us_to_ticks(0, timescale));
+        assert_eq!(
+            us_to_ticks(70_001, timescale),
+            us_to_ticks(70_000, timescale)
+        );
+    }
+
+    #[test]
     fn mp4_delayed_track_edit_list_preserves_early_b_frames() -> Result<(), String> {
         let video = |pts: i64| ContainerPacket {
             track: 1,
@@ -2030,6 +2062,83 @@ mod tests {
             tags,
             vec![0, 3, 1, 2],
             "decode order I0, P3, B1, B2 must survive MKV reopen"
+        );
+        for (index, packet) in sorted.iter().enumerate() {
+            assert!(packet.dts <= packet.pts);
+            if index > 0 {
+                assert!(packet.dts > sorted[index - 1].dts);
+            }
+        }
+        Ok(())
+    }
+
+    /// MPEG-TS rebases timestamps and rounds them to 90 kHz ticks (~11.1 µs).
+    /// One-microsecond DTS steps collapse onto a single tick; a decoder then
+    /// sorts the tied B-frames by PTS and decodes them before their P reference.
+    /// Feed the real NVENC DTS assignment through the TS muxer to prove the
+    /// reordered reference picture still decodes first after reopening.
+    #[test]
+    fn ts_b_frame_roundtrip_preserves_reference_decode_order() -> Result<(), String> {
+        let timings = [
+            (0_i64, 25_000_u64),
+            (25_000, 25_000),
+            (50_000, 25_000),
+            (75_000, 25_000),
+        ];
+        // Non-zero tags: the Annex-B helper trims trailing zero bytes, so a 0
+        // tag would be stripped from the NAL and lost on the TS round-trip.
+        let display_order: [u8; 4] = [1, 4, 2, 3]; // decode order I0, P3, B1, B2
+        let stamps = crate::gpu::nvenc::assign_reordered_timestamps(&timings, &[0, 3, 1, 2])
+            .map_err(|err| err.to_string())?;
+        let video = |pts: i64, dts: i64, duration: u64, keyframe: bool, tag: u8| ContainerPacket {
+            track: 0,
+            pts,
+            dts,
+            duration,
+            keyframe,
+            data: vec![0, 0, 0, 2, if keyframe { 0x65 } else { 0x41 }, tag],
+        };
+        let media = ContainerMedia {
+            tracks: vec![ContainerTrack {
+                codec: VideoCodec::H264,
+                width: Some(320),
+                height: Some(240),
+                channels: None,
+                sample_rate: None,
+                config: extract_avcc_from_annex_b(&[
+                    0, 0, 1, 0x67, 0x42, 0x00, 0x1E, 0, 0, 1, 0x68, 0xCE,
+                ])
+                .unwrap_or_default(),
+                timescale: US_TIMESCALE,
+                presentation_edit: None,
+            }],
+            packets: stamps
+                .into_iter()
+                .zip(display_order)
+                .map(|((pts, dts, duration), tag)| video(pts, dts, duration, tag == 1, tag))
+                .collect(),
+        };
+        let dir =
+            std::env::temp_dir().join(format!("fastconv-ts-bframe-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let path = dir.join("bframes.ts");
+        let file = File::create(&path).map_err(|err| err.to_string())?;
+        mux_video(&file, &path, VideoContainerFormat::Ts, &media).map_err(|err| err.to_string())?;
+        drop(file);
+        let reopened =
+            demux_video(&path, VideoContainerFormat::Ts).map_err(|err| err.to_string())?;
+        std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
+        let mut sorted: Vec<&ContainerPacket> = reopened.packets.iter().collect();
+        // The TS demuxer prepends an access-unit delimiter and parameter sets,
+        // so the frame tag is the final byte of each demuxed AVCC access unit.
+        sorted.sort_by_key(|packet| (packet.dts, packet.pts));
+        let tags: Vec<u8> = sorted
+            .iter()
+            .map(|packet| packet.data.last().copied().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            tags, display_order,
+            "decode order I0, P3, B1, B2 must survive MPEG-TS reopen"
         );
         for (index, packet) in sorted.iter().enumerate() {
             assert!(packet.dts <= packet.pts);

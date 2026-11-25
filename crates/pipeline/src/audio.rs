@@ -1528,6 +1528,7 @@ fn encode_ogg(
     if buf.samples_f32.is_empty() {
         return Err(PipelineError::EmptyOutput(path.to_path_buf()));
     }
+    let total_frames = buf.samples_f32.len() / channels;
     let rate_nz = NonZeroU32::new(target_rate).ok_or_else(|| PipelineError::EncodeFailed {
         path: path.to_path_buf(),
         reason: "Ogg Vorbis sample rate must be non-zero".to_owned(),
@@ -1552,17 +1553,20 @@ fn encode_ogg(
             path: path.to_path_buf(),
             reason: format!("failed to create Ogg Vorbis encoder: {err}"),
         })?;
-    let total_frames = buf.samples_f32.len() / channels;
     let mut planes: Vec<Vec<f32>> = vec![Vec::with_capacity(OGG_CHUNK_FRAMES); channels];
     for start in (0..total_frames).step_by(OGG_CHUNK_FRAMES) {
         let frames = OGG_CHUNK_FRAMES.min(total_frames.saturating_sub(start));
         for plane in &mut planes {
             plane.clear();
         }
-        for frame in 0..frames {
-            let base = (start.saturating_add(frame)).saturating_mul(channels);
+        for frame_samples in buf
+            .samples_f32
+            .chunks_exact(channels)
+            .skip(start)
+            .take(frames)
+        {
             for (plane, &source) in planes.iter_mut().zip(channel_order) {
-                if let Some(&value) = buf.samples_f32.get(base.saturating_add(source)) {
+                if let Some(&value) = frame_samples.get(source) {
                     plane.push(value);
                 }
             }
@@ -1591,8 +1595,13 @@ fn encode_alac(
     rate: u32,
     channels: usize,
     buf: &AudioWorkerBuffer,
+    batch_workers: usize,
 ) -> Result<(), PipelineError> {
-    crate::m4a::encode_alac_m4a(path, rate, channels, &buf.samples_i16)
+    let available = std::thread::available_parallelism()
+        .map_or(1, NonZeroUsize::get)
+        .min(8);
+    let inner_threads = (available / batch_workers.max(1)).max(1);
+    crate::m4a::encode_alac_m4a(path, rate, channels, &buf.samples_i16, inner_threads)
 }
 
 fn encode_aiff(
@@ -1744,7 +1753,7 @@ fn encode_audio(
         AudioOutputFormat::Mp3 => encode_mp3(temp, rate, channels, buf),
         AudioOutputFormat::Aac => encode_aac(temp, rate, channels, buf),
         AudioOutputFormat::M4a => encode_m4a(temp, rate, channels, buf),
-        AudioOutputFormat::Alac => encode_alac(temp, rate, channels, buf),
+        AudioOutputFormat::Alac => encode_alac(temp, rate, channels, buf, batch_workers),
         AudioOutputFormat::Aiff => encode_aiff(temp, rate, channels, bits, buf),
     })
 }
@@ -1853,6 +1862,8 @@ pub fn execute_audio_batch(plan: &AudioBatchPlan) -> Result<AudioConversionRepor
     let input_total = AtomicU64::new(0);
     let output_total = AtomicU64::new(0);
     let worker_count = resolve_worker_count(items, plan.effective_workers().get())?;
+    // Idle workers must not shrink the inner-encoder budget of the active files.
+    let active_workers = worker_count.min(items.len());
 
     thread::scope(|scope| {
         let mut handles = Vec::with_capacity(worker_count);
@@ -1875,7 +1886,7 @@ pub fn execute_audio_batch(plan: &AudioBatchPlan) -> Result<AudioConversionRepor
                         }
                         let index = next.fetch_add(1, Ordering::Relaxed);
                         let Some(item) = items.get(index) else { break };
-                        match convert_item(item, plan.mode(), &mut buffer, worker_count) {
+                        match convert_item(item, plan.mode(), &mut buffer, active_workers) {
                             Ok((in_bytes, out_bytes)) => {
                                 input_total.fetch_add(in_bytes, Ordering::Relaxed);
                                 output_total.fetch_add(out_bytes, Ordering::Relaxed);
@@ -2739,6 +2750,195 @@ mod tests {
             fastconv_domain::AudioExecutionMode::CpuOgg,
             AudioInputFormat::Vorbis,
         )
+    }
+
+    fn ogg_packets(path: &Path) -> Result<Vec<ogg::Packet>, PipelineError> {
+        let file = File::open(path).map_err(|source| PipelineError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let mut reader = ogg::reading::PacketReader::new(file);
+        let mut packets = Vec::new();
+        loop {
+            match reader.read_packet() {
+                Ok(Some(packet)) => packets.push(packet),
+                Ok(None) => break,
+                Err(err) => {
+                    return Err(PipelineError::DecodeFailed {
+                        path: path.to_path_buf(),
+                        reason: format!("invalid Ogg page: {err}"),
+                    });
+                }
+            }
+        }
+        Ok(packets)
+    }
+
+    fn best_snr_db(reference: &[f32], decoded: &[f32], max_lag: isize, channels: usize) -> f64 {
+        // Interleaved samples carry channel identity in index parity, so only
+        // whole-frame shifts may be searched. Odd shifts would line a channel up
+        // with its neighbour and let swapped stereo pass the fidelity check.
+        let channels = isize::try_from(channels.max(1)).unwrap_or(1);
+        let max_frames = max_lag / channels;
+        let count = 4096.min(reference.len()).min(decoded.len());
+        let mut best = f64::NEG_INFINITY;
+        for frame_lag in -max_frames..=max_frames {
+            let lag = frame_lag.saturating_mul(channels);
+            let mut signal = 0.0_f64;
+            let mut error = 0.0_f64;
+            for (index, &decoded_value) in decoded.iter().enumerate().take(count) {
+                let decoded_index = isize::try_from(index).unwrap_or(isize::MAX) + max_lag;
+                let reference_index = decoded_index + lag;
+                if reference_index < 0 {
+                    continue;
+                }
+                let Ok(reference_index) = usize::try_from(reference_index) else {
+                    continue;
+                };
+                let Some(&original) = reference.get(reference_index) else {
+                    break;
+                };
+                let value = f64::from(decoded_value);
+                signal += f64::from(original) * f64::from(original);
+                let delta = value - f64::from(original);
+                error += delta * delta;
+            }
+            if error > 0.0 && signal > 0.0 {
+                best = best.max(10.0 * (signal / error).log10());
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn ogg_stereo_roundtrip_has_valid_ogg_paging() -> Result<(), PipelineError> {
+        const FRAMES: usize = 16_384;
+        let dir = temp_dir("ogg-stereo-paging");
+        let ogg = dir.join("out.ogg");
+        // Smooth parabolic sweeps, as used by the benchmark fixture, keep the
+        // fidelity assertion meaningful for a q4-class Vorbis encoder.
+        let parabolic = |phase: u16| -> i64 {
+            let signed = i64::from(phase) - 32_768;
+            let abs = signed.abs();
+            (signed * (32_768 - abs)) >> 14
+        };
+        let mut phase_l = 0_u16;
+        let mut phase_r = 8_192_u16;
+        let samples: Vec<i16> = (0..FRAMES)
+            .flat_map(|_| {
+                phase_l = phase_l.wrapping_add(300);
+                phase_r = phase_r.wrapping_add(450);
+                [
+                    i16::try_from(parabolic(phase_l)).unwrap_or(0),
+                    i16::try_from(parabolic(phase_r)).unwrap_or(0),
+                ]
+            })
+            .collect();
+        let mut encoder_buf = AudioWorkerBuffer::new();
+        encoder_buf
+            .samples_f32
+            .extend(samples.iter().map(|&value| f32::from(value) / 32_768.0));
+        encode_ogg(&ogg, 48_000, 2, &mut encoder_buf)?;
+
+        let packets = ogg_packets(&ogg)?;
+        assert!(packets.len() > 4, "expected ident/comment/setup and audio");
+        assert!(packets[0].first_in_stream() && packets[0].last_in_page());
+        assert_eq!(packets[0].absgp_page(), 0);
+        assert_ne!(packets[0].stream_serial(), 0, "Ogg serial must be non-zero");
+        assert_eq!(packets[0].data.first().copied(), Some(1), "ident header");
+        assert_eq!(packets[1].data.first().copied(), Some(3), "comment header");
+        assert!(!packets[1].last_in_page(), "comment shares the setup page");
+        assert!(packets[2].last_in_page(), "setup ends its page");
+        assert_eq!(packets[2].absgp_page(), 0);
+        let mut previous_granule = 0_u64;
+        for packet in packets.iter().skip(3) {
+            assert_eq!(packet.stream_serial(), packets[0].stream_serial());
+            assert!(
+                packet.absgp_page() >= previous_granule,
+                "Ogg granules must not decrease"
+            );
+            previous_granule = packet.absgp_page();
+        }
+        assert!(packets.last().is_some_and(ogg::Packet::last_in_stream));
+        assert_eq!(previous_granule, u64::try_from(FRAMES).unwrap_or(u64::MAX));
+
+        let mut decoded_buf = AudioWorkerBuffer::new();
+        let (rate, channels, _) = decode_symphonia(
+            &ogg,
+            AudioInputFormat::Vorbis,
+            AudioOutputFormat::Wav,
+            &mut decoded_buf,
+        )?;
+        assert_eq!(rate, 48_000);
+        assert_eq!(channels, 2);
+        assert_eq!(decoded_buf.samples_f32.len() / channels, FRAMES);
+        assert!(
+            decoded_buf
+                .samples_f32
+                .iter()
+                .all(|value| value.is_finite() && value.abs() <= 1.05),
+            "decoded Vorbis samples must be finite and unclipped"
+        );
+        let snr = best_snr_db(
+            &encoder_buf.samples_f32,
+            &decoded_buf.samples_f32,
+            2048,
+            channels,
+        );
+        assert!(snr > 25.0, "Vorbis q4 SNR too low: {snr:.1} dB");
+
+        // Negative control: swapping left/right must not pass, because a whole-frame
+        // lag keeps each decoded sample on its original channel.
+        let swapped: Vec<f32> = encoder_buf
+            .samples_f32
+            .chunks_exact(channels)
+            .flat_map(|frame| [frame[1], frame[0]])
+            .collect();
+        let swapped_snr = best_snr_db(&swapped, &decoded_buf.samples_f32, 2048, channels);
+        assert!(
+            swapped_snr < 25.0,
+            "swapped stereo placement must be rejected: {swapped_snr:.1} dB"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn ogg_mono_and_short_audio_use_the_plain_vorbis_path() -> Result<(), PipelineError> {
+        let dir = temp_dir("ogg-fallback");
+        let mono = dir.join("mono.ogg");
+        let mut mono_buf = AudioWorkerBuffer::new();
+        mono_buf
+            .samples_f32
+            .extend(tone(8_192, 1).iter().map(|&v| f32::from(v) / 32_768.0));
+        encode_ogg(&mono, 48_000, 1, &mut mono_buf)?;
+        let mut decoded = AudioWorkerBuffer::new();
+        let (rate, channels, _) = decode_symphonia(
+            &mono,
+            AudioInputFormat::Vorbis,
+            AudioOutputFormat::Wav,
+            &mut decoded,
+        )?;
+        assert_eq!((rate, channels), (48_000, 1));
+        assert_ne!(decoded.samples_f32.len(), 0);
+
+        let short = dir.join("short.ogg");
+        let mut short_buf = AudioWorkerBuffer::new();
+        short_buf
+            .samples_f32
+            .extend(tone(2_048, 2).iter().map(|&v| f32::from(v) / 32_768.0));
+        encode_ogg(&short, 48_000, 2, &mut short_buf)?;
+        let mut decoded_short = AudioWorkerBuffer::new();
+        let (rate, channels, _) = decode_symphonia(
+            &short,
+            AudioInputFormat::Vorbis,
+            AudioOutputFormat::Wav,
+            &mut decoded_short,
+        )?;
+        assert_eq!((rate, channels), (48_000, 2));
+        assert_ne!(decoded_short.samples_f32.len(), 0);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[test]

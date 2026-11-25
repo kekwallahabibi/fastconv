@@ -1907,19 +1907,17 @@ mod tests {
         let bpp = if with_alpha { 4_usize } else { 3_usize };
         let len = usize::try_from(width * height).unwrap_or(0) * bpp;
         let pixels = vec![180_u8; len];
-        let cfg = if lossless {
-            zenwebp::EncoderConfig::new_lossless()
+        let layout = if with_alpha {
+            zenwebp::PixelLayout::Rgba8
         } else {
-            zenwebp::EncoderConfig::new().quality(80.0)
+            zenwebp::PixelLayout::Rgb8
         };
-        let encoded = if with_alpha {
-            zenwebp::Encoder::new_rgba(&pixels, width, height)
-                .config(cfg)
-                .encode()
+        let encoded = if lossless {
+            let config = zenwebp::LosslessConfig::new();
+            zenwebp::EncodeRequest::lossless(&config, &pixels, layout, width, height).encode()
         } else {
-            zenwebp::Encoder::new_rgb(&pixels, width, height)
-                .config(cfg)
-                .encode()
+            let config = zenwebp::LossyConfig::new().with_quality(80.0);
+            zenwebp::EncodeRequest::lossy(&config, &pixels, layout, width, height).encode()
         }
         .map_err(|err| ProbeError::InvalidImage {
             path: path.to_path_buf(),

@@ -8,6 +8,9 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
 
 use fastconv_domain::{VideoCodec, VideoEncodeMode, VideoQuality};
 use rav1d_safe::src::managed::{Decoder as Av1Decoder, PixelLayout, Planes as Av1Planes};
@@ -1895,6 +1898,151 @@ fn quality_to_vp9_qindex(quality: VideoQuality) -> u32 {
         .clamp(8, 208)
 }
 
+/// One H.264 access unit paired with its keyframe flag.
+type H264Units = Vec<(Vec<u8>, bool)>;
+
+fn h264_access_units(annex_b: &[u8]) -> H264Units {
+    split_annex_b_access_units(annex_b, false)
+        .into_iter()
+        .map(|data| {
+            let keyframe = is_h264_keyframe_annex_b(&data);
+            (data, keyframe)
+        })
+        .collect()
+}
+
+/// Encodes independent GOPs concurrently. Every worker owns its encoder but
+/// only borrows the source frames, so no plane data is cloned. GOPs are
+/// collected back into display order before muxing. The scoped worker body,
+/// error collection and ordered reassembly belong together: splitting them
+/// would obscure the zero-copy borrow and the join-before-drain lifecycle.
+#[allow(clippy::too_many_lines)]
+fn cpu_h264_parallel_gops(
+    path: &Path,
+    frames: &[Yuv420Frame],
+    w: usize,
+    h: usize,
+    gop_size: usize,
+    config: &H264EncoderConfig,
+) -> Result<Vec<(Vec<u8>, bool)>, PipelineError> {
+    let gop_count = frames.len().div_ceil(gop_size);
+    let workers = thread::available_parallelism()
+        .unwrap_or(NonZeroUsize::MIN)
+        .get()
+        .min(gop_count)
+        .min(8);
+    let (tx, rx) = mpsc::channel::<(usize, H264Units)>();
+    let next_gop = AtomicUsize::new(0);
+
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let next_gop = &next_gop;
+            let worker_config = config.clone();
+            handles.push(
+                thread::Builder::new()
+                    .name("fastconv-h264-gop".to_owned())
+                    .spawn_scoped(scope, move || -> Result<(), PipelineError> {
+                        loop {
+                            let gop = next_gop.fetch_add(1, Ordering::Relaxed);
+                            if gop >= gop_count {
+                                return Ok(());
+                            }
+                            let start = gop.saturating_mul(gop_size);
+                            let end = start.saturating_add(gop_size).min(frames.len());
+                            let slice = &frames[start..end];
+                            let mut encoder = H264Encoder::new(worker_config.clone())
+                                .map_err(|err| encode_error(path, format!("{err}")))?;
+                            let mut annex_b = Vec::new();
+                            for frame in slice {
+                                let planes =
+                                    H264YuvPlanes::tight(w, h, &frame.y, &frame.u, &frame.v)
+                                        .ok_or_else(|| {
+                                            encode_error(
+                                                path,
+                                                "invalid H.264 source frame geometry",
+                                            )
+                                        })?;
+                                annex_b.extend_from_slice(
+                                    &encoder.encode_planes(&planes).map_err(|err| {
+                                        encode_error(path, format!("H.264 encode failed: {err}"))
+                                    })?,
+                                );
+                            }
+                            annex_b.extend_from_slice(&encoder.flush());
+                            let units = h264_access_units(&annex_b);
+                            if units.len() != slice.len() {
+                                return Err(encode_error(
+                                    path,
+                                    format!(
+                                        "H.264 GOP {gop} produced {} access units for {} frames",
+                                        units.len(),
+                                        slice.len()
+                                    ),
+                                ));
+                            }
+                            if !units.first().is_some_and(|(_, keyframe)| *keyframe) {
+                                return Err(encode_error(
+                                    path,
+                                    format!("H.264 GOP {gop} did not start with an IDR keyframe"),
+                                ));
+                            }
+                            tx.send((gop, units))
+                                .map_err(|_| PipelineError::WorkerPanicked)?;
+                        }
+                    })
+                    .map_err(PipelineError::WorkerStartFailed)?,
+            );
+        }
+        drop(tx);
+
+        let mut worker_error = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    if worker_error.is_none() {
+                        worker_error = Some(err);
+                    }
+                }
+                Err(_) => {
+                    if worker_error.is_none() {
+                        worker_error = Some(PipelineError::WorkerPanicked);
+                    }
+                }
+            }
+        }
+        if let Some(err) = worker_error {
+            return Err(err);
+        }
+
+        let mut ordered: Vec<Option<H264Units>> = (0..gop_count).map(|_| None).collect();
+        for (gop, units) in rx {
+            if gop < gop_count {
+                ordered[gop] = Some(units);
+            }
+        }
+        let mut result = Vec::with_capacity(frames.len());
+        for (gop, units) in ordered.into_iter().enumerate() {
+            let units = units
+                .ok_or_else(|| encode_error(path, format!("H.264 GOP {gop} produced no output")))?;
+            result.extend(units);
+        }
+        if result.len() != frames.len() {
+            return Err(encode_error(
+                path,
+                format!(
+                    "H.264 produced {} access units for {} frames",
+                    result.len(),
+                    frames.len()
+                ),
+            ));
+        }
+        Ok(result)
+    })
+}
+
 fn cpu_h264(
     path: &Path,
     frames: &[Yuv420Frame],
@@ -1910,7 +2058,10 @@ fn cpu_h264(
     let mut config = H264EncoderConfig::new(w, h);
     config.qp = quality_to_h264_qp(quality);
     config.preset = H264Preset::Fast;
-    config.gop_size = 60;
+    // One-second keyframe interval, bounded so low/high frame rates stay sane.
+    let fps_rounded = fps_num.div_ceil(fps_den.max(1));
+    let gop_size = fps_rounded.clamp(15, 60);
+    config.gop_size = gop_size;
     // Frame rates from packet durations are small; f32 is the encoder's field type.
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     let framerate = (f64::from(fps_num) / f64::from(fps_den.max(1))) as f32;
@@ -1919,26 +2070,26 @@ fn cpu_h264(
     config.lookahead = 0;
     config.scenecut = 0;
     config.mbtree = false;
-    let mut encoder =
-        H264Encoder::new(config).map_err(|err| encode_error(path, format!("{err}")))?;
-    let mut annex_b = Vec::new();
-    for frame in frames {
-        let planes = H264YuvPlanes::tight(w, h, &frame.y, &frame.u, &frame.v)
-            .ok_or_else(|| encode_error(path, "invalid H.264 source frame geometry"))?;
-        annex_b.extend_from_slice(
-            &encoder
-                .encode_planes(&planes)
-                .map_err(|err| encode_error(path, format!("H.264 encode failed: {err}")))?,
-        );
-    }
-    annex_b.extend_from_slice(&encoder.flush());
-    let units = split_annex_b_access_units(&annex_b, false)
-        .into_iter()
-        .map(|data| {
-            let keyframe = is_h264_keyframe_annex_b(&data);
-            (data, keyframe)
-        })
-        .collect();
+
+    let gop_len = usize::try_from(gop_size).unwrap_or(usize::MAX);
+    let units = if frames.len() > gop_len {
+        cpu_h264_parallel_gops(path, frames, w, h, gop_len, &config)?
+    } else {
+        let mut encoder =
+            H264Encoder::new(config).map_err(|err| encode_error(path, format!("{err}")))?;
+        let mut annex_b = Vec::new();
+        for frame in frames {
+            let planes = H264YuvPlanes::tight(w, h, &frame.y, &frame.u, &frame.v)
+                .ok_or_else(|| encode_error(path, "invalid H.264 source frame geometry"))?;
+            annex_b.extend_from_slice(
+                &encoder
+                    .encode_planes(&planes)
+                    .map_err(|err| encode_error(path, format!("H.264 encode failed: {err}")))?,
+            );
+        }
+        annex_b.extend_from_slice(&encoder.flush());
+        h264_access_units(&annex_b)
+    };
     make_stream(
         path,
         track_index,
@@ -2241,6 +2392,54 @@ mod tests {
             64,
             48,
         )
+    }
+
+    #[test]
+    fn h264_parallel_gops_preserve_count_cadence_and_sps_pps() -> Result<(), PipelineError> {
+        let path = Path::new("h264-parallel-gop");
+        let frames = synthetic_frames(32, 24, 70);
+        // 15 fps -> a one-second, 15-frame GOP, so 70 frames span five GOPs.
+        let stream = cpu_h264(path, &frames, VideoQuality::DEFAULT, 0, 15, 1)?;
+        assert_eq!(
+            stream.packets.len(),
+            frames.len(),
+            "one packet per source frame"
+        );
+        assert!(
+            !stream.track.config.is_empty(),
+            "the first parallel GOP must contribute an avcC record"
+        );
+        for (index, packet) in stream.packets.iter().enumerate() {
+            assert_eq!(
+                packet.keyframe,
+                index % 15 == 0,
+                "keyframe cadence broke at frame {index}"
+            );
+            assert!(!packet.data.is_empty(), "empty access unit at {index}");
+        }
+        let decoded = decode_video_track(path, &stream.track, &stream.packets)?;
+        assert_eq!(
+            decoded.len(),
+            frames.len(),
+            "every independently encoded GOP must decode"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn h264_parallel_gops_with_higher_fps() -> Result<(), PipelineError> {
+        let path = Path::new("h264-parallel-gop-60");
+        let frames = synthetic_frames(32, 24, 130);
+        let stream = cpu_h264(path, &frames, VideoQuality::DEFAULT, 0, 60, 1)?;
+        assert_eq!(stream.packets.len(), frames.len());
+        for (index, packet) in stream.packets.iter().enumerate() {
+            assert_eq!(
+                packet.keyframe,
+                index % 60 == 0,
+                "keyframe cadence broke at frame {index}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

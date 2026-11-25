@@ -6,7 +6,10 @@ license.workspace = true
 
 [features]
 default = []
-nvenc = ["dep:cudarc", "dep:nvidia-video-codec-sdk"]
+nvenc = ["dep:cudarc", "dep:libloading", "dep:nvidia-video-codec-sdk"]
+
+[dev-dependencies]
+ogg.workspace = true
 
 [dependencies]
 alac-encoder.workspace = true
@@ -18,6 +21,7 @@ hound.workspace = true
 jpeg-encoder.workspace = true
 jxl.workspace = true
 jixel.workspace = true
+libloading = { workspace = true, optional = true }
 nvidia-video-codec-sdk = { workspace = true, optional = true }
 opus-pure.workspace = true
 png.workspace = true
@@ -40,6 +44,7 @@ zenavif.workspace = true
 zenavif-parse.workspace = true
 zenwebp.workspace = true
 zune-jpeg.workspace = true
+yuv.workspace = true
 
 [lints.rust]
 # Default builds enforce `#![forbid(unsafe_code)]` via `src/lib.rs`.

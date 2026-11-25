@@ -1,5 +1,7 @@
+#[cfg(test)]
 use std::io::Write;
 use std::path::Path;
+use std::sync::{Condvar, Mutex};
 
 use crate::PipelineError;
 use crate::decode::{DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat};
@@ -7,9 +9,103 @@ use crate::decode::{DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat};
 const BMP_FILE_HEADER_LEN: usize = 14;
 const BMP_INFO_HEADER_LEN: usize = 40;
 const BMP_V4_HEADER_LEN: usize = 108;
-// Flush BMP scanlines in 2 MiB contiguous chunks directly to the OS file handle so
-// parallel workers avoid both BufWriter double-copies and filesystem extent contention.
-const BMP_BATCH_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+
+// WHY: each worker keeps its fully prepared BMP in a reusable scratch Vec until
+// the next item overwrites it, so the write mutex does not bound output memory.
+// Eight 8192x8192 BGRA frames would retain ~2 GiB on top of the decoded pixels.
+// Cap the aggregate at two such frames: ordinary frames never contend, while a
+// pathological batch serializes instead of exhausting RAM.
+const BMP_FRAME_BUFFER_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+// Allocator round-up in a reused Vec is negligible; only reclaim genuinely stale
+// allocations so the steady-state path never reallocates for a few spare bytes.
+const BMP_FRAME_SCRATCH_SLACK_BYTES: usize = 1024 * 1024;
+
+static BMP_FRAME_BUFFER_RESERVED: Mutex<usize> = Mutex::new(0);
+static BMP_FRAME_BUFFER_FREED: Condvar = Condvar::new();
+
+/// Reusable BMP frame buffer whose process-wide budget reservation is owned by
+/// the allocation it guards. Dropping the scratch (sequential batch end, worker
+/// exit, or error unwind) returns the budget; tying it to a thread instead would
+/// let a stale reservation survive into the next batch and deadlock other workers.
+pub(crate) struct BmpFrameScratch {
+    bytes: Vec<u8>,
+    reserved_bytes: usize,
+}
+
+impl BmpFrameScratch {
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            reserved_bytes: 0,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Reserves `total_bytes` of the process-wide BMP scratch budget before growing
+    /// the reusable allocation. Any previous reservation held by this scratch is
+    /// released first: the buffer is still live here, and this is the only place
+    /// we can observe that the earlier frame has been consumed.
+    fn reserve(&mut self, total_bytes: usize) -> Result<(), PipelineError> {
+        if self.bytes.capacity().saturating_sub(total_bytes) > BMP_FRAME_SCRATCH_SLACK_BYTES {
+            // A prior frame left a much larger allocation behind; return it before
+            // reserving again so the steady-state path keeps its reusable buffer.
+            self.bytes.clear();
+            self.bytes.shrink_to(total_bytes);
+        }
+        self.release();
+
+        let mut reserved = BMP_FRAME_BUFFER_RESERVED
+            .lock()
+            .map_err(|_| PipelineError::WorkerPanicked)?;
+        loop {
+            let current = *reserved;
+            // A single frame larger than the budget still has to run; let it take the
+            // budget exclusively instead of waiting forever for other workers.
+            if current == 0 || current.saturating_add(total_bytes) <= BMP_FRAME_BUFFER_BUDGET_BYTES
+            {
+                break;
+            }
+            reserved = BMP_FRAME_BUFFER_FREED
+                .wait(reserved)
+                .map_err(|_| PipelineError::WorkerPanicked)?;
+        }
+        *reserved = reserved.saturating_add(total_bytes);
+        drop(reserved);
+
+        self.reserved_bytes = total_bytes;
+        Ok(())
+    }
+
+    fn release(&mut self) {
+        let bytes = std::mem::replace(&mut self.reserved_bytes, 0);
+        if bytes == 0 {
+            return;
+        }
+        let mut reserved = BMP_FRAME_BUFFER_RESERVED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *reserved = reserved.saturating_sub(bytes);
+        drop(reserved);
+        BMP_FRAME_BUFFER_FREED.notify_all();
+    }
+}
+
+impl Default for BmpFrameScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for BmpFrameScratch {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
 
 #[inline]
 const fn is_contiguous_mask(mask: u32) -> bool {
@@ -36,6 +132,7 @@ fn swizzle_rgb24_to_bgr24(src_row: &[u8], dst_row: &mut [u8]) {
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn flush_slice<W: Write>(target: &Path, bytes: &[u8], writer: &mut W) -> Result<(), PipelineError> {
     if !bytes.is_empty() {
@@ -49,14 +146,18 @@ fn flush_slice<W: Write>(target: &Path, bytes: &[u8], writer: &mut W) -> Result<
     Ok(())
 }
 
-/// Streams decoded 8-bit pixels as a spec-compliant BMP directly into `writer` using a
-/// single reusable scanline buffer (`row_scratch`) to minimize memory overhead.
-pub(crate) fn encode_bmp_to_writer<W: Write>(
+/// Builds a complete, contiguous BMP (header + bottom-up scanlines) in `frame`.
+///
+/// This is deliberately independent of any sink: callers may prepare frames in
+/// parallel and hand the finished bytes to one serialized writer, so no filesystem
+/// contention slows down parallel decoding or swizzling. A process-wide budget
+/// bounds the full-frame buffers retained across all workers; frames that exceed
+/// it wait here (before allocating) until an earlier frame buffer is reused.
+pub(crate) fn encode_bmp_into_frame(
     target: &Path,
     pixels: &[u8],
     decoded: DecodedFrameMeta,
-    row_scratch: &mut Vec<u8>,
-    writer: &mut W,
+    frame: &mut BmpFrameScratch,
 ) -> Result<u64, PipelineError> {
     let width_i32 = i32::try_from(decoded.width).map_err(|_| PipelineError::EncodeFailed {
         path: target.to_path_buf(),
@@ -76,61 +177,48 @@ pub(crate) fn encode_bmp_to_writer<W: Write>(
     })?;
 
     match decoded.format {
-        DecodedPixelFormat::Rgb8 => encode_bmp_rgb24(
-            target,
-            pixels,
-            width,
-            height,
-            width_i32,
-            height_i32,
-            row_scratch,
-            writer,
-        ),
+        DecodedPixelFormat::Rgb8 => {
+            encode_bmp_rgb24(target, pixels, width, height, width_i32, height_i32, frame)
+        }
         DecodedPixelFormat::Rgba8 => encode_bmp_bgra32(
-            target,
-            pixels,
-            width,
-            height,
-            width_i32,
-            height_i32,
-            false,
-            row_scratch,
-            writer,
+            target, pixels, width, height, width_i32, height_i32, false, frame,
         ),
-        DecodedPixelFormat::L8 => encode_bmp_gray8(
-            target,
-            pixels,
-            width,
-            height,
-            width_i32,
-            height_i32,
-            row_scratch,
-            writer,
-        ),
+        DecodedPixelFormat::L8 => {
+            encode_bmp_gray8(target, pixels, width, height, width_i32, height_i32, frame)
+        }
         DecodedPixelFormat::La8 => encode_bmp_bgra32(
-            target,
-            pixels,
-            width,
-            height,
-            width_i32,
-            height_i32,
-            true,
-            row_scratch,
-            writer,
+            target, pixels, width, height, width_i32, height_i32, true, frame,
         ),
     }
 }
 
+/// Test helper: writes a complete BMP frame into `writer`.
+#[cfg(test)]
+fn encode_bmp_to_writer<W: Write>(
+    target: &Path,
+    pixels: &[u8],
+    decoded: DecodedFrameMeta,
+    frame: &mut BmpFrameScratch,
+    writer: &mut W,
+) -> Result<u64, PipelineError> {
+    let bytes = encode_bmp_into_frame(target, pixels, decoded, frame)?;
+    let len = usize::try_from(bytes).map_err(|_| PipelineError::EncodeFailed {
+        path: target.to_path_buf(),
+        reason: "BMP encoded size exceeds addressable memory".to_owned(),
+    })?;
+    flush_slice(target, &frame.bytes()[..len], writer)?;
+    Ok(bytes)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn encode_bmp_rgb24<W: Write>(
+fn encode_bmp_rgb24(
     target: &Path,
     pixels: &[u8],
     width: usize,
     height: usize,
     width_i32: i32,
     height_i32: i32,
-    row_scratch: &mut Vec<u8>,
-    writer: &mut W,
+    frame: &mut BmpFrameScratch,
 ) -> Result<u64, PipelineError> {
     let src_row_bytes = width
         .checked_mul(3)
@@ -191,32 +279,28 @@ fn encode_bmp_rgb24<W: Write>(
     header[26..28].copy_from_slice(&1_u16.to_le_bytes());
     header[28..30].copy_from_slice(&24_u16.to_le_bytes());
     header[34..38].copy_from_slice(&image_size_u32.to_le_bytes());
-    let batch_cap = total_bytes.min(BMP_BATCH_BUFFER_BYTES.max(header_len + row_stride));
-    if row_scratch.len() < batch_cap {
-        row_scratch.resize(batch_cap, 0);
+    frame.reserve(total_bytes)?;
+    if frame.bytes.len() < total_bytes {
+        frame.bytes.resize(total_bytes, 0);
     }
-    let buf = &mut row_scratch[..batch_cap];
+    let buf = &mut frame.bytes[..total_bytes];
     buf[..header_len].copy_from_slice(&header);
     let mut cursor = header_len;
 
     for row in pixels.chunks_exact(src_row_bytes).rev() {
-        if cursor + row_stride > batch_cap {
-            flush_slice(target, &buf[..cursor], writer)?;
-            cursor = 0;
-        }
         swizzle_rgb24_to_bgr24(row, &mut buf[cursor..cursor + src_row_bytes]);
         if row_stride > src_row_bytes {
             buf[cursor + src_row_bytes..cursor + row_stride].fill(0);
         }
         cursor += row_stride;
     }
-    flush_slice(target, &buf[..cursor], writer)?;
+    debug_assert_eq!(cursor, total_bytes);
 
     Ok(u64::from(file_size_u32))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_bmp_bgra32<W: Write>(
+fn encode_bmp_bgra32(
     target: &Path,
     pixels: &[u8],
     width: usize,
@@ -224,8 +308,7 @@ fn encode_bmp_bgra32<W: Write>(
     width_i32: i32,
     height_i32: i32,
     from_la8: bool,
-    row_scratch: &mut Vec<u8>,
-    writer: &mut W,
+    frame: &mut BmpFrameScratch,
 ) -> Result<u64, PipelineError> {
     let src_bpp = if from_la8 { 2_usize } else { 4_usize };
     let src_row_bytes = width
@@ -299,19 +382,15 @@ fn encode_bmp_bgra32<W: Write>(
     header[62..66].copy_from_slice(&0x0000_00FF_u32.to_le_bytes()); // B
     header[66..70].copy_from_slice(&0xFF00_0000_u32.to_le_bytes()); // A
     header[70..74].copy_from_slice(b"BGRs"); // LCS_sRGB
-    let batch_cap = total_bytes.min(BMP_BATCH_BUFFER_BYTES.max(header_len + row_stride));
-    if row_scratch.len() < batch_cap {
-        row_scratch.resize(batch_cap, 0);
+    frame.reserve(total_bytes)?;
+    if frame.bytes.len() < total_bytes {
+        frame.bytes.resize(total_bytes, 0);
     }
-    let buf = &mut row_scratch[..batch_cap];
+    let buf = &mut frame.bytes[..total_bytes];
     buf[..header_len].copy_from_slice(&header);
     let mut cursor = header_len;
 
     for row in pixels.chunks_exact(src_row_bytes).rev() {
-        if cursor + row_stride > batch_cap {
-            flush_slice(target, &buf[..cursor], writer)?;
-            cursor = 0;
-        }
         let (dst_quads, _) = buf[cursor..cursor + row_stride].as_chunks_mut::<4>();
         if from_la8 {
             let (src_pairs, _) = row.as_chunks::<2>();
@@ -326,21 +405,20 @@ fn encode_bmp_bgra32<W: Write>(
         }
         cursor += row_stride;
     }
-    flush_slice(target, &buf[..cursor], writer)?;
+    debug_assert_eq!(cursor, total_bytes);
 
     Ok(u64::from(file_size_u32))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_bmp_gray8<W: Write>(
+fn encode_bmp_gray8(
     target: &Path,
     pixels: &[u8],
     width: usize,
     height: usize,
     width_i32: i32,
     height_i32: i32,
-    row_scratch: &mut Vec<u8>,
-    writer: &mut W,
+    frame: &mut BmpFrameScratch,
 ) -> Result<u64, PipelineError> {
     let expected_len = width
         .checked_mul(height)
@@ -397,11 +475,11 @@ fn encode_bmp_gray8<W: Write>(
     header[28..30].copy_from_slice(&8_u16.to_le_bytes());
     header[34..38].copy_from_slice(&image_size_u32.to_le_bytes());
     header[46..50].copy_from_slice(&256_u32.to_le_bytes());
-    let batch_cap = total_bytes.min(BMP_BATCH_BUFFER_BYTES.max(pixel_offset + row_stride));
-    if row_scratch.len() < batch_cap {
-        row_scratch.resize(batch_cap, 0);
+    frame.reserve(total_bytes)?;
+    if frame.bytes.len() < total_bytes {
+        frame.bytes.resize(total_bytes, 0);
     }
-    let buf = &mut row_scratch[..batch_cap];
+    let buf = &mut frame.bytes[..total_bytes];
     let header_len = BMP_FILE_HEADER_LEN + BMP_INFO_HEADER_LEN;
     buf[..header_len].copy_from_slice(&header);
     for i in 0_usize..256 {
@@ -416,17 +494,13 @@ fn encode_bmp_gray8<W: Write>(
     let mut cursor = pixel_offset;
 
     for row in pixels.chunks_exact(width).rev() {
-        if cursor + row_stride > batch_cap {
-            flush_slice(target, &buf[..cursor], writer)?;
-            cursor = 0;
-        }
         buf[cursor..cursor + width].copy_from_slice(row);
         if row_stride > width {
             buf[cursor + width..cursor + row_stride].fill(0);
         }
         cursor += row_stride;
     }
-    flush_slice(target, &buf[..cursor], writer)?;
+    debug_assert_eq!(cursor, total_bytes);
 
     Ok(u64::from(file_size_u32))
 }
@@ -1231,7 +1305,7 @@ fn decode_bmp_indexed(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_bmp_slice_into, encode_bmp_to_writer};
+    use super::{BmpFrameScratch, decode_bmp_slice_into, encode_bmp_to_writer};
     use crate::decode::{DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat};
     use std::path::Path;
 
@@ -1251,7 +1325,7 @@ mod tests {
             }
         }
 
-        let mut row_scratch = Vec::new();
+        let mut row_scratch = BmpFrameScratch::new();
         let mut encoded = Vec::new();
         let written = encode_bmp_to_writer(
             p,

@@ -77,7 +77,6 @@ mod enabled {
     /// cannot be used here despite being safe.
     struct DeviceBuffer {
         ptr: sys::CUdeviceptr,
-        len: usize,
         ctx: Arc<CudaContext>,
     }
 
@@ -100,7 +99,6 @@ mod enabled {
             })?;
             let buffer = Self {
                 ptr,
-                len,
                 ctx: Arc::clone(ctx),
             };
             // SAFETY: `ptr` is a fresh `cuMemAlloc` allocation of `len` bytes.
@@ -115,10 +113,6 @@ mod enabled {
 
         fn ptr(&self) -> sys::CUdeviceptr {
             self.ptr
-        }
-
-        fn len(&self) -> usize {
-            self.len
         }
     }
 
@@ -1383,25 +1377,44 @@ mod enabled {
         }
     }
 
-    struct RawMappedResource<'a> {
+    /// A CUDA device pointer registered once for the lifetime of the session.
+    ///
+    /// Registration is expensive, so all NVENC ring slots are registered at
+    /// session init and reused; only the lightweight map/unmap pair is per frame.
+    struct RawRegisteredResource<'a> {
         reg_ptr: *mut c_void,
+        encoder_ptr: *mut c_void,
+        _session: std::marker::PhantomData<&'a RawNvencSession>,
+    }
+
+    impl Drop for RawRegisteredResource<'_> {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            // SAFETY: all mappings borrow this registration and drop first.
+            if !self.reg_ptr.is_null() {
+                let _unreg =
+                    unsafe { (ENCODE_API.unregister_resource)(self.encoder_ptr, self.reg_ptr) };
+            }
+        }
+    }
+
+    /// A short-lived mapping of a registered slot, held only from `encode_picture`
+    /// until the matching output bitstream has been drained. Unmapping before a
+    /// CUDA copy reuses the slot prevents NVENC from reading a surface being written.
+    struct RawMappedResource<'a> {
         map_ptr: *mut c_void,
         pitch: u32,
         encoder_ptr: *mut c_void,
-        _session: std::marker::PhantomData<&'a RawNvencSession>,
+        _registered: &'a RawRegisteredResource<'a>,
     }
 
     impl Drop for RawMappedResource<'_> {
         #[allow(unsafe_code)]
         fn drop(&mut self) {
-            // SAFETY: unmap before unregister while `encoder_ptr` is still alive.
+            // SAFETY: unmapping while the encoder and registration are alive.
             if !self.map_ptr.is_null() {
                 let _unmap =
                     unsafe { (ENCODE_API.unmap_input_resource)(self.encoder_ptr, self.map_ptr) };
-            }
-            if !self.reg_ptr.is_null() {
-                let _unreg =
-                    unsafe { (ENCODE_API.unregister_resource)(self.encoder_ptr, self.reg_ptr) };
             }
         }
     }
@@ -1440,7 +1453,7 @@ mod enabled {
             &self,
             resource_ptr: *mut c_void,
             pitch: u32,
-        ) -> Result<RawMappedResource<'_>, PipelineError> {
+        ) -> Result<RawRegisteredResource<'_>, PipelineError> {
             let mut reg_params = NV_ENC_REGISTER_RESOURCE {
                 version: NV_ENC_REGISTER_RESOURCE_VER,
                 resourceType: NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
@@ -1456,31 +1469,36 @@ mod enabled {
                 unsafe { (ENCODE_API.register_resource)(self.encoder.ptr, &raw mut reg_params) },
                 "failed to register NVENC CUDA device buffer",
             )?;
-            let reg_ptr = reg_params.registeredResource;
+            Ok(RawRegisteredResource {
+                reg_ptr: reg_params.registeredResource,
+                encoder_ptr: self.encoder.ptr,
+                _session: std::marker::PhantomData,
+            })
+        }
+
+        #[allow(unsafe_code)]
+        fn map_cuda_resource<'a>(
+            &self,
+            registered: &'a RawRegisteredResource<'a>,
+            pitch: u32,
+        ) -> Result<RawMappedResource<'a>, PipelineError> {
             let mut map_params = NV_ENC_MAP_INPUT_RESOURCE {
                 version: NV_ENC_MAP_INPUT_RESOURCE_VER,
-                registeredResource: reg_ptr,
+                registeredResource: registered.reg_ptr,
                 mappedResource: ptr::null_mut(),
                 mappedBufferFmt: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_UNDEFINED,
                 ..Default::default()
             };
-            let map_status =
-                unsafe { (ENCODE_API.map_input_resource)(self.encoder.ptr, &raw mut map_params) };
-            if map_status != NVENCSTATUS::NV_ENC_SUCCESS {
-                // SAFETY: clean up the registration handle when mapping fails.
-                let _unreg = unsafe { (ENCODE_API.unregister_resource)(self.encoder.ptr, reg_ptr) };
-                nvenc_check(
-                    self.encoder.ptr,
-                    map_status,
-                    "failed to map NVENC CUDA device buffer",
-                )?;
-            }
+            nvenc_check(
+                self.encoder.ptr,
+                unsafe { (ENCODE_API.map_input_resource)(self.encoder.ptr, &raw mut map_params) },
+                "failed to map NVENC CUDA device buffer",
+            )?;
             Ok(RawMappedResource {
-                reg_ptr,
                 map_ptr: map_params.mappedResource,
                 pitch,
                 encoder_ptr: self.encoder.ptr,
-                _session: std::marker::PhantomData,
+                _registered: registered,
             })
         }
 
@@ -1646,28 +1664,31 @@ mod enabled {
     fn dma_pinned_to_device(
         cuda_stream: &CudaStream,
         pinned: &PinnedHostSlice<u8>,
-        dev_buf: &DeviceBuffer,
+        dev_ptr: sys::CUdeviceptr,
+        dev_len: usize,
     ) -> Result<(), PipelineError> {
         let (host, sync_guard) = unsafe { pinned.stream_synced_slice(cuda_stream) };
-        if host.len() > dev_buf.len() {
+        if host.len() > dev_len {
             return Err(video_error("NV12 frame exceeds CUDA device slot capacity"));
         }
-        let dma =
-            unsafe { result::memcpy_htod_async(dev_buf.ptr(), host, cuda_stream.cu_stream()) };
+        let dma = unsafe { result::memcpy_htod_async(dev_ptr, host, cuda_stream.cu_stream()) };
         drop(sync_guard);
         dma.map_err(|err| video_error(format!("failed to upload NV12 frame to GPU: {err}")))
     }
 
-    /// Drains every bitstream slot confirmed eligible in `ready_bitstreams`
-    /// using a blocking synchronous lock, releasing each completed picture's
-    /// input surface only once its own output timestamp has been retrieved.
+    /// Drains the bitstream slots whose output is *confirmed* signalled in
+    /// `ready_bitstreams` using a blocking synchronous lock, releasing each
+    /// completed picture's input surface only once its own output timestamp has
+    /// been retrieved. Slots that have not been signalled stay in
+    /// `pending_bitstreams` so teardown never blocks on deferred NVENC output.
     #[allow(clippy::too_many_arguments)]
     fn drain_ready_bitstreams(
         session: &RawNvencSession,
         codec: NvencVideoCodec,
         bitstreams: &mut [RawBitstream<'_>],
-        reg_resources: &mut [Option<RawMappedResource<'_>>],
+        mapped: &mut [Option<RawMappedResource<'_>>],
         ready_bitstreams: &mut VecDeque<usize>,
+        pending_bitstreams: &mut VecDeque<usize>,
         free_bitstreams: &mut VecDeque<usize>,
         free_inputs: &mut VecDeque<usize>,
         frame_to_input_slot: &mut HashMap<usize, usize>,
@@ -1676,7 +1697,20 @@ mod enabled {
         on_frame_encoded: &mut impl FnMut() -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError> {
         while let Some(bs_slot) = ready_bitstreams.pop_front() {
-            let (data, timestamp) = session.lock_bitstream(&mut bitstreams[bs_slot])?;
+            let (data, timestamp) = match session.lock_bitstream(&mut bitstreams[bs_slot]) {
+                Ok(result) => result,
+                Err(err) => {
+                    // A failed lock does not prove NVENC is done with this
+                    // picture, so it must not stay in the confirmed-ready queue.
+                    // Keep it tracked in the deferred queue instead (the earlier
+                    // fix pushed it back into `ready_bitstreams`): the slot is
+                    // never dropped here, and `abort_pending_nvenc_work` either
+                    // blocking-discards it after a confirmed EOS or quarantines
+                    // its buffers when no successful submission is available.
+                    pending_bitstreams.push_back(bs_slot);
+                    return Err(err);
+                }
+            };
             if data.is_empty() {
                 return Err(video_error("NVENC produced an empty access unit"));
             }
@@ -1689,9 +1723,10 @@ mod enabled {
                 ))
             })?;
             // With B-frame reordering, the finished picture's input surface is
-            // identified by `display_idx`, not by `bs_slot`. Unmap and
-            // unregister that exact surface before recycling its device slot.
-            reg_resources[finished_in_slot] = None;
+            // identified by `display_idx`, not by `bs_slot`. Unmap that exact
+            // surface before recycling its device slot; the registration stays
+            // alive for the whole session.
+            mapped[finished_in_slot] = None;
             free_inputs.push_back(finished_in_slot);
             free_bitstreams.push_back(bs_slot);
 
@@ -1708,34 +1743,63 @@ mod enabled {
         Ok(())
     }
 
-    /// Completes any queued NVENC pictures before `bitstreams`,
-    /// `reg_resources`, and `dev_bufs` drop on an early stage error so the
-    /// driver never accesses freed bitstream or CUDA surface memory.
+    /// Completes every NVENC picture whose output is confirmed before the ring
+    /// buffers drop on an early stage error, and reports whether deferred work
+    /// had to be quarantined instead.
+    ///
+    /// `ready_bitstreams` holds slots whose output was signalled by a
+    /// successfully submitted later picture (the SDK's output-delay contract),
+    /// so a synchronous lock on them is safe. `pending_bitstreams` holds
+    /// submitted but unsignalled slots — including any picture that returned
+    /// `NV_ENC_ERR_NEED_MORE_INPUT` and any slot whose earlier lock failed. If
+    /// EOS was never confirmed, no further picture will be submitted, so a
+    /// blocking `NvEncLockBitstream` on those slots would wait forever. They
+    /// are handed to the caller's bounded quarantine rather than freed while
+    /// the driver can still write into them.
+    ///
+    /// Returns `true` when at least one slot was quarantined, i.e. the caller
+    /// must leak the owning buffers instead of dropping them.
     fn abort_pending_nvenc_work(
         session: &RawNvencSession,
         eos_flushed: bool,
         bitstreams: &mut [RawBitstream<'_>],
         ready_bitstreams: &mut VecDeque<usize>,
         pending_bitstreams: &mut VecDeque<usize>,
-    ) {
+    ) -> bool {
         if ready_bitstreams.is_empty() && pending_bitstreams.is_empty() {
-            return;
+            return false;
         }
-        let can_drain_pending = if eos_flushed {
-            true
-        } else if !session.eos_sent.get() {
-            session.flush_eos().is_ok()
-        } else {
-            false
-        };
-        if can_drain_pending {
-            ready_bitstreams.extend(pending_bitstreams.drain(..));
+        let mut eos_confirmed = eos_flushed;
+        if !eos_confirmed {
+            // `flush_eos` sets `eos_sent` before submitting, so a failed attempt
+            // leaves a stale flag. Retry regardless: a successful EOS signals
+            // all deferred output, which makes the blocking discards safe.
+            eos_confirmed = session.flush_eos().is_ok();
         }
+
+        // Best-effort: each lock is independent, so a failure on one slot must
+        // not abandon the slots behind it. The caller returns the original
+        // stage error rather than masking it.
         while let Some(bs_slot) = ready_bitstreams.pop_front() {
-            if session.discard_bitstream(&mut bitstreams[bs_slot]).is_err() {
-                break;
-            }
+            let discard_result = session.discard_bitstream(&mut bitstreams[bs_slot]);
+            drop(discard_result);
         }
+
+        if eos_confirmed {
+            while let Some(bs_slot) = pending_bitstreams.pop_front() {
+                let discard_result = session.discard_bitstream(&mut bitstreams[bs_slot]);
+                drop(discard_result);
+            }
+            return false;
+        }
+
+        // EOS was never confirmed: NVENC requires a successful submission
+        // before it signals deferred output, and none is coming. Do not block
+        // on these slots and do not destroy their bitstreams; the caller keeps
+        // every owning buffer alive in a bounded quarantine instead.
+        let quarantined = !pending_bitstreams.is_empty();
+        pending_bitstreams.clear();
+        quarantined
     }
 
     /// GPU side of the streaming pipeline. Runs on the calling thread while the
@@ -1764,7 +1828,10 @@ mod enabled {
         let (width, height, pitch) = (first.info.width, first.info.height, first.pitch);
         let pitch_usize =
             usize::try_from(pitch).map_err(|_| video_error("NVENC frame pitch exceeds usize"))?;
-        let slot_bytes = nv12_buffer_len(width, height, pitch_usize)?;
+        // Align each slot to 256 bytes: one contiguous slab replaces a ring of
+        // synchronous cuMemAlloc calls while keeping every registered surface
+        // at the alignment NVENC's DMA expects.
+        let slot_bytes = nv12_buffer_len(width, height, pitch_usize)?.next_multiple_of(256);
 
         let mut preset_cfg = encoder.get_preset_config(
             guid,
@@ -1810,14 +1877,29 @@ mod enabled {
 
         let slot_count = plan.ring_slots();
         let output_delay = plan.output_delay();
+        let total_slab_bytes = slot_bytes
+            .checked_mul(slot_count)
+            .ok_or_else(|| video_error("NVENC VRAM slab size overflow"))?;
         let cuda_stream = cuda_ctx.default_stream();
-        // Declaration order fixes drop order: bitstreams and registered
-        // resources drop before device buffers, and all drop before `session`.
-        let mut dev_bufs: Vec<DeviceBuffer> = Vec::with_capacity(slot_count);
-        for _ in 0..slot_count {
-            dev_bufs.push(DeviceBuffer::zeroed(cuda_ctx, &cuda_stream, slot_bytes)?);
+        // Declaration order fixes drop order: live mappings and bitstreams drop
+        // before the pre-registered resources, which drop before the one VRAM
+        // slab, and all drop before `session`. Registration happens once per
+        // slot here instead of once per frame, removing NVENC registration churn.
+        let vram_slab = DeviceBuffer::zeroed(cuda_ctx, &cuda_stream, total_slab_bytes)?;
+        let slot_ptrs: Vec<sys::CUdeviceptr> = (0..slot_count)
+            .map(|slot| {
+                let offset = u64::try_from(slot.saturating_mul(slot_bytes)).unwrap_or(u64::MAX);
+                vram_slab.ptr().saturating_add(offset)
+            })
+            .collect();
+        let mut reg_resources: Vec<RawRegisteredResource<'_>> = Vec::with_capacity(slot_count);
+        for &slot_ptr in &slot_ptrs {
+            let ptr = usize::try_from(slot_ptr)
+                .map_err(|_| video_error("CUDA device pointer exceeds usize"))?
+                as *mut c_void;
+            reg_resources.push(session.register_cuda_resource(ptr, pitch)?);
         }
-        let mut reg_resources: Vec<Option<RawMappedResource<'_>>> =
+        let mut mapped: Vec<Option<RawMappedResource<'_>>> =
             (0..slot_count).map(|_| None).collect();
         let mut bitstreams: Vec<RawBitstream<'_>> = Vec::with_capacity(slot_count);
         for _ in 0..slot_count {
@@ -1854,18 +1936,17 @@ mod enabled {
                     video_error("NVENC bitstream ring exhausted while awaiting encoder output")
                 })?;
 
-                dma_pinned_to_device(&cuda_stream, &filled.pinned, &dev_bufs[in_slot])?;
+                dma_pinned_to_device(&cuda_stream, &filled.pinned, slot_ptrs[in_slot], slot_bytes)?;
                 if free_tx.send(filled.pinned).is_err() {
                     // The decode thread already exited; its error is surfaced after
                     // the join, and dropping the send error recycles this slot.
                 }
-                let ptr = usize::try_from(dev_bufs[in_slot].ptr())
-                    .map_err(|_| video_error("CUDA device pointer exceeds usize"))?
-                    as *mut c_void;
-                reg_resources[in_slot] = Some(session.register_cuda_resource(ptr, pitch)?);
-                let resource = reg_resources[in_slot]
+                // Only the lightweight map is per frame; the CUDA pointer was
+                // registered once at session init with the rest of the ring.
+                mapped[in_slot] = Some(session.map_cuda_resource(&reg_resources[in_slot], pitch)?);
+                let resource = mapped[in_slot]
                     .as_ref()
-                    .ok_or_else(|| video_error("NVENC input slot was not registered"))?;
+                    .ok_or_else(|| video_error("NVENC input slot was not mapped"))?;
 
                 let frame_idx = frame_timings.len();
                 let frame_idx_u64 =
@@ -1888,8 +1969,9 @@ mod enabled {
                         &session,
                         codec,
                         &mut bitstreams,
-                        &mut reg_resources,
+                        &mut mapped,
                         &mut ready_bitstreams,
+                        &mut pending_bitstreams,
                         &mut free_bitstreams,
                         &mut free_inputs,
                         &mut frame_to_input_slot,
@@ -1907,8 +1989,9 @@ mod enabled {
                 &session,
                 codec,
                 &mut bitstreams,
-                &mut reg_resources,
+                &mut mapped,
                 &mut ready_bitstreams,
+                &mut pending_bitstreams,
                 &mut free_bitstreams,
                 &mut free_inputs,
                 &mut frame_to_input_slot,
@@ -1919,8 +2002,9 @@ mod enabled {
             Ok(())
         })();
 
+        let mut quarantined = false;
         if stage_result.is_err() {
-            abort_pending_nvenc_work(
+            quarantined = abort_pending_nvenc_work(
                 &session,
                 eos_flushed,
                 &mut bitstreams,
@@ -1928,13 +2012,24 @@ mod enabled {
                 &mut pending_bitstreams,
             );
         }
+        if quarantined {
+            // WHY: EOS was never confirmed, so NVENC may still write into the
+            // deferred pictures' bitstreams and mapped input surfaces. Keep this
+            // bounded set — one ring's buffers, registrations, the VRAM slab and
+            // the encoder handle — alive until process teardown instead of
+            // destroying memory the driver may still access.
+            std::mem::forget(bitstreams);
+            std::mem::forget(mapped);
+            std::mem::forget(reg_resources);
+            std::mem::forget(vram_slab);
+            std::mem::forget(session);
+        }
 
-        // Drop borrows of `session` explicitly before returning or building packets.
-        drop(bitstreams);
-        drop(reg_resources);
-        drop(dev_bufs);
-        drop(session);
-
+        // Reverse declaration order drops bitstreams, live mappings,
+        // registrations and device buffers before the NVENC session on every
+        // normal exit path, including early `?` errors. Explicit drops are
+        // avoided because `mapped` borrows `reg_resources`, which borrows
+        // `session`; the quarantine above is the only exception.
         stage_result?;
 
         if encoded_units.len() != frame_timings.len() {
@@ -1968,6 +2063,322 @@ mod enabled {
             EncodedVideoStream { track, packets },
             frames_encoded,
         )))
+    }
+
+    /// GPU-resident NVDEC -> NVENC path: luma and chroma of each decoded surface
+    /// are copied device-to-device into a separate, pre-registered NVENC slot.
+    /// This avoids CPU readback and pinned host staging but does not directly
+    /// share the original NVDEC surface. Any NVDEC setup or caps failure is a
+    /// hard error (no CPU fallback).
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn encode_video_nvdec_nvenc_streaming_enabled<F>(
+        source_track: &ContainerTrack,
+        track_packets: &[ContainerPacket],
+        source_codec: VideoCodec,
+        mode: VideoEncodeMode,
+        track_index: usize,
+        mut on_frame_encoded: F,
+    ) -> Result<(EncodedVideoStream, u64, String), PipelineError>
+    where
+        F: FnMut() -> Result<(), PipelineError>,
+    {
+        if !source_codec.nvdec_decodable() {
+            return Err(video_error(format!(
+                "--hwdecode nvdec cannot decode {source_codec}; no silent CPU fallback"
+            )));
+        }
+        let (codec, quality) = NvencVideoCodec::from_mode(mode)?;
+        let guid = codec.guid();
+        let width = u32::from(
+            source_track
+                .width
+                .ok_or_else(|| video_error("NVDEC -> NVENC requires a known source width"))?,
+        );
+        let height = u32::from(
+            source_track
+                .height
+                .ok_or_else(|| video_error("NVDEC -> NVENC requires a known source height"))?,
+        );
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(video_error(format!(
+                "NVENC requires even, non-zero dimensions; got {width}x{height}"
+            )));
+        }
+        let cuda_ctx = CudaContext::new(0)
+            .map_err(|err| video_error(format!("failed to initialise CUDA device 0: {err}")))?;
+        // NVCUVID capability queries require a current CUDA context.
+        crate::gpu::nvdec::validate_decode_caps(source_codec, 8, width, height)?;
+        let device_name = cuda_ctx
+            .name()
+            .map_err(|err| video_error(format!("failed to query CUDA device name: {err}")))?;
+        let encoder = RawNvencEncoder::open(Arc::clone(&cuda_ctx))?;
+        if !encoder.get_encode_guids()?.contains(&guid) {
+            return Err(video_error(
+                "this NVIDIA GPU does not expose the requested NVENC video codec",
+            ));
+        }
+        if !encoder
+            .get_supported_input_formats(guid)?
+            .contains(&NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12)
+        {
+            return Err(video_error(
+                "NVENC on this GPU does not support NV12 input buffers",
+            ));
+        }
+        let caps = encoder.query_codec_caps(guid)?;
+        let fps = estimate_video_fps_from_packets(track_packets);
+        let plan = NvencVideoPlan::from_caps(fps, caps);
+        let mut preset_cfg = encoder.get_preset_config(
+            guid,
+            NV_ENC_PRESET_P4_GUID,
+            NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_HIGH_QUALITY,
+        )?;
+        configure_video_rc(
+            &mut preset_cfg.presetCfg.rcParams,
+            quality,
+            plan.temporal_aq,
+            plan.lookahead_depth,
+            false,
+        );
+        preset_cfg.presetCfg.gopLength = plan.gop_length;
+        preset_cfg.presetCfg.frameIntervalP = plan.frame_interval_p();
+        codec.configure_codec_config(
+            &mut preset_cfg.presetCfg,
+            plan.gop_length,
+            plan.bframe_ref_mode(),
+        );
+        let mut init_params = NV_ENC_INITIALIZE_PARAMS {
+            version: NV_ENC_INITIALIZE_PARAMS_VER,
+            encodeGUID: guid,
+            presetGUID: NV_ENC_PRESET_P4_GUID,
+            encodeWidth: width,
+            encodeHeight: height,
+            darWidth: width,
+            darHeight: height,
+            frameRateNum: fps,
+            frameRateDen: 1,
+            enablePTD: 1,
+            encodeConfig: &raw mut preset_cfg.presetCfg,
+            tuningInfo: NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_HIGH_QUALITY,
+            ..Default::default()
+        };
+        let session = encoder.start_session(
+            width,
+            height,
+            NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12,
+            &mut init_params,
+        )?;
+
+        // 256-byte pitch alignment gives coalesced VRAM-to-VRAM copies and NVENC DMA.
+        let pitch_usize = usize::try_from(width)
+            .unwrap_or(usize::MAX)
+            .next_multiple_of(256);
+        let pitch =
+            u32::try_from(pitch_usize).map_err(|_| video_error("NVENC frame pitch exceeds u32"))?;
+        let slot_bytes = nv12_buffer_len(width, height, pitch_usize)?.next_multiple_of(256);
+        let output_delay = plan.output_delay();
+        let slot_count = plan.ring_slots().max(output_delay + 4);
+        let total_slab_bytes = slot_bytes
+            .checked_mul(slot_count)
+            .ok_or_else(|| video_error("NVENC VRAM slab size overflow"))?;
+        let cuda_stream = cuda_ctx.default_stream();
+        // Reverse declaration order gives the required teardown order. One
+        // contiguous VRAM slab avoids 29 synchronous cuMemAlloc/cuMemFree stalls.
+        let vram_slab = DeviceBuffer::zeroed(&cuda_ctx, &cuda_stream, total_slab_bytes)?;
+        let slot_ptrs: Vec<sys::CUdeviceptr> = (0..slot_count)
+            .map(|slot| {
+                let offset = u64::try_from(slot.saturating_mul(slot_bytes)).unwrap_or(u64::MAX);
+                vram_slab.ptr().saturating_add(offset)
+            })
+            .collect();
+        let mut reg_resources: Vec<RawRegisteredResource<'_>> = Vec::with_capacity(slot_count);
+        for &slot_ptr in &slot_ptrs {
+            let ptr = usize::try_from(slot_ptr)
+                .map_err(|_| video_error("CUDA device pointer exceeds usize"))?
+                as *mut c_void;
+            reg_resources.push(session.register_cuda_resource(ptr, pitch)?);
+        }
+        let mut mapped: Vec<Option<RawMappedResource<'_>>> =
+            (0..slot_count).map(|_| None).collect();
+        let mut bitstreams: Vec<RawBitstream<'_>> = Vec::with_capacity(slot_count);
+        for _ in 0..slot_count {
+            bitstreams.push(session.create_bitstream()?);
+        }
+
+        let mut track = ContainerTrack {
+            codec: codec.output_codec(),
+            width: u16::try_from(width).ok(),
+            height: u16::try_from(height).ok(),
+            channels: None,
+            sample_rate: None,
+            config: Vec::new(),
+            timescale: US_TIMESCALE,
+            presentation_edit: source_track.presentation_edit,
+        };
+        let mut free_inputs: VecDeque<usize> = (0..slot_count).collect();
+        let mut free_bitstreams: VecDeque<usize> = (0..slot_count).collect();
+        let mut pending_bitstreams: VecDeque<usize> = VecDeque::with_capacity(slot_count);
+        let mut ready_bitstreams: VecDeque<usize> = VecDeque::with_capacity(slot_count);
+        let mut frame_to_input_slot: HashMap<usize, usize> = HashMap::with_capacity(slot_count);
+        let mut frame_timings: Vec<(i64, u64)> = Vec::new();
+        let mut encoded_units: Vec<(Vec<u8>, bool, usize)> = Vec::new();
+        let mut frames_encoded = 0_u64;
+        let mut eos_flushed = false;
+
+        let decode_result = crate::gpu::nvdec::decode_packets_to_gpu(
+            &cuda_ctx,
+            &cuda_stream,
+            source_codec,
+            &source_track.config,
+            track_packets,
+            |frame, pts_us, duration_us| {
+                if free_inputs.is_empty() {
+                    // Recycle whatever the encoder has already produced before
+                    // refusing a new surface; never overwrite a mapped slot.
+                    while pending_bitstreams.len() > output_delay {
+                        if let Some(bs) = pending_bitstreams.pop_front() {
+                            ready_bitstreams.push_back(bs);
+                        }
+                    }
+                    drain_ready_bitstreams(
+                        &session,
+                        codec,
+                        &mut bitstreams,
+                        &mut mapped,
+                        &mut ready_bitstreams,
+                        &mut pending_bitstreams,
+                        &mut free_bitstreams,
+                        &mut free_inputs,
+                        &mut frame_to_input_slot,
+                        &mut track,
+                        &mut encoded_units,
+                        &mut on_frame_encoded,
+                    )?;
+                }
+                let in_slot = free_inputs.pop_front().ok_or_else(|| {
+                    video_error("NVDEC -> NVENC input ring exhausted while awaiting encoder output")
+                })?;
+                let bs_slot = free_bitstreams.pop_front().ok_or_else(|| {
+                    video_error("NVENC bitstream ring exhausted while awaiting encoder output")
+                })?;
+                frame.copy_to_nvenc_slot(
+                    &cuda_stream,
+                    slot_ptrs[in_slot],
+                    pitch_usize,
+                    width,
+                    height,
+                )?;
+                mapped[in_slot] = Some(session.map_cuda_resource(&reg_resources[in_slot], pitch)?);
+                let resource = mapped[in_slot]
+                    .as_ref()
+                    .ok_or_else(|| video_error("NVENC input slot was not mapped"))?;
+                let frame_idx = frame_timings.len();
+                let frame_idx_u64 =
+                    u64::try_from(frame_idx).map_err(|_| video_error("frame index exceeds u64"))?;
+                frame_timings.push((pts_us, duration_us.max(1)));
+                frame_to_input_slot.insert(frame_idx, in_slot);
+                let outcome =
+                    session.encode_picture(resource, &mut bitstreams[bs_slot], frame_idx_u64)?;
+                pending_bitstreams.push_back(bs_slot);
+                frames_encoded = frames_encoded.saturating_add(1);
+                if outcome == SubmitOutcome::Ready {
+                    while pending_bitstreams.len() > output_delay {
+                        if let Some(bs) = pending_bitstreams.pop_front() {
+                            ready_bitstreams.push_back(bs);
+                        }
+                    }
+                    drain_ready_bitstreams(
+                        &session,
+                        codec,
+                        &mut bitstreams,
+                        &mut mapped,
+                        &mut ready_bitstreams,
+                        &mut pending_bitstreams,
+                        &mut free_bitstreams,
+                        &mut free_inputs,
+                        &mut frame_to_input_slot,
+                        &mut track,
+                        &mut encoded_units,
+                        &mut on_frame_encoded,
+                    )?;
+                }
+                Ok(())
+            },
+        );
+
+        let stage_result = decode_result.and_then(|_| {
+            session.flush_eos()?;
+            eos_flushed = true;
+            ready_bitstreams.extend(pending_bitstreams.drain(..));
+            drain_ready_bitstreams(
+                &session,
+                codec,
+                &mut bitstreams,
+                &mut mapped,
+                &mut ready_bitstreams,
+                &mut pending_bitstreams,
+                &mut free_bitstreams,
+                &mut free_inputs,
+                &mut frame_to_input_slot,
+                &mut track,
+                &mut encoded_units,
+                &mut on_frame_encoded,
+            )
+        });
+        let mut quarantined = false;
+        if stage_result.is_err() {
+            quarantined = abort_pending_nvenc_work(
+                &session,
+                eos_flushed,
+                &mut bitstreams,
+                &mut ready_bitstreams,
+                &mut pending_bitstreams,
+            );
+        }
+        if quarantined {
+            // WHY: EOS was never confirmed, so NVENC may still write into the
+            // deferred pictures' bitstreams and mapped input surfaces. Keep this
+            // bounded set — one ring's buffers, registrations, the VRAM slab and
+            // the encoder handle — alive until process teardown instead of
+            // destroying memory the driver may still access.
+            std::mem::forget(bitstreams);
+            std::mem::forget(mapped);
+            std::mem::forget(reg_resources);
+            std::mem::forget(vram_slab);
+            std::mem::forget(session);
+        }
+        stage_result?;
+
+        if encoded_units.len() != frame_timings.len() {
+            return Err(video_error(format!(
+                "NVENC returned {} packets for {} NVDEC frames",
+                encoded_units.len(),
+                frame_timings.len()
+            )));
+        }
+        let display_indices: Vec<usize> = encoded_units.iter().map(|(_, _, idx)| *idx).collect();
+        let timestamps = super::assign_reordered_timestamps(&frame_timings, &display_indices)?;
+        let mut packets = Vec::with_capacity(encoded_units.len());
+        for ((payload, keyframe, _), (pts, dts, duration)) in
+            encoded_units.into_iter().zip(timestamps)
+        {
+            packets.push(ContainerPacket {
+                track: track_index,
+                pts,
+                dts,
+                duration,
+                keyframe,
+                data: payload,
+            });
+        }
+        if packets.is_empty() {
+            return Err(video_error("NVDEC -> NVENC produced no video packets"));
+        }
+        Ok((
+            EncodedVideoStream { track, packets },
+            frames_encoded,
+            device_name.clone(),
+        ))
     }
 
     #[cfg(test)]
@@ -2008,29 +2419,14 @@ mod enabled {
         let (codec, quality) = NvencVideoCodec::from_mode(mode)?;
         let guid = codec.guid();
 
-        // Validate everything that can fail without a decoded frame before any
-        // thread is spawned, so unsupported hardware fails fast.
+        // Only the CUDA context is needed before the decode thread starts.
+        // NVENC session setup runs on the calling thread in parallel with the
+        // CPU/GIF/WebP decode so both halves overlap instead of serialising.
         let cuda_ctx = CudaContext::new(0)
             .map_err(|err| video_error(format!("failed to initialize CUDA device 0: {err}")))?;
         let device_name = cuda_ctx
             .name()
             .map_err(|err| video_error(format!("failed to query CUDA device name: {err}")))?;
-        let encoder = RawNvencEncoder::open(Arc::clone(&cuda_ctx))?;
-        let guids = encoder.get_encode_guids()?;
-        if !guids.contains(&guid) {
-            return Err(video_error(
-                "this NVIDIA GPU does not expose the requested NVENC video codec",
-            ));
-        }
-        let formats = encoder.get_supported_input_formats(guid)?;
-        if !formats.contains(&NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12) {
-            return Err(video_error(
-                "NVENC on this GPU does not support NV12 input buffers",
-            ));
-        }
-        let caps = encoder.query_codec_caps(guid)?;
-        let fps = estimate_video_fps_from_packets(track_packets);
-        let plan = NvencVideoPlan::from_caps(fps, caps);
         let cancelled = AtomicBool::new(false);
 
         thread::scope(|scope| {
@@ -2166,25 +2562,54 @@ mod enabled {
                 })
                 .map_err(PipelineError::WorkerStartFailed)?;
 
-            // Receive the first frame before configuring the session: its geometry
-            // determines both the NVENC session and the ring buffer sizes.
-            let first = ready_rx.recv().ok();
-            let gpu_result = match first {
-                Some(first) => run_streaming_nvenc_stage(
-                    encoder,
-                    &cuda_ctx,
-                    codec,
-                    quality,
-                    fps,
-                    plan,
-                    disable_b_adapt,
-                    track_index,
-                    first,
-                    &ready_rx,
-                    &free_tx,
-                    &mut on_frame_encoded,
-                ),
-                None => Ok(None),
+            // NVENC encoder open/capability queries overlap with the decode
+            // thread refilling the bounded pinned ring. Any failure here still
+            // reaches the shared cancellation path below, which drops both
+            // channel ends before joining so the decoder never blocks forever.
+            let init = (|| -> Result<(RawNvencEncoder, u32, NvencVideoPlan), PipelineError> {
+                let encoder = RawNvencEncoder::open(Arc::clone(&cuda_ctx))?;
+                let guids = encoder.get_encode_guids()?;
+                if !guids.contains(&guid) {
+                    return Err(video_error(
+                        "this NVIDIA GPU does not expose the requested NVENC video codec",
+                    ));
+                }
+                let formats = encoder.get_supported_input_formats(guid)?;
+                if !formats.contains(&NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12) {
+                    return Err(video_error(
+                        "NVENC on this GPU does not support NV12 input buffers",
+                    ));
+                }
+                let caps = encoder.query_codec_caps(guid)?;
+                let fps = estimate_video_fps_from_packets(track_packets);
+                let plan = NvencVideoPlan::from_caps(fps, caps);
+                Ok((encoder, fps, plan))
+            })();
+
+            // The first decoded frame determines the session and ring geometry;
+            // subsequent frames decode while NVENC initialises and encodes.
+            let gpu_result = match init {
+                Ok((encoder, fps, plan)) => {
+                    let first = ready_rx.recv().ok();
+                    match first {
+                        Some(first) => run_streaming_nvenc_stage(
+                            encoder,
+                            &cuda_ctx,
+                            codec,
+                            quality,
+                            fps,
+                            plan,
+                            disable_b_adapt,
+                            track_index,
+                            first,
+                            &ready_rx,
+                            &free_tx,
+                            &mut on_frame_encoded,
+                        ),
+                        None => Ok(None),
+                    }
+                }
+                Err(err) => Err(err),
             };
 
             // On every exit path (including early `?` inside the stage) cancel the
@@ -2341,75 +2766,98 @@ fn quality_to_nvenc_cq(quality: VideoQuality) -> (u8, u8) {
 /// Assigns presentation and decode timestamps to packets emitted in decode order.
 ///
 /// `display_indices[k]` is the input-frame index carried by output packet `k`
-/// (NVENC's `input_timestamp`). It is a permutation of `0..n`, so `pts[k]` is
-/// the source presentation time of that packet. `reorder_shift` delays every DTS
-/// by the largest lead a picture has in display order; constant shifts alone
-/// cannot separate duplicate source PTS, so an extra per-packet backoff keeps
-/// DTS strictly increasing without ever exceeding that packet's PTS.
+/// (NVENC's `input_timestamp`). It must be a permutation of `0..n`. Packet order
+/// is decode order, so both PTS and DTS are produced **in packet order**: pairing
+/// a packet's PTS with an unrelated frame's DTS (the previous implementation)
+/// produces inverted or equal DTS for B-frame/animation sources and is the root
+/// cause of `non monotonically increasing dts` warnings on GIF→MP4 NVENC output.
+///
+/// The DTS sequence advances by the *current packet's own* duration-derived
+/// cadence for reordered packets (and by 1 µs only to break a PTS tie), then is
+/// uniformly shifted back by the largest deficit `max(g - pts)`. Taking the
+/// cadence from the current packet rather than a global median matters when a
+/// later segment is faster: a median cadence would keep applying the old, wider
+/// frame spacing on every reorder, growing an unbounded decode lead. This still
+/// guarantees `dts[k] <= pts[k]` and strictly increasing DTS with one global
+/// reorder delay, and gaps wide enough to stay distinct after conversion to the
+/// 90 kHz timebase of MP4/MPEG-TS: there a 1 µs step rounds a reordered P/B group
+/// onto a single tick, making a decoder sort B-frames ahead of their reference.
 #[cfg(any(feature = "nvenc", test))]
-fn assign_reordered_timestamps(
+pub(crate) fn assign_reordered_timestamps(
     frame_timings: &[(i64, u64)],
     display_indices: &[usize],
 ) -> Result<Vec<(i64, i64, u64)>, PipelineError> {
+    let encode_error = |reason: String| PipelineError::EncodeFailed {
+        path: Path::new("nvenc").to_path_buf(),
+        reason,
+    };
     if display_indices.len() != frame_timings.len() {
-        return Err(PipelineError::EncodeFailed {
-            path: Path::new("nvenc").to_path_buf(),
-            reason: format!(
-                "NVENC returned {} frames for {} inputs",
-                display_indices.len(),
-                frame_timings.len()
-            ),
-        });
+        return Err(encode_error(format!(
+            "NVENC returned {} frames for {} inputs",
+            display_indices.len(),
+            frame_timings.len()
+        )));
     }
+    let mut seen = vec![false; frame_timings.len()];
     let mut pts = Vec::with_capacity(display_indices.len());
+    let mut durations = Vec::with_capacity(display_indices.len());
     for (k, &index) in display_indices.iter().enumerate() {
-        let (frame_pts, _) =
-            frame_timings
-                .get(index)
-                .ok_or_else(|| PipelineError::EncodeFailed {
-                    path: Path::new("nvenc").to_path_buf(),
-                    reason: format!(
-                        "NVENC output timestamp {index} at packet {k} exceeds the {} input frames",
-                        frame_timings.len()
-                    ),
-                })?;
-        pts.push(*frame_pts);
+        let (frame_pts, duration) = frame_timings.get(index).ok_or_else(|| {
+            encode_error(format!(
+                "NVENC output timestamp {index} at packet {k} exceeds the {} input frames",
+                frame_timings.len()
+            ))
+        })?;
+        if seen[index] {
+            return Err(encode_error(format!(
+                "NVENC returned duplicate output timestamp {index}"
+            )));
+        }
+        seen[index] = true;
+        pts.push(i128::from(*frame_pts));
+        durations.push(*duration);
     }
-    let reorder_shift = frame_timings
+
+    // Per-packet decode-order cadence: a reordered packet (PTS below the
+    // previous packet's) advances by its own frame duration instead of 1 µs so
+    // its DTS stays distinct once the container rescales to 90 kHz (~11.1 µs per
+    // tick). A global median would keep the slower cadence of an earlier
+    // segment in a later, faster one and stretch the decode timeline. The 12 µs
+    // floor is `US_TIMESCALE / 90_000 + 1`, the smallest step that cannot round
+    // onto the neighbouring tick.
+    //
+    // Strictly increasing sequence with g[k] >= pts[k]: keep each packet's own
+    // PTS when it moves forward, advance by that packet's cadence on a reorder,
+    // and bump by 1 µs only to break an exact PTS tie (the minimal repair for
+    // duplicate display delays).
+    let mut increasing = Vec::with_capacity(pts.len());
+    for (k, &packet_pts) in pts.iter().enumerate() {
+        let packet_cadence = i128::from(durations[k]).max(12);
+        let next = match increasing.last().copied() {
+            Some(prev) if packet_pts < prev => prev.saturating_add(packet_cadence),
+            Some(prev) if packet_pts == prev => prev.saturating_add(1),
+            None | Some(_) => packet_pts,
+        };
+        increasing.push(next);
+    }
+    // Uniform delay covering every deficit keeps `dts <= pts` for all packets.
+    let shift = increasing
         .iter()
         .zip(&pts)
-        .fold(0_i128, |max, (frame, &packet_pts)| {
-            max.max(i128::from(frame.0) - i128::from(packet_pts))
-        })
-        .max(0);
-    let mut dts = Vec::with_capacity(frame_timings.len());
-    for &(source_pts, _) in frame_timings {
-        let shifted = i64::try_from(i128::from(source_pts) - reorder_shift).map_err(|_| {
-            PipelineError::EncodeFailed {
-                path: Path::new("nvenc").to_path_buf(),
-                reason: "NVENC reordered DTS underflowed signed 64-bit range".to_owned(),
-            }
-        })?;
-        dts.push(shifted);
-    }
-    // One O(n) backward pass bounds each provisional DTS by `next - 1`, leaving
-    // strictly increasing segments unchanged and only moving earlier ties
-    // backward so `dts <= pts` holds for every packet.
-    for k in (0..dts.len().saturating_sub(1)).rev() {
-        let max_allowed = dts[k + 1]
-            .checked_sub(1)
-            .ok_or_else(|| PipelineError::EncodeFailed {
-                path: Path::new("nvenc").to_path_buf(),
-                reason: "NVENC DTS tie repair exhausted signed 64-bit range".to_owned(),
-            })?;
-        if dts[k] > max_allowed {
-            dts[k] = max_allowed;
-        }
-    }
+        .fold(0_i128, |max, (&g, &p)| max.max(g - p));
     let mut result = Vec::with_capacity(pts.len());
-    for (k, &packet_pts) in pts.iter().enumerate() {
-        let dts = dts[k];
-        result.push((packet_pts, dts, frame_timings[display_indices[k]].1));
+    for ((k, &g), (&p, &duration)) in increasing
+        .iter()
+        .enumerate()
+        .zip(pts.iter().zip(&durations))
+    {
+        let dts = g - shift;
+        let dts = i64::try_from(dts)
+            .map_err(|_| encode_error(format!("NVENC DTS of packet {k} exceeds i64 range")))?;
+        let pts = i64::try_from(p)
+            .map_err(|_| encode_error(format!("NVENC PTS of packet {k} exceeds i64 range")))?;
+        debug_assert!(dts <= pts, "reordered DTS must not exceed PTS");
+        result.push((pts, dts, duration));
     }
     Ok(result)
 }
@@ -2501,6 +2949,57 @@ where
     }
 }
 
+/// NVDEC hardware decode followed by a GPU-resident handoff into NVENC: luma and
+/// chroma are copied device-to-device into a separate NVENC slot. No CPU readback
+/// or pinned host staging is involved, but the original NVDEC surface is not
+/// directly shared. Every hardware failure is returned instead of a silent CPU
+/// fallback.
+///
+/// # Errors
+///
+/// Returns [`PipelineError::DecodeFailed`] / [`PipelineError::GpuBackendFailed`]
+/// when the `nvenc` feature is missing, NVDEC setup fails, caps reject the
+/// source, or NVENC fails.
+pub(crate) fn encode_video_nvdec_nvenc_streaming<F>(
+    source_track: &crate::video_container::ContainerTrack,
+    track_packets: &[crate::video_container::ContainerPacket],
+    source_codec: fastconv_domain::VideoCodec,
+    mode: VideoEncodeMode,
+    track_index: usize,
+    on_frame_encoded: F,
+) -> Result<(EncodedVideoStream, u64, String), PipelineError>
+where
+    F: FnMut() -> Result<(), PipelineError>,
+{
+    #[cfg(feature = "nvenc")]
+    {
+        enabled::encode_video_nvdec_nvenc_streaming_enabled(
+            source_track,
+            track_packets,
+            source_codec,
+            mode,
+            track_index,
+            on_frame_encoded,
+        )
+    }
+
+    #[cfg(not(feature = "nvenc"))]
+    {
+        let _ = (
+            source_track,
+            track_packets,
+            source_codec,
+            mode,
+            track_index,
+            on_frame_encoded,
+        );
+        Err(PipelineError::GpuBackendFailed {
+            backend: GpuBackend::Nvenc,
+            reason: "--hwdecode nvdec requires building with --features nvenc".to_owned(),
+        })
+    }
+}
+
 /// Test-only entry point that sets `disableBadapt = 1` so lookahead cannot
 /// suppress B-frames on synthetic fixtures when verifying B-frame PTS
 /// inversions and reorder roundtrips on B-frame-capable GPUs.
@@ -2530,6 +3029,9 @@ where
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
 
     fn cq(quality: u8) -> (u8, u8) {
         quality_to_nvenc_cq(VideoQuality::new(quality).unwrap_or(VideoQuality::DEFAULT))
@@ -2561,6 +3063,57 @@ mod unit_tests {
             let (target, _) = cq(q);
             assert!((1..=51).contains(&target));
         }
+    }
+
+    #[test]
+    fn nvenc_streaming_cancel_unblocks_the_decode_producer() -> Result<(), String> {
+        // Mirrors the bounded ready/free channel topology of
+        // `encode_video_nvenc_streaming_enabled`. When NVENC init or the
+        // progress callback fails, both consumer ends are dropped before the
+        // decode thread is joined; the producer must observe the closed
+        // channels (or the cancel flag) instead of blocking on send/recv.
+        let cancelled = AtomicBool::new(false);
+        thread::scope(|scope| -> Result<(), String> {
+            let (ready_tx, ready_rx) = mpsc::sync_channel::<u32>(2);
+            let (free_tx, free_rx) = mpsc::sync_channel::<u32>(2);
+            free_tx.send(0).map_err(|err| err.to_string())?;
+            free_tx.send(1).map_err(|err| err.to_string())?;
+
+            let cancel_flag = &cancelled;
+            let producer = thread::Builder::new()
+                .name("fastconv-nvenc-cancel-test".to_owned())
+                .spawn_scoped(scope, move || -> u32 {
+                    let mut frames = 0_u32;
+                    while frames < 64 {
+                        if cancel_flag.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if free_rx.recv().is_err() {
+                            break;
+                        }
+                        if ready_tx.send(frames).is_err() {
+                            break;
+                        }
+                        frames = frames.saturating_add(1);
+                    }
+                    frames
+                })
+                .map_err(|err| err.to_string())?;
+
+            // Consumer fails after draining a couple of frames: drop both ends
+            // exactly as the GPU thread does on an init/callback error.
+            ready_rx.recv().map_err(|err| err.to_string())?;
+            ready_rx.recv().map_err(|err| err.to_string())?;
+            drop(ready_rx);
+            drop(free_tx);
+            cancelled.store(true, Ordering::Release);
+
+            match producer.join() {
+                Ok(frames) if frames < 64 => Ok(()),
+                Ok(_) => Err("producer ignored cancellation".to_owned()),
+                Err(_) => Err("decode producer panicked after cancellation".to_owned()),
+            }
+        })
     }
 
     #[test]
@@ -2631,10 +3184,12 @@ mod unit_tests {
             (75_000, 25_000),
         ];
         let result = assign_reordered_timestamps(&timings, &[0, 3, 1, 2])?;
+        // One uniform 75 ms reorder delay, then 25 ms of decode-order cadence
+        // between P3, B1 and B2 (no 1 µs bump that a 90 kHz tick would erase).
         assert_eq!(
             result,
             vec![
-                (0, -25_000, 25_000),
+                (0, -75_000, 25_000),
                 (75_000, 0, 25_000),
                 (25_000, 25_000, 25_000),
                 (50_000, 50_000, 25_000),
@@ -2649,6 +3204,53 @@ mod unit_tests {
                 assert!(dts > result[k - 1].1, "packet {k}: dts must increase");
             }
         }
+        // MPEG-TS/MP4 video uses 90 kHz (1 tick ≈ 11.1 µs): the reordered P3/B1/B2
+        // DTS must not collapse onto one tick, or a decoder sorts B1/B2 before
+        // their P3 reference.
+        let dts_90k = |dts: i64| -> i64 {
+            i64::try_from((i128::from(dts) * 90_000 + 500_000) / 1_000_000).unwrap_or(i64::MAX)
+        };
+        let ticks: Vec<i64> = result[1..]
+            .iter()
+            .map(|&(_, dts, _)| dts_90k(dts))
+            .collect();
+        assert!(
+            ticks.windows(2).all(|pair| pair[0] < pair[1]),
+            "reordered DTS collapsed at 90 kHz: {ticks:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reordered_timestamps_cadence_change_bounds_decode_lead() -> Result<(), PipelineError> {
+        const SLOW: i64 = 40_000;
+        const FAST: i64 = 10_000;
+        let mut timings: Vec<(i64, u64)> = (0..1_000_i64).map(|k| (k * SLOW, 40_000)).collect();
+        let fast_start = 1_000_i64 * SLOW;
+        timings.extend((0..600_i64).map(|k| (fast_start + k * FAST, 10_000)));
+
+        let mut display_indices: Vec<usize> = (0..timings.len()).collect();
+        // One swapped pair inside the fast segment: packet 1_500 presents frame
+        // 1_501, then 98 more 10 ms frames follow in presentation order.
+        display_indices.swap(1_500, 1_501);
+
+        let result = assign_reordered_timestamps(&timings, &display_indices)?;
+        assert_eq!(result.len(), timings.len());
+        for (k, &(pts, dts, _)) in result.iter().enumerate() {
+            assert!(dts <= pts, "packet {k}: dts {dts} > pts {pts}");
+            if k > 0 {
+                assert!(dts > result[k - 1].1, "packet {k}: dts must increase");
+            }
+        }
+
+        // A global 40 ms median keeps applying the old cadence to every later
+        // 10 ms packet, adding 30 ms of decode lead per frame. Using the current
+        // packet's own cadence settles at two fast frames instead.
+        let lead = result[result.len() - 1].0 - result[result.len() - 1].1;
+        assert!(
+            (2 * FAST..=3 * FAST).contains(&lead),
+            "decode lead {lead} us escaped the 10 ms segment cadence"
+        );
         Ok(())
     }
 
@@ -2665,6 +3267,45 @@ mod unit_tests {
         }
         assert!(result[2].0 < result[1].0);
         Ok(())
+    }
+
+    #[test]
+    fn reordered_timestamps_variable_gif_delays_stay_monotonic() -> Result<(), PipelineError> {
+        // GIF delays are stored in centiseconds: 7 cs/9 cs here. NVENC emits
+        // I0 P5 B2 B1 B4 B3 with two B-frames, so packet order differs from
+        // presentation order and durations are not uniform.
+        let timings: Vec<(i64, u64)> = [70_000, 90_000, 70_000, 90_000, 70_000, 90_000]
+            .into_iter()
+            .scan(0_i64, |pts, duration| {
+                let current = *pts;
+                *pts = pts.saturating_add(i64::try_from(duration).unwrap_or(0));
+                Some((current, duration))
+            })
+            .collect();
+        let result = assign_reordered_timestamps(&timings, &[0, 5, 2, 1, 4, 3])?;
+        assert_eq!(result.len(), timings.len());
+        for (k, &(pts, dts, duration)) in result.iter().enumerate() {
+            assert!(dts <= pts, "packet {k}: dts {dts} > pts {pts}");
+            if k > 0 {
+                assert!(
+                    dts > result[k - 1].1,
+                    "packet {k}: DTS must strictly increase"
+                );
+            }
+            let frame = timings[[0, 5, 2, 1, 4, 3][k]];
+            assert_eq!(
+                (pts, duration),
+                frame,
+                "packet {k}: PTS/duration must follow display index"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reordered_timestamps_rejects_duplicate_display_indices() {
+        let timings = [(0, 1), (1, 1), (2, 1)];
+        assert!(assign_reordered_timestamps(&timings, &[0, 0, 2]).is_err());
     }
 
     #[test]

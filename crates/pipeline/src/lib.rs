@@ -344,7 +344,7 @@ mod tests {
         assert_eq!(report.hardware_device(), None);
 
         let rgb_webp = fs::read(&rgb_out)?;
-        let (dec_rgb, w, h) = zenwebp::decode_rgb(&rgb_webp)?;
+        let (dec_rgb, w, h) = zenwebp::oneshot::decode_rgb(&rgb_webp)?;
         assert_eq!((w, h), (64, 48));
         assert_eq!(dec_rgb.len(), 64 * 48 * 3);
 
@@ -362,7 +362,7 @@ mod tests {
         let lossless_report = execute_image_batch(&lossless_plan)?;
         assert_eq!(lossless_report.files_converted().get(), 1);
         let lossless_bytes = fs::read(&lossless_out)?;
-        let (dec_alpha, lw, lh) = zenwebp::decode_rgba(&lossless_bytes)?;
+        let (dec_alpha, lw, lh) = zenwebp::oneshot::decode_rgba(&lossless_bytes)?;
         assert_eq!((lw, lh), (32, 24));
         assert_eq!(dec_alpha, alpha_pixels);
 
@@ -545,15 +545,18 @@ mod tests {
         let webp_report = execute_image_batch(&mixed_webp_plan)?;
         assert_eq!(webp_report.files_converted().get(), 3);
 
-        let (dec_a, aw, ah) = zenwebp::decode_rgb(&fs::read(root.join("out_webp/a.webp"))?)?;
+        let (dec_a, aw, ah) =
+            zenwebp::oneshot::decode_rgb(&fs::read(root.join("out_webp/a.webp"))?)?;
         assert_eq!((aw, ah), (64, 48));
         assert_eq!(dec_a, grad_rgb);
 
-        let (dec_d, dw, dh) = zenwebp::decode_rgb(&fs::read(root.join("out_webp/d.webp"))?)?;
+        let (dec_d, dw, dh) =
+            zenwebp::oneshot::decode_rgb(&fs::read(root.join("out_webp/d.webp"))?)?;
         assert_eq!((dw, dh), (64, 48));
         assert!(mean_abs_channel_diff(&dec_d, &grad_rgb)? < 12.0);
 
-        let (dec_e, ew, eh) = zenwebp::decode_rgb(&fs::read(root.join("out_webp/e.webp"))?)?;
+        let (dec_e, ew, eh) =
+            zenwebp::oneshot::decode_rgb(&fs::read(root.join("out_webp/e.webp"))?)?;
         assert_eq!((ew, eh), (32, 48));
         assert!(mean_abs_channel_diff(&dec_e, &grad_luma_rgb)? < 12.0);
 

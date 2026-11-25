@@ -77,6 +77,91 @@
 | `image_batch_4k_jpeg_to_heic` | `fastconv (gpu:nvenc q=80)` | 985.2 | 27.26 MB/s | 514.9 MiB | 26.86 MB | 19.24 MB | 38.16 dB | **13.17x** vs ff(webp) / **9.73x** vs cpu(webp) |
 | `image_batch_4k_webp_to_heic` | `fastconv (gpu:nvenc q=80)` | 1254.4 | 4.53 MB/s | 653.8 MiB | 5.69 MB | 13.21 MB | 38.10 dB | NVENC 20× 4K (38.10 dB) |
 
+## Performance-Update 2026-11-25 (perf/beat-ffmpeg — alle reworkten Pfade)
+- **Datum / Host / Toolchain**: 2026-11-25, `Intel(R) Core(TM) i7-6700` (4C/8T, `x86:avx2+fma`, 32 GiB RAM) + `NVIDIA GeForce RTX 2060` (6 GB, Treiber `620.73.04`), ffmpeg `n9.1` (`--enable-libsvtav1 --enable-libjxl --enable-libwebp --enable-libvorbis --enable-nvenc --enable-nvdec …`), git SHA `9991345c4b9c379a7a731789e7b72c652b449860` (Branch `perf/beat-ffmpeg`). Die Messungen wurden auf dem Baum `9991345` plus den Stage-4-/Audit-Fixes im Arbeitsbaum durchgeführt; genau dieser Stand ist inzwischen als `4466d8d` (Code) committet und in `a8249ca` (Benchmark-Doku) festgehalten, sodass der exakt gemessene Quellstand rekonstruierbar ist. Der spätere Safety-Fix `2971464` betrifft nur einen seltenen NVENC-Abort-Fehlerpfad und beeinflusst keine der hier berichteten Messungen (die Zahlen wurden also nicht auf dem finalen HEAD `2971464` gemessen).
+- **Befehle (streng seriell, keine parallelen Benchmarks)**: `cargo build --release -p fastconv-cli --features nvenc`; `timeout -k 10 180s cargo xtask bench`; `timeout -k 10 180s cargo xtask bench --audio`; `timeout -k 10 180s cargo xtask bench --nvenc`; `timeout -k 10 180s cargo xtask bench --remux`; Animations-Workloads: 3 serielle Läufe je Workload (Median Zeit, max. `VmHWM`), identische Methode wie in der Animations-Sektion unten, exakte Flags in einem eigenen Bullet weiter unten; Abschluss `cargo xtask verify`. Fixtures: `cargo xtask gen-fixtures` (20× 4K PNG/JPEG/WebP, 60 s Stereo-WAV, 9 Mixed-Audio, 1080p60 MP4). Anim-Input: aus `fixtures/video_1080p60.mp4` abgeleiteter 480×270/15-fps/4-s-Clip (60 Frames, 148741 Bytes, sha256 `ce09f03c27efb3427c705eaff3991618594f410cc08732bc763d713b6a622ef2`); beide Tools lesen exakt dieselben Dateien.
+- **Validierung**: Bild 20/20 je Workload (3840×2160, exakt RGB gegen eigene Decoder-Referenz bzw. Quell-PSNR ≥ 25 dB; `bench-output/head-to-head.json` Schema v4); Audio 18/18 Single-File + 18/18 Batch-Outputs (`ffprobe` Codec/Rate/Kanäle/Dauer, bit-exakte PCM-Roundtrips FLAC/AIFF/ALAC, lag-alignierte SNR ≥ 18 dB Single / ≥ 20 dB Batch — alle 18 Content-Checks PASS; `bench-output/audio-head-to-head.json` Schema v2); NVENC 4/4 (1920×1080, 600 Frames, `dts_ok=true`, identische Größe/PSNR, explizites `gpu:nvdec+nvenc on NVIDIA GeForce RTX 2060` im CLI-Output — kein CPU-Fallback); Remux 4/4 (600/470 Frames, Codecs `aac+h264` unverändert, sauberer Decode); Anim 12/12 (480×270, 60 Frames, sauberer Decode, **0** DTS-Warnungen im Null-Muxer — vorher 4 bei `gif_to_mp4_nv`).
+- **Verify**: `cargo xtask verify` 100 % grün — kein FFmpeg/ffprobe in `crates/`, 326 Lizenzen AGPL-kompatibel/permissiv, `cargo fmt --check`, `clippy -D warnings` (default + `--features nvenc`), **424** Default-Tests (21 cli + 50 domain + 260 pipeline + 71 probe + 22 xtask) + **297** `--features nvenc`-Tests (21 cli + 276 pipeline, inkl. Live-RTX-2060-NVDEC→NVENC-Roundtrips).
+
+### Bild — 20× 4K, Q=80 / gleiche Kompressionsklasse (20/20 validiert)
+| Workload | Tool | Zeit (ms) | Durchsatz | Peak RAM | Input | Output | Qualität | Speedup |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `png_to_webp` | `fastconv (cpu q=80)` | 5251.3 | 57.84 MB/s | 638.3 MiB | 303.75 MB | 5.69 MB | 33.95 dB | **2.89x** (+0.35 dB) |
+| `png_to_webp` | `ffmpeg (libwebp q=80)` | 15170.6 | 20.02 MB/s | 666.0 MiB | 303.75 MB | 5.34 MB | 33.61 dB | Baseline |
+| `png_to_jpeg` | `fastconv (cpu q=80)` | 666.4 | 455.81 MB/s | 414.8 MiB | 303.75 MB | 13.33 MB | 34.29 dB | **1.38x** (+0.32 dB) |
+| `png_to_jpeg` | `ffmpeg (mjpeg qv=3)` | 917.9 | 330.93 MB/s | 874.0 MiB | 303.75 MB | 8.58 MB | 33.98 dB | Baseline |
+| `jpeg_to_webp` | `fastconv (cpu q=80)` | 4715.1 | 5.70 MB/s | 421.0 MiB | 26.86 MB | 5.90 MB | 38.12 dB | **3.07x** (−0.28 dB) |
+| `jpeg_to_webp` | `ffmpeg (libwebp q=80)` | 14484.0 | 1.85 MB/s | 165.5 MiB | 26.86 MB | 5.44 MB | 38.40 dB | Baseline |
+| `webp_to_png` | `fastconv (cpu png)` | 553.3 | 10.28 MB/s | 494.2 MiB | 5.69 MB | 153.64 MB | exact | **3.72x** |
+| `webp_to_png` | `ffmpeg (png)` | 2059.6 | 2.76 MB/s | 816.2 MiB | 5.69 MB | 89.97 MB | exact | Baseline |
+| `png_to_qoi` | `fastconv (cpu qoi)` | 695.1 | 437.01 MB/s | 576.2 MiB | 303.75 MB | 250.91 MB | exact | **1.38x** |
+| `png_to_qoi` | `ffmpeg (qoi)` | 960.2 | 316.34 MB/s | 1006.0 MiB | 303.75 MB | 250.91 MB | exact | Baseline |
+| `webp_to_bmp` | `fastconv (cpu bmp)` | 386.6 | 14.71 MB/s | 715.6 MiB | 5.69 MB | 497.67 MB | exact | **1.05x** |
+| `webp_to_bmp` | `ffmpeg (bmp)` | 406.4 | 13.99 MB/s | 484.4 MiB | 5.69 MB | 497.67 MB | exact | Baseline |
+| `png_to_tiff` | `fastconv (cpu tiff)` | 812.8 | 373.73 MB/s | 358.5 MiB | 303.75 MB | 276.93 MB | exact (beide Deflate) | **3.13x** |
+| `png_to_tiff` | `ffmpeg (tiff deflate)` | 2542.4 | 119.47 MB/s | 1431.0 MiB | 303.75 MB | 373.65 MB | exact | Baseline |
+| `png_to_jxl` | `fastconv (cpu q=80)` | 3954.9 | 76.80 MB/s | 1375.4 MiB | 303.75 MB | 1.25 MB | 34.80 dB | **4.42x** (gleiche Distance 1.9) |
+| `png_to_jxl` | `ffmpeg (libjxl d=1.9)` | 17481.6 | 17.38 MB/s | 941.2 MiB | 303.75 MB | 6.49 MB | 34.95 dB | Baseline |
+| `png_to_avif` | `fastconv (cpu q=80)` | 2546.4 | 119.28 MB/s | 1256.9 MiB | 303.75 MB | 0.63 MB | 35.63 dB | **1.62x** (bei −0.12 dB, 4.5x kleiner) |
+| `png_to_avif` | `ffmpeg (libsvtav1 preset 8)` | 4129.0 | 73.56 MB/s | 2870.8 MiB | 303.75 MB | 2.86 MB | 35.75 dB | Baseline |
+| `png_to_heic` | `fastconv (gpu:nvenc q=80)` | 991.7 | 306.30 MB/s | 739.7 MiB | 303.75 MB | 27.47 MB | 39.21 dB | **15.30x** vs ff(webp) / **5.30x** vs cpu(webp) |
+| `jpeg_to_heic` | `fastconv (gpu:nvenc q=80)` | 947.7 | 28.34 MB/s | 534.1 MiB | 26.86 MB | 19.24 MB | 38.16 dB | **15.28x** vs ff(webp) / **4.98x** vs cpu(webp) |
+| `webp_to_heic` | `fastconv (gpu:nvenc q=80)` | 998.2 | 5.70 MB/s | 834.0 MiB | 5.69 MB | 13.21 MB | 38.10 dB | NVENC 20× 4K (kein ffmpeg-HEIC-Gegner) |
+
+### Audio — 60 s Stereo (48 kHz/16 Bit), identische Bitrate/Qualitätsklasse (18/18 + Batch validiert)
+| Workload | Tool | Zeit (ms) | Durchsatz | Peak RAM | Input | Output | Qualität | Speedup |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `wav_to_flac` | `fastconv (flacenc pure rust)` | 55.3 | 208.26 MB/s | 72.9 MiB | 11.52 MB | 4.12 MB | bit-exakt | **3.89x** |
+| `wav_to_flac` | `ffmpeg (flac -5)` | 215.2 | 53.54 MB/s | 57.5 MiB | 11.52 MB | 4.11 MB | bit-exakt | Baseline |
+| `wav_to_aiff` | `fastconv (native pcm_s16be)` | 36.5 | 315.68 MB/s | 20.6 MiB | 11.52 MB | 11.52 MB | bit-exakt | **2.99x** |
+| `wav_to_aiff` | `ffmpeg (pcm_s16be)` | 109.1 | 105.61 MB/s | 51.8 MiB | 11.52 MB | 11.52 MB | bit-exakt | Baseline |
+| `wav_to_alac` | `fastconv (alac-encoder m4a)` | 120.2 | 95.88 MB/s | 30.3 MiB | 11.52 MB | 4.48 MB | bit-exakt | **3.29x** |
+| `wav_to_alac` | `ffmpeg (alac)` | 395.3 | 29.14 MB/s | 52.8 MiB | 11.52 MB | 4.69 MB | bit-exakt | Baseline |
+| `wav_to_opus` | `fastconv (opus-pure)` | 170.4 | 67.62 MB/s | 73.6 MiB | 11.52 MB | 0.98 MB | 37.1 dB | **3.54x** |
+| `wav_to_opus` | `ffmpeg (libopus 128k)` | 603.8 | 19.08 MB/s | 55.4 MiB | 11.52 MB | 1.35 MB | — | Baseline |
+| `wav_to_ogg` | `fastconv (vorbis-enc q4)` | 977.1 | 11.79 MB/s | 36.1 MiB | 11.52 MB | 0.74 MB | 35.8 dB | **0.99x** (Parität) |
+| `wav_to_ogg` | `ffmpeg (libvorbis q4)` | 964.5 | 11.94 MB/s | 56.2 MiB | 11.52 MB | 0.70 MB | — | Baseline |
+| `wav_to_mp3` | `fastconv (rusty_mp3 192k)` | 793.5 | 14.52 MB/s | 38.3 MiB | 11.52 MB | 1.44 MB | 64.3 dB | **1.40x** |
+| `wav_to_mp3` | `ffmpeg (libmp3lame 192k)` | 1109.4 | 10.38 MB/s | 56.1 MiB | 11.52 MB | 1.44 MB | — | Baseline |
+| `wav_to_aac` | `fastconv (rusty_aac 128k ADTS)` | 171.3 | 67.25 MB/s | 62.1 MiB | 11.52 MB | 0.98 MB | 26.4 dB | **10.68x** |
+| `wav_to_aac` | `ffmpeg (aac 128k)` | 1829.1 | 6.30 MB/s | 56.1 MiB | 11.52 MB | 0.98 MB | — | Baseline |
+| `wav_to_m4a` | `fastconv (rusty_aac 128k muxed)` | 197.2 | 58.42 MB/s | 65.9 MiB | 11.52 MB | 0.97 MB | 26.4 dB | **9.02x** |
+| `wav_to_m4a` | `ffmpeg (aac 128k)` | 1778.5 | 6.48 MB/s | 55.5 MiB | 11.52 MB | 0.97 MB | — | Baseline |
+| `audio_batch_mixed_to_flac` | `fastconv (parallel, 9 Inputs)` | 190.1 | 32.01 MB/s | 85.0 MiB | 6.09 MB | 5.65 MB | 9/9 validiert | **4.75x** |
+| `audio_batch_mixed_to_flac` | `ffmpeg (sequenziell, 9 Inputs)` | 902.4 | 6.74 MB/s | 60.4 MiB | 6.09 MB | 6.83 MB | 9/9 validiert | Baseline |
+
+### Video-Regressionen (seriell, gleiche 1080p60-Fixture, 3 Wiederholungen/Seite)
+| Workload | Tool | Zeit (ms) | FPS | Peak RAM | Output | PSNR | Speedup |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `nvenc_h264_mp4` | `fastconv (nvdec+nvenc)` | 1933.5 | 310.3 | 482.3 MiB | 25.86 MB | 50.72 dB | **1.04x** |
+| `nvenc_h264_mp4` | `ffmpeg (h264_nvenc, hwaccel cuda)` | 2015.3 | 297.7 | 631.6 MiB | 25.90 MB | 50.73 dB | Baseline |
+| `nvenc_hevc_mp4` | `fastconv (nvdec+nvenc)` | 2051.5 | 292.5 | 592.1 MiB | 20.52 MB | 47.62 dB | **1.01x** |
+| `nvenc_hevc_mp4` | `ffmpeg (hevc_nvenc, hwaccel cuda)` | 2080.3 | 288.4 | 580.7 MiB | 20.54 MB | 47.62 dB | Baseline |
+| `remux_mp4_to_mkv` | `fastconv (pure rust)` | 15.5 | 38802.2 | 17.0 MiB | 19.16 MB | codec-copy | **6.70x** |
+| `remux_mp4_to_mkv` | `ffmpeg (-c copy)` | 103.9 | 5772.1 | 60.4 MiB | 19.14 MB | codec-copy | Baseline |
+| `remux_mkv_to_mp4` | `fastconv (pure rust)` | 30.7 | 19550.4 | 37.5 MiB | 19.15 MB | codec-copy | **2.99x** |
+| `remux_mkv_to_mp4` | `ffmpeg (-c copy)` | 91.9 | 6529.6 | 57.5 MiB | 19.15 MB | codec-copy | Baseline |
+
+### Animation — 480×270/15 fps/60 Frames, 3 serielle Läufe (Median, max. VmHWM), 12/12 validiert
+| Workload | Tool | Zeit (ms) | FPS | MB/s (Input) | Peak RAM | Output | PSNR vs. Quelle | Speedup |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `mp4_to_gif` | `fastconv (cpu gif q80)` | 343.1 | 174.9 | 0.43 | 34.2 MiB | 1.19 MB | 35.39 dB | **2.34x** |
+| `mp4_to_gif` | `ffmpeg (palettegen/use)` | 802.7 | 74.7 | 0.19 | 111.7 MiB | 1.02 MB | 36.23 dB | Baseline |
+| `mp4_to_webp` | `fastconv (cpu webp q80)` | 174.4 | 344.0 | 0.85 | 45.7 MiB | 0.36 MB | 39.99 dB | **4.56x** |
+| `mp4_to_webp` | `ffmpeg (libwebp_anim q80)` | 795.2 | 75.5 | 0.19 | 70.5 MiB | 0.36 MB | 39.04 dB | Baseline |
+| `gif_to_mp4` | `fastconv (cpu h264 q80)` | 100.0 | 600.0 | 10.16 | 44.7 MiB | 0.37 MB | 37.73 dB | **1.84x** |
+| `gif_to_mp4` | `ffmpeg (libx264 qp17)` | 184.2 | 325.7 | 5.52 | 73.4 MiB | 0.34 MB | 36.93 dB | Baseline |
+| `webp_to_mp4` | `fastconv (cpu h264 q80)` | 146.1 | 410.7 | 2.44 | 49.1 MiB | 0.30 MB | 29.79 dB | **1.26x** |
+| `webp_to_mp4` | `ffmpeg (libx264 qp17)` | 183.8 | 326.4 | 1.94 | 72.1 MiB | 0.27 MB | 48.94 dB | Baseline |
+| `gif_to_mp4_nv` | `fastconv (nvenc h264 q80)` | 348.5 | 172.2 | 2.92 | 228.5 MiB | 0.19 MB | 36.87 dB | **1.12x** |
+| `gif_to_mp4_nv` | `ffmpeg (h264_nvenc cq23)` | 391.3 | 153.3 | 2.60 | 289.8 MiB | 0.19 MB | 36.84 dB | Baseline |
+| `webp_to_mkv_nv` | `fastconv (nvenc hevc q80)` | 395.5 | 151.7 | 0.90 | 244.0 MiB | 0.18 MB | 29.63 dB | **1.03x** |
+| `webp_to_mkv_nv` | `ffmpeg (hevc_nvenc cq23)` | 408.0 | 147.1 | 0.88 | 292.5 MiB | 0.18 MB | 36.56 dB | Baseline |
+
+- **Exakte Flags der Animationsläufe** (eine Datei pro Seite, identische Fixture, `-y -v error` bei ffmpeg): `mp4_to_gif` — fastconv `video <clip> out.gif --to gif --vcodec gif --acodec none --quality 80 --threads 8`, ffmpeg `-vf 'fps=15,split[a][b];[a]palettegen=stats_mode=full[p];[b][p]paletteuse' -loop 0`; `mp4_to_webp` — fastconv `--to webp --vcodec webp --acodec none --quality 80 --threads 8`, ffmpeg `-vf fps=15 -c:v libwebp_anim -quality 80 -loop 0 -pix_fmt rgba`; `gif_to_mp4`/`webp_to_mp4` — fastconv `--to mp4 --vcodec h264 --acodec none --quality 80 --threads 8`, ffmpeg `-an -c:v libx264 -qp 17 -preset fast -g 60 -bf 0 -pix_fmt yuv420p`; `gif_to_mp4_nv` — fastconv zusätzlich `--backend nvenc`, ffmpeg `-an -c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 23 -b:v 0 -bf 3 -b_ref_mode middle -spatial-aq 1 -aq-strength 8 -temporal-aq 1 -rc-lookahead 16 -g 120`; `webp_to_mkv_nv` — fastconv `video <src.webp> out.mkv --to mkv --vcodec hevc --acodec none --quality 80 --threads 8 --backend nvenc`, ffmpeg identischer NVENC-Strang mit `hevc_nvenc`.
+- **Befunde / Fairness**: AVIF und JXL sind bei annähernd gleicher PSNR (35.63 vs. 35.75 dB; 34.80 vs. 34.95 dB) **schneller und deutlich kleiner** (0.63 vs. 2.86 MB; 1.25 vs. 6.49 MB) — kein Preset-/Qualitäts-Cheating; TIFF beide Deflate und bit-exakt; AVIF-Peak-RAM 1256.9 vs. 2870.8 MiB (kein 3-GB-Problem). Alle 6 Animations-Workloads schlagen ffmpeg (vorher 4/6); die vier `non monotonically increasing dts`-Warnungen bei `gif_to_mp4_nv` sind auf **0** gesunken.
+- **Bekannte, nicht durch den Benchmark gefixte Punkte**: (1) `wav_to_ogg` liegt im kanonischen Harness-Lauf bei 977.1 vs. 964.5 ms (~0.99x, Parität) — der frühere Spot-Check maß 842.1 vs. 923.2 ms (1.10x);beide Werte sind echte Messungen; veröffentlicht wird der weniger günstige Harness-Sample (kein Cherry-Picking). (2) Bei WebP-Animations-Inputs bleibt die PSNR-Lücke (29.79 vs. 48.94 dB CPU, 29.63 vs. 36.56 dB NVENC) — bekannte Farbkonversions-Differenz `zenwebp` vs. `libwebp` (Still-Image-Repro 30.1 dB), kein Regressionsfall und nicht durch niedrigere Kompression erkauft (Output-Größen 0.30 vs. 0.27 MB). (3) AV1 bleibt auf Turing explizit CPU-decodiert und lehnt `--hwdecode nvdec` ohne Fallback ab.
+
 ## Performance-Update 2026-11-24 (PR #10 — Remux/Audio/Image)
 - **Host/Pfad**: i7-6700 (4C/8T, AVX2/FMA), RTX 2060 für HEIC; FFmpeg n9.1; Fixtures aus `cargo xtask gen-fixtures`; alle Läufe seriell (keine parallelen Benchmarks). Ergebnisse in `bench-output/{head-to-head,audio-head-to-head}.json`.
 - **Bild (20× 4K, 20/20 validiert, Q=80 / gleiche Kompressionsklasse)**: TIFF 908.4 ms / 334.39 MB/s / 328.4 MiB vs. ffmpeg 2847.0 ms (**3.13x**, beide Deflate, exakt); JXL 4297.2 ms / 70.69 MB/s vs. ffmpeg 19572.3 ms (**4.55x** bei Distance 1.9, 34.80 vs. 34.95 dB); AVIF 16745.4 ms / 18.14 MB/s / 1206.0 MiB vs. ffmpeg 3899.0 ms / 3024.0 MiB (**0.23x** im Speed-Preset, aber 1.07 vs. 2.86 MB und 35.96 vs. 35.75 dB). Gegenüber dem alten AVIF-Pfad (157402.7 ms / 1804.2 MiB) ist das **9.4x schneller bei 33 % weniger Peak-RAM**, aber 0.44 dB niedrigerem PSNR (35.96 vs. 36.40 dB; weiterhin über FFmpeg 35.75 dB) bei 3x kleinerer Datei.
@@ -84,7 +169,7 @@
 - **Remux (1080p60, 10 s, ffprobe-validiert, 600 Video-Frames)**: MP4→MKV 17.4 ms / 34551 fps / 8.5 MiB vs. ffmpeg 101.9 ms (**5.86x**); MKV→MP4 26.1 ms / 22995 fps / 28.1 MiB vs. ffmpeg 91.1 ms (**3.49x**). Codecs unverändert `aac+h264`, keine Re-Encodierung.
 
 ## Animations-Benchmarks 2026-11-25 (video ↔ animiertes GIF/WebP)
-- **Hinweis**: Die älteren Zeilen zu „GIF nur Still-Image / Video→GIF hart abgelehnt" sind durch diesen Stand überholt: `fastconv video --to gif|webp` und `--vcodec gif|webp` sowie GIF/WebP als Video-Input sind jetzt implementiert.
+- **Hinweis**: Die Zahlen in diesem Abschnitt sind frühe Spot-Check-Werte und durch das obige `## Performance-Update 2026-11-25 (perf/beat-ffmpeg — alle reworkten Pfade)` (kanonische, serielle Harness-Messungen, 3 Läufe/Workload) **überholt** — dort sind alle 6 Animations-Workloads mit 1.03x–4.56x und 0 DTS-Warnungen belegt. Die älteren Zeilen zu „GIF nur Still-Image / Video→GIF hart abgelehnt" sind ebenfalls überholt: `fastconv video --to gif|webp` und `--vcodec gif|webp` sowie GIF/WebP als Video-Input sind jetzt implementiert.
 - **Host/Pfad**: i7-6700 (4C/8T, AVX2/FMA), RTX 2060 (NVENC, Treiber 620.73.04), ffmpeg n9.1 (`palettegen/paletteuse`, `libwebp_anim`, `libx264`, `h264_nvenc`, `hevc_nvenc`); 3 serielle Läufe je Workload (Median Zeit, max. `VmHWM`), alle 12 Outputs validiert (siehe Zeilen unten). Quelle: aus `fixtures/video_1080p60.mp4` abgeleiteter 480×270/15-fps/4-s-Clip (60 Frames, 148 KiB); beide Tools lesen exakt dieselbe Datei.
 - **Fairness**: GIF 256-Farben-Palette auf beiden Seiten, WebP beide Q80, MP4 beide H.264 QP17 / `preset fast` / GOP 60 / keine B-Frames, NVENC beide `p4/hq`, VBR CQ23, bf3 `b_ref_mode=middle`, spatial/temporal AQ, Lookahead 16, GOP 120. Output-Größen liegen zwischen 0.18 und 1.19 MB und weichen nur 1–17 % voneinander ab (kein Preset-/Qualitäts-Cheating).
 

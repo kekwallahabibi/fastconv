@@ -5,6 +5,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 
@@ -19,11 +20,11 @@ use jixel::{
 use jpeg_encoder::{ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder as JpegEncoder};
 use tiff::encoder::{Compression as TiffCompression, DeflateLevel, TiffEncoder, colortype};
 use tiff::tags::{ExtraSamples, Predictor, Tag};
-use zenwebp::{Encoder as WebpEncoder, EncoderConfig as WebpEncoderConfig};
+use zenwebp::{EncodeRequest, LosslessConfig, LossyConfig, PixelLayout};
 
 use crate::PipelineError;
 use crate::avif::encode_avif_into;
-use crate::bmp::encode_bmp_to_writer;
+use crate::bmp::{BmpFrameScratch, encode_bmp_into_frame};
 use crate::decode::{
     DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat, decode_image_into,
     precreate_target_directories,
@@ -226,6 +227,7 @@ struct WorkerScratch {
     pixel_buf: Vec<u8>,
     encoded_buf: Vec<u8>,
     aux_buf: Vec<u8>,
+    bmp_frame: BmpFrameScratch,
 }
 
 impl WorkerScratch {
@@ -235,6 +237,7 @@ impl WorkerScratch {
             pixel_buf: Vec::new(),
             encoded_buf: Vec::new(),
             aux_buf: Vec::new(),
+            bmp_frame: BmpFrameScratch::new(),
         }
     }
 }
@@ -270,8 +273,12 @@ pub(crate) fn execute_cpu_image_batch(
             (count, (configured_workers / count).max(1))
         }
         CpuImageEncoder::Avif { .. } => {
-            let count = configured_workers.min(items.len()).clamp(1, 6);
-            (count, (configured_workers / count).max(1))
+            // Prefer image-level parallelism up to 8 workers so rav1e avoids
+            // per-image Rayon pool creation and tile-sync overhead on batches,
+            // while small batches assign remaining cores to inner tile threads.
+            let count = configured_workers.min(items.len()).clamp(1, 8);
+            let inner = (configured_workers / count).clamp(1, 8);
+            (count, inner)
         }
         _ => (effective_workers, 1),
     };
@@ -279,10 +286,19 @@ pub(crate) fn execute_cpu_image_batch(
     let files_converted = NonZeroUsize::new(items.len())
         .ok_or_else(|| PipelineError::EmptyOutput(first_item.target().to_path_buf()))?;
 
+    // BMP frames are prepared in parallel but committed one at a time: concurrent
+    // 25 MiB writes thrash the filesystem and erase the gains from parallel decoding.
+    let bmp_write_lock = Mutex::new(());
     let (total_input, total_output) = if worker_threads.get() == 1 || items.len() == 1 {
-        execute_sequential(items, encoder, inner_threads)?
+        execute_sequential(items, encoder, inner_threads, &bmp_write_lock)?
     } else {
-        execute_parallel(items, encoder, worker_threads.get(), inner_threads)?
+        execute_parallel(
+            items,
+            encoder,
+            worker_threads.get(),
+            inner_threads,
+            &bmp_write_lock,
+        )?
     };
 
     let input_nz = NonZeroU64::new(total_input)
@@ -304,14 +320,20 @@ fn execute_sequential(
     items: &[ImageBatchItem],
     encoder: CpuImageEncoder,
     jxl_inner_threads: usize,
+    bmp_write_lock: &Mutex<()>,
 ) -> Result<(u64, u64), PipelineError> {
     let mut scratch = WorkerScratch::new();
     let mut total_in = 0_u64;
     let mut total_out = 0_u64;
 
     for item in items {
-        let (in_bytes, out_bytes) =
-            convert_single_item(item, encoder, &mut scratch, jxl_inner_threads)?;
+        let (in_bytes, out_bytes) = convert_single_item(
+            item,
+            encoder,
+            &mut scratch,
+            jxl_inner_threads,
+            bmp_write_lock,
+        )?;
         total_in = total_in.saturating_add(in_bytes);
         total_out = total_out.saturating_add(out_bytes);
     }
@@ -324,6 +346,7 @@ fn execute_parallel(
     encoder: CpuImageEncoder,
     worker_count: usize,
     inner_threads: usize,
+    bmp_write_lock: &Mutex<()>,
 ) -> Result<(u64, u64), PipelineError> {
     let next_index = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
@@ -340,7 +363,13 @@ fn execute_parallel(
                     let Some(item) = items.get(index) else {
                         break;
                     };
-                    match convert_single_item(item, encoder, &mut scratch, inner_threads) {
+                    match convert_single_item(
+                        item,
+                        encoder,
+                        &mut scratch,
+                        inner_threads,
+                        bmp_write_lock,
+                    ) {
                         Ok((in_bytes, out_bytes)) => {
                             total_in.fetch_add(in_bytes, Ordering::Relaxed);
                             total_out.fetch_add(out_bytes, Ordering::Relaxed);
@@ -376,6 +405,7 @@ fn convert_single_item(
     encoder: CpuImageEncoder,
     scratch: &mut WorkerScratch,
     encode_threads: usize,
+    bmp_write_lock: &Mutex<()>,
 ) -> Result<(u64, u64), PipelineError> {
     let decoded = decode_image_into(
         item,
@@ -422,9 +452,13 @@ fn convert_single_item(
             write_encoded_buffer(item.target(), &scratch.encoded_buf)?
         }
         CpuImageEncoder::Png => encode_png_streaming(item.target(), pixels, decoded)?,
-        CpuImageEncoder::Bmp => {
-            encode_bmp_streaming(item.target(), pixels, decoded, &mut scratch.aux_buf)?
-        }
+        CpuImageEncoder::Bmp => encode_bmp_streaming(
+            item.target(),
+            pixels,
+            decoded,
+            &mut scratch.bmp_frame,
+            bmp_write_lock,
+        )?,
         CpuImageEncoder::Tiff => {
             encode_tiff_streaming(item.target(), pixels, decoded, &mut scratch.aux_buf)?
         }
@@ -590,23 +624,43 @@ fn encode_pnm_streaming(
     Ok(bytes)
 }
 
+/// Prepares the whole BMP frame in parallel, then flushes it to disk under a
+/// shared lock. Only the contiguous 25 MiB write is serialized; decode, swizzle
+/// and header setup still overlap across workers.
 fn encode_bmp_streaming(
     target: &Path,
     pixels: &[u8],
     decoded: DecodedFrameMeta,
-    batch_scratch: &mut Vec<u8>,
+    frame: &mut BmpFrameScratch,
+    write_lock: &Mutex<()>,
 ) -> Result<u64, PipelineError> {
-    let (staging, mut file) = StagingFile::create_for(target)?;
-    let bytes = encode_bmp_to_writer(target, pixels, decoded, batch_scratch, &mut file)?;
-    if bytes == 0 {
-        drop(file);
+    let bytes = encode_bmp_into_frame(target, pixels, decoded, frame)?;
+    let len =
+        usize::try_from(bytes).map_err(|_| PipelineError::EmptyOutput(target.to_path_buf()))?;
+    if len == 0 {
         return Err(PipelineError::EmptyOutput(target.to_path_buf()));
     }
+
+    let guard = write_lock
+        .lock()
+        .map_err(|_| PipelineError::WorkerPanicked)?;
+    let (staging, file) = StagingFile::create_for(target)?;
+    file.set_len(bytes).map_err(|source| PipelineError::Io {
+        path: target.to_path_buf(),
+        source,
+    })?;
+    let mut file = file;
+    file.write_all(&frame.bytes()[..len])
+        .map_err(|source| PipelineError::Io {
+            path: target.to_path_buf(),
+            source,
+        })?;
     file.flush().map_err(|source| PipelineError::Io {
         path: target.to_path_buf(),
         source,
     })?;
     staging.commit(target, file)?;
+    drop(guard);
     Ok(bytes)
 }
 
@@ -617,26 +671,25 @@ fn encode_webp_into(
     decoded: DecodedFrameMeta,
     encoded_buf: &mut Vec<u8>,
 ) -> Result<(), PipelineError> {
-    let config = match compression {
-        ImageCompression::Lossy { quality } => {
-            WebpEncoderConfig::new().quality(quality.as_f32()).method(4)
-        }
-        ImageCompression::Lossless => WebpEncoderConfig::new_lossless(),
+    let layout = match decoded.format {
+        DecodedPixelFormat::L8 => PixelLayout::L8,
+        DecodedPixelFormat::La8 => PixelLayout::La8,
+        DecodedPixelFormat::Rgb8 => PixelLayout::Rgb8,
+        DecodedPixelFormat::Rgba8 => PixelLayout::Rgba8,
     };
 
-    let encode_res = match decoded.format {
-        DecodedPixelFormat::L8 => WebpEncoder::new_l8(pixels, decoded.width, decoded.height)
-            .config(config)
-            .encode_into(encoded_buf),
-        DecodedPixelFormat::La8 => WebpEncoder::new_la8(pixels, decoded.width, decoded.height)
-            .config(config)
-            .encode_into(encoded_buf),
-        DecodedPixelFormat::Rgb8 => WebpEncoder::new_rgb(pixels, decoded.width, decoded.height)
-            .config(config)
-            .encode_into(encoded_buf),
-        DecodedPixelFormat::Rgba8 => WebpEncoder::new_rgba(pixels, decoded.width, decoded.height)
-            .config(config)
-            .encode_into(encoded_buf),
+    // `LossyConfig::new()` defaults to method 4 — the prior 0.2.0 speed/quality balance.
+    let encode_res = match compression {
+        ImageCompression::Lossy { quality } => {
+            let config = LossyConfig::new().with_quality(quality.as_f32());
+            EncodeRequest::lossy(&config, pixels, layout, decoded.width, decoded.height)
+                .encode_into(encoded_buf)
+        }
+        ImageCompression::Lossless => {
+            let config = LosslessConfig::new();
+            EncodeRequest::lossless(&config, pixels, layout, decoded.width, decoded.height)
+                .encode_into(encoded_buf)
+        }
     };
 
     encode_res.map_err(|err| PipelineError::EncodeFailed {
@@ -884,12 +937,14 @@ fn encode_jxl_into(
 mod tests {
     use super::{encode_bmp_streaming, encode_png_streaming, encode_png_to_writer};
     use crate::PipelineError;
+    use crate::bmp::BmpFrameScratch;
     use crate::decode::{DecodedFrameMeta, DecodedPixelFormat};
     use std::env;
     use std::fs;
     use std::io::{self, Write};
     use std::path::Path;
     use std::process;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static CPU_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1009,8 +1064,8 @@ mod tests {
         fs::set_permissions(&bmp_target, fs::Permissions::from_mode(0o600))?;
 
         encode_png_streaming(&png_target, &pixels, meta)?;
-        let mut scratch = Vec::new();
-        encode_bmp_streaming(&bmp_target, &pixels, meta, &mut scratch)?;
+        let mut scratch = BmpFrameScratch::new();
+        encode_bmp_streaming(&bmp_target, &pixels, meta, &mut scratch, &Mutex::new(()))?;
 
         assert_eq!(
             fs::metadata(&png_target)?.permissions().mode() & 0o777,
@@ -1049,8 +1104,17 @@ mod tests {
             has_non_opaque_native_alpha: false,
         };
         assert!(encode_png_streaming(&png_target, &bad_pixels, meta).is_err());
-        let mut scratch = Vec::new();
-        assert!(encode_bmp_streaming(&bmp_target, &bad_pixels, meta, &mut scratch).is_err());
+        let mut scratch = BmpFrameScratch::new();
+        assert!(
+            encode_bmp_streaming(
+                &bmp_target,
+                &bad_pixels,
+                meta,
+                &mut scratch,
+                &Mutex::new(())
+            )
+            .is_err()
+        );
 
         assert_eq!(fs::read(&png_target)?, sentinel);
         assert_eq!(fs::read(&bmp_target)?, sentinel);

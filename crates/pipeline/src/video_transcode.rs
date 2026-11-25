@@ -15,9 +15,10 @@ use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 use std::time::Instant;
 
+use fastconv_domain::video::VideoDecodePaths;
 use fastconv_domain::{
     AnimationMeta, AudioTrackAction, GpuBackend, HardwareBackend, TargetAudioCodec, VideoCodec,
-    VideoContainerFormat, VideoEncodeMode, VideoTrackAction, VideoTranscodeItem,
+    VideoContainerFormat, VideoDecodeMode, VideoEncodeMode, VideoTrackAction, VideoTranscodeItem,
     VideoTranscodePlan, VideoTranscodeReport,
 };
 use opus_pure::{Application, MAX_PACKET_BYTES, OpusEncoder};
@@ -1675,6 +1676,7 @@ struct VideoEncodeJob {
     source_track: ContainerTrack,
     track_packets: Vec<ContainerPacket>,
     mode: VideoEncodeMode,
+    decode_mode: VideoDecodeMode,
     new_index: usize,
     track_origin: i64,
 }
@@ -1799,6 +1801,7 @@ fn transcode_to_animation(
     item: &VideoTranscodeItem,
     tag: usize,
     frame_workers: usize,
+    decoded_video: &mut Vec<VideoDecodeMode>,
 ) -> Result<(u64, u64, u64, Option<String>), PipelineError> {
     let source = item.source();
     let target = item.target();
@@ -1884,6 +1887,8 @@ fn transcode_to_animation(
         },
     )?;
     staging.commit()?;
+    // Animation output decodes frames even though it has no video encode job.
+    decoded_video.push(item.decode_mode());
     Ok((written, input_size(source), input_size(target), None))
 }
 
@@ -1893,6 +1898,7 @@ fn transcode_file(
     item: &VideoTranscodeItem,
     tag: usize,
     frame_workers: usize,
+    decoded_video: &mut Vec<VideoDecodeMode>,
 ) -> Result<(u64, u64, u64, Option<String>), PipelineError> {
     let source = item.source();
     let target = item.target();
@@ -1901,7 +1907,7 @@ fn transcode_file(
         format,
         VideoContainerFormat::Gif | VideoContainerFormat::Webp
     ) {
-        return transcode_to_animation(item, tag, frame_workers);
+        return transcode_to_animation(item, tag, frame_workers, decoded_video);
     }
     let media = demux_video(source, item.input_format())?;
     // One file-level origin for every track: copied/NVENC packets carry source
@@ -1985,6 +1991,7 @@ fn transcode_file(
                         source_track: source_track.clone(),
                         track_packets,
                         mode,
+                        decode_mode: item.decode_mode(),
                         new_index,
                         track_origin,
                     });
@@ -2085,28 +2092,51 @@ fn transcode_file(
             'video: for job in &video_jobs {
                 match job.mode {
                     VideoEncodeMode::NvencH264 { .. } | VideoEncodeMode::NvencHevc { .. } => {
-                        let (mut stream, frames, device) =
-                            match crate::gpu::nvenc::encode_video_nvenc_streaming(
-                                source,
-                                &job.source_track,
-                                &job.track_packets,
-                                job.mode,
-                                job.new_index,
-                                || {
-                                    drain_audio_nonblocking(
-                                        audio_rx.as_ref(),
-                                        &audio_failed,
-                                        &mut tracks,
-                                        &mut packets,
-                                    )
-                                },
-                            ) {
-                                Ok(result) => result,
-                                Err(err) => {
-                                    video_error = Some(err);
-                                    break 'video;
-                                }
-                            };
+                        let (mut stream, frames, device) = match match job.decode_mode {
+                            VideoDecodeMode::Nvdec => {
+                                crate::gpu::nvenc::encode_video_nvdec_nvenc_streaming(
+                                    &job.source_track,
+                                    &job.track_packets,
+                                    job.source_track.codec,
+                                    job.mode,
+                                    job.new_index,
+                                    || {
+                                        drain_audio_nonblocking(
+                                            audio_rx.as_ref(),
+                                            &audio_failed,
+                                            &mut tracks,
+                                            &mut packets,
+                                        )
+                                    },
+                                )
+                            }
+                            VideoDecodeMode::Cpu => {
+                                crate::gpu::nvenc::encode_video_nvenc_streaming(
+                                    source,
+                                    &job.source_track,
+                                    &job.track_packets,
+                                    job.mode,
+                                    job.new_index,
+                                    || {
+                                        drain_audio_nonblocking(
+                                            audio_rx.as_ref(),
+                                            &audio_failed,
+                                            &mut tracks,
+                                            &mut packets,
+                                        )
+                                    },
+                                )
+                            }
+                        } {
+                            Ok(result) => {
+                                decoded_video.push(job.decode_mode);
+                                result
+                            }
+                            Err(err) => {
+                                video_error = Some(err);
+                                break 'video;
+                            }
+                        };
                         stream.track.presentation_edit = job.source_track.presentation_edit;
                         if needs_rebase {
                             rebase_source_packets(&mut stream.packets, origin);
@@ -2170,6 +2200,7 @@ fn transcode_file(
                                 break 'video;
                             }
                         };
+                        decoded_video.push(job.decode_mode);
                         // An audio worker failure during decode must stop the job
                         // before the (much longer) CPU encode starts.
                         if let Err(err) = drain_audio_nonblocking(
@@ -2358,21 +2389,27 @@ pub fn execute_video_transcode_batch(
     let frames = AtomicU64::new(0);
     let device: Mutex<Option<String>> = Mutex::new(None);
     let tag = AtomicUsize::new(0);
+    let decoded_video: Mutex<Vec<VideoDecodeMode>> = Mutex::new(Vec::new());
 
     if items.len() == 1 {
-        let (processed, _in, _out, hw) = transcode_file(&items[0], 0, frame_workers)?;
+        let mut modes = Vec::new();
+        let (processed, _in, _out, hw) = transcode_file(&items[0], 0, frame_workers, &mut modes)?;
         frames.store(processed, Ordering::Relaxed);
         if let Some(hw) = hw
             && let Ok(mut guard) = device.lock()
         {
             *guard = Some(hw);
         }
+        if let Ok(mut guard) = decoded_video.lock() {
+            guard.extend(modes);
+        }
     } else {
         thread::scope(|scope| -> Result<(), PipelineError> {
             let mut handles = Vec::with_capacity(workers);
             let mut startup_error = None;
             for worker in 0..workers {
-                let (admission, frames, device, tag) = (&admission, &frames, &device, &tag);
+                let (admission, frames, device, tag, decoded_video) =
+                    (&admission, &frames, &device, &tag, &decoded_video);
                 let worker = thread::Builder::new()
                     .name(format!("fastconv-video-{worker}"))
                     .spawn_scoped(scope, move || {
@@ -2381,7 +2418,8 @@ pub fn execute_video_transcode_batch(
                         {
                             let Some(item) = items.get(index) else { break };
                             let my_tag = tag.fetch_add(1, Ordering::Relaxed);
-                            match transcode_file(item, my_tag, frame_workers) {
+                            let mut modes = Vec::new();
+                            match transcode_file(item, my_tag, frame_workers, &mut modes) {
                                 Ok((processed, _in, _out, hw)) => {
                                     frames.fetch_add(processed, Ordering::Relaxed);
                                     if let Some(hw) = hw
@@ -2389,6 +2427,9 @@ pub fn execute_video_transcode_batch(
                                         && guard.is_none()
                                     {
                                         *guard = Some(hw);
+                                    }
+                                    if let Ok(mut guard) = decoded_video.lock() {
+                                        guard.extend(modes);
                                     }
                                 }
                                 Err(err) => {
@@ -2443,6 +2484,12 @@ pub fn execute_video_transcode_batch(
     let hardware_device = device
         .into_inner()
         .map_err(|_| PipelineError::WorkerPanicked)?;
+    // Only files that actually dispatched a video decode contribute a path;
+    // an audio-only copy has no video job and must not be reported as CPU decode.
+    let executed = decoded_video
+        .into_inner()
+        .map_err(|_| PipelineError::WorkerPanicked)?;
+    let decode_paths = VideoDecodePaths::from_modes(executed).unwrap_or(VideoDecodePaths::NoVideo);
     Ok(VideoTranscodeReport::new(
         files,
         frames.load(Ordering::Relaxed),
@@ -2452,6 +2499,7 @@ pub fn execute_video_transcode_batch(
         worker_threads,
         backend,
         hardware_device,
+        decode_paths,
     ))
 }
 
@@ -2586,6 +2634,7 @@ mod tests {
                     streams(source, input)?,
                     video,
                     audio,
+                    fastconv_domain::VideoDecodeMode::Cpu,
                 )
                 .map_err(|err| PipelineError::RemuxFailed {
                     path: target.to_path_buf(),
@@ -2673,6 +2722,8 @@ mod tests {
         )?;
         assert_eq!(report.files_converted().get(), 1);
         assert_eq!(report.frames_processed(), 4);
+        assert_eq!(report.decode_paths(), VideoDecodePaths::Cpu);
+        assert_eq!(report.decode_path(), "cpu");
         assert_output(
             &webm,
             VideoContainerFormat::Webm,
@@ -3139,6 +3190,62 @@ mod tests {
             decoded.len()
         );
         assert!(decoded.iter().any(|sample| sample.abs() > 0.01));
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn audio_only_copy_reports_no_video_decode_path() -> Result<(), PipelineError> {
+        let dir = temp_dir("audio-only-decode-path")?;
+        let source = dir.join("in.mp4");
+        let target = dir.join("out.mp4");
+        let (track, packets) = encode_audio_track(
+            &source,
+            &sine(4_800, 44_100, 2),
+            44_100,
+            2,
+            TargetAudioCodec::Aac,
+        )?;
+        let media = ContainerMedia {
+            tracks: vec![track],
+            packets,
+        };
+        let file = File::create(&source).map_err(|err| PipelineError::Io {
+            path: source.clone(),
+            source: err,
+        })?;
+        mux_video(&file, &source, VideoContainerFormat::Mp4, &media)?;
+        drop(file);
+
+        let plan = VideoTranscodePlan::new(
+            vec![
+                VideoTranscodeItem::new(
+                    source.clone(),
+                    target.clone(),
+                    VideoContainerFormat::Mp4,
+                    VideoContainerFormat::Mp4,
+                    streams(&source, VideoContainerFormat::Mp4)?,
+                    VideoTrackAction::Copy,
+                    AudioTrackAction::Copy,
+                    VideoDecodeMode::Cpu,
+                )
+                .map_err(|err| PipelineError::RemuxFailed {
+                    path: target.clone(),
+                    reason: err.to_string(),
+                })?,
+            ],
+            NonZeroUsize::MIN,
+        )
+        .map_err(|err| PipelineError::RemuxFailed {
+            path: target.clone(),
+            reason: err.to_string(),
+        })?;
+        let report = execute_video_transcode_batch(&plan)?;
+        assert_eq!(report.decode_paths(), VideoDecodePaths::NoVideo);
+        assert_eq!(report.decode_path(), "no video decoded");
         fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
             path: dir.clone(),
             source,
@@ -4060,6 +4167,99 @@ mod tests {
         fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
             path: dir.clone(),
             source,
+        })?;
+        Ok(())
+    }
+
+    #[cfg(feature = "nvenc")]
+    #[test]
+    fn hwdecode_auto_reports_nvdec_nvenc_hardware_path() -> Result<(), PipelineError> {
+        use fastconv_domain::{HardwareBackend, HardwareDecodeBackend};
+
+        if cudarc::driver::CudaContext::new(0).is_err() {
+            return Ok(());
+        }
+
+        let dir = temp_dir("nvdec-nvenc-cli")?;
+        let source = dir.join("in.mp4");
+        let target = dir.join("out.mp4");
+        // NVENC requires at least 320x240; the shared 64x48 test frames are
+        // intentionally below the hardware minimum.
+        let video_frames: Vec<Yuv420Frame> = (0..8_u32)
+            .map(|index| Yuv420Frame {
+                width: 320,
+                height: 240,
+                y: vec![u8::try_from(48 + index).unwrap_or(48); 320 * 240],
+                u: vec![96; 160 * 120],
+                v: vec![128; 160 * 120],
+                pts_us: i64::from(index) * 40_000,
+                duration_us: 40_000,
+            })
+            .collect();
+        let encoded = encode_video_cpu(
+            &source,
+            &video_frames,
+            VideoEncodeMode::CpuH264 {
+                quality: fastconv_domain::VideoQuality::DEFAULT,
+            },
+            0,
+        )?;
+        let media = ContainerMedia {
+            tracks: vec![encoded.track],
+            packets: encoded.packets,
+        };
+        let file = File::create(&source).map_err(|source_err| PipelineError::Io {
+            path: source.clone(),
+            source: source_err,
+        })?;
+        mux_video(&file, &source, VideoContainerFormat::Mp4, &media)?;
+        drop(file);
+        let mode = VideoEncodeMode::NvencH264 {
+            quality: fastconv_domain::VideoQuality::DEFAULT,
+        };
+        let decode_mode = HardwareDecodeBackend::Auto
+            .resolve(VideoCodec::H264, HardwareBackend::Gpu(GpuBackend::Nvenc))
+            .map_err(|err| PipelineError::DecodeFailed {
+                path: source.clone(),
+                reason: err.to_string(),
+            })?;
+        assert_eq!(decode_mode, VideoDecodeMode::Nvdec);
+        let plan = VideoTranscodePlan::new(
+            vec![
+                VideoTranscodeItem::new(
+                    source.clone(),
+                    target.clone(),
+                    VideoContainerFormat::Mp4,
+                    VideoContainerFormat::Mp4,
+                    streams(&source, VideoContainerFormat::Mp4)?,
+                    VideoTrackAction::Encode(mode),
+                    AudioTrackAction::Drop,
+                    decode_mode,
+                )
+                .map_err(|err| PipelineError::DecodeFailed {
+                    path: source.clone(),
+                    reason: err.to_string(),
+                })?,
+            ],
+            NonZeroUsize::MIN,
+        )
+        .map_err(|err| PipelineError::DecodeFailed {
+            path: source.clone(),
+            reason: err.to_string(),
+        })?;
+        let report = execute_video_transcode_batch(&plan)?;
+        assert_eq!(report.decode_path(), "gpu:nvdec+nvenc");
+        assert!(report.hardware_device().is_some());
+        let media = demux_video(&target, VideoContainerFormat::Mp4)?;
+        assert_eq!(media.tracks[0].codec, VideoCodec::H264);
+        assert!(
+            media.packets.len() >= 8,
+            "NVDEC -> NVENC output lost frames: {} packets",
+            media.packets.len()
+        );
+        fs::remove_dir_all(&dir).map_err(|source_err| PipelineError::Io {
+            path: dir.clone(),
+            source: source_err,
         })?;
         Ok(())
     }

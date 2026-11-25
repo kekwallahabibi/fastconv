@@ -13,7 +13,8 @@ use rav1e::color::{
     ColorDescription, ColorPrimaries, MatrixCoefficients, PixelRange, TransferCharacteristics,
 };
 use rav1e::prelude::{
-    ChromaSampling, Config, EncoderConfig, Frame, SceneDetectionSpeed, SpeedSettings,
+    BlockSize, ChromaSampling, Config, EncoderConfig, Frame, PartitionRange, SceneDetectionSpeed,
+    SegmentationLevel, SpeedSettings, Tune,
 };
 
 use crate::PipelineError;
@@ -47,7 +48,7 @@ fn encode_av1_frame(
     threads: usize,
     fill_planes: impl FnOnce(&mut Frame<u8>),
 ) -> Result<Vec<u8>, PipelineError> {
-    let mut enc = EncoderConfig::with_speed_preset(8);
+    let mut enc = EncoderConfig::with_speed_preset(10);
     enc.width = width;
     enc.height = height;
     enc.bit_depth = 8;
@@ -71,17 +72,31 @@ fn encode_av1_frame(
     enc.error_resilient = false;
     enc.quantizer = quantizer;
     enc.min_quantizer = u8::try_from(quantizer).unwrap_or(u8::MAX);
+    // Tune::Psnr enables TX-domain distortion (ignored under Psychovisual) and
+    // avoids pixel-domain psy distortion passes on every intra candidate.
+    enc.tune = Tune::Psnr;
 
-    enc.speed_settings = SpeedSettings::from_preset(8);
+    // Preset 10 fixes partitions to 32x32 and skips CDEF/fine directional intra
+    // on still frames, keeping comparable PSNR/size to SVT-AV1 preset 8 while
+    // eliminating the 8x8/16x16 partition search bottleneck on 4K inputs.
+    enc.speed_settings = SpeedSettings::from_preset(10);
     enc.speed_settings.multiref = false;
     enc.speed_settings.rdo_lookahead_frames = 1;
     enc.speed_settings.scene_detection_mode = SceneDetectionSpeed::None;
     enc.speed_settings.lrf = false;
-    enc.speed_settings.cdef = true;
+    enc.speed_settings.cdef = false;
+    enc.speed_settings.segmentation = SegmentationLevel::Disabled;
     enc.speed_settings.transform.rdo_tx_decision = false;
     enc.speed_settings.transform.reduced_tx_set = true;
+    enc.speed_settings.transform.tx_domain_distortion = true;
+    enc.speed_settings.transform.tx_domain_rate = true;
+    enc.speed_settings.prediction.fine_directional_intra = false;
+    if width >= 1024 && height >= 1024 {
+        enc.speed_settings.partition.partition_range =
+            PartitionRange::new(BlockSize::BLOCK_64X64, BlockSize::BLOCK_64X64);
+    }
     enc.tiles = if threads > 1 && width >= 256 && height >= 256 {
-        threads.next_power_of_two().min(16)
+        threads.next_power_of_two().clamp(4, 16)
     } else {
         0
     };
@@ -152,6 +167,175 @@ const fn chroma_bt601(r: i32, g: i32, b: i32) -> (u8, u8) {
     (clamp_u8(cb), clamp_u8(cr))
 }
 
+#[allow(clippy::many_single_char_names)] // r/g/b are canonical color-component names.
+#[inline]
+fn chroma_from_opaque_block(r_sum: i32, g_sum: i32, b_sum: i32) -> (u8, u8) {
+    // Four opaque pixels: (sum * 255 + 510) / 1020 == (sum + 2) / 4.
+    chroma_bt601((r_sum + 2) / 4, (g_sum + 2) / 4, (b_sum + 2) / 4)
+}
+
+/// Fused two-row luma + chroma pass for opaque RGB8: no alpha weighting or
+/// division, and independent row slices let LLVM auto-vectorize the luma loop.
+#[allow(clippy::many_single_char_names)]
+fn fill_yuv420_rgb(frame: &mut Frame<u8>, pixels: &[u8], width: usize, height: usize) {
+    let cw = width.div_ceil(2);
+    let [y_plane, u_plane, v_plane] = &mut frame.planes;
+    let mut y_rows = y_plane.rows_iter_mut();
+    let mut u_rows = u_plane.rows_iter_mut();
+    let mut v_rows = v_plane.rows_iter_mut();
+    let row_bytes = width * 3;
+
+    for y0 in (0..height).step_by(2) {
+        let Some(y_dst0) = y_rows.next() else {
+            break;
+        };
+        let y1 = (y0 + 1).min(height.saturating_sub(1));
+        let y_dst1 = if y1 == y0 { None } else { y_rows.next() };
+        let row0 = &pixels[y0 * row_bytes..(y0 + 1) * row_bytes];
+        let row1 = &pixels[y1 * row_bytes..(y1 + 1) * row_bytes];
+
+        for (x, dst) in y_dst0.iter_mut().take(width).enumerate() {
+            let i = x * 3;
+            *dst = luma_bt601(
+                i32::from(row0[i]),
+                i32::from(row0[i + 1]),
+                i32::from(row0[i + 2]),
+            );
+        }
+        if let Some(dst1) = y_dst1 {
+            for (x, dst) in dst1.iter_mut().take(width).enumerate() {
+                let i = x * 3;
+                *dst = luma_bt601(
+                    i32::from(row1[i]),
+                    i32::from(row1[i + 1]),
+                    i32::from(row1[i + 2]),
+                );
+            }
+        }
+
+        let (Some(u_dst), Some(v_dst)) = (u_rows.next(), v_rows.next()) else {
+            break;
+        };
+        for cx in 0..cw {
+            let x0 = cx * 2;
+            let x1 = (x0 + 1).min(width.saturating_sub(1));
+            let i0 = x0 * 3;
+            let i1 = x1 * 3;
+            let (cb, cr) = chroma_from_opaque_block(
+                i32::from(row0[i0])
+                    + i32::from(row0[i1])
+                    + i32::from(row1[i0])
+                    + i32::from(row1[i1]),
+                i32::from(row0[i0 + 1])
+                    + i32::from(row0[i1 + 1])
+                    + i32::from(row1[i0 + 1])
+                    + i32::from(row1[i1 + 1]),
+                i32::from(row0[i0 + 2])
+                    + i32::from(row0[i1 + 2])
+                    + i32::from(row1[i0 + 2])
+                    + i32::from(row1[i1 + 2]),
+            );
+            u_dst[cx] = cb;
+            v_dst[cx] = cr;
+        }
+    }
+}
+
+/// Same fused pass for RGBA8; a fully opaque 2x2 block takes the division-free
+/// path, while partially transparent blocks keep alpha-weighted chroma.
+#[allow(clippy::many_single_char_names)]
+fn fill_yuv420_rgba(frame: &mut Frame<u8>, pixels: &[u8], width: usize, height: usize) {
+    let cw = width.div_ceil(2);
+    let [y_plane, u_plane, v_plane] = &mut frame.planes;
+    let mut y_rows = y_plane.rows_iter_mut();
+    let mut u_rows = u_plane.rows_iter_mut();
+    let mut v_rows = v_plane.rows_iter_mut();
+    let row_bytes = width * 4;
+
+    for y0 in (0..height).step_by(2) {
+        let Some(y_dst0) = y_rows.next() else {
+            break;
+        };
+        let y1 = (y0 + 1).min(height.saturating_sub(1));
+        let y_dst1 = if y1 == y0 { None } else { y_rows.next() };
+        let row0 = &pixels[y0 * row_bytes..(y0 + 1) * row_bytes];
+        let row1 = &pixels[y1 * row_bytes..(y1 + 1) * row_bytes];
+
+        for (x, dst) in y_dst0.iter_mut().take(width).enumerate() {
+            let i = x * 4;
+            *dst = luma_bt601(
+                i32::from(row0[i]),
+                i32::from(row0[i + 1]),
+                i32::from(row0[i + 2]),
+            );
+        }
+        if let Some(dst1) = y_dst1 {
+            for (x, dst) in dst1.iter_mut().take(width).enumerate() {
+                let i = x * 4;
+                *dst = luma_bt601(
+                    i32::from(row1[i]),
+                    i32::from(row1[i + 1]),
+                    i32::from(row1[i + 2]),
+                );
+            }
+        }
+
+        let (Some(u_dst), Some(v_dst)) = (u_rows.next(), v_rows.next()) else {
+            break;
+        };
+        for cx in 0..cw {
+            let x0 = cx * 2;
+            let x1 = (x0 + 1).min(width.saturating_sub(1));
+            let i0 = x0 * 4;
+            let i1 = x1 * 4;
+            let [r0, g0, b0, a0] = [row0[i0], row0[i0 + 1], row0[i0 + 2], row0[i0 + 3]];
+            let [r1, g1, b1, a1] = [row0[i1], row0[i1 + 1], row0[i1 + 2], row0[i1 + 3]];
+            let [r2, g2, b2, a2] = [row1[i0], row1[i0 + 1], row1[i0 + 2], row1[i0 + 3]];
+            let [r3, g3, b3, a3] = [row1[i1], row1[i1 + 1], row1[i1 + 2], row1[i1 + 3]];
+
+            let (cb, cr) = if a0 & a1 & a2 & a3 == u8::MAX {
+                chroma_from_opaque_block(
+                    i32::from(r0) + i32::from(r1) + i32::from(r2) + i32::from(r3),
+                    i32::from(g0) + i32::from(g1) + i32::from(g2) + i32::from(g3),
+                    i32::from(b0) + i32::from(b1) + i32::from(b2) + i32::from(b3),
+                )
+            } else {
+                // Fully transparent pixels carry invisible RGB that must not shift
+                // the chroma shared with opaque neighbours in this block.
+                let a0 = i32::from(a0);
+                let a1 = i32::from(a1);
+                let a2 = i32::from(a2);
+                let a3 = i32::from(a3);
+                let r_sum = i32::from(r0) * a0
+                    + i32::from(r1) * a1
+                    + i32::from(r2) * a2
+                    + i32::from(r3) * a3;
+                let g_sum = i32::from(g0) * a0
+                    + i32::from(g1) * a1
+                    + i32::from(g2) * a2
+                    + i32::from(g3) * a3;
+                let b_sum = i32::from(b0) * a0
+                    + i32::from(b1) * a1
+                    + i32::from(b2) * a2
+                    + i32::from(b3) * a3;
+                let a_sum = a0 + a1 + a2 + a3;
+                if a_sum == 0 {
+                    (128, 128)
+                } else {
+                    let half = a_sum / 2;
+                    chroma_bt601(
+                        (r_sum + half) / a_sum,
+                        (g_sum + half) / a_sum,
+                        (b_sum + half) / a_sum,
+                    )
+                }
+            };
+            u_dst[cx] = cb;
+            v_dst[cx] = cr;
+        }
+    }
+}
+
 #[allow(clippy::many_single_char_names)] // x/y and r/g/b are canonical image coordinates/components.
 fn fill_yuv420(
     frame: &mut Frame<u8>,
@@ -160,98 +344,31 @@ fn fill_yuv420(
     height: usize,
     format: DecodedPixelFormat,
 ) {
-    let cw = width.div_ceil(2);
-    let ch = height.div_ceil(2);
-    let [y_plane_ref, u_plane_ref, v_plane_ref] = &mut frame.planes;
-
     match format {
         DecodedPixelFormat::L8 | DecodedPixelFormat::La8 => {
+            let cw = width.div_ceil(2);
+            let ch = height.div_ceil(2);
+            let [y_plane, u_plane, v_plane] = &mut frame.planes;
             let bpp = if format == DecodedPixelFormat::L8 {
                 1
             } else {
                 2
             };
-            for (y, row) in y_plane_ref.rows_iter_mut().take(height).enumerate() {
+            for (y, row) in y_plane.rows_iter_mut().take(height).enumerate() {
                 let row_offset = y * width * bpp;
                 for (x, dst) in row.iter_mut().take(width).enumerate() {
                     *dst = pixels[row_offset + x * bpp];
                 }
             }
-            for row in u_plane_ref.rows_iter_mut().take(ch) {
+            for row in u_plane.rows_iter_mut().take(ch) {
                 row[..cw].fill(128);
             }
-            for row in v_plane_ref.rows_iter_mut().take(ch) {
+            for row in v_plane.rows_iter_mut().take(ch) {
                 row[..cw].fill(128);
             }
         }
-        DecodedPixelFormat::Rgb8 | DecodedPixelFormat::Rgba8 => {
-            let bpp = if format == DecodedPixelFormat::Rgb8 {
-                3
-            } else {
-                4
-            };
-            let has_alpha = format == DecodedPixelFormat::Rgba8;
-            for (y, row) in y_plane_ref.rows_iter_mut().take(height).enumerate() {
-                let row_offset = y * width * bpp;
-                for (x, dst) in row.iter_mut().take(width).enumerate() {
-                    let idx = row_offset + x * bpp;
-                    *dst = luma_bt601(
-                        i32::from(pixels[idx]),
-                        i32::from(pixels[idx + 1]),
-                        i32::from(pixels[idx + 2]),
-                    );
-                }
-            }
-            for (cy, (u_row, v_row)) in u_plane_ref
-                .rows_iter_mut()
-                .zip(v_plane_ref.rows_iter_mut())
-                .take(ch)
-                .enumerate()
-            {
-                let y0 = cy * 2;
-                let y1 = (y0 + 1).min(height - 1);
-                let row0 = y0 * width * bpp;
-                let row1 = y1 * width * bpp;
-                for cx in 0..cw {
-                    let x0 = cx * 2;
-                    let x1 = (x0 + 1).min(width - 1);
-                    let mut r_sum = 0_i32;
-                    let mut g_sum = 0_i32;
-                    let mut b_sum = 0_i32;
-                    let mut a_sum = 0_i32;
-                    for idx in [
-                        row0 + x0 * bpp,
-                        row0 + x1 * bpp,
-                        row1 + x0 * bpp,
-                        row1 + x1 * bpp,
-                    ] {
-                        // Fully transparent pixels carry invisible RGB that must not
-                        // shift the chroma shared with opaque neighbours in this block.
-                        let alpha = if has_alpha {
-                            i32::from(pixels[idx + 3])
-                        } else {
-                            255
-                        };
-                        r_sum += i32::from(pixels[idx]) * alpha;
-                        g_sum += i32::from(pixels[idx + 1]) * alpha;
-                        b_sum += i32::from(pixels[idx + 2]) * alpha;
-                        a_sum += alpha;
-                    }
-                    let (cb, cr) = if a_sum == 0 {
-                        (128, 128)
-                    } else {
-                        let half = a_sum / 2;
-                        chroma_bt601(
-                            (r_sum + half) / a_sum,
-                            (g_sum + half) / a_sum,
-                            (b_sum + half) / a_sum,
-                        )
-                    };
-                    u_row[cx] = cb;
-                    v_row[cx] = cr;
-                }
-            }
-        }
+        DecodedPixelFormat::Rgb8 => fill_yuv420_rgb(frame, pixels, width, height),
+        DecodedPixelFormat::Rgba8 => fill_yuv420_rgba(frame, pixels, width, height),
     }
 }
 

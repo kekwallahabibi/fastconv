@@ -14,6 +14,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use fastconv_domain::{AnimationLoop, VideoContainerFormat, VideoQuality};
+use yuv::{
+    BufferStoreMut, YuvBiPlanarImageMut, YuvConversionMode, YuvPlanarImageMut,
+    YuvRange as SimdYuvRange, YuvStandardMatrix,
+};
 
 use crate::PipelineError;
 use crate::video_codecs::{Yuv420Frame, YuvColor, YuvMatrix, YuvRange};
@@ -93,8 +97,105 @@ fn rgb_to_yuv_block(red: i32, green: i32, blue: i32) -> (u8, u8, u8) {
     )
 }
 
+/// SIMD conversions use BT.601 limited range — the same colour description the
+/// scalar path and the downstream H.264/NV12 encoders assume.
+const SIMD_RANGE: SimdYuvRange = SimdYuvRange::Limited;
+const SIMD_MATRIX: YuvStandardMatrix = YuvStandardMatrix::Bt601;
+const SIMD_MODE: YuvConversionMode = YuvConversionMode::Balanced;
+
+/// True when every pixel of an RGBA frame is fully opaque. Such frames can skip
+/// the premultiplication/flattening copy and feed `rgba_to_yuv*` directly.
+fn rgba_is_opaque(rgba: &[u8]) -> bool {
+    rgba.as_chunks::<4>().0.iter().all(|px| px[3] == 255)
+}
+
+fn packed_stride(width: usize, channels: usize, path: &Path) -> Result<u32, PipelineError> {
+    let stride = width
+        .checked_mul(channels)
+        .ok_or_else(|| decode_error(path, "animation row stride overflow"))?;
+    u32::try_from(stride).map_err(|_| decode_error(path, "animation row stride exceeds u32"))
+}
+
+fn even_geometry(
+    path: &Path,
+    width: u32,
+    height: u32,
+) -> Result<(u32, u32, usize, usize), PipelineError> {
+    let even_width = even_dim(width).ok_or_else(|| decode_error(path, "width overflow"))?;
+    let even_height = even_dim(height).ok_or_else(|| decode_error(path, "height overflow"))?;
+    if even_width == 0 || even_height == 0 {
+        return Err(decode_error(path, "zero-sized animation frame"));
+    }
+    let padded_w =
+        usize::try_from(even_width).map_err(|_| decode_error(path, "padded width overflow"))?;
+    let padded_h =
+        usize::try_from(even_height).map_err(|_| decode_error(path, "padded height overflow"))?;
+    Ok((even_width, even_height, padded_w, padded_h))
+}
+
+/// SIMD conversion of an even-dimension, tightly packed frame. `channels` is
+/// 3 for RGB8 and 4 for RGBA8.
+fn yuv420_simd_frame(
+    info: AnimFrameInfo,
+    pixels: &[u8],
+    channels: usize,
+    padded_w: usize,
+    padded_h: usize,
+) -> Result<Yuv420Frame, PipelineError> {
+    let path = Path::new("animation-yuv420-simd");
+    let chroma_w = padded_w / 2;
+    let chroma_h = padded_h / 2;
+    let mut y_plane = vec![0_u8; padded_w * padded_h];
+    let mut u_plane = vec![0_u8; chroma_w * chroma_h];
+    let mut v_plane = vec![0_u8; chroma_w * chroma_h];
+    let stride = packed_stride(padded_w, channels, path)?;
+    let mut image = YuvPlanarImageMut {
+        y_plane: BufferStoreMut::Borrowed(&mut y_plane),
+        y_stride: u32::try_from(padded_w)
+            .map_err(|_| decode_error(path, "padded width exceeds u32"))?,
+        u_plane: BufferStoreMut::Borrowed(&mut u_plane),
+        u_stride: u32::try_from(chroma_w)
+            .map_err(|_| decode_error(path, "chroma width exceeds u32"))?,
+        v_plane: BufferStoreMut::Borrowed(&mut v_plane),
+        v_stride: u32::try_from(chroma_w)
+            .map_err(|_| decode_error(path, "chroma width exceeds u32"))?,
+        width: info.width,
+        height: info.height,
+    };
+    let converted = if channels == 4 {
+        yuv::rgba_to_yuv420(
+            &mut image,
+            pixels,
+            stride,
+            SIMD_RANGE,
+            SIMD_MATRIX,
+            SIMD_MODE,
+        )
+    } else {
+        yuv::rgb_to_yuv420(
+            &mut image,
+            pixels,
+            stride,
+            SIMD_RANGE,
+            SIMD_MATRIX,
+            SIMD_MODE,
+        )
+    };
+    converted.map_err(|err| decode_error(path, format!("SIMD YUV420 conversion failed: {err}")))?;
+    Ok(Yuv420Frame {
+        width: info.width,
+        height: info.height,
+        y: y_plane,
+        u: u_plane,
+        v: v_plane,
+        pts_us: info.pts_us,
+        duration_us: info.duration_us,
+    })
+}
+
 /// Converts tightly packed RGB8 into planar YUV420, padding odd dimensions by
-/// replicating the rightmost column and bottommost row.
+/// replicating the rightmost column and bottommost row. Even dimensions use
+/// the SIMD converter; odd dimensions keep the exact scalar fallback.
 pub(crate) fn rgb_to_yuv420(info: AnimFrameInfo, rgb: &[u8]) -> Result<Yuv420Frame, PipelineError> {
     let path = Path::new("animation-rgb-to-yuv420");
     if rgb.len() != byte_len(info.width, info.height, 3)? {
@@ -107,21 +208,17 @@ pub(crate) fn rgb_to_yuv420(info: AnimFrameInfo, rgb: &[u8]) -> Result<Yuv420Fra
             ),
         ));
     }
-    let even_width = even_dim(info.width).ok_or_else(|| decode_error(path, "width overflow"))?;
-    let even_height = even_dim(info.height).ok_or_else(|| decode_error(path, "height overflow"))?;
-    if even_width == 0 || even_height == 0 {
-        return Err(decode_error(path, "zero-sized animation frame"));
+    let (even_width, even_height, padded_w, padded_h) =
+        even_geometry(path, info.width, info.height)?;
+    if info.width == even_width && info.height == even_height {
+        return yuv420_simd_frame(info, rgb, 3, padded_w, padded_h);
     }
+
     let source_w = usize::try_from(info.width).map_err(|_| decode_error(path, "width overflow"))?;
     let source_h =
         usize::try_from(info.height).map_err(|_| decode_error(path, "height overflow"))?;
-    let padded_w =
-        usize::try_from(even_width).map_err(|_| decode_error(path, "padded width overflow"))?;
-    let padded_h =
-        usize::try_from(even_height).map_err(|_| decode_error(path, "padded height overflow"))?;
     let right = source_w.saturating_sub(1);
     let bottom = source_h.saturating_sub(1);
-
     let pixel = |sample_x: usize, sample_y: usize| -> (i32, i32, i32) {
         let idx = (sample_y.min(bottom) * source_w + sample_x.min(right)) * 3;
         (
@@ -130,7 +227,8 @@ pub(crate) fn rgb_to_yuv420(info: AnimFrameInfo, rgb: &[u8]) -> Result<Yuv420Fra
             i32::from(rgb[idx + 2]),
         )
     };
-
+    let chroma_w = padded_w / 2;
+    let chroma_h = padded_h / 2;
     let mut y_plane = vec![0_u8; padded_w * padded_h];
     for (row_y, out) in y_plane.chunks_exact_mut(padded_w).enumerate() {
         for (sample_x, dst) in out.iter_mut().enumerate() {
@@ -138,9 +236,6 @@ pub(crate) fn rgb_to_yuv420(info: AnimFrameInfo, rgb: &[u8]) -> Result<Yuv420Fra
             *dst = rgb_to_yuv_block(red, green, blue).0;
         }
     }
-
-    let chroma_w = padded_w / 2;
-    let chroma_h = padded_h / 2;
     let mut u_plane = vec![0_u8; chroma_w * chroma_h];
     let mut v_plane = vec![0_u8; chroma_w * chroma_h];
     for chroma_y in 0..chroma_h {
@@ -162,7 +257,6 @@ pub(crate) fn rgb_to_yuv420(info: AnimFrameInfo, rgb: &[u8]) -> Result<Yuv420Fra
             v_plane[chroma_y * chroma_w + chroma_x] = chroma_v;
         }
     }
-
     Ok(Yuv420Frame {
         width: even_width,
         height: even_height,
@@ -174,30 +268,44 @@ pub(crate) fn rgb_to_yuv420(info: AnimFrameInfo, rgb: &[u8]) -> Result<Yuv420Fra
     })
 }
 
-/// Writes tightly packed RGB8 as pitched NV12, padding odd dimensions by
-/// replicating edge pixels. Rows beyond `width` are left untouched.
-pub(crate) fn write_nv12(
-    rgb: &[u8],
+/// RGBA-aware entry point used by the animation decoders. Fully opaque RGBA
+/// frames go straight to the SIMD RGBA converter (no flattening copy); frames
+/// with transparency are premultiplied onto black exactly as before.
+fn pixels_to_yuv420(
+    info: AnimFrameInfo,
+    pixels: &[u8],
+    channels: usize,
+) -> Result<Yuv420Frame, PipelineError> {
+    let path = Path::new("animation-pixels-to-yuv420");
+    match channels {
+        3 => rgb_to_yuv420(info, pixels),
+        4 => {
+            if pixels.len() != byte_len(info.width, info.height, 4)? {
+                return Err(decode_error(path, "RGBA frame buffer has the wrong length"));
+            }
+            let (even_width, even_height, padded_w, padded_h) =
+                even_geometry(path, info.width, info.height)?;
+            if info.width == even_width && info.height == even_height && rgba_is_opaque(pixels) {
+                return yuv420_simd_frame(info, pixels, 4, padded_w, padded_h);
+            }
+            let flat = rgba_to_rgb(pixels, 4, info.width, info.height)?;
+            rgb_to_yuv420(info, &flat)
+        }
+        other => Err(decode_error(
+            path,
+            format!("unsupported animation pixel layout: {other} channels"),
+        )),
+    }
+}
+
+fn nv12_validate_dst(
+    path: &Path,
     width: u32,
     height: u32,
-    dst: &mut [u8],
+    dst: &[u8],
     pitch: usize,
-) -> Result<(), PipelineError> {
-    let path = Path::new("animation-write-nv12");
-    if rgb.len() != byte_len(width, height, 3)? {
-        return Err(decode_error(path, "RGB frame buffer has the wrong length"));
-    }
-    let even_width = even_dim(width).ok_or_else(|| decode_error(path, "width overflow"))?;
-    let even_height = even_dim(height).ok_or_else(|| decode_error(path, "height overflow"))?;
-    if even_width == 0 || even_height == 0 {
-        return Err(decode_error(path, "zero-sized animation frame"));
-    }
-    let source_w = usize::try_from(width).map_err(|_| decode_error(path, "width overflow"))?;
-    let source_h = usize::try_from(height).map_err(|_| decode_error(path, "height overflow"))?;
-    let padded_w =
-        usize::try_from(even_width).map_err(|_| decode_error(path, "padded width overflow"))?;
-    let padded_h =
-        usize::try_from(even_height).map_err(|_| decode_error(path, "padded height overflow"))?;
+) -> Result<(u32, u32, usize, usize), PipelineError> {
+    let (even_width, even_height, padded_w, padded_h) = even_geometry(path, width, height)?;
     if pitch < padded_w {
         return Err(decode_error(
             path,
@@ -216,6 +324,86 @@ pub(crate) fn write_nv12(
             format!("NV12 buffer is {} bytes, needs {needed}", dst.len()),
         ));
     }
+    Ok((even_width, even_height, padded_w, padded_h))
+}
+
+/// SIMD conversion of an even-dimension, tightly packed frame into a pitched
+/// NV12 destination. `channels` is 3 for RGB8 and 4 for RGBA8.
+#[allow(clippy::too_many_arguments)]
+fn nv12_simd_write(
+    path: &Path,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    dst: &mut [u8],
+    pitch: usize,
+    channels: usize,
+    padded_w: usize,
+    padded_h: usize,
+) -> Result<(), PipelineError> {
+    let uv_base = padded_h
+        .checked_mul(pitch)
+        .ok_or_else(|| decode_error(path, "NV12 UV offset overflow"))?;
+    let y_len = pitch
+        .checked_mul(padded_h)
+        .ok_or_else(|| decode_error(path, "NV12 luma region overflow"))?;
+    let uv_len = pitch
+        .checked_mul(padded_h / 2)
+        .ok_or_else(|| decode_error(path, "NV12 chroma region overflow"))?;
+    let (y_region, uv_region) = dst.split_at_mut(uv_base);
+    let mut image = YuvBiPlanarImageMut {
+        y_plane: BufferStoreMut::Borrowed(&mut y_region[..y_len]),
+        y_stride: u32::try_from(pitch).map_err(|_| decode_error(path, "NV12 pitch exceeds u32"))?,
+        uv_plane: BufferStoreMut::Borrowed(&mut uv_region[..uv_len]),
+        uv_stride: u32::try_from(pitch)
+            .map_err(|_| decode_error(path, "NV12 pitch exceeds u32"))?,
+        width,
+        height,
+    };
+    let stride = packed_stride(padded_w, channels, path)?;
+    let converted = if channels == 4 {
+        yuv::rgba_to_yuv_nv12(
+            &mut image,
+            pixels,
+            stride,
+            SIMD_RANGE,
+            SIMD_MATRIX,
+            SIMD_MODE,
+        )
+    } else {
+        yuv::rgb_to_yuv_nv12(
+            &mut image,
+            pixels,
+            stride,
+            SIMD_RANGE,
+            SIMD_MATRIX,
+            SIMD_MODE,
+        )
+    };
+    converted.map_err(|err| decode_error(path, format!("SIMD NV12 conversion failed: {err}")))
+}
+
+/// Writes tightly packed RGB8 as pitched NV12, padding odd dimensions by
+/// replicating edge pixels. Rows beyond `width` are left untouched.
+pub(crate) fn write_nv12(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    dst: &mut [u8],
+    pitch: usize,
+) -> Result<(), PipelineError> {
+    let path = Path::new("animation-write-nv12");
+    if rgb.len() != byte_len(width, height, 3)? {
+        return Err(decode_error(path, "RGB frame buffer has the wrong length"));
+    }
+    let (even_width, even_height, padded_w, padded_h) =
+        nv12_validate_dst(path, width, height, dst, pitch)?;
+    if width == even_width && height == even_height {
+        return nv12_simd_write(path, rgb, width, height, dst, pitch, 3, padded_w, padded_h);
+    }
+
+    let source_w = usize::try_from(width).map_err(|_| decode_error(path, "width overflow"))?;
+    let source_h = usize::try_from(height).map_err(|_| decode_error(path, "height overflow"))?;
     let right = source_w.saturating_sub(1);
     let bottom = source_h.saturating_sub(1);
     let pixel = |sample_x: usize, sample_y: usize| -> (i32, i32, i32) {
@@ -254,6 +442,40 @@ pub(crate) fn write_nv12(
         }
     }
     Ok(())
+}
+
+/// RGBA-aware NV12 entry point used by the animation decoders. Opaque RGBA
+/// frames avoid the flattening copy entirely.
+fn write_pixels_nv12(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    dst: &mut [u8],
+    pitch: usize,
+    channels: usize,
+) -> Result<(), PipelineError> {
+    let path = Path::new("animation-write-nv12");
+    match channels {
+        3 => write_nv12(pixels, width, height, dst, pitch),
+        4 => {
+            if pixels.len() != byte_len(width, height, 4)? {
+                return Err(decode_error(path, "RGBA frame buffer has the wrong length"));
+            }
+            let (even_width, even_height, padded_w, padded_h) =
+                nv12_validate_dst(path, width, height, dst, pitch)?;
+            if width == even_width && height == even_height && rgba_is_opaque(pixels) {
+                return nv12_simd_write(
+                    path, pixels, width, height, dst, pitch, 4, padded_w, padded_h,
+                );
+            }
+            let flat = rgba_to_rgb(pixels, 4, width, height)?;
+            write_nv12(&flat, width, height, dst, pitch)
+        }
+        other => Err(decode_error(
+            path,
+            format!("unsupported animation pixel layout: {other} channels"),
+        )),
+    }
 }
 
 /// 8.8 fixed-point YUV→RGB coefficients: `(y_gain, y_offset, r_v, g_u, g_v, b_u)`.
@@ -867,6 +1089,7 @@ fn apply_gif_disposal(
 }
 
 /// Composites GIF frames and streams flattened RGB8 for non-animation outputs.
+#[cfg(test)]
 pub(crate) fn decode_gif_frames_streaming_rgb<F>(
     path: &Path,
     on_frame: F,
@@ -899,7 +1122,7 @@ where
         &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError>,
 {
-    decode_gif_frames_streaming_rgb(path, |info, rgb| {
+    decode_gif_frames_streaming_pixels(path, |info, pixels| {
         let padded_width =
             even_dim(info.width).ok_or_else(|| decode_error(path, "GIF width overflow"))?;
         let padded_height =
@@ -909,8 +1132,16 @@ where
             height: padded_height,
             ..info
         };
-        let mut pack =
-            |dst: &mut [u8], pitch: usize| write_nv12(rgb, info.width, info.height, dst, pitch);
+        let mut pack = |dst: &mut [u8], pitch: usize| {
+            write_pixels_nv12(
+                pixels,
+                info.width,
+                info.height,
+                dst,
+                pitch,
+                usize::from(info.channels),
+            )
+        };
         on_frame(nv12_info, &mut pack)
     })
 }
@@ -922,8 +1153,9 @@ pub(crate) fn decode_gif_frames_yuv420(
 ) -> Result<Vec<Yuv420Frame>, PipelineError> {
     let mut frames = Vec::new();
     let mut used = 0_u64;
-    decode_gif_frames_streaming_rgb(path, |info, rgb| {
-        let frame = rgb_to_yuv420(info, rgb)?;
+    decode_gif_frames_streaming_pixels(path, |info, pixels| {
+        let channels = usize::from(info.channels);
+        let frame = pixels_to_yuv420(info, pixels, channels)?;
         used = used.saturating_add(
             u64::try_from(
                 frame
@@ -1032,7 +1264,7 @@ where
         loop {
             let ms = match decoder.read_frame(&mut buf) {
                 Ok(ms) => ms,
-                Err(zenwebp::DecodingError::NoMoreFrames) => break,
+                Err(err) if matches!(err.error(), zenwebp::DecodeError::NoMoreFrames) => break,
                 Err(err) => {
                     return Err(decode_error(
                         path,
@@ -1072,6 +1304,7 @@ where
 }
 
 /// Streams flattened RGB8 frames from a still or animated WebP file.
+#[cfg(test)]
 pub(crate) fn decode_webp_frames_streaming_rgb<F>(
     path: &Path,
     on_frame: F,
@@ -1104,7 +1337,7 @@ where
         &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError>,
 {
-    decode_webp_frames_streaming_rgb(path, |info, rgb| {
+    decode_webp_frames_streaming_pixels(path, |info, pixels| {
         let padded_width =
             even_dim(info.width).ok_or_else(|| decode_error(path, "WebP width overflow"))?;
         let padded_height =
@@ -1114,8 +1347,16 @@ where
             height: padded_height,
             ..info
         };
-        let mut pack =
-            |dst: &mut [u8], pitch: usize| write_nv12(rgb, info.width, info.height, dst, pitch);
+        let mut pack = |dst: &mut [u8], pitch: usize| {
+            write_pixels_nv12(
+                pixels,
+                info.width,
+                info.height,
+                dst,
+                pitch,
+                usize::from(info.channels),
+            )
+        };
         on_frame(nv12_info, &mut pack)
     })
 }
@@ -1127,8 +1368,9 @@ pub(crate) fn decode_webp_frames_yuv420(
 ) -> Result<Vec<Yuv420Frame>, PipelineError> {
     let mut frames = Vec::new();
     let mut used = 0_u64;
-    decode_webp_frames_streaming_rgb(path, |info, rgb| {
-        let frame = rgb_to_yuv420(info, rgb)?;
+    decode_webp_frames_streaming_pixels(path, |info, pixels| {
+        let channels = usize::from(info.channels);
+        let frame = pixels_to_yuv420(info, pixels, channels)?;
         used = used.saturating_add(
             u64::try_from(
                 frame
@@ -1261,16 +1503,23 @@ fn prepare_frame(
         Ok(PreparedFrame::Gif(frame))
     } else {
         let path = Path::new("webp-encoder");
-        let encoder = if job.info.channels == 4 {
-            zenwebp::Encoder::new_rgba(&job.rgb, job.info.width, job.info.height)
+        let layout = if job.info.channels == 4 {
+            zenwebp::PixelLayout::Rgba8
         } else {
-            zenwebp::Encoder::new_rgb(&job.rgb, job.info.width, job.info.height)
+            zenwebp::PixelLayout::Rgb8
         };
-        let webp_bytes = encoder
-            .quality(f32::from(quality.get()))
-            .method(4)
-            .encode()
-            .map_err(|err| encode_error(path, format!("WebP encoding failed: {err}")))?;
+        let config = zenwebp::LossyConfig::new()
+            .with_quality(f32::from(quality.get()))
+            .with_method(4);
+        let webp_bytes = zenwebp::EncodeRequest::lossy(
+            &config,
+            &job.rgb,
+            layout,
+            job.info.width,
+            job.info.height,
+        )
+        .encode()
+        .map_err(|err| encode_error(path, format!("WebP encoding failed: {err}")))?;
         let (inner, has_alpha) = extract_inner_vp8_chunk(&webp_bytes)?;
         Ok(PreparedFrame::Webp {
             inner,
@@ -1826,6 +2075,173 @@ mod tests {
     }
 
     #[test]
+    fn simd_rgb_to_yuv420_even_dimensions() -> Result<(), PipelineError> {
+        let colors: [[u8; 3]; 8] = [
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+            [255, 255, 255],
+            [16, 32, 48],
+            [180, 96, 40],
+            [10, 200, 90],
+            [90, 10, 200],
+        ];
+        let rgb: Vec<u8> = colors.iter().flatten().copied().collect();
+        let frame = rgb_to_yuv420(info(4, 2), &rgb)?;
+        assert_eq!((frame.width, frame.height), (4, 2));
+        assert_eq!((frame.y.len(), frame.u.len(), frame.v.len()), (8, 2, 2));
+        for (idx, color) in colors.iter().enumerate() {
+            let want = rgb_to_yuv_block(
+                i32::from(color[0]),
+                i32::from(color[1]),
+                i32::from(color[2]),
+            )
+            .0;
+            assert!(
+                frame.y[idx].abs_diff(want) <= 2,
+                "SIMD luma for {color:?}: {} vs scalar {want}",
+                frame.y[idx]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn simd_opaque_rgba_matches_rgb_without_flattening() -> Result<(), PipelineError> {
+        let colors: [[u8; 3]; 8] = [
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+            [255, 255, 255],
+            [16, 32, 48],
+            [180, 96, 40],
+            [10, 200, 90],
+            [90, 10, 200],
+        ];
+        let rgb: Vec<u8> = colors.iter().flatten().copied().collect();
+        let rgba: Vec<u8> = colors
+            .iter()
+            .flat_map(|c| [c[0], c[1], c[2], 255])
+            .collect();
+        let from_rgb = rgb_to_yuv420(info(4, 2), &rgb)?;
+        let from_rgba = pixels_to_yuv420(info(4, 2), &rgba, 4)?;
+        assert_eq!(from_rgb.y, from_rgba.y, "opaque alpha must be ignored");
+        assert_eq!(from_rgb.u, from_rgba.u);
+        assert_eq!(from_rgb.v, from_rgba.v);
+        Ok(())
+    }
+
+    #[test]
+    fn transparent_rgba_composites_onto_black() -> Result<(), PipelineError> {
+        let rgba = vec![
+            255, 0, 0, 0, // fully transparent -> limited-range black
+            255, 0, 0, 255, // fully opaque red
+            0, 255, 0, 128, // half-transparent green
+            0, 0, 255, 255, // fully opaque blue
+        ];
+        let frame = pixels_to_yuv420(info(2, 2), &rgba, 4)?;
+        assert_eq!(frame.y[0], 16, "transparent pixel must become black luma");
+        assert!(
+            frame.y[1].abs_diff(rgb_to_yuv_block(255, 0, 0).0) <= 2,
+            "opaque red luma drift: {}",
+            frame.y[1]
+        );
+        assert!(frame.y[2] > 16, "half-transparent green must be visible");
+        assert!(
+            frame.y[3].abs_diff(rgb_to_yuv_block(0, 0, 255).0) <= 2,
+            "opaque blue luma drift: {}",
+            frame.y[3]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn odd_dimension_rgba_yuv420_matches_scalar_flatten() -> Result<(), PipelineError> {
+        let mut rgba = Vec::new();
+        for index in 0..15_u32 {
+            let alpha = if index == 5 { 0 } else { 255 };
+            rgba.extend_from_slice(&[
+                u8::try_from(index * 13).unwrap_or(255),
+                u8::try_from(255 - index * 7).unwrap_or(0),
+                u8::try_from(index * 11).unwrap_or(255),
+                alpha,
+            ]);
+        }
+        let flat = rgba_to_rgb(&rgba, 4, 5, 3)?;
+        let expected = rgb_to_yuv420(info(5, 3), &flat)?;
+        let actual = pixels_to_yuv420(info(5, 3), &rgba, 4)?;
+        assert_eq!(actual, expected, "odd transparent RGBA must be bit-exact");
+        assert_eq!((actual.width, actual.height), (6, 4));
+        assert_eq!(actual.y[5], actual.y[4], "rightmost column replicated");
+        assert_eq!(actual.y[18], actual.y[12], "bottom row replicated");
+        Ok(())
+    }
+
+    #[test]
+    fn simd_nv12_opaque_rgba_matches_rgb() -> Result<(), PipelineError> {
+        let colors: [[u8; 3]; 8] = [
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+            [255, 255, 255],
+            [16, 32, 48],
+            [180, 96, 40],
+            [10, 200, 90],
+            [90, 10, 200],
+        ];
+        let rgb: Vec<u8> = colors.iter().flatten().copied().collect();
+        let rgba: Vec<u8> = colors
+            .iter()
+            .flat_map(|c| [c[0], c[1], c[2], 255])
+            .collect();
+        let mut from_rgb = vec![0xAA_u8; 4 * 6];
+        let mut from_rgba = vec![0xAA_u8; 4 * 6];
+        write_nv12(&rgb, 4, 2, &mut from_rgb, 4)?;
+        write_pixels_nv12(&rgba, 4, 2, &mut from_rgba, 4, 4)?;
+        assert_eq!(from_rgb, from_rgba, "NV12 RGBA fast path must match RGB");
+        for (row, color_row) in colors.as_chunks::<4>().0.iter().enumerate() {
+            for (col, color) in color_row.iter().enumerate() {
+                let got = from_rgba[row * 4 + col];
+                let want = rgb_to_yuv_block(
+                    i32::from(color[0]),
+                    i32::from(color[1]),
+                    i32::from(color[2]),
+                )
+                .0;
+                assert!(
+                    got.abs_diff(want) <= 2,
+                    "NV12 luma at ({row},{col}): {got} vs scalar {want}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn odd_dimension_nv12_rgba_matches_scalar_flatten() -> Result<(), PipelineError> {
+        let rgba: Vec<u8> = (0..9_u32)
+            .flat_map(|i| {
+                [
+                    u8::try_from(i * 20).unwrap_or(255),
+                    u8::try_from(255 - i * 10).unwrap_or(0),
+                    64_u8,
+                    255,
+                ]
+            })
+            .collect();
+        let flat = rgba_to_rgb(&rgba, 4, 3, 3)?;
+        let mut from_rgb = vec![0xAA_u8; 4 * 6];
+        let mut from_rgba = vec![0xAA_u8; 4 * 6];
+        write_nv12(&flat, 3, 3, &mut from_rgb, 4)?;
+        write_pixels_nv12(&rgba, 3, 3, &mut from_rgba, 4, 4)?;
+        assert_eq!(
+            from_rgb, from_rgba,
+            "odd NV12 RGBA must match scalar flatten"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn nv12_write_and_inverse_preserves_pitch() -> Result<(), PipelineError> {
         // A uniform colour keeps 4:2:0 chroma averaging exact, so only the
         // integer BT.601 rounding is under test here.
@@ -1916,7 +2332,7 @@ mod tests {
         let mut decoder = zenwebp::WebPDecoder::new(&bytes)
             .map_err(|err| decode_error(&path, format!("{err}")))?;
         assert!(decoder.is_animated());
-        assert_eq!(decoder.loop_count(), zenwebp::LoopCount::Forever);
+        assert_eq!(decoder.loop_count(), zenwebp::decoder::LoopCount::Forever);
         assert_eq!(decoder.dimensions(), (5, 5));
         let mut count = 0_u32;
         let mut buf = vec![0_u8; decoder.output_buffer_size().unwrap_or(0)];
@@ -1926,7 +2342,7 @@ mod tests {
                     assert_eq!(ms, 100, "100 ms per frame");
                     count = count.saturating_add(1);
                 }
-                Err(zenwebp::DecodingError::NoMoreFrames) => break,
+                Err(err) if matches!(err.error(), zenwebp::DecodeError::NoMoreFrames) => break,
                 Err(err) => return Err(decode_error(&path, format!("{err}"))),
             }
         }
@@ -2175,7 +2591,10 @@ mod tests {
         let bytes = fs::read(&webp).map_err(|source| io_error(&webp, source))?;
         let decoder = zenwebp::WebPDecoder::new(&bytes)
             .map_err(|err| decode_error(&webp, format!("{err}")))?;
-        assert_eq!(decoder.loop_count(), zenwebp::LoopCount::Times(times));
+        assert_eq!(
+            decoder.loop_count(),
+            zenwebp::decoder::LoopCount::Times(times)
+        );
 
         let gif = dir.join("loop.gif");
         let file = File::create(&gif).map_err(|source| io_error(&gif, source))?;
