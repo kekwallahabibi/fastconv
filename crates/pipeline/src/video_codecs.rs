@@ -2006,6 +2006,10 @@ pub(crate) fn encode_video_cpu(
         VideoEncodeMode::CpuVp9 { quality } => {
             cpu_vp9(path, frames, quality, track_index, fps_num, fps_den)
         }
+        VideoEncodeMode::CpuGif { .. } | VideoEncodeMode::CpuWebp { .. } => Err(encode_error(
+            path,
+            "animated GIF/WebP encoding is not implemented yet (Stage 2 pending)",
+        )),
         VideoEncodeMode::NvencH264 { .. } | VideoEncodeMode::NvencHevc { .. } => Err(encode_error(
             path,
             "NVENC modes must be encoded on the NVENC backend",

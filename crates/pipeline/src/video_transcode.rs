@@ -1762,6 +1762,7 @@ fn transcode_file(
             match item.audio_action() {
                 AudioTrackAction::Copy => track.codec,
                 AudioTrackAction::Encode(codec) => codec.as_video_codec(),
+                AudioTrackAction::Drop => continue,
             }
         } else {
             track.codec
@@ -1822,6 +1823,7 @@ fn transcode_file(
                         track_origin,
                     });
                 }
+                AudioTrackAction::Drop => {}
             },
             // Timed text is copy-only. The domain already allows it in MOV/MP4
             // and skips it in codec validation, so execution must not abort.
@@ -1939,6 +1941,13 @@ fn transcode_file(
                             hardware_device = Some(device);
                         }
                     }
+                    VideoEncodeMode::CpuGif { .. } | VideoEncodeMode::CpuWebp { .. } => {
+                        video_error = Some(encode_error(
+                            source,
+                            "animated GIF/WebP encoding is not implemented yet (Stage 2 pending)",
+                        ));
+                        break 'video;
+                    }
                     VideoEncodeMode::CpuH264 { .. }
                     | VideoEncodeMode::CpuAv1 { .. }
                     | VideoEncodeMode::CpuVp9 { .. } => {
@@ -2053,19 +2062,28 @@ fn transcode_file(
                 return Err(err);
             }
 
-            if tracks.is_empty() || packets.is_empty() {
+            // A dropped audio track leaves its pre-sized slot empty. Compact the
+            // surviving tracks and remap every packet onto the dense indices so
+            // the muxer never sees a hole or a packet for a removed track.
+            let mut index_map = vec![None; media.tracks.len()];
+            let mut staged_tracks = Vec::with_capacity(tracks.len());
+            for (old_index, slot) in tracks.into_iter().enumerate() {
+                if let Some(track) = slot {
+                    index_map[old_index] = Some(staged_tracks.len());
+                    staged_tracks.push(track);
+                }
+            }
+            if staged_tracks.is_empty() || packets.is_empty() {
                 return Err(PipelineError::RemuxFailed {
                     path: target.to_path_buf(),
                     reason: "source has no supported tracks to transcode".to_owned(),
                 });
             }
-            let mut staged_tracks = Vec::with_capacity(tracks.len());
-            for (index, slot) in tracks.into_iter().enumerate() {
-                let track = slot.ok_or_else(|| PipelineError::RemuxFailed {
-                    path: target.to_path_buf(),
-                    reason: format!("track {index} was not produced"),
-                })?;
-                staged_tracks.push(track);
+            packets.retain(|packet| index_map.get(packet.track).is_some_and(Option::is_some));
+            for packet in &mut packets {
+                if let Some(new_index) = index_map.get(packet.track).copied().flatten() {
+                    packet.track = new_index;
+                }
             }
             packets.sort_by_key(|packet| (packet.dts, packet.track));
             let out_media = crate::video_container::ContainerMedia {
