@@ -1,4 +1,6 @@
 pub mod heic;
+#[cfg(feature = "nvenc")]
+pub(crate) mod nvdec;
 pub mod nvenc;
 
 use fastconv_domain::{ExecutionPlan, GpuBackend, HardwareBackend};

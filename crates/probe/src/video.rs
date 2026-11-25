@@ -8,10 +8,10 @@ use containr::CodecConfig;
 use containr::Track;
 use containr::TrackKind;
 use fastconv_domain::{
-    AnimationLoop, AnimationMeta, AudioTrackAction, DomainError, HardwareBackend, PathRole,
-    TargetAudioCodec, TargetVideoCodec, VideoCodec, VideoContainerFormat, VideoEncodeMode,
-    VideoQuality, VideoRemuxItem, VideoRemuxPlan, VideoStreamInfo, VideoStreamKind,
-    VideoTrackAction, VideoTranscodeItem, VideoTranscodePlan,
+    AnimationLoop, AnimationMeta, AudioTrackAction, DomainError, HardwareBackend,
+    HardwareDecodeBackend, PathRole, TargetAudioCodec, TargetVideoCodec, VideoCodec,
+    VideoContainerFormat, VideoEncodeMode, VideoQuality, VideoRemuxItem, VideoRemuxPlan,
+    VideoStreamInfo, VideoStreamKind, VideoTrackAction, VideoTranscodeItem, VideoTranscodePlan,
 };
 
 use crate::{ProbeError, available_cpu_threads};
@@ -1884,6 +1884,39 @@ pub fn prepare_video_transcode_batch(
     backend: HardwareBackend,
     worker_threads: Option<NonZeroUsize>,
 ) -> Result<VideoTranscodePlan, ProbeError> {
+    prepare_video_transcode_batch_with_decode(
+        source,
+        target,
+        to,
+        video_codec,
+        audio_codec,
+        quality,
+        backend,
+        HardwareDecodeBackend::Auto,
+        worker_threads,
+    )
+}
+
+/// Same as [`prepare_video_transcode_batch`] but with an explicit decode
+/// backend request. `Nvdec` is rejected here unless the source codec and the
+/// encoder backend can actually execute it — no silent CPU fallback.
+///
+/// # Errors
+///
+/// Returns [`ProbeError`] for invalid paths, unsupported combinations, or a
+/// forced NVDEC request that cannot be honoured.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn prepare_video_transcode_batch_with_decode(
+    source: &Path,
+    target: &Path,
+    to: Option<VideoContainerFormat>,
+    video_codec: Option<RequestedVideoCodec>,
+    audio_codec: Option<RequestedAudioCodec>,
+    quality: VideoQuality,
+    backend: HardwareBackend,
+    decode_backend: HardwareDecodeBackend,
+    worker_threads: Option<NonZeroUsize>,
+) -> Result<VideoTranscodePlan, ProbeError> {
     if source.as_os_str().is_empty() {
         return Err(DomainError::EmptyPath(PathRole::Source).into());
     }
@@ -1981,6 +2014,12 @@ pub fn prepare_video_transcode_batch(
     for (input, output) in specs {
         reject_alias_collision(&input, &output)?;
         let probed = probe_video(&input)?;
+        let source_codec = probed
+            .streams
+            .iter()
+            .find(|s| s.kind() == VideoStreamKind::Video)
+            .map_or(VideoCodec::Unknown, VideoStreamInfo::codec);
+        let decode_mode = decode_backend.resolve(source_codec, video_action.backend())?;
         items.push(VideoTranscodeItem::new(
             input,
             output,
@@ -1989,6 +2028,7 @@ pub fn prepare_video_transcode_batch(
             probed.streams,
             video_action,
             audio_action,
+            decode_mode,
         )?);
     }
     Ok(VideoTranscodePlan::new(items, threads)?)

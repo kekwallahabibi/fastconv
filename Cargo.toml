@@ -28,6 +28,7 @@ jxl = "0.8.0"
 # `jixel` is the pure-Rust JPEG XL encoder used for JXL output.
 # It is dual-licensed BSD-3-Clause OR Apache-2.0.
 jixel = { version = "0.5.13", default-features = false, features = ["avx", "sse"] }
+libloading = "0.8"
 nvidia-video-codec-sdk = "0.4"
 ogg = "0.9.2"
 opus-pure = "0.2.3"

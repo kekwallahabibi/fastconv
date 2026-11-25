@@ -140,6 +140,16 @@ fn us_to_ticks(value_us: i64, timescale: u32) -> i64 {
     i64::try_from(rounded).unwrap_or(if numerator >= 0 { i64::MAX } else { i64::MIN })
 }
 
+/// MP4 requires strictly increasing DTS ticks. A 1 µs step can round to zero
+/// ticks at 90 kHz (or any timescale above 1 MHz), so the tick-domain bump is
+/// authoritative: apply it after rescaling, never only in microseconds.
+fn monotonic_dts_ticks(raw_ticks: i64, previous: Option<i64>) -> i64 {
+    match previous {
+        None => 0,
+        Some(previous) => raw_ticks.max(previous.saturating_add(1)),
+    }
+}
+
 /// A windowed reader that keeps containr's absolute seeks cheap.
 struct WindowedFileReader {
     file: File,
@@ -1189,10 +1199,7 @@ fn mux_mp4_into<W: Read + Write + Seek>(
         media_end[packet.track] =
             media_end[packet.track].max(u64::try_from(end).unwrap_or(u64::MAX));
         let raw_dts_ticks = us_to_ticks(dts, track_timescale);
-        let dts_ticks = match prev_dts_ticks[packet.track] {
-            None => 0,
-            Some(prev) => raw_dts_ticks.max(prev.saturating_add(1)),
-        };
+        let dts_ticks = monotonic_dts_ticks(raw_dts_ticks, prev_dts_ticks[packet.track]);
         prev_dts_ticks[packet.track] = Some(dts_ticks);
         let pts_ticks = us_to_ticks(pts, track_timescale);
         let final_duration_ticks = (last_packet_for_track[packet.track] == Some(packet_index))
@@ -1713,6 +1720,31 @@ mod tests {
         // Presentation deltas stay exact and no frame gets a negative PTS.
         assert_eq!(timestamps[2].1 - timestamps[1].1, -150_000);
         assert!(timestamps.iter().all(|&(_, pts)| pts >= 0));
+    }
+
+    #[test]
+    fn mp4_dts_stays_strictly_increasing_when_microseconds_collapse_to_ticks() {
+        // At the common 90 kHz MP4 timescale one tick is ~11 µs: GIF delays
+        // rounded to whole centiseconds and 1 µs DTS backoffs map to equal
+        // ticks unless the bump happens in tick space.
+        let timescale = 90_000_u32;
+        let microseconds = [0_i64, 1, 2, 70_000, 70_001, 140_000];
+        let mut previous = None;
+        for value in microseconds {
+            let ticks = monotonic_dts_ticks(us_to_ticks(value, timescale), previous);
+            if let Some(previous) = previous {
+                assert!(
+                    ticks > previous,
+                    "{value} µs collapsed to non-monotonic DTS tick {ticks} <= {previous}"
+                );
+            }
+            previous = Some(ticks);
+        }
+        assert_eq!(us_to_ticks(1, timescale), us_to_ticks(0, timescale));
+        assert_eq!(
+            us_to_ticks(70_001, timescale),
+            us_to_ticks(70_000, timescale)
+        );
     }
 
     #[test]

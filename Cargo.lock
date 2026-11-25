@@ -589,6 +589,7 @@ dependencies = [
  "jixel",
  "jpeg-encoder",
  "jxl",
+ "libloading",
  "nvidia-video-codec-sdk",
  "ogg",
  "opus-pure",

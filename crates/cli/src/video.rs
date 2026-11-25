@@ -2,7 +2,8 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use fastconv_domain::{
-    HardwareBackend, TargetAudioCodec, TargetVideoCodec, VideoContainerFormat, VideoQuality,
+    HardwareBackend, HardwareDecodeBackend, TargetAudioCodec, TargetVideoCodec,
+    VideoContainerFormat, VideoQuality,
 };
 use fastconv_probe::{RequestedAudioCodec, RequestedVideoCodec};
 
@@ -149,6 +150,7 @@ pub(crate) struct VideoArgs {
     quality: Option<VideoQuality>,
     threads: Option<NonZeroUsize>,
     backend: HardwareBackend,
+    decode_backend: HardwareDecodeBackend,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,9 +161,12 @@ pub(crate) enum VideoCommand {
 
 pub(crate) fn print_video_help() {
     println!(
-        "Usage: fastconv video <source> <target> [--to <mp4|mkv|webm|mov|avi|ts|gif|webp>] [--vcodec <h264|hevc|h265|av1|vp9|gif|webp|copy>] [--acodec <aac|opus|mp3|none|copy>] [--quality <0..=100>] [--threads <N>] [--backend <cpu|nvenc>]\n\n\
+        "Usage: fastconv video <source> <target> [--to <mp4|mkv|webm|mov|avi|ts|gif|webp>] [--vcodec <h264|hevc|h265|av1|vp9|gif|webp|copy>] [--acodec <aac|opus|mp3|none|copy>] [--quality <0..=100>] [--threads <N>] [--backend <cpu|nvenc>] [--hwdecode <auto|cpu|nvdec>]\n\n\
          Transcode audio/video tracks while converting between MP4/MOV, MKV, WebM, AVI, TS, GIF, and WebP containers.\n\n\
          Backends: cpu runs every codec and --vcodec copy; nvenc encodes H.264/HEVC only.\n\
+         Decode: --hwdecode auto (default) uses NVDEC for H.264/HEVC/VP9 with --backend nvenc;\n\
+                 --hwdecode cpu forces CPU decode; --hwdecode nvdec requires --backend nvenc and\n\
+                 a hardware-decodable source. A failed NVDEC setup is a hard error, never a CPU fallback.\n\
          Animated GIF/WebP encoding runs on CPU only and drops audio tracks by default.\n\n\
          Arguments:\n  \
            <source>              Source video file or directory\n  \
@@ -173,6 +178,7 @@ pub(crate) fn print_video_help() {
            --quality <0..=100>   Encoding quality (cannot be combined with --vcodec copy)\n  \
            --threads <N>         Number of parallel workers\n  \
            --backend <name>      cpu (default) or nvenc (H.264/HEVC encoding only)\n  \
+           --hwdecode <name>     auto (default), cpu, or nvdec (NVDEC + NVENC zero-copy)\n  \
            -h, --help            Print this help\n\n\
          Container aliases: m4v -> mp4, qt -> mov, m2ts/mts -> ts"
     );
@@ -215,6 +221,9 @@ fn parse_audio_codec(raw: &str) -> Result<RequestedAudioCodec, String> {
 ///
 /// Returns a diagnostic for missing positional arguments, duplicate flags, malformed values,
 /// unknown codecs/backends, or combinations with no implementation.
+// Each flag is parsed and validated in one explicit branch at the CLI boundary;
+// splitting it would hide the mapping from the user-facing error messages.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
     let mut positional = Vec::new();
     let mut to = None;
@@ -223,6 +232,7 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
     let mut quality = None;
     let mut threads = None;
     let mut backend = None;
+    let mut decode_backend = None;
     let mut index = 0_usize;
 
     while let Some(&arg) = args.get(index) {
@@ -285,6 +295,16 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
                 backend = Some(crate::parse_backend(flag_value(args, index, "--backend")?)?);
                 index += 2;
             }
+            "--hwdecode" => {
+                if decode_backend.is_some() {
+                    return Err("duplicate flag '--hwdecode'".to_owned());
+                }
+                let raw = flag_value(args, index, "--hwdecode")?;
+                decode_backend = Some(HardwareDecodeBackend::from_name(raw).ok_or_else(|| {
+                    format!("unknown decode backend '{raw}' (expected auto, cpu, or nvdec)")
+                })?);
+                index += 2;
+            }
             flag if flag.starts_with('-') => return Err(format!("unknown flag '{flag}'")),
             value => {
                 positional.push(value);
@@ -309,6 +329,7 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
         quality,
         threads,
         backend: backend.unwrap_or(HardwareBackend::Cpu),
+        decode_backend: decode_backend.unwrap_or(HardwareDecodeBackend::Auto),
     }))
 }
 
@@ -319,7 +340,7 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
 /// Returns a diagnostic if probing, planning, decoding, encoding, or muxing fails. Unsupported
 /// codec/container pairs and backend combinations are rejected before any file is written.
 pub(crate) fn run_video(args: &VideoArgs) -> Result<(), String> {
-    let plan = fastconv_probe::prepare_video_transcode_batch(
+    let plan = fastconv_probe::prepare_video_transcode_batch_with_decode(
         &args.source,
         &args.target,
         args.to,
@@ -327,6 +348,7 @@ pub(crate) fn run_video(args: &VideoArgs) -> Result<(), String> {
         args.audio_codec,
         args.quality.unwrap_or(VideoQuality::DEFAULT),
         args.backend,
+        args.decode_backend,
         args.threads,
     )
     .map_err(|err| err.to_string())?;
@@ -335,8 +357,8 @@ pub(crate) fn run_video(args: &VideoArgs) -> Result<(), String> {
         fastconv_pipeline::execute_video_transcode_batch(&plan).map_err(|err| err.to_string())?;
 
     let backend_desc = match report.hardware_device() {
-        Some(device) => format!("{} on {device}", report.backend()),
-        None => report.backend().to_string(),
+        Some(device) => format!("{} on {device}", report.decode_path()),
+        None => report.decode_path().to_owned(),
     };
     let first = plan.items().first();
     let mut input_formats: Vec<&str> = plan
@@ -472,6 +494,7 @@ mod tests {
                 quality: None,
                 threads: None,
                 backend: HardwareBackend::Cpu,
+                decode_backend: HardwareDecodeBackend::Auto,
             })
         );
         Ok(())
@@ -512,6 +535,34 @@ mod tests {
         assert_eq!(flagged.quality, VideoQuality::new(75).ok());
         assert_eq!(flagged.threads, NonZeroUsize::new(4));
         assert_eq!(flagged.backend, HardwareBackend::Gpu(GpuBackend::Nvenc));
+        assert_eq!(flagged.decode_backend, HardwareDecodeBackend::Auto);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_hwdecode_values_and_rejects_invalid_input() -> Result<(), String> {
+        for raw in ["auto", "cpu", "nvdec", "NVDEC", "cuda"] {
+            let VideoCommand::Run(flagged) =
+                parse_video_args(&["in.mp4", "out.mp4", "--hwdecode", raw])?
+            else {
+                return Err("expected video run args".to_owned());
+            };
+            let expected = HardwareDecodeBackend::from_name(raw)
+                .ok_or_else(|| format!("test case {raw} must parse"))?;
+            assert_eq!(flagged.decode_backend, expected, "--hwdecode {raw}");
+        }
+        assert!(parse_video_args(&["in.mp4", "out.mp4", "--hwdecode", "magic"]).is_err());
+        assert!(
+            parse_video_args(&[
+                "in.mp4",
+                "out.mp4",
+                "--hwdecode",
+                "cpu",
+                "--hwdecode",
+                "nvdec"
+            ])
+            .is_err()
+        );
         Ok(())
     }
 

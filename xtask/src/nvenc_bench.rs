@@ -84,8 +84,10 @@ struct NvencValidation {
 ///
 /// Both contenders use identical preset, tuning, rate control, CQ, B-frame count and
 /// reference mode, AQ settings, lookahead, and GOP so neither tool can win by lowering
-/// quality or output size. Every output is validated with `ffprobe`, a clean full decode,
-/// and PSNR against the source.
+/// quality or output size. Both decode with CUDA hardware (fastconv via NVDEC,
+/// ffmpeg via `-hwaccel cuda -hwaccel_output_format cuda`) and hand GPU-resident
+/// frames straight to NVENC. Every output is validated with `ffprobe`, a clean full
+/// decode, and PSNR against the source.
 ///
 /// # Errors
 ///
@@ -371,16 +373,24 @@ fn fastconv_args(codec: &str, source: &Path, output: &Path) -> Vec<String> {
         "copy".to_owned(),
         "--backend".to_owned(),
         "nvenc".to_owned(),
+        "--hwdecode".to_owned(),
+        "nvdec".to_owned(),
         "--quality".to_owned(),
         "80".to_owned(),
     ]
 }
 
-/// Keeps every quality-relevant NVENC knob identical to fastconv's Stage 2 config
+/// Keeps every quality-relevant NVENC knob identical to fastconv's config
 /// (P4/HQ, VBR with zero bitrate and CQ 23, 3 B-frames with middle reference,
-/// spatial AQ strength 8, temporal AQ, 16-frame lookahead, 120-frame GOP).
+/// spatial AQ strength 8, temporal AQ, 16-frame lookahead, 120-frame GOP), and
+/// uses CUDA hardware decode with GPU-resident output frames so ffmpeg's
+/// NVDEC -> NVENC handoff is fair against fastconv's zero-copy path.
 fn ffmpeg_args(encoder: &str, source: &Path, output: &Path) -> Vec<String> {
     vec![
+        "-hwaccel".to_owned(),
+        "cuda".to_owned(),
+        "-hwaccel_output_format".to_owned(),
+        "cuda".to_owned(),
         "-i".to_owned(),
         path_str_lossy(source),
         "-c:v".to_owned(),
@@ -505,9 +515,14 @@ fn sample_peak_rss(pid: u32) -> Option<u64> {
     None
 }
 
-/// Proves fastconv really used GPU NVENC by reading its first-run stdout. A
-/// silent CPU fallback would print a different backend and no NVIDIA device.
+/// Proves fastconv really used the NVDEC -> NVENC zero-copy path by reading its
+/// stdout. A silent CPU decode fallback would print `gpu:nvenc (cpu decode)`.
 fn verify_fastconv_hardware(stdout: &str) -> Result<String, String> {
+    if !stdout.contains("gpu:nvdec+nvenc") {
+        return Err(format!(
+            "fastconv stdout does not report gpu:nvdec+nvenc (possible CPU decode fallback): {stdout}"
+        ));
+    }
     if !stdout.to_ascii_lowercase().contains("nvenc") {
         return Err(format!(
             "fastconv stdout does not report the nvenc backend (possible CPU fallback): {stdout}"
