@@ -479,9 +479,11 @@ impl fmt::Display for VideoDecodeMode {
 }
 
 /// Decode paths actually executed by a whole batch. Under `--hwdecode auto`
-/// each item is resolved separately, so one batch may use both paths.
+/// each item is resolved separately, so one batch may use both paths. `NoVideo`
+/// means no item dispatched a video decode (e.g. an audio-only copy batch).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum VideoDecodePaths {
+    NoVideo,
     Cpu,
     Nvdec,
     Mixed {
@@ -519,6 +521,7 @@ impl VideoDecodePaths {
     #[must_use]
     pub const fn path(self, encode_backend: HardwareBackend) -> &'static str {
         match self {
+            Self::NoVideo => "no video decoded",
             Self::Cpu => VideoDecodeMode::Cpu.path(encode_backend),
             Self::Nvdec => VideoDecodeMode::Nvdec.path(encode_backend),
             Self::Mixed { .. } => match encode_backend {
@@ -1304,6 +1307,9 @@ impl VideoTranscodePlan {
     ///
     /// Returns [`DomainError::EmptyBatch`] if `items` is empty, or
     /// [`DomainError::DuplicateTargetPath`] / [`DomainError::TargetOverwritesSource`].
+    /// A batch that mixes encoder backends (e.g. CPU and NVENC items) is rejected
+    /// with [`DomainError::UnsupportedVideoPipeline`]: the batch report carries a
+    /// single encoder backend, so a mixed batch would mislabel the other items.
     pub fn new(
         items: Vec<VideoTranscodeItem>,
         worker_threads: NonZeroUsize,
@@ -1325,6 +1331,28 @@ impl VideoTranscodePlan {
                     item.target().to_path_buf(),
                 ));
             }
+        }
+        // Stream-copy items have no encoder, so only Encode actions define the
+        // batch's reported encoder backend. NVDEC and CPU decode stay valid
+        // together as long as every encoder is NVENC.
+        let mut encoder_backend: Option<HardwareBackend> = None;
+        for item in &items {
+            let VideoTrackAction::Encode(mode) = item.video_action() else {
+                continue;
+            };
+            let backend = mode.backend();
+            if let Some(existing) = encoder_backend
+                && existing != backend
+            {
+                return Err(DomainError::UnsupportedVideoPipeline {
+                    codec: VideoCodec::Unknown,
+                    backend,
+                    reason: format!(
+                        "a batch cannot mix {existing} and {backend} video encoders; split the batch by backend"
+                    ),
+                });
+            }
+            encoder_backend = Some(backend);
         }
         Ok(Self {
             items,
@@ -2548,5 +2576,88 @@ mod tests {
             report.decode_path(),
             "mixed: gpu:nvdec+nvenc + gpu:nvenc (cpu decode)"
         );
+    }
+
+    #[test]
+    fn report_without_video_decode_has_no_video_path() {
+        let one = NonZeroUsize::MIN;
+        let bytes = NonZeroU64::MIN;
+        let report = VideoTranscodeReport::new(
+            one,
+            0,
+            bytes,
+            bytes,
+            Duration::from_secs(1),
+            one,
+            HardwareBackend::Cpu,
+            None,
+            VideoDecodePaths::NoVideo,
+        );
+        assert_eq!(report.decode_paths(), VideoDecodePaths::NoVideo);
+        assert_eq!(report.decode_path(), "no video decoded");
+    }
+
+    #[test]
+    fn transcode_plan_rejects_mixed_encoder_backends() -> Result<(), DomainError> {
+        let w = NonZeroUsize::MIN;
+        let quality = VideoQuality::DEFAULT;
+        let stream = vec![stream(VideoCodec::H264, VideoStreamKind::Video)];
+        let cpu = VideoTranscodeItem::new(
+            PathBuf::from("cpu.mp4"),
+            PathBuf::from("cpu.out.mp4"),
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            stream.clone(),
+            VideoTrackAction::Encode(VideoEncodeMode::CpuH264 { quality }),
+            AudioTrackAction::Drop,
+            VideoDecodeMode::Cpu,
+        )?;
+        let nvenc = VideoTranscodeItem::new(
+            PathBuf::from("gpu.mp4"),
+            PathBuf::from("gpu.out.mp4"),
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            stream,
+            VideoTrackAction::Encode(VideoEncodeMode::NvencH264 { quality }),
+            AudioTrackAction::Drop,
+            VideoDecodeMode::Cpu,
+        )?;
+        assert!(matches!(
+            VideoTranscodePlan::new(vec![cpu, nvenc], w),
+            Err(DomainError::UnsupportedVideoPipeline { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn transcode_plan_keeps_nvenc_backend_with_both_decode_paths() -> Result<(), DomainError> {
+        let w = NonZeroUsize::MIN;
+        let quality = VideoQuality::DEFAULT;
+        let stream = vec![stream(VideoCodec::H264, VideoStreamKind::Video)];
+        let nvdec = VideoTranscodeItem::new(
+            PathBuf::from("nvdec.mp4"),
+            PathBuf::from("nvdec.out.mp4"),
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            stream.clone(),
+            VideoTrackAction::Encode(VideoEncodeMode::NvencH264 { quality }),
+            AudioTrackAction::Drop,
+            VideoDecodeMode::Nvdec,
+        )?;
+        let cpu_decode = VideoTranscodeItem::new(
+            PathBuf::from("cpu.mp4"),
+            PathBuf::from("cpu.out.mp4"),
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            stream,
+            VideoTrackAction::Encode(VideoEncodeMode::NvencH264 { quality }),
+            AudioTrackAction::Drop,
+            VideoDecodeMode::Cpu,
+        )?;
+        let plan = VideoTranscodePlan::new(vec![nvdec, cpu_decode], w)?;
+        assert_eq!(plan.backend(), HardwareBackend::Gpu(GpuBackend::Nvenc));
+        assert_eq!(plan.items()[0].decode_mode(), VideoDecodeMode::Nvdec);
+        assert_eq!(plan.items()[1].decode_mode(), VideoDecodeMode::Cpu);
+        Ok(())
     }
 }

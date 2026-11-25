@@ -1801,6 +1801,7 @@ fn transcode_to_animation(
     item: &VideoTranscodeItem,
     tag: usize,
     frame_workers: usize,
+    decoded_video: &mut Vec<VideoDecodeMode>,
 ) -> Result<(u64, u64, u64, Option<String>), PipelineError> {
     let source = item.source();
     let target = item.target();
@@ -1886,6 +1887,8 @@ fn transcode_to_animation(
         },
     )?;
     staging.commit()?;
+    // Animation output decodes frames even though it has no video encode job.
+    decoded_video.push(item.decode_mode());
     Ok((written, input_size(source), input_size(target), None))
 }
 
@@ -1895,6 +1898,7 @@ fn transcode_file(
     item: &VideoTranscodeItem,
     tag: usize,
     frame_workers: usize,
+    decoded_video: &mut Vec<VideoDecodeMode>,
 ) -> Result<(u64, u64, u64, Option<String>), PipelineError> {
     let source = item.source();
     let target = item.target();
@@ -1903,7 +1907,7 @@ fn transcode_file(
         format,
         VideoContainerFormat::Gif | VideoContainerFormat::Webp
     ) {
-        return transcode_to_animation(item, tag, frame_workers);
+        return transcode_to_animation(item, tag, frame_workers, decoded_video);
     }
     let media = demux_video(source, item.input_format())?;
     // One file-level origin for every track: copied/NVENC packets carry source
@@ -2124,7 +2128,10 @@ fn transcode_file(
                                 )
                             }
                         } {
-                            Ok(result) => result,
+                            Ok(result) => {
+                                decoded_video.push(job.decode_mode);
+                                result
+                            }
                             Err(err) => {
                                 video_error = Some(err);
                                 break 'video;
@@ -2193,6 +2200,7 @@ fn transcode_file(
                                 break 'video;
                             }
                         };
+                        decoded_video.push(job.decode_mode);
                         // An audio worker failure during decode must stop the job
                         // before the (much longer) CPU encode starts.
                         if let Err(err) = drain_audio_nonblocking(
@@ -2381,21 +2389,27 @@ pub fn execute_video_transcode_batch(
     let frames = AtomicU64::new(0);
     let device: Mutex<Option<String>> = Mutex::new(None);
     let tag = AtomicUsize::new(0);
+    let decoded_video: Mutex<Vec<VideoDecodeMode>> = Mutex::new(Vec::new());
 
     if items.len() == 1 {
-        let (processed, _in, _out, hw) = transcode_file(&items[0], 0, frame_workers)?;
+        let mut modes = Vec::new();
+        let (processed, _in, _out, hw) = transcode_file(&items[0], 0, frame_workers, &mut modes)?;
         frames.store(processed, Ordering::Relaxed);
         if let Some(hw) = hw
             && let Ok(mut guard) = device.lock()
         {
             *guard = Some(hw);
         }
+        if let Ok(mut guard) = decoded_video.lock() {
+            guard.extend(modes);
+        }
     } else {
         thread::scope(|scope| -> Result<(), PipelineError> {
             let mut handles = Vec::with_capacity(workers);
             let mut startup_error = None;
             for worker in 0..workers {
-                let (admission, frames, device, tag) = (&admission, &frames, &device, &tag);
+                let (admission, frames, device, tag, decoded_video) =
+                    (&admission, &frames, &device, &tag, &decoded_video);
                 let worker = thread::Builder::new()
                     .name(format!("fastconv-video-{worker}"))
                     .spawn_scoped(scope, move || {
@@ -2404,7 +2418,8 @@ pub fn execute_video_transcode_batch(
                         {
                             let Some(item) = items.get(index) else { break };
                             let my_tag = tag.fetch_add(1, Ordering::Relaxed);
-                            match transcode_file(item, my_tag, frame_workers) {
+                            let mut modes = Vec::new();
+                            match transcode_file(item, my_tag, frame_workers, &mut modes) {
                                 Ok((processed, _in, _out, hw)) => {
                                     frames.fetch_add(processed, Ordering::Relaxed);
                                     if let Some(hw) = hw
@@ -2412,6 +2427,9 @@ pub fn execute_video_transcode_batch(
                                         && guard.is_none()
                                     {
                                         *guard = Some(hw);
+                                    }
+                                    if let Ok(mut guard) = decoded_video.lock() {
+                                        guard.extend(modes);
                                     }
                                 }
                                 Err(err) => {
@@ -2466,9 +2484,12 @@ pub fn execute_video_transcode_batch(
     let hardware_device = device
         .into_inner()
         .map_err(|_| PipelineError::WorkerPanicked)?;
-    let decode_paths =
-        VideoDecodePaths::from_modes(items.iter().map(VideoTranscodeItem::decode_mode))
-            .ok_or_else(|| PipelineError::EmptyOutput(PathBuf::new()))?;
+    // Only files that actually dispatched a video decode contribute a path;
+    // an audio-only copy has no video job and must not be reported as CPU decode.
+    let executed = decoded_video
+        .into_inner()
+        .map_err(|_| PipelineError::WorkerPanicked)?;
+    let decode_paths = VideoDecodePaths::from_modes(executed).unwrap_or(VideoDecodePaths::NoVideo);
     Ok(VideoTranscodeReport::new(
         files,
         frames.load(Ordering::Relaxed),
@@ -2701,6 +2722,8 @@ mod tests {
         )?;
         assert_eq!(report.files_converted().get(), 1);
         assert_eq!(report.frames_processed(), 4);
+        assert_eq!(report.decode_paths(), VideoDecodePaths::Cpu);
+        assert_eq!(report.decode_path(), "cpu");
         assert_output(
             &webm,
             VideoContainerFormat::Webm,
@@ -3167,6 +3190,62 @@ mod tests {
             decoded.len()
         );
         assert!(decoded.iter().any(|sample| sample.abs() > 0.01));
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn audio_only_copy_reports_no_video_decode_path() -> Result<(), PipelineError> {
+        let dir = temp_dir("audio-only-decode-path")?;
+        let source = dir.join("in.mp4");
+        let target = dir.join("out.mp4");
+        let (track, packets) = encode_audio_track(
+            &source,
+            &sine(4_800, 44_100, 2),
+            44_100,
+            2,
+            TargetAudioCodec::Aac,
+        )?;
+        let media = ContainerMedia {
+            tracks: vec![track],
+            packets,
+        };
+        let file = File::create(&source).map_err(|err| PipelineError::Io {
+            path: source.clone(),
+            source: err,
+        })?;
+        mux_video(&file, &source, VideoContainerFormat::Mp4, &media)?;
+        drop(file);
+
+        let plan = VideoTranscodePlan::new(
+            vec![
+                VideoTranscodeItem::new(
+                    source.clone(),
+                    target.clone(),
+                    VideoContainerFormat::Mp4,
+                    VideoContainerFormat::Mp4,
+                    streams(&source, VideoContainerFormat::Mp4)?,
+                    VideoTrackAction::Copy,
+                    AudioTrackAction::Copy,
+                    VideoDecodeMode::Cpu,
+                )
+                .map_err(|err| PipelineError::RemuxFailed {
+                    path: target.clone(),
+                    reason: err.to_string(),
+                })?,
+            ],
+            NonZeroUsize::MIN,
+        )
+        .map_err(|err| PipelineError::RemuxFailed {
+            path: target.clone(),
+            reason: err.to_string(),
+        })?;
+        let report = execute_video_transcode_batch(&plan)?;
+        assert_eq!(report.decode_paths(), VideoDecodePaths::NoVideo);
+        assert_eq!(report.decode_path(), "no video decoded");
         fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
             path: dir.clone(),
             source,
