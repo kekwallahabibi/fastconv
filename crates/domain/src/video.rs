@@ -16,6 +16,8 @@ pub enum VideoContainerFormat {
     Mov,
     Avi,
     Ts,
+    Gif,
+    Webp,
 }
 
 impl VideoContainerFormat {
@@ -28,6 +30,8 @@ impl VideoContainerFormat {
             Self::Mov => "mov",
             Self::Avi => "avi",
             Self::Ts => "ts",
+            Self::Gif => "gif",
+            Self::Webp => "webp",
         }
     }
 
@@ -40,6 +44,8 @@ impl VideoContainerFormat {
             Self::Mov => "MOV",
             Self::Avi => "AVI",
             Self::Ts => "TS",
+            Self::Gif => "GIF",
+            Self::Webp => "WebP",
         }
     }
 
@@ -52,23 +58,41 @@ impl VideoContainerFormat {
             "webm" => Some(Self::Webm),
             "avi" => Some(Self::Avi),
             "ts" | "m2ts" | "mts" => Some(Self::Ts),
+            "gif" => Some(Self::Gif),
+            "webp" => Some(Self::Webp),
             _ => None,
         }
+    }
+
+    /// Whether this container can carry a stream copy (no re-encoding).
+    #[must_use]
+    pub const fn supports_remux(self) -> bool {
+        !matches!(self, Self::Gif | Self::Webp)
+    }
+
+    /// Whether this container can carry an audio track.
+    #[must_use]
+    pub const fn supports_audio(self) -> bool {
+        !matches!(self, Self::Gif | Self::Webp)
     }
 
     #[must_use]
     pub const fn default_video_codec(self) -> TargetVideoCodec {
         match self {
             Self::Webm => TargetVideoCodec::Vp9,
+            Self::Gif => TargetVideoCodec::Gif,
+            Self::Webp => TargetVideoCodec::Webp,
             Self::Mp4 | Self::Mkv | Self::Mov | Self::Avi | Self::Ts => TargetVideoCodec::H264,
         }
     }
 
+    /// `None` for animation containers, which have no audio track.
     #[must_use]
-    pub const fn default_audio_codec(self) -> TargetAudioCodec {
+    pub const fn default_audio_codec(self) -> Option<TargetAudioCodec> {
         match self {
-            Self::Webm => TargetAudioCodec::Opus,
-            Self::Mp4 | Self::Mkv | Self::Mov | Self::Avi | Self::Ts => TargetAudioCodec::Aac,
+            Self::Gif | Self::Webp => None,
+            Self::Webm => Some(TargetAudioCodec::Opus),
+            Self::Mp4 | Self::Mkv | Self::Mov | Self::Avi | Self::Ts => Some(TargetAudioCodec::Aac),
         }
     }
 }
@@ -91,6 +115,8 @@ pub enum VideoCodec {
     Mp3,
     Vorbis,
     TimedText,
+    Gif,
+    Webp,
     Unknown,
 }
 
@@ -107,6 +133,8 @@ impl VideoCodec {
             Self::Mp3 => "MP3",
             Self::Vorbis => "Vorbis",
             Self::TimedText => "Timed text",
+            Self::Gif => "GIF",
+            Self::Webp => "WebP",
             Self::Unknown => "unknown",
         }
     }
@@ -156,12 +184,17 @@ impl VideoCodec {
                 self,
                 Self::H264 | Self::Hevc | Self::Av1 | Self::Aac | Self::Opus | Self::Mp3
             ),
+            VideoContainerFormat::Gif => matches!(self, Self::Gif),
+            VideoContainerFormat::Webp => matches!(self, Self::Webp),
         }
     }
 
     #[must_use]
     pub const fn is_video(self) -> bool {
-        matches!(self, Self::H264 | Self::Hevc | Self::Av1 | Self::Vp9)
+        matches!(
+            self,
+            Self::H264 | Self::Hevc | Self::Av1 | Self::Vp9 | Self::Gif | Self::Webp
+        )
     }
 
     #[must_use]
@@ -183,6 +216,8 @@ pub enum TargetVideoCodec {
     Hevc,
     Av1,
     Vp9,
+    Gif,
+    Webp,
 }
 
 impl TargetVideoCodec {
@@ -193,6 +228,8 @@ impl TargetVideoCodec {
             Self::Hevc => "HEVC",
             Self::Av1 => "AV1",
             Self::Vp9 => "VP9",
+            Self::Gif => "GIF",
+            Self::Webp => "WebP",
         }
     }
 
@@ -203,6 +240,8 @@ impl TargetVideoCodec {
             Self::Hevc => VideoCodec::Hevc,
             Self::Av1 => VideoCodec::Av1,
             Self::Vp9 => VideoCodec::Vp9,
+            Self::Gif => VideoCodec::Gif,
+            Self::Webp => VideoCodec::Webp,
         }
     }
 
@@ -218,6 +257,8 @@ impl TargetVideoCodec {
             "hevc" | "h265" | "x265" => Some(Self::Hevc),
             "av1" => Some(Self::Av1),
             "vp9" => Some(Self::Vp9),
+            "gif" => Some(Self::Gif),
+            "webp" => Some(Self::Webp),
             _ => None,
         }
     }
@@ -319,6 +360,8 @@ pub enum VideoEncodeMode {
     CpuH264 { quality: VideoQuality },
     CpuAv1 { quality: VideoQuality },
     CpuVp9 { quality: VideoQuality },
+    CpuGif { quality: VideoQuality },
+    CpuWebp { quality: VideoQuality },
     NvencH264 { quality: VideoQuality },
     NvencHevc { quality: VideoQuality },
 }
@@ -339,6 +382,17 @@ impl VideoEncodeMode {
             (TargetVideoCodec::H264, HardwareBackend::Cpu) => Ok(Self::CpuH264 { quality }),
             (TargetVideoCodec::Av1, HardwareBackend::Cpu) => Ok(Self::CpuAv1 { quality }),
             (TargetVideoCodec::Vp9, HardwareBackend::Cpu) => Ok(Self::CpuVp9 { quality }),
+            (TargetVideoCodec::Gif, HardwareBackend::Cpu) => Ok(Self::CpuGif { quality }),
+            (TargetVideoCodec::Webp, HardwareBackend::Cpu) => Ok(Self::CpuWebp { quality }),
+            (TargetVideoCodec::Gif | TargetVideoCodec::Webp, HardwareBackend::Gpu(_)) => {
+                Err(DomainError::UnsupportedVideoPipeline {
+                    codec: codec.as_video_codec(),
+                    backend,
+                    reason:
+                        "animation encoding (GIF/WebP) runs on CPU only; no silent CPU fallback"
+                            .to_owned(),
+                })
+            }
             (TargetVideoCodec::Hevc, HardwareBackend::Cpu) => {
                 Err(DomainError::UnsupportedVideoPipeline {
                     codec: VideoCodec::Hevc,
@@ -379,6 +433,8 @@ impl VideoEncodeMode {
             Self::CpuH264 { .. } | Self::NvencH264 { .. } => TargetVideoCodec::H264,
             Self::CpuAv1 { .. } => TargetVideoCodec::Av1,
             Self::CpuVp9 { .. } => TargetVideoCodec::Vp9,
+            Self::CpuGif { .. } => TargetVideoCodec::Gif,
+            Self::CpuWebp { .. } => TargetVideoCodec::Webp,
             Self::NvencHevc { .. } => TargetVideoCodec::Hevc,
         }
     }
@@ -389,6 +445,8 @@ impl VideoEncodeMode {
             Self::CpuH264 { quality }
             | Self::CpuAv1 { quality }
             | Self::CpuVp9 { quality }
+            | Self::CpuGif { quality }
+            | Self::CpuWebp { quality }
             | Self::NvencH264 { quality }
             | Self::NvencHevc { quality } => quality,
         }
@@ -397,9 +455,11 @@ impl VideoEncodeMode {
     #[must_use]
     pub const fn backend(self) -> HardwareBackend {
         match self {
-            Self::CpuH264 { .. } | Self::CpuAv1 { .. } | Self::CpuVp9 { .. } => {
-                HardwareBackend::Cpu
-            }
+            Self::CpuH264 { .. }
+            | Self::CpuAv1 { .. }
+            | Self::CpuVp9 { .. }
+            | Self::CpuGif { .. }
+            | Self::CpuWebp { .. } => HardwareBackend::Cpu,
             Self::NvencH264 { .. } | Self::NvencHevc { .. } => {
                 HardwareBackend::Gpu(GpuBackend::Nvenc)
             }
@@ -450,6 +510,7 @@ impl fmt::Display for VideoTrackAction {
 pub enum AudioTrackAction {
     Copy,
     Encode(TargetAudioCodec),
+    Drop,
 }
 
 impl fmt::Display for AudioTrackAction {
@@ -457,6 +518,7 @@ impl fmt::Display for AudioTrackAction {
         match self {
             Self::Copy => f.write_str("copy"),
             Self::Encode(codec) => write!(f, "encode {codec}"),
+            Self::Drop => f.write_str("drop"),
         }
     }
 }
@@ -484,6 +546,43 @@ impl fmt::Display for VideoStreamKind {
     }
 }
 
+/// Playback loop count signalled by an animation source. `Times(1)` plays once;
+/// there is deliberately no `Times(0)` (that bit pattern means "forever").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum AnimationLoop {
+    #[default]
+    Infinite,
+    Times(NonZeroU16),
+}
+
+/// Animation facts validated once at the probe boundary and carried unchanged
+/// into execution, so the pipeline never re-parses container metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct AnimationMeta {
+    loop_count: AnimationLoop,
+    has_alpha: bool,
+}
+
+impl AnimationMeta {
+    #[must_use]
+    pub const fn new(loop_count: AnimationLoop, has_alpha: bool) -> Self {
+        Self {
+            loop_count,
+            has_alpha,
+        }
+    }
+
+    #[must_use]
+    pub const fn loop_count(self) -> AnimationLoop {
+        self.loop_count
+    }
+
+    #[must_use]
+    pub const fn has_alpha(self) -> bool {
+        self.has_alpha
+    }
+}
+
 /// Probed stream metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VideoStreamInfo {
@@ -497,6 +596,7 @@ pub struct VideoStreamInfo {
     timebase_den: u32,
     duration: Option<u64>,
     language: Option<String>,
+    animation: Option<AnimationMeta>,
 }
 
 impl VideoStreamInfo {
@@ -526,7 +626,20 @@ impl VideoStreamInfo {
             timebase_den,
             duration,
             language,
+            animation: None,
         }
+    }
+
+    /// Attaches animation metadata validated by the probe boundary.
+    #[must_use]
+    pub const fn with_animation(mut self, animation: AnimationMeta) -> Self {
+        self.animation = Some(animation);
+        self
+    }
+
+    #[must_use]
+    pub const fn animation(&self) -> Option<AnimationMeta> {
+        self.animation
     }
 
     #[must_use]
@@ -670,6 +783,14 @@ impl VideoRemuxPlan {
         let sources: std::collections::HashSet<PathBuf> =
             items.iter().map(|i| i.source().to_path_buf()).collect();
         for item in &items {
+            if !item.input_format().supports_remux() || !item.output_format().supports_remux() {
+                return Err(DomainError::UnsupportedVideoPipeline {
+                    codec: VideoCodec::Unknown,
+                    backend: HardwareBackend::Cpu,
+                    reason: "GIF and WebP are animation containers and cannot be stream-copied; use `fastconv video`"
+                        .to_owned(),
+                });
+            }
             if !targets.insert(item.target().to_path_buf()) {
                 return Err(DomainError::DuplicateTargetPath(
                     item.target().to_path_buf(),
@@ -821,6 +942,14 @@ impl VideoTranscodeItem {
 
         match video_action {
             VideoTrackAction::Copy => {
+                if !input_format.supports_remux() || !output_format.supports_remux() {
+                    return Err(DomainError::UnsupportedVideoPipeline {
+                        codec: VideoCodec::Unknown,
+                        backend: HardwareBackend::Cpu,
+                        reason: "stream copy requires remuxable containers; animation formats must be re-encoded"
+                            .to_owned(),
+                    });
+                }
                 for stream in streams
                     .iter()
                     .filter(|s| s.kind() == VideoStreamKind::Video)
@@ -844,7 +973,16 @@ impl VideoTranscodeItem {
         }
 
         match audio_action {
+            AudioTrackAction::Drop => {}
             AudioTrackAction::Copy => {
+                if !output_format.supports_audio() {
+                    return Err(DomainError::UnsupportedVideoPipeline {
+                        codec: VideoCodec::Unknown,
+                        backend: HardwareBackend::Cpu,
+                        reason: "GIF and WebP containers have no audio track; drop audio streams for animation output"
+                            .to_owned(),
+                    });
+                }
                 for stream in streams
                     .iter()
                     .filter(|s| s.kind() == VideoStreamKind::Audio)
@@ -865,6 +1003,17 @@ impl VideoTranscodeItem {
                     });
                 }
             }
+        }
+
+        if !output_format.supports_audio()
+            && !streams.is_empty()
+            && !streams.iter().any(|s| s.kind() == VideoStreamKind::Video)
+        {
+            return Err(DomainError::UnsupportedVideoPipeline {
+                codec: VideoCodec::Unknown,
+                backend: HardwareBackend::Cpu,
+                reason: "GIF and WebP containers require at least one video stream".to_owned(),
+            });
         }
 
         Ok(Self {
@@ -1123,6 +1272,8 @@ mod tests {
             TargetVideoCodec::Av1 => VideoEncodeMode::CpuAv1 { quality },
             TargetVideoCodec::Vp9 => VideoEncodeMode::CpuVp9 { quality },
             TargetVideoCodec::Hevc => VideoEncodeMode::NvencHevc { quality },
+            TargetVideoCodec::Gif => VideoEncodeMode::CpuGif { quality },
+            TargetVideoCodec::Webp => VideoEncodeMode::CpuWebp { quality },
         })
     }
 
@@ -1250,12 +1401,92 @@ mod tests {
         assert!(VideoCodec::Hevc.is_video());
         assert!(VideoCodec::Av1.is_video());
         assert!(VideoCodec::Vp9.is_video());
+        assert!(VideoCodec::Gif.is_video());
+        assert!(VideoCodec::Webp.is_video());
         assert!(VideoCodec::Aac.is_audio());
         assert!(VideoCodec::Opus.is_audio());
         assert!(VideoCodec::Mp3.is_audio());
         assert!(VideoCodec::Vorbis.is_audio());
         assert!(!VideoCodec::H264.is_audio());
         assert!(!VideoCodec::Mp3.is_video());
+    }
+
+    #[test]
+    fn animation_codecs_are_confined_to_their_own_container() {
+        assert!(VideoCodec::Gif.supported_in(VideoContainerFormat::Gif));
+        assert!(VideoCodec::Webp.supported_in(VideoContainerFormat::Webp));
+        for container in [
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Webm,
+            VideoContainerFormat::Mov,
+            VideoContainerFormat::Avi,
+            VideoContainerFormat::Ts,
+        ] {
+            assert!(!VideoCodec::Gif.supported_in(container), "{container}");
+            assert!(!VideoCodec::Webp.supported_in(container), "{container}");
+        }
+        assert!(!VideoCodec::Gif.supported_in(VideoContainerFormat::Webp));
+        assert!(!VideoCodec::Webp.supported_in(VideoContainerFormat::Gif));
+        assert!(!VideoCodec::H264.supported_in(VideoContainerFormat::Gif));
+        assert!(!VideoCodec::Aac.supported_in(VideoContainerFormat::Webp));
+    }
+
+    #[test]
+    fn animation_containers_are_video_only_and_cpu_encoded() {
+        let gif = VideoContainerFormat::Gif;
+        let webp = VideoContainerFormat::Webp;
+        assert_eq!(gif.extension(), "gif");
+        assert_eq!(webp.extension(), "webp");
+        assert_eq!(gif.label(), "GIF");
+        assert_eq!(webp.label(), "WebP");
+        assert!(!gif.supports_remux());
+        assert!(!webp.supports_remux());
+        assert!(!gif.supports_audio());
+        assert!(!webp.supports_audio());
+        for container in [
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Webm,
+            VideoContainerFormat::Mov,
+            VideoContainerFormat::Avi,
+            VideoContainerFormat::Ts,
+        ] {
+            assert!(container.supports_remux(), "{container}");
+            assert!(container.supports_audio(), "{container}");
+        }
+        assert_eq!(gif.default_video_codec(), TargetVideoCodec::Gif);
+        assert_eq!(webp.default_video_codec(), TargetVideoCodec::Webp);
+        assert_eq!(gif.default_audio_codec(), None);
+        assert_eq!(webp.default_audio_codec(), None);
+        assert_eq!(
+            VideoContainerFormat::Mp4.default_audio_codec(),
+            Some(TargetAudioCodec::Aac)
+        );
+        assert_eq!(
+            VideoContainerFormat::Webm.default_audio_codec(),
+            Some(TargetAudioCodec::Opus)
+        );
+        assert_eq!(AudioTrackAction::Drop.to_string(), "drop");
+    }
+
+    #[test]
+    fn animation_meta_carries_validated_playback_facts() {
+        let times = NonZeroU16::new(3).unwrap_or(NonZeroU16::MIN);
+        let meta = AnimationMeta::new(AnimationLoop::Times(times), true);
+        assert_eq!(meta.loop_count(), AnimationLoop::Times(times));
+        assert!(meta.has_alpha());
+        assert_eq!(
+            AnimationMeta::default().loop_count(),
+            AnimationLoop::Infinite
+        );
+        assert!(!AnimationMeta::default().has_alpha());
+        let with_meta = stream(VideoCodec::Webp, VideoStreamKind::Video).with_animation(meta);
+        assert_eq!(with_meta.animation(), Some(meta));
+        assert_eq!(
+            stream(VideoCodec::Webp, VideoStreamKind::Video).animation(),
+            None
+        );
     }
 
     #[test]
@@ -1271,8 +1502,12 @@ mod tests {
             ("ts", VideoContainerFormat::Ts),
             ("m2ts", VideoContainerFormat::Ts),
             ("mts", VideoContainerFormat::Ts),
+            ("gif", VideoContainerFormat::Gif),
+            ("webp", VideoContainerFormat::Webp),
             ("MP4", VideoContainerFormat::Mp4),
             ("WEBM", VideoContainerFormat::Webm),
+            ("GIF", VideoContainerFormat::Gif),
+            ("WEBP", VideoContainerFormat::Webp),
         ];
         for (ext, expected) in cases {
             assert_eq!(
@@ -1281,7 +1516,7 @@ mod tests {
                 "extension {ext}"
             );
         }
-        assert_eq!(VideoContainerFormat::from_extension("gif"), None);
+        assert_eq!(VideoContainerFormat::from_extension("flv"), None);
     }
 
     #[test]
@@ -1304,11 +1539,11 @@ mod tests {
         );
         assert_eq!(
             VideoContainerFormat::Webm.default_audio_codec(),
-            TargetAudioCodec::Opus
+            Some(TargetAudioCodec::Opus)
         );
         assert_eq!(
             VideoContainerFormat::Mp4.default_audio_codec(),
-            TargetAudioCodec::Aac
+            Some(TargetAudioCodec::Aac)
         );
         assert_eq!(
             TargetVideoCodec::from_name("x264"),
@@ -1329,6 +1564,14 @@ mod tests {
         assert_eq!(
             TargetVideoCodec::from_name("vp9"),
             Some(TargetVideoCodec::Vp9)
+        );
+        assert_eq!(
+            TargetVideoCodec::from_name("gif"),
+            Some(TargetVideoCodec::Gif)
+        );
+        assert_eq!(
+            TargetVideoCodec::from_name("WebP"),
+            Some(TargetVideoCodec::Webp)
         );
         assert_eq!(TargetVideoCodec::from_name("vp8"), None);
         assert_eq!(
@@ -1364,6 +1607,14 @@ mod tests {
             VideoEncodeMode::resolve(TargetVideoCodec::Vp9, q, HardwareBackend::Cpu)?,
             VideoEncodeMode::CpuVp9 { quality: q }
         );
+        assert_eq!(
+            VideoEncodeMode::resolve(TargetVideoCodec::Gif, q, HardwareBackend::Cpu)?,
+            VideoEncodeMode::CpuGif { quality: q }
+        );
+        assert_eq!(
+            VideoEncodeMode::resolve(TargetVideoCodec::Webp, q, HardwareBackend::Cpu)?,
+            VideoEncodeMode::CpuWebp { quality: q }
+        );
         let nvenc = HardwareBackend::Gpu(GpuBackend::Nvenc);
         assert_eq!(
             VideoEncodeMode::resolve(TargetVideoCodec::H264, q, nvenc)?,
@@ -1383,7 +1634,21 @@ mod tests {
         );
         assert_eq!(VideoEncodeMode::CpuAv1 { quality: q }.quality(), q);
         assert_eq!(
+            VideoEncodeMode::CpuGif { quality: q }.codec(),
+            TargetVideoCodec::Gif
+        );
+        assert_eq!(
+            VideoEncodeMode::CpuWebp { quality: q }.codec(),
+            TargetVideoCodec::Webp
+        );
+        assert_eq!(VideoEncodeMode::CpuGif { quality: q }.quality(), q);
+        assert_eq!(VideoEncodeMode::CpuWebp { quality: q }.quality(), q);
+        assert_eq!(
             VideoEncodeMode::CpuVp9 { quality: q }.backend(),
+            HardwareBackend::Cpu
+        );
+        assert_eq!(
+            VideoEncodeMode::CpuWebp { quality: q }.backend(),
             HardwareBackend::Cpu
         );
         assert_eq!(VideoEncodeMode::NvencH264 { quality: q }.backend(), nvenc);
@@ -1413,6 +1678,23 @@ mod tests {
                         .to_owned(),
                 })
             );
+        }
+        for codec in [TargetVideoCodec::Gif, TargetVideoCodec::Webp] {
+            for backend in [
+                HardwareBackend::Gpu(GpuBackend::Nvenc),
+                HardwareBackend::Gpu(GpuBackend::Vaapi),
+            ] {
+                assert_eq!(
+                    VideoEncodeMode::resolve(codec, q, backend),
+                    Err(DomainError::UnsupportedVideoPipeline {
+                        codec: codec.as_video_codec(),
+                        backend,
+                        reason:
+                            "animation encoding (GIF/WebP) runs on CPU only; no silent CPU fallback"
+                                .to_owned(),
+                    })
+                );
+            }
         }
         for gpu in [
             GpuBackend::Vaapi,
@@ -1708,5 +1990,131 @@ mod tests {
             VideoRemuxPlan::new(Vec::new(), w),
             Err(DomainError::EmptyBatch)
         ));
+    }
+
+    #[test]
+    fn remux_plan_rejects_animation_formats() -> Result<(), String> {
+        let w = NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN);
+        let gif_source = VideoRemuxItem::new(
+            PathBuf::from("in.gif"),
+            PathBuf::from("out.mkv"),
+            VideoContainerFormat::Gif,
+            VideoContainerFormat::Mkv,
+            vec![stream(VideoCodec::Gif, VideoStreamKind::Video)],
+        );
+        assert!(matches!(
+            VideoRemuxPlan::new(vec![gif_source], w),
+            Err(DomainError::UnsupportedVideoPipeline { .. })
+        ));
+        let webp_target = VideoRemuxItem::new(
+            PathBuf::from("in.mp4"),
+            PathBuf::from("out.webp"),
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Webp,
+            vec![stream(VideoCodec::H264, VideoStreamKind::Video)],
+        );
+        assert!(matches!(
+            VideoRemuxPlan::new(vec![webp_target], w),
+            Err(DomainError::UnsupportedVideoPipeline { .. })
+        ));
+        let valid = VideoRemuxItem::new(
+            PathBuf::from("in.mp4"),
+            PathBuf::from("out.mkv"),
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mkv,
+            vec![stream(VideoCodec::H264, VideoStreamKind::Video)],
+        );
+        assert_eq!(
+            VideoRemuxPlan::new(vec![valid], w)
+                .map_err(|err| err.to_string())?
+                .items()
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transcode_item_accepts_animation_with_dropped_audio()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let video = stream(VideoCodec::Gif, VideoStreamKind::Video);
+        let into_gif = item(
+            "in.mp4",
+            "out.gif",
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Gif,
+            vec![video.clone()],
+            cpu_encode(TargetVideoCodec::Gif),
+            AudioTrackAction::Drop,
+        )?;
+        assert_eq!(into_gif.output_format(), VideoContainerFormat::Gif);
+        assert_eq!(into_gif.audio_action(), AudioTrackAction::Drop);
+        let into_webp = item(
+            "in.gif",
+            "out.webp",
+            VideoContainerFormat::Gif,
+            VideoContainerFormat::Webp,
+            vec![video],
+            cpu_encode(TargetVideoCodec::Webp),
+            AudioTrackAction::Drop,
+        )?;
+        assert_eq!(into_webp.video_action(), cpu_encode(TargetVideoCodec::Webp));
+        // An animation container with no streams has nothing to reject.
+        let empty = item(
+            "in.mp4",
+            "empty.gif",
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Gif,
+            Vec::new(),
+            cpu_encode(TargetVideoCodec::Gif),
+            AudioTrackAction::Drop,
+        )?;
+        assert_eq!(empty.streams(), []);
+        Ok(())
+    }
+
+    #[test]
+    fn transcode_item_rejects_illegal_animation_audio_and_copy() {
+        let video = stream(VideoCodec::Gif, VideoStreamKind::Video);
+        let audio = stream(VideoCodec::Aac, VideoStreamKind::Audio);
+        let result = item(
+            "in.gif",
+            "out.gif",
+            VideoContainerFormat::Gif,
+            VideoContainerFormat::Gif,
+            vec![video.clone()],
+            VideoTrackAction::Copy,
+            AudioTrackAction::Drop,
+        );
+        assert!(
+            matches!(result, Err(DomainError::UnsupportedVideoPipeline { .. })),
+            "animation streams cannot be copied"
+        );
+        let result = item(
+            "in.mp4",
+            "out.gif",
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Gif,
+            vec![video.clone(), audio.clone()],
+            cpu_encode(TargetVideoCodec::Gif),
+            AudioTrackAction::Copy,
+        );
+        assert!(
+            matches!(result, Err(DomainError::UnsupportedVideoPipeline { .. })),
+            "animation containers cannot carry copied audio"
+        );
+        let result = item(
+            "in.mp4",
+            "out.gif",
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Gif,
+            vec![audio],
+            cpu_encode(TargetVideoCodec::Gif),
+            AudioTrackAction::Drop,
+        );
+        assert!(
+            matches!(result, Err(DomainError::UnsupportedVideoPipeline { .. })),
+            "animation containers require at least one video stream"
+        );
     }
 }

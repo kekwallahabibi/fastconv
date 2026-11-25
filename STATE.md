@@ -83,6 +83,31 @@
 - **Audio (60 s Stereo, alter 3-Format-Stand)**: WAV→FLAC 57.0 ms vs. ffmpeg 202.4 ms (3.55x), WAV→Opus 151.9 ms vs. 595.6 ms (3.92x), 3-Input-Batch 74.8 ms vs. 329.1 ms (4.40x) — jetzt ersetzt durch die 9×9-Messung unten.
 - **Remux (1080p60, 10 s, ffprobe-validiert, 600 Video-Frames)**: MP4→MKV 17.4 ms / 34551 fps / 8.5 MiB vs. ffmpeg 101.9 ms (**5.86x**); MKV→MP4 26.1 ms / 22995 fps / 28.1 MiB vs. ffmpeg 91.1 ms (**3.49x**). Codecs unverändert `aac+h264`, keine Re-Encodierung.
 
+## Animations-Benchmarks 2026-11-25 (video ↔ animiertes GIF/WebP)
+- **Hinweis**: Die älteren Zeilen zu „GIF nur Still-Image / Video→GIF hart abgelehnt" sind durch diesen Stand überholt: `fastconv video --to gif|webp` und `--vcodec gif|webp` sowie GIF/WebP als Video-Input sind jetzt implementiert.
+- **Host/Pfad**: i7-6700 (4C/8T, AVX2/FMA), RTX 2060 (NVENC, Treiber 620.73.04), ffmpeg n9.1 (`palettegen/paletteuse`, `libwebp_anim`, `libx264`, `h264_nvenc`, `hevc_nvenc`); 3 serielle Läufe je Workload (Median Zeit, max. `VmHWM`), alle 12 Outputs validiert (siehe Zeilen unten). Quelle: aus `fixtures/video_1080p60.mp4` abgeleiteter 480×270/15-fps/4-s-Clip (60 Frames, 148 KiB); beide Tools lesen exakt dieselbe Datei.
+- **Fairness**: GIF 256-Farben-Palette auf beiden Seiten, WebP beide Q80, MP4 beide H.264 QP17 / `preset fast` / GOP 60 / keine B-Frames, NVENC beide `p4/hq`, VBR CQ23, bf3 `b_ref_mode=middle`, spatial/temporal AQ, Lookahead 16, GOP 120. Output-Größen liegen zwischen 0.18 und 1.19 MB und weichen nur 1–17 % voneinander ab (kein Preset-/Qualitäts-Cheating).
+
+| Workload | Tool | Zeit (ms) | FPS | MB/s (Input) | Peak RAM | Output | PSNR vs. Quelle |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `mp4_to_gif` | fastconv (cpu gif q80) | 272.4 | 220.3 | 0.54 | 38.2 MiB | 1.19 MB | 35.39 dB |
+| `mp4_to_gif` | ffmpeg (palettegen/use) | 709.1 | 84.6 | 0.21 | 111.9 MiB | 1.02 MB | 36.23 dB |
+| `mp4_to_webp` | fastconv (cpu webp q80) | 370.6 | 161.9 | 0.40 | 48.9 MiB | 0.37 MB | 39.74 dB |
+| `mp4_to_webp` | ffmpeg (libwebp_anim q80) | 702.2 | 85.4 | 0.21 | 70.6 MiB | 0.36 MB | 39.04 dB |
+| `gif_to_mp4` | fastconv (cpu h264 q80) | 232.8 | 257.7 | 4.37 | 26.4 MiB | 0.35 MB | 37.50 dB |
+| `gif_to_mp4` | ffmpeg (libx264 qp17) | 184.5 | 325.2 | 5.51 | 73.3 MiB | 0.34 MB | 36.93 dB |
+| `webp_to_mp4` | fastconv (cpu h264 q80) | 344.9 | 174.0 | 1.04 | 48.7 MiB | 0.28 MB | 29.61 dB |
+| `webp_to_mp4` | ffmpeg (libx264 qp17) | 184.1 | 325.9 | 1.94 | 72.0 MiB | 0.27 MB | 48.94 dB |
+| `gif_to_mp4_nv` | fastconv (nvenc h264 q80) | 403.3 | 148.8 | 2.52 | 227.2 MiB | 0.19 MB | 36.70 dB |
+| `gif_to_mp4_nv` | ffmpeg (h264_nvenc cq23) | 420.6 | 142.7 | 2.42 | 289.7 MiB | 0.19 MB | 36.84 dB |
+| `webp_to_mkv_nv` | fastconv (nvenc hevc q80) | 466.3 | 128.7 | 0.77 | 244.7 MiB | 0.18 MB | 29.44 dB |
+| `webp_to_mkv_nv` | ffmpeg (hevc_nvenc cq23) | 391.7 | 153.2 | 0.91 | 291.5 MiB | 0.18 MB | 36.56 dB |
+
+- **Speedup fastconv vs. ffmpeg**: MP4→GIF **2.60x**, MP4→WebP **1.90x**, GIF→MP4 (CPU) **0.79x**, WebP→MP4 (CPU) **0.53x**, GIF→MP4 (NVENC) **1.04x**, WebP→MKV (NVENC) **0.84x**. Peak-RAM durchweg niedriger (26–245 MiB vs. 70–292 MiB).
+- **Validierung (12/12 Outputs bestanden)**: `ffprobe` Codec, 480×270, 60 Frames, 4.000 s (WebP-Dauer aus summierten ANMF-Delays: 4000/3999 ms), vollständiger Decode ohne Fehler (rawvideo-Sink), RGB-PSNR gegen dieselbe Quelle. NVENC-Hardwarepfad explizit belegt durch `gpu:nvenc on NVIDIA GeForce RTX 2060` im CLI-Output — kein stiller CPU-Fallback; `--backend nvenc` für Bild-Outputs weiterhin hart abgelehnt.
+- **Befunde (nicht durch den Benchmark gefixt)**: (1) WebP-Input-PSNR niedriger als bei ffmpeg (29.6 vs. 48.9 dB CPU, 29.4 vs. 36.6 dB NVENC) — Reproduktion auf Still-Image-Pfad (`still.webp` → PNG: fastconv vs. ffmpeg 30.1 dB): bestehende Farbkonversions-Differenz zwischen `zenwebp` und `libwebp`, nicht durch die Animations-Pipeline eingeführt. (2) NVENC-GIF→MP4 erzeugt vier `non monotonically increasing dts`-Warnungen im Null-Muxer (ms-gerundete GIF-Delays; Datei dekodiert sauber 60 Frames / 4 s). (3) CLI-Ausgabe meldet bei Single-Item-Läufen `1 thread(s)`, obwohl die Frame-Kodierung `--threads 8` nutzt (nur Anzeige, `configured_threads` → `frame_workers`).
+- **Regressionschecks (seriell, gleiche Fixtures)**: `cargo xtask bench --nvenc` 1080p60/600 Frames: H.264 5306.6 ms / 113.1 fps / 514.5 MiB vs. ffmpeg 2031.1 ms / 295.4 fps / 722.9 MiB (50.72 vs. 50.73 dB, 25.86 vs. 25.90 MB); HEVC 5271.7 ms / 113.8 fps / 626.2 MiB vs. ffmpeg 2129.9 ms / 281.7 fps / 672.0 MiB (47.62 dB, 20.52 vs. 20.54 MB). `cargo xtask bench --remux`: MP4→MKV 15.4 ms vs. 89.5 ms (**5.81x**), MKV→MP4 24.1 ms vs. 85.3 ms (**3.54x**), je 600/470 Frames ffprobe-validiert. Bild-/Audio-Benchmarks wurden nicht erneut gemessen (keine Änderung an Bild- oder Audio-Pfaden).
+
 ## Audio-Benchmarks 2026-11-24 (9 Inputs × 9 Outputs, messbar seriell)
 - **Host/Pfad**: i7-6700 (4C/8T, AVX2/FMA), CPU-Audio (kein System-Opus/Vorbis), ffmpeg n9.1, 60 s Stereo-Fixture (48 kHz, 16 Bit), `timeout -k 10 180s cargo xtask bench --audio` nach `cargo xtask gen-fixtures`. Alle 18 Single-File-Läufe + 18 Batch-Outputs: FFmpeg-Decode + `ffprobe`-Codec/Rate/Kanäle/Dauer (rohes AAC über exakte Sampledauer) + bit-exakte bzw. lag-alignierte SNR-Signalchecks **bestanden**.
 

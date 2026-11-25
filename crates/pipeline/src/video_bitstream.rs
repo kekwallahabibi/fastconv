@@ -244,53 +244,39 @@ pub(crate) fn is_h264_keyframe_annex_b(annex_b: &[u8]) -> bool {
 
 /// Reads the coded dimensions from the first H.264 SPS in an Annex-B stream.
 pub(crate) fn h264_dimensions_from_annex_b(data: &[u8]) -> Option<(u16, u16)> {
+    parse_h264_sps(data)?.dimensions
+}
+
+/// Colour metadata parsed from an H.264/HEVC SPS VUI. `matrix` is `None` when
+/// `colour_description_present_flag == 0` so `full_range` is still preserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BitstreamColor {
+    pub(crate) matrix: Option<u8>,
+    pub(crate) full_range: bool,
+}
+
+/// Colour metadata from the first SPS VUI that signals video signal type.
+/// `None` means the source did not signal colour range or matrix.
+pub(crate) fn h264_color_from_annex_b(data: &[u8]) -> Option<BitstreamColor> {
+    parse_h264_sps(data)?.color
+}
+
+struct H264SpsInfo {
+    dimensions: Option<(u16, u16)>,
+    color: Option<BitstreamColor>,
+}
+
+fn parse_h264_sps(data: &[u8]) -> Option<H264SpsInfo> {
     let sps = annex_b_nalus(data)
         .into_iter()
         .find(|nalu| nalu_type(nalu) == Some(7))?;
     let rbsp = strip_emulation_prevention(sps.get(1..)?);
     let mut bits = BitReader::new(&rbsp);
-    let profile = bits.read(8)?;
+    let profile = u8::try_from(bits.read(8)?).ok()?;
     let _constraints = bits.read(8)?;
     let _level = bits.read(8)?;
     let _sps_id = bits.ue()?;
-    let mut chroma_format = 1_u32;
-    let mut separate_colour_plane = false;
-    if matches!(
-        profile,
-        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
-    ) {
-        chroma_format = bits.ue()?;
-        if chroma_format == 3 {
-            separate_colour_plane = bits.read(1)? == 1;
-        }
-        let _luma_depth_minus8 = bits.ue()?;
-        let _chroma_depth_minus8 = bits.ue()?;
-        let _transform_bypass = bits.read(1)?;
-        if bits.read(1)? == 1 {
-            let lists = if chroma_format == 3 { 12 } else { 8 };
-            for index in 0..lists {
-                if bits.read(1)? == 1 {
-                    let values = if index < 6 { 16 } else { 64 };
-                    // scaling_list(): a zero nextScale means the rest of the
-                    // list repeats lastScale and carries no delta_scale bits.
-                    let mut last_scale = 8_i32;
-                    let mut next_scale = 8_i32;
-                    for _ in 0..values {
-                        if next_scale != 0 {
-                            let delta = bits.se()?;
-                            next_scale = last_scale.saturating_add(delta).rem_euclid(256);
-                        }
-                        let scale = if next_scale == 0 {
-                            last_scale
-                        } else {
-                            next_scale
-                        };
-                        last_scale = scale;
-                    }
-                }
-            }
-        }
-    }
+    let (chroma_format, separate_colour_plane) = h264_profile_extras(&mut bits, profile)?;
     let _log2_max_frame_num = bits.ue()?;
     let pic_order_type = bits.ue()?;
     if pic_order_type == 0 {
@@ -343,7 +329,81 @@ pub(crate) fn h264_dimensions_from_annex_b(data: &[u8]) -> Option<(u16, u16)> {
                 .checked_mul(sub_height)?
                 .checked_mul(field_factor)?,
         )?;
-    u16::try_from(width).ok().zip(u16::try_from(height).ok())
+    let dimensions = u16::try_from(width).ok().zip(u16::try_from(height).ok());
+    // A trailing SPS may end immediately after the crop fields; padding reads
+    // as zero there, which simply means "no VUI" and must not lose dimensions.
+    let color = if bits.read(1)? == 1 {
+        h264_vui_color(&mut bits)
+    } else {
+        None
+    };
+    Some(H264SpsInfo { dimensions, color })
+}
+
+/// High-profile SPS fields before `log2_max_frame_num_minus4`: chroma format,
+/// separate colour planes and the optional scaling lists.
+fn h264_profile_extras(bits: &mut BitReader<'_>, profile: u8) -> Option<(u32, bool)> {
+    if !matches!(
+        profile,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    ) {
+        return Some((1, false));
+    }
+    let chroma_format = bits.ue()?;
+    let separate_colour_plane = chroma_format == 3 && bits.read(1)? == 1;
+    let _luma_depth_minus8 = bits.ue()?;
+    let _chroma_depth_minus8 = bits.ue()?;
+    let _transform_bypass = bits.read(1)?;
+    if bits.read(1)? == 1 {
+        let lists = if chroma_format == 3 { 12 } else { 8 };
+        for index in 0..lists {
+            if bits.read(1)? == 1 {
+                let values = if index < 6 { 16 } else { 64 };
+                // scaling_list(): a zero nextScale means the rest of the list
+                // repeats lastScale and carries no delta_scale bits.
+                let mut last_scale = 8_i32;
+                let mut next_scale = 8_i32;
+                for _ in 0..values {
+                    if next_scale != 0 {
+                        let delta = bits.se()?;
+                        next_scale = last_scale.saturating_add(delta).rem_euclid(256);
+                    }
+                    last_scale = if next_scale == 0 {
+                        last_scale
+                    } else {
+                        next_scale
+                    };
+                }
+            }
+        }
+    }
+    Some((chroma_format, separate_colour_plane))
+}
+
+/// H.264 `vui_parameters` colour fields. Every read is length-checked so a
+/// truncated SPS cannot yield invented colour metadata.
+fn h264_vui_color(bits: &mut BitReader<'_>) -> Option<BitstreamColor> {
+    if bits.read_checked(1)? == 1 && bits.read_checked(8)? == 255 {
+        // aspect_ratio_idc == Extended_SAR: two 16-bit values.
+        let _sar_width = bits.read_checked(16)?;
+        let _sar_height = bits.read_checked(16)?;
+    }
+    if bits.read_checked(1)? == 1 {
+        let _overscan_appropriate = bits.read_checked(1)?;
+    }
+    if bits.read_checked(1)? == 0 {
+        return None;
+    }
+    let _video_format = bits.read_checked(3)?;
+    let full_range = bits.read_checked(1)? == 1;
+    let matrix = if bits.read_checked(1)? == 1 {
+        let _primaries = bits.read_checked(8)?;
+        let _transfer = bits.read_checked(8)?;
+        Some(u8::try_from(bits.read_checked(8)?).ok()?)
+    } else {
+        None
+    };
+    Some(BitstreamColor { matrix, full_range })
 }
 
 // ---- HEVC ----------------------------------------------------------------
@@ -460,6 +520,26 @@ pub(crate) fn extract_hvcc_from_annex_b(annex_b: &[u8]) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Colour metadata from the first HEVC SPS VUI. `None` means the source did
+/// not signal colour range or matrix.
+pub(crate) fn hevc_color_from_annex_b(data: &[u8]) -> Option<BitstreamColor> {
+    let sps = annex_b_nalus(data)
+        .into_iter()
+        .find(|nalu| hevc_nalu_type(nalu) == Some(33))?;
+    let rbsp = strip_emulation_prevention(sps.get(2..)?);
+    let parsed = rusty_h265::ps::parse_sps(&rbsp).ok()?;
+    let vui = parsed.vui?;
+    // `rusty_h265::ps::Vui` leaves `matrix_coeffs` at 0 when colour_description
+    // is absent; preserve `video_full_range_flag` even without a matrix.
+    if vui.matrix_coeffs == 0 && !vui.video_full_range_flag {
+        return None;
+    }
+    Some(BitstreamColor {
+        matrix: (vui.matrix_coeffs != 0).then_some(vui.matrix_coeffs),
+        full_range: vui.video_full_range_flag,
+    })
 }
 
 pub(crate) fn is_hevc_keyframe_annex_b(annex_b: &[u8]) -> bool {
@@ -1218,6 +1298,83 @@ mod tests {
         out.extend_from_slice(&[0, 0, 1, 0x68, 0xCE]);
         out.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88]);
         out
+    }
+
+    #[test]
+    fn h264_sps_vui_signals_color_matrix_and_range() {
+        let mut bits = BitWriter::new();
+        bits.write(0x42, 8); // profile_idc
+        bits.write(0, 8); // constraint flags + reserved
+        bits.write(30, 8); // level_idc
+        bits.ue(0); // seq_parameter_set_id (baseline: no high-profile fields)
+        bits.ue(4); // log2_max_frame_num_minus4
+        bits.ue(0); // pic_order_cnt_type
+        bits.ue(4); // log2_max_pic_order_cnt_lsb_minus4
+        bits.ue(1); // max_num_ref_frames
+        bits.write(0, 1); // gaps_in_frame_num_value_allowed_flag
+        bits.ue(0); // pic_width_in_mbs_minus1
+        bits.ue(0); // pic_height_in_map_units_minus1
+        bits.write(1, 1); // frame_mbs_only_flag
+        bits.write(1, 1); // direct_8x8_inference_flag
+        bits.write(0, 1); // frame_cropping_flag
+        bits.write(1, 1); // vui_parameters_present_flag
+        bits.write(0, 1); // aspect_ratio_info_present_flag
+        bits.write(0, 1); // overscan_info_present_flag
+        bits.write(1, 1); // video_signal_type_present_flag
+        bits.write(2, 3); // video_format
+        bits.write(0, 1); // video_full_range_flag (limited)
+        bits.write(1, 1); // colour_description_present_flag
+        bits.write(1, 8); // colour_primaries
+        bits.write(1, 8); // transfer_characteristics
+        bits.write(1, 8); // matrix_coefficients = BT.709
+        bits.write(1, 1); // rbsp_stop_one_bit
+        let mut annex_b = vec![0, 0, 0, 1, 0x67];
+        annex_b.extend(bits.bytes);
+        annex_b.extend([0, 0, 0, 1, 0x68, 0xCE]);
+        assert_eq!(
+            h264_color_from_annex_b(&annex_b),
+            Some(BitstreamColor {
+                matrix: Some(1),
+                full_range: false,
+            })
+        );
+        assert_eq!(h264_dimensions_from_annex_b(&annex_b), Some((16, 16)));
+        // A stream without a colour description must not claim one.
+        assert_eq!(h264_color_from_annex_b(&h264_annex_b()), None);
+
+        // Full range with colour_description_present_flag == 0 must keep full_range.
+        let mut full_bits = BitWriter::new();
+        full_bits.write(0x42, 8);
+        full_bits.write(0, 8);
+        full_bits.write(30, 8);
+        full_bits.ue(0);
+        full_bits.ue(4);
+        full_bits.ue(0);
+        full_bits.ue(4);
+        full_bits.ue(1);
+        full_bits.write(0, 1);
+        full_bits.ue(0);
+        full_bits.ue(0);
+        full_bits.write(1, 1);
+        full_bits.write(1, 1);
+        full_bits.write(0, 1);
+        full_bits.write(1, 1); // vui_parameters_present_flag
+        full_bits.write(0, 1); // aspect_ratio_info_present_flag
+        full_bits.write(0, 1); // overscan_info_present_flag
+        full_bits.write(1, 1); // video_signal_type_present_flag
+        full_bits.write(5, 3); // video_format = unspecified
+        full_bits.write(1, 1); // video_full_range_flag = full
+        full_bits.write(0, 1); // colour_description_present_flag = absent
+        full_bits.write(1, 1); // rbsp_stop_one_bit
+        let mut full_annex_b = vec![0, 0, 0, 1, 0x67];
+        full_annex_b.extend(full_bits.bytes);
+        assert_eq!(
+            h264_color_from_annex_b(&full_annex_b),
+            Some(BitstreamColor {
+                matrix: None,
+                full_range: true,
+            })
+        );
     }
 
     #[test]

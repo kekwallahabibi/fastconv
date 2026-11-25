@@ -63,7 +63,13 @@ pub(crate) fn parse_remux_args(args: &[&str]) -> Result<RemuxCommand, String> {
                 let raw = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --to".to_owned())?;
-                to = Some(parse_target_format(raw)?);
+                let parsed = parse_target_format(raw)?;
+                if !parsed.supports_remux() {
+                    return Err(format!(
+                        "format '{raw}' cannot be remuxed; use `fastconv video` for GIF/WebP"
+                    ));
+                }
+                to = Some(parsed);
                 index += 2;
             }
             "--threads" => {
@@ -93,6 +99,9 @@ pub(crate) fn parse_remux_args(args: &[&str]) -> Result<RemuxCommand, String> {
                 .to_owned(),
         );
     };
+    // Do not reject GIF/WebP from the positional target here: an explicit
+    // `--to mkv` may name a directory whose path ends in `.gif`. The probe
+    // layer rejects animation *file* targets after target resolution.
 
     Ok(RemuxCommand::Run(RemuxArgs {
         source: PathBuf::from(*source),
@@ -150,16 +159,17 @@ pub(crate) enum VideoCommand {
 
 pub(crate) fn print_video_help() {
     println!(
-        "Usage: fastconv video <source> <target> [--to <mp4|mkv|webm|mov|avi|ts>] [--vcodec <h264|hevc|h265|av1|vp9|copy>] [--acodec <aac|opus|mp3|copy>] [--quality <0..=100>] [--threads <N>] [--backend <cpu|nvenc>]\n\n\
-         Transcode audio/video tracks while converting between MP4/MOV, MKV, WebM, AVI, and TS containers.\n\n\
-         Backends: cpu runs every codec and --vcodec copy; nvenc encodes H.264/HEVC only.\n\n\
+        "Usage: fastconv video <source> <target> [--to <mp4|mkv|webm|mov|avi|ts|gif|webp>] [--vcodec <h264|hevc|h265|av1|vp9|gif|webp|copy>] [--acodec <aac|opus|mp3|none|copy>] [--quality <0..=100>] [--threads <N>] [--backend <cpu|nvenc>]\n\n\
+         Transcode audio/video tracks while converting between MP4/MOV, MKV, WebM, AVI, TS, GIF, and WebP containers.\n\n\
+         Backends: cpu runs every codec and --vcodec copy; nvenc encodes H.264/HEVC only.\n\
+         Animated GIF/WebP encoding runs on CPU only and drops audio tracks by default.\n\n\
          Arguments:\n  \
            <source>              Source video file or directory\n  \
            <target>              Target file or directory\n\n\
          Options:\n  \
-           --to <mp4|mkv|webm|mov|avi|ts>  Output container (required for directory batches)\n  \
-           --vcodec <codec>      Video codec: h264, hevc (h265), av1, vp9, or copy\n  \
-           --acodec <codec>      Audio codec: aac, opus, mp3, or copy\n  \
+           --to <mp4|mkv|webm|mov|avi|ts|gif|webp>  Output container (required for directory batches)\n  \
+           --vcodec <codec>      Video codec: h264, hevc (h265), av1, vp9, gif, webp, or copy\n  \
+           --acodec <codec>      Audio codec: aac, opus, mp3, none (drop), or copy\n  \
            --quality <0..=100>   Encoding quality (cannot be combined with --vcodec copy)\n  \
            --threads <N>         Number of parallel workers\n  \
            --backend <name>      cpu (default) or nvenc (H.264/HEVC encoding only)\n  \
@@ -179,18 +189,24 @@ fn parse_video_codec(raw: &str) -> Result<RequestedVideoCodec, String> {
         return Ok(RequestedVideoCodec::Copy);
     }
     let codec = TargetVideoCodec::from_name(raw).ok_or_else(|| {
-        format!("unknown video codec '{raw}' (expected h264, hevc (h265), av1, vp9, or copy)")
+        format!(
+            "unknown video codec '{raw}' (expected h264, hevc (h265), av1, vp9, gif, webp, or copy)"
+        )
     })?;
     Ok(RequestedVideoCodec::Encode(codec))
 }
 
 fn parse_audio_codec(raw: &str) -> Result<RequestedAudioCodec, String> {
-    if raw == "copy" {
-        return Ok(RequestedAudioCodec::Copy);
+    match raw {
+        "copy" => Ok(RequestedAudioCodec::Copy),
+        "none" => Ok(RequestedAudioCodec::Drop),
+        _ => {
+            let codec = TargetAudioCodec::from_name(raw).ok_or_else(|| {
+                format!("unknown audio codec '{raw}' (expected aac, opus, mp3, none, or copy)")
+            })?;
+            Ok(RequestedAudioCodec::Encode(codec))
+        }
     }
-    let codec = TargetAudioCodec::from_name(raw)
-        .ok_or_else(|| format!("unknown audio codec '{raw}' (expected aac, opus, mp3, or copy)"))?;
-    Ok(RequestedAudioCodec::Encode(codec))
 }
 
 /// Parses `fastconv video` arguments without touching the file system.
@@ -279,7 +295,7 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
 
     let [source, target] = positional.as_slice() else {
         return Err(
-            "expected `fastconv video <source> <target> [--to <mp4|mkv|webm|mov|avi|ts>] [options]`"
+            "expected `fastconv video <source> <target> [--to <mp4|mkv|webm|mov|avi|ts|gif|webp>] [options]`"
                 .to_owned(),
         );
     };
@@ -422,8 +438,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_video_to_gif_remux() {
+    fn rejects_explicit_animation_remux_targets_but_accepts_positional_paths() -> Result<(), String>
+    {
         assert!(parse_remux_args(&["clip.mp4", "out.gif", "--to", "gif"]).is_err());
+        assert!(parse_remux_args(&["clip.mp4", "out.webp", "--to", "webp"]).is_err());
+        let RemuxCommand::Run(gif_target) = parse_remux_args(&["clip.mp4", "out.gif"])? else {
+            return Err("expected remux run args".to_owned());
+        };
+        assert_eq!(gif_target.target, PathBuf::from("out.gif"));
+        // A directory target merely named `archive.gif` is valid when `--to`
+        // selects a remuxable container; rejection happens after resolution.
+        let RemuxCommand::Run(dir_target) =
+            parse_remux_args(&["clips", "archive.gif", "--to", "mkv"])?
+        else {
+            return Err("expected remux run args".to_owned());
+        };
+        assert_eq!(dir_target.to, Some(VideoContainerFormat::Mkv));
+        Ok(())
     }
 
     #[test]
@@ -497,7 +528,11 @@ mod tests {
             ("qt", VideoContainerFormat::Mov),
             ("m2ts", VideoContainerFormat::Ts),
             ("mts", VideoContainerFormat::Ts),
+            ("gif", VideoContainerFormat::Gif),
+            ("webp", VideoContainerFormat::Webp),
             ("WEBM", VideoContainerFormat::Webm),
+            ("GIF", VideoContainerFormat::Gif),
+            ("WEBP", VideoContainerFormat::Webp),
         ] {
             let VideoCommand::Run(parsed) = parse_video_args(&["in.mp4", "out.x", "--to", raw])?
             else {
@@ -516,6 +551,8 @@ mod tests {
             ("h265", TargetVideoCodec::Hevc),
             ("av1", TargetVideoCodec::Av1),
             ("vp9", TargetVideoCodec::Vp9),
+            ("gif", TargetVideoCodec::Gif),
+            ("webp", TargetVideoCodec::Webp),
         ] {
             let VideoCommand::Run(parsed) =
                 parse_video_args(&["in.mp4", "out.x", "--vcodec", raw])?
@@ -642,6 +679,38 @@ mod tests {
                 "missing {flag}"
             );
         }
+    }
+
+    #[test]
+    fn parses_animation_and_dropped_audio_flags() -> Result<(), String> {
+        for (to, container, vcodec) in [
+            ("gif", VideoContainerFormat::Gif, TargetVideoCodec::Gif),
+            ("webp", VideoContainerFormat::Webp, TargetVideoCodec::Webp),
+        ] {
+            let VideoCommand::Run(parsed) = parse_video_args(&[
+                "in.mp4",
+                "out.x",
+                "--to",
+                to,
+                "--vcodec",
+                to,
+                "--acodec",
+                "none",
+                "--backend",
+                "cpu",
+            ])?
+            else {
+                return Err("expected video run args".to_owned());
+            };
+            assert_eq!(parsed.to, Some(container), "video --to {to}");
+            assert_eq!(
+                parsed.video_codec,
+                Some(RequestedVideoCodec::Encode(vcodec)),
+                "video --vcodec {to}"
+            );
+            assert_eq!(parsed.audio_codec, Some(RequestedAudioCodec::Drop));
+        }
+        Ok(())
     }
 
     #[test]

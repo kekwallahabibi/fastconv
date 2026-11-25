@@ -42,13 +42,54 @@ pub(crate) struct Yuv420Frame {
     pub(crate) duration_us: u64,
 }
 
-/// Geometry and timing metadata for one decoded 8-bit 4:2:0 video frame.
+/// YUV→RGB matrix signalled by the source bitstream. BT.601 is the explicit
+/// default only for sources that signal no usable matrix. `Bt2020` covers
+/// non-constant luminance (H.273 coefficient 9); signalled matrices without an
+/// RGB converter are carried as `Unsupported` and rejected only where RGB is
+/// actually produced, so NV12 video-to-video paths stay unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum YuvMatrix {
+    #[default]
+    Bt601,
+    Bt709,
+    Bt2020,
+    Unsupported(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum YuvRange {
+    #[default]
+    Limited,
+    Full,
+}
+
+/// Signalled source colour description carried with each decoded frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct YuvColor {
+    pub(crate) matrix: YuvMatrix,
+    pub(crate) range: YuvRange,
+    /// False only when the source bitstream does not signal colour at all.
+    pub(crate) signalled: bool,
+}
+
+impl YuvColor {
+    pub(crate) const fn specified(matrix: YuvMatrix, range: YuvRange) -> Self {
+        Self {
+            matrix,
+            range,
+            signalled: true,
+        }
+    }
+}
+
+/// Geometry, timing and colour metadata for one decoded 8-bit 4:2:0 frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DecodedFrameInfo {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) pts_us: i64,
     pub(crate) duration_us: u64,
+    pub(crate) color: YuvColor,
 }
 
 /// One encoded video track with canonical container packets.
@@ -669,6 +710,14 @@ pub(crate) fn decode_video_track(
             }
             Ok(frames)
         }
+        VideoCodec::Gif => crate::video_anim::decode_gif_frames_yuv420(
+            path,
+            crate::video_anim::ANIM_DECODED_BUDGET,
+        ),
+        VideoCodec::Webp => crate::video_anim::decode_webp_frames_yuv420(
+            path,
+            crate::video_anim::ANIM_DECODED_BUDGET,
+        ),
         other => Err(decode_error(
             path,
             format!("codec {other} is not a supported video decoder"),
@@ -676,23 +725,26 @@ pub(crate) fn decode_video_track(
     }
 }
 
-/// Streaming NV12 decode path feeding the NVENC backend. Without the `nvenc`
-/// feature the helpers are only reachable from tests.
-#[cfg_attr(not(feature = "nvenc"), allow(dead_code))]
+/// Streaming NV12 decode path shared by the CPU animation pipeline and the
+/// NVENC backend.
 mod streaming {
     use super::{
         Av1Decoder, Av1Planes, ContainerPacket, ContainerTrack, DecodedFrameInfo, H264Decoder,
         H264YuvFrame, HevcDecoder, Path, PipelineError, PixelLayout, VideoCodec, Vp9DecodedFrame,
-        Vp9Decoder, Vp9Error, avcc_to_annex_b, decode_error, decode_order, has_b_frame_reordering,
-        hevc_picture_duration, hevc_picture_pts, hevc_pts_to_packet, hvcc_to_annex_b,
-        median_duration,
+        Vp9Decoder, Vp9Error, YuvColor, YuvMatrix, YuvRange, avcc_to_annex_b, decode_error,
+        decode_order, has_b_frame_reordering, hevc_picture_duration, hevc_picture_pts,
+        hevc_pts_to_packet, hvcc_to_annex_b, median_duration, source_color,
     };
+
+    type PackFn<'a> = dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError> + 'a;
 
     /// Estimates the frame rate implied by the median packet duration, rounded
     /// to the nearest integer so 16,666 µs and 16,667 µs both resolve to 60 fps.
     ///
     /// Kept as a pure helper so the streaming GPU path and CPU path share one
-    /// definition of "fps" derived from container timing.
+    /// definition of "fps" derived from container timing. Only the optional
+    /// NVENC backend consumes it in a non-test build.
+    #[cfg_attr(not(any(feature = "nvenc", test)), allow(dead_code))]
     pub(crate) fn estimate_video_fps_from_packets(packets: &[ContainerPacket]) -> u32 {
         let duration = median_duration(packets).max(1);
         let fps = 1_000_000_u64.saturating_add(duration / 2) / duration;
@@ -978,6 +1030,24 @@ mod streaming {
         emit_nv12_frame(path, on_frame, info, write_y, write_uv)
     }
 
+    /// Maps the AV1 signal description onto our RGB matrix/range model. The
+    /// range is independent of the matrix: an AV1 frame can be full range with
+    /// no matrix description at all.
+    pub(super) fn av1_color(
+        matrix: rav1d_safe::src::managed::MatrixCoefficients,
+        range: YuvRange,
+    ) -> YuvColor {
+        use rav1d_safe::src::managed::MatrixCoefficients as Mc;
+        match matrix {
+            Mc::BT709 => YuvColor::specified(YuvMatrix::Bt709, range),
+            Mc::BT2020NCL => YuvColor::specified(YuvMatrix::Bt2020, range),
+            Mc::BT470BG | Mc::BT601 | Mc::Unspecified | Mc::Reserved => {
+                YuvColor::specified(YuvMatrix::Bt601, range)
+            }
+            other => YuvColor::specified(YuvMatrix::Unsupported(other as u8), range),
+        }
+    }
+
     fn emit_av1_frame<F>(
         path: &Path,
         frame: &rav1d_safe::src::managed::Frame,
@@ -1007,11 +1077,18 @@ mod streaming {
                 format!("AV1 chroma layout {layout:?} is not 4:2:0"),
             ));
         }
+        let infos = frame.color_info();
+        let range = match infos.color_range {
+            rav1d_safe::src::managed::ColorRange::Full => YuvRange::Full,
+            rav1d_safe::src::managed::ColorRange::Limited => YuvRange::Limited,
+        };
+        let color = av1_color(infos.matrix_coefficients, range);
         let info = DecodedFrameInfo {
             width: frame.width(),
             height: frame.height(),
             pts_us,
             duration_us,
+            color,
         };
         match frame.planes() {
             Av1Planes::Depth8(planes) => {
@@ -1050,6 +1127,7 @@ mod streaming {
             height: u32::try_from(height).unwrap_or(u32::MAX),
             pts_us,
             duration_us,
+            color: YuvColor::default(),
         };
         let write_y = |dst_row: &mut [u8], row: usize| {
             let start = row
@@ -1134,6 +1212,7 @@ mod streaming {
             height: u32::try_from(height).unwrap_or(u32::MAX),
             pts_us,
             duration_us,
+            color: YuvColor::default(),
         };
         let write_y = |dst_row: &mut [u8], row: usize| {
             let plane = &picture.planes[0];
@@ -1282,6 +1361,7 @@ mod streaming {
             height: u32::try_from(height).unwrap_or(u32::MAX),
             pts_us: frame.pts.unwrap_or(0),
             duration_us,
+            color: YuvColor::default(),
         };
         emit_nv12_frame(path, on_frame, info, write_y, write_uv)
     }
@@ -1534,11 +1614,51 @@ mod streaming {
         ) -> Result<(), PipelineError>,
     {
         let ordered = decode_order(packets);
+        // Derive the source colour description once per track. Frames whose
+        // decoder signals its own colour (AV1) keep that; everything else gets
+        // the signalled track value, or the explicit BT.601 default only when
+        // the bitstream carries no colour description at all.
+        let track_color = source_color(track, &ordered);
+        let mut deliver =
+            |mut info: DecodedFrameInfo, pack: &mut PackFn<'_>| -> Result<(), PipelineError> {
+                if !info.color.signalled {
+                    info.color = track_color;
+                }
+                on_frame(info, pack)
+            };
         match track.codec {
-            VideoCodec::H264 => stream_h264(path, track, &ordered, &mut on_frame),
-            VideoCodec::Hevc => stream_hevc(path, track, &ordered, packets, &mut on_frame),
-            VideoCodec::Av1 => stream_av1(path, &ordered, packets, &mut on_frame),
-            VideoCodec::Vp9 => stream_vp9(path, &ordered, packets, &mut on_frame),
+            VideoCodec::H264 => stream_h264(path, track, &ordered, &mut deliver),
+            VideoCodec::Hevc => stream_hevc(path, track, &ordered, packets, &mut deliver),
+            VideoCodec::Av1 => stream_av1(path, &ordered, packets, &mut deliver),
+            VideoCodec::Vp9 => stream_vp9(path, &ordered, packets, &mut deliver),
+            VideoCodec::Gif => {
+                crate::video_anim::decode_gif_frames_streaming_nv12(path, |info, pack| {
+                    deliver(
+                        DecodedFrameInfo {
+                            width: info.width,
+                            height: info.height,
+                            pts_us: info.pts_us,
+                            duration_us: info.duration_us,
+                            color: YuvColor::default(),
+                        },
+                        pack,
+                    )
+                })
+            }
+            VideoCodec::Webp => {
+                crate::video_anim::decode_webp_frames_streaming_nv12(path, |info, pack| {
+                    deliver(
+                        DecodedFrameInfo {
+                            width: info.width,
+                            height: info.height,
+                            pts_us: info.pts_us,
+                            duration_us: info.duration_us,
+                            color: YuvColor::default(),
+                        },
+                        pack,
+                    )
+                })
+            }
             other => Err(decode_error(
                 path,
                 format!("codec {other} is not a supported video decoder"),
@@ -1547,11 +1667,57 @@ mod streaming {
     }
 } // mod streaming
 
-// Re-exports preserve the `video_codecs` API path for the upcoming NVENC stage.
-#[allow(unused_imports)]
-pub(crate) use streaming::{
-    decode_video_track_streaming, estimate_video_fps_from_packets, nv12_buffer_len,
-};
+/// Reads the source colour description from canonical codec configuration.
+/// Unparseable or absent VUI data means "not signalled", never a silent guess.
+/// Preserves `full_range` independently of matrix availability. Signalled
+/// matrices without an RGB converter (constant luminance 10, SMPTE 240M, ...)
+/// are carried as `Unsupported` so only the RGB conversion rejects them.
+fn source_color(track: &ContainerTrack, packets: &[&ContainerPacket]) -> YuvColor {
+    let resolve = |matrix: Option<u8>, full_range: bool| -> YuvColor {
+        let range = if full_range {
+            YuvRange::Full
+        } else {
+            YuvRange::Limited
+        };
+        let matrix = match matrix {
+            Some(1) => YuvMatrix::Bt709,
+            Some(9) => YuvMatrix::Bt2020,
+            Some(code @ (10 | 4 | 7 | 8 | 11..=14)) => YuvMatrix::Unsupported(code),
+            _ => YuvMatrix::Bt601,
+        };
+        YuvColor::specified(matrix, range)
+    };
+    match track.codec {
+        VideoCodec::H264 => {
+            let annex_b = avcc_to_annex_b(&track.config, &[], true).unwrap_or_default();
+            match crate::video_bitstream::h264_color_from_annex_b(&annex_b) {
+                Some(color) => resolve(color.matrix, color.full_range),
+                None => YuvColor::default(),
+            }
+        }
+        VideoCodec::Hevc => {
+            let annex_b = hvcc_to_annex_b(&track.config, &[], true).unwrap_or_default();
+            match crate::video_bitstream::hevc_color_from_annex_b(&annex_b) {
+                Some(color) => resolve(color.matrix, color.full_range),
+                None => YuvColor::default(),
+            }
+        }
+        VideoCodec::Vp9 => match packets
+            .iter()
+            .find_map(|packet| crate::video_bitstream::vp9_color_from_keyframe(&packet.data))
+        {
+            Some(color) => resolve(Some(color.matrix), color.full_range),
+            None => YuvColor::default(),
+        },
+        // AV1 frames signal their own colour; leave it unsignalled here so the
+        // per-frame decoder metadata wins.
+        _ => YuvColor::default(),
+    }
+}
+
+#[cfg(any(feature = "nvenc", test))]
+pub(crate) use streaming::estimate_video_fps_from_packets;
+pub(crate) use streaming::{decode_video_track_streaming, nv12_buffer_len};
 
 /// Splits an Annex-B byte stream into one packet per coded access unit,
 /// grouping parameter sets and SEI with the VCL NAL that follows them.
@@ -2006,6 +2172,10 @@ pub(crate) fn encode_video_cpu(
         VideoEncodeMode::CpuVp9 { quality } => {
             cpu_vp9(path, frames, quality, track_index, fps_num, fps_den)
         }
+        VideoEncodeMode::CpuGif { .. } | VideoEncodeMode::CpuWebp { .. } => Err(encode_error(
+            path,
+            "animated GIF/WebP frames must be encoded by the animation path, not the frame encoder",
+        )),
         VideoEncodeMode::NvencH264 { .. } | VideoEncodeMode::NvencHevc { .. } => Err(encode_error(
             path,
             "NVENC modes must be encoded on the NVENC backend",
@@ -2632,5 +2802,130 @@ mod tests {
         assert_eq!(estimate_video_fps_from_packets(&[packet(41_667)]), 24);
         assert_eq!(estimate_video_fps_from_packets(&[]), 30);
         assert_eq!(estimate_video_fps_from_packets(&[packet(1)]), 240);
+    }
+
+    fn h264_avcc_with_vui(full_range: bool, matrix: Option<u8>) -> Vec<u8> {
+        // Minimal baseline 16x16 SPS + VUI colour fields packed MSB-first.
+        let mut bits: Vec<u8> = Vec::new();
+        let mut push_bits = |value: u32, count: usize| {
+            for shift in (0..count).rev() {
+                bits.push(u8::try_from((value >> shift) & 1).unwrap_or(0));
+            }
+        };
+        let push_ue = |bits: &mut Vec<u8>, value: u32| {
+            let code = value.saturating_add(1);
+            let bit_len = usize::try_from(32 - code.leading_zeros()).unwrap_or(1);
+            for _ in 0..bit_len.saturating_sub(1) {
+                bits.push(0);
+            }
+            for shift in (0..bit_len).rev() {
+                bits.push(u8::try_from((code >> shift) & 1).unwrap_or(0));
+            }
+        };
+        push_bits(0x42, 8); // profile_idc
+        push_bits(0, 8); // constraints
+        push_bits(30, 8); // level_idc
+        push_ue(&mut bits, 0); // sps_id
+        push_ue(&mut bits, 4); // log2_max_frame_num_minus4
+        push_ue(&mut bits, 0); // pic_order_cnt_type
+        push_ue(&mut bits, 4); // log2_max_pic_order_cnt_lsb_minus4
+        push_ue(&mut bits, 1); // max_num_ref_frames
+        bits.push(0); // gaps_in_frame_num_value_allowed_flag
+        push_ue(&mut bits, 0); // width_mbs_minus1
+        push_ue(&mut bits, 0); // height_map_units_minus1
+        bits.push(1); // frame_mbs_only_flag
+        bits.push(1); // direct_8x8_inference_flag
+        bits.push(0); // frame_cropping_flag
+        bits.push(1); // vui_parameters_present_flag
+        bits.push(0); // aspect_ratio_info_present_flag
+        bits.push(0); // overscan_info_present_flag
+        bits.push(1); // video_signal_type_present_flag
+        for bit in [1_u8, 0, 1] {
+            bits.push(bit); // video_format = 5 (unspecified)
+        }
+        bits.push(u8::from(full_range));
+        if let Some(matrix_coeffs) = matrix {
+            bits.push(1); // colour_description_present_flag
+            for byte in [2_u8, 2, matrix_coeffs] {
+                for shift in (0..8).rev() {
+                    bits.push((byte >> shift) & 1);
+                }
+            }
+        } else {
+            bits.push(0); // colour_description_present_flag
+        }
+        bits.push(1); // rbsp_stop_one_bit
+        let mut sps_rbsp = Vec::new();
+        for chunk in bits.chunks(8) {
+            let mut byte = 0_u8;
+            for (i, &bit) in chunk.iter().enumerate() {
+                byte |= bit << (7 - i);
+            }
+            sps_rbsp.push(byte);
+        }
+        let mut annex_b = vec![0, 0, 0, 1, 0x67];
+        annex_b.extend_from_slice(&sps_rbsp);
+        annex_b.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xCE]);
+        extract_avcc_from_annex_b(&annex_b).unwrap_or_default()
+    }
+
+    #[test]
+    fn source_color_preserves_range_and_flags_unsupported_rgb_matrices() {
+        let make_track = |config| ContainerTrack {
+            codec: VideoCodec::H264,
+            width: Some(16),
+            height: Some(16),
+            channels: None,
+            sample_rate: None,
+            config,
+            timescale: US_TIMESCALE,
+            presentation_edit: None,
+        };
+
+        // Full range without colour_description keeps BT.601 default matrix + Full range.
+        let full_only = make_track(h264_avcc_with_vui(true, None));
+        assert_eq!(
+            source_color(&full_only, &[]),
+            YuvColor::specified(YuvMatrix::Bt601, YuvRange::Full)
+        );
+
+        // Matrix coefficient 9 stays on BT.2020 non-constant luminance.
+        let bt2020_ncl = make_track(h264_avcc_with_vui(false, Some(9)));
+        assert_eq!(
+            source_color(&bt2020_ncl, &[]),
+            YuvColor::specified(YuvMatrix::Bt2020, YuvRange::Limited)
+        );
+
+        // Unsupported matrices are carried (with their range) past NV12 delivery;
+        // only the RGB conversion rejects them.
+        let constant_luminance = make_track(h264_avcc_with_vui(false, Some(10)));
+        assert_eq!(
+            source_color(&constant_luminance, &[]),
+            YuvColor::specified(YuvMatrix::Unsupported(10), YuvRange::Limited)
+        );
+        let smpte_240m = make_track(h264_avcc_with_vui(true, Some(7)));
+        assert_eq!(
+            source_color(&smpte_240m, &[]),
+            YuvColor::specified(YuvMatrix::Unsupported(7), YuvRange::Full)
+        );
+    }
+
+    #[test]
+    fn av1_color_preserves_range_when_matrix_is_unspecified() {
+        use rav1d_safe::src::managed::MatrixCoefficients as Mc;
+        for matrix in [Mc::Unspecified, Mc::Reserved] {
+            assert_eq!(
+                streaming::av1_color(matrix, YuvRange::Full),
+                YuvColor::specified(YuvMatrix::Bt601, YuvRange::Full)
+            );
+            assert_eq!(
+                streaming::av1_color(matrix, YuvRange::Limited),
+                YuvColor::specified(YuvMatrix::Bt601, YuvRange::Limited)
+            );
+        }
+        assert_eq!(
+            streaming::av1_color(Mc::BT709, YuvRange::Full),
+            YuvColor::specified(YuvMatrix::Bt709, YuvRange::Full)
+        );
     }
 }
