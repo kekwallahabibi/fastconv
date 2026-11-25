@@ -737,7 +737,10 @@ mod enabled {
     /// Splits Annex-B H.264/HEVC into access units. A unit is marked complete
     /// only when it contains the first slice of a picture; that is the only
     /// case where `CUVID_PKT_ENDOFPICTURE` is legal for the submitted packet.
-    fn annex_b_access_units(data: &[u8], codec: VideoCodec) -> Vec<(&[u8], bool)> {
+    /// Returns `(bytes, has_picture_start, has_vcl)` per unit. The VCL flag
+    /// matters for timing: header-only tails are submitted but must not be
+    /// counted as pictures when the PES interval is divided.
+    pub(super) fn annex_b_access_units(data: &[u8], codec: VideoCodec) -> Vec<(&[u8], bool, bool)> {
         let mut units = Vec::new();
         let mut au_start = 0_usize;
         let mut au_end = 0_usize;
@@ -747,7 +750,7 @@ mod enabled {
             let nal = &data[range.payload_start..range.end];
             let (is_vcl, starts_au, starts_picture) = nal_role(nal, codec);
             if starts_au && has_vcl {
-                units.push((&data[au_start..au_end], has_picture_start));
+                units.push((&data[au_start..au_end], has_picture_start, has_vcl));
                 au_start = range.start;
                 has_picture_start = false;
                 has_vcl = false;
@@ -757,7 +760,7 @@ mod enabled {
             has_vcl |= is_vcl;
         }
         if au_end > au_start {
-            units.push((&data[au_start..au_end], has_picture_start));
+            units.push((&data[au_start..au_end], has_picture_start, has_vcl));
         }
         units
     }
@@ -868,23 +871,34 @@ mod enabled {
             // may hold several access units. Submit each one separately so
             // ENDOFPICTURE only marks a packet with exactly one complete
             // frame/field, as NVCUVID requires.
-            let units: Vec<(&[u8], bool)> = match state.source {
+            let units: Vec<(&[u8], bool, bool)> = match state.source {
                 VideoCodec::H264 | VideoCodec::Hevc => {
                     let split = annex_b_access_units(&payload, state.source);
                     if split.is_empty() && !payload.is_empty() {
                         // Unparsable Annex-B cannot be proven complete; never
                         // claim an end-of-picture boundary for it.
-                        vec![(payload.as_slice(), false)]
+                        vec![(payload.as_slice(), false, false)]
                     } else {
                         split
                     }
                 }
-                VideoCodec::Vp9 => vec![(payload.as_slice(), true)],
+                VideoCodec::Vp9 => vec![(payload.as_slice(), true, true)],
                 other => return Err(nvdec_error(format!("NVDEC cannot decode {other}"))),
             };
-            let au_count = units.len();
-            for (index, (bytes, complete)) in units.into_iter().enumerate() {
-                let (timestamp, step) = au_timing(packet.pts, packet.duration, au_count, index);
+            // Only units carrying a VCL NAL produce a picture; a trailing AUD,
+            // SPS or PPS is still submitted but must not inflate the divisor.
+            let au_count = units
+                .iter()
+                .filter(|(_, _, has_vcl)| *has_vcl)
+                .count()
+                .max(1);
+            let mut picture_index = 0_usize;
+            for (bytes, complete, has_vcl) in units {
+                let (timestamp, step) =
+                    au_timing(packet.pts, packet.duration, au_count, picture_index);
+                if has_vcl {
+                    picture_index = picture_index.saturating_add(1);
+                }
                 state.durations.insert(timestamp, step);
                 let mut flags = nvcuvid::CUvideopacketflags::CUVID_PKT_TIMESTAMP as u32;
                 if complete {
@@ -944,7 +958,7 @@ mod tests {
     use cudarc::driver::CudaContext;
     use fastconv_domain::{VideoCodec, VideoEncodeMode, VideoQuality};
 
-    use super::enabled::au_timing;
+    use super::enabled::{annex_b_access_units, au_timing};
     use super::{decode_packets_to_gpu, validate_decode_caps};
     use crate::PipelineError;
     use crate::gpu::nvenc::{encode_video_nvdec_nvenc_streaming, encode_video_nvenc_streaming};
@@ -983,6 +997,23 @@ mod tests {
         assert_eq!(second, [(80_000, 40_000), (120_000, 40_000)]);
         // A packet holding a single AU keeps its timestamp and duration exactly.
         assert_eq!(au_timing(80_000, 40_000, 1, 0), (80_000, 40_000));
+    }
+
+    #[test]
+    fn header_only_tail_does_not_inflate_the_picture_timing_divisor() {
+        // AUD, first IDR slice, a later slice of the same picture, trailing AUD.
+        let annex_b = [
+            0, 0, 0, 1, 0x09, 0xF0, //
+            0, 0, 0, 1, 0x65, 0x80, //
+            0, 0, 0, 1, 0x65, 0x40, //
+            0, 0, 0, 1, 0x09, 0xF0, //
+        ];
+        let units = annex_b_access_units(&annex_b, VideoCodec::H264);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units.iter().filter(|(_, _, has_vcl)| *has_vcl).count(), 1);
+        assert!(!units[1].1, "a header-only tail cannot end a picture");
+        // The single picture gets the full 80 ms interval, not 80/3 ms.
+        assert_eq!(au_timing(0, 80_000, 1, 0), (0, 80_000));
     }
 
     #[test]
