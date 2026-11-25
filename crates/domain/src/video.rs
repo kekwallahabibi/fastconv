@@ -478,6 +478,68 @@ impl fmt::Display for VideoDecodeMode {
     }
 }
 
+/// Decode paths actually executed by a whole batch. Under `--hwdecode auto`
+/// each item is resolved separately, so one batch may use both paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum VideoDecodePaths {
+    Cpu,
+    Nvdec,
+    Mixed {
+        nvdec_files: NonZeroUsize,
+        cpu_files: NonZeroUsize,
+    },
+}
+
+impl VideoDecodePaths {
+    /// Collapses per-item modes into one batch-level value. `None` means the
+    /// batch had no items; mixed counts are non-zero by construction.
+    #[must_use]
+    pub fn from_modes(modes: impl IntoIterator<Item = VideoDecodeMode>) -> Option<Self> {
+        let (mut nvdec, mut cpu) = (0_usize, 0_usize);
+        for mode in modes {
+            match mode {
+                VideoDecodeMode::Nvdec => nvdec = nvdec.saturating_add(1),
+                VideoDecodeMode::Cpu => cpu = cpu.saturating_add(1),
+            }
+        }
+        match (NonZeroUsize::new(nvdec), NonZeroUsize::new(cpu)) {
+            (Some(nvdec_files), Some(cpu_files)) => Some(Self::Mixed {
+                nvdec_files,
+                cpu_files,
+            }),
+            (Some(_), None) => Some(Self::Nvdec),
+            (None, Some(_)) => Some(Self::Cpu),
+            (None, None) => None,
+        }
+    }
+
+    /// Exact executed paths for reports and the CLI summary. Homogeneous
+    /// batches keep the single-path labels; mixed batches name both paths
+    /// (counts remain available through [`Self::Mixed`]).
+    #[must_use]
+    pub const fn path(self, encode_backend: HardwareBackend) -> &'static str {
+        match self {
+            Self::Cpu => VideoDecodeMode::Cpu.path(encode_backend),
+            Self::Nvdec => VideoDecodeMode::Nvdec.path(encode_backend),
+            Self::Mixed { .. } => match encode_backend {
+                HardwareBackend::Gpu(GpuBackend::Nvenc) => {
+                    "mixed: gpu:nvdec+nvenc + gpu:nvenc (cpu decode)"
+                }
+                _ => "mixed: invalid:nvdec+cpu + cpu",
+            },
+        }
+    }
+}
+
+impl From<VideoDecodeMode> for VideoDecodePaths {
+    fn from(mode: VideoDecodeMode) -> Self {
+        match mode {
+            VideoDecodeMode::Nvdec => Self::Nvdec,
+            VideoDecodeMode::Cpu => Self::Cpu,
+        }
+    }
+}
+
 /// Compile-time-legal video encoder choice: a codec/backend pair and its quality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum VideoEncodeMode {
@@ -1316,7 +1378,7 @@ pub struct VideoTranscodeReport {
     worker_threads_used: NonZeroUsize,
     backend: HardwareBackend,
     hardware_device: Option<String>,
-    decode_mode: VideoDecodeMode,
+    decode_paths: VideoDecodePaths,
 }
 
 impl VideoTranscodeReport {
@@ -1332,7 +1394,7 @@ impl VideoTranscodeReport {
         worker_threads_used: NonZeroUsize,
         backend: HardwareBackend,
         hardware_device: Option<String>,
-        decode_mode: VideoDecodeMode,
+        decode_paths: impl Into<VideoDecodePaths>,
     ) -> Self {
         Self {
             files_converted,
@@ -1343,7 +1405,7 @@ impl VideoTranscodeReport {
             worker_threads_used,
             backend,
             hardware_device,
-            decode_mode,
+            decode_paths: decode_paths.into(),
         }
     }
 
@@ -1387,17 +1449,17 @@ impl VideoTranscodeReport {
         self.hardware_device.as_deref()
     }
 
-    /// Concrete decode path executed for the batch.
+    /// Concrete decode paths executed across the batch.
     #[must_use]
-    pub const fn decode_mode(&self) -> VideoDecodeMode {
-        self.decode_mode
+    pub const fn decode_paths(&self) -> VideoDecodePaths {
+        self.decode_paths
     }
 
     /// Exact executed hardware path for the CLI summary,
-    /// e.g. `gpu:nvdec+nvenc` or `gpu:nvenc (cpu decode)`.
+    /// e.g. `gpu:nvdec+nvenc`, `gpu:nvenc (cpu decode)` or a mixed-path label.
     #[must_use]
     pub const fn decode_path(&self) -> &'static str {
-        self.decode_mode.path(self.backend)
+        self.decode_paths.path(self.backend)
     }
 
     #[must_use]
@@ -2436,5 +2498,55 @@ mod tests {
             VideoDecodeMode::Cpu,
         );
         assert_eq!(cpu_decode.decode_path(), "gpu:nvenc (cpu decode)");
+    }
+
+    #[test]
+    fn report_surfaces_mixed_decode_paths() {
+        let one = NonZeroUsize::MIN;
+        let two = NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN);
+        let bytes = NonZeroU64::MIN;
+        let modes = [
+            VideoDecodeMode::Nvdec,
+            VideoDecodeMode::Cpu,
+            VideoDecodeMode::Nvdec,
+        ];
+        assert_eq!(
+            VideoDecodePaths::from_modes(modes),
+            Some(VideoDecodePaths::Mixed {
+                nvdec_files: two,
+                cpu_files: one,
+            })
+        );
+        assert_eq!(
+            VideoDecodePaths::from_modes([VideoDecodeMode::Cpu; 2]),
+            Some(VideoDecodePaths::Cpu)
+        );
+        assert_eq!(VideoDecodePaths::from_modes([]), None);
+
+        let report = VideoTranscodeReport::new(
+            NonZeroUsize::new(3).unwrap_or(NonZeroUsize::MIN),
+            3,
+            bytes,
+            bytes,
+            Duration::from_secs(1),
+            one,
+            HardwareBackend::Gpu(GpuBackend::Nvenc),
+            None,
+            VideoDecodePaths::Mixed {
+                nvdec_files: two,
+                cpu_files: one,
+            },
+        );
+        assert_eq!(
+            report.decode_paths(),
+            VideoDecodePaths::Mixed {
+                nvdec_files: two,
+                cpu_files: one,
+            }
+        );
+        assert_eq!(
+            report.decode_path(),
+            "mixed: gpu:nvdec+nvenc + gpu:nvenc (cpu decode)"
+        );
     }
 }

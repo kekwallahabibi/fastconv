@@ -15,6 +15,7 @@ use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 use std::time::Instant;
 
+use fastconv_domain::video::VideoDecodePaths;
 use fastconv_domain::{
     AnimationMeta, AudioTrackAction, GpuBackend, HardwareBackend, TargetAudioCodec, VideoCodec,
     VideoContainerFormat, VideoDecodeMode, VideoEncodeMode, VideoTrackAction, VideoTranscodeItem,
@@ -2465,6 +2466,9 @@ pub fn execute_video_transcode_batch(
     let hardware_device = device
         .into_inner()
         .map_err(|_| PipelineError::WorkerPanicked)?;
+    let decode_paths =
+        VideoDecodePaths::from_modes(items.iter().map(VideoTranscodeItem::decode_mode))
+            .ok_or_else(|| PipelineError::EmptyOutput(PathBuf::new()))?;
     Ok(VideoTranscodeReport::new(
         files,
         frames.load(Ordering::Relaxed),
@@ -2474,7 +2478,7 @@ pub fn execute_video_transcode_batch(
         worker_threads,
         backend,
         hardware_device,
-        plan.decode_mode(),
+        decode_paths,
     ))
 }
 
