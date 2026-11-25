@@ -57,7 +57,7 @@ symphonia = { version = "0.6.1", default-features = false, features = ["opt-simd
 tiff = { version = "0.11.3", default-features = false, features = ["deflate", "lzw"] }
 vorbis-enc = "0.1.1"
 wgpu = { version = "30", default-features = false, features = ["std", "vulkan", "metal", "dx12"] }
-zenwebp = { version = "=0.2.0", default-features = false, features = ["std", "fast-yuv", "simd"] }
+zenwebp = { version = "0.4.6", default-features = false, features = ["std"] }
 # Pin 0.5.16-rc3 until stable 0.5.16 ships: fixes silent wrong-color decoding in 0.5.15 (zune-image#496).
 zune-jpeg = "0.5.16-rc3"
 

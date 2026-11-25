@@ -1032,7 +1032,7 @@ where
         loop {
             let ms = match decoder.read_frame(&mut buf) {
                 Ok(ms) => ms,
-                Err(zenwebp::DecodingError::NoMoreFrames) => break,
+                Err(err) if matches!(err.error(), zenwebp::DecodeError::NoMoreFrames) => break,
                 Err(err) => {
                     return Err(decode_error(
                         path,
@@ -1261,16 +1261,23 @@ fn prepare_frame(
         Ok(PreparedFrame::Gif(frame))
     } else {
         let path = Path::new("webp-encoder");
-        let encoder = if job.info.channels == 4 {
-            zenwebp::Encoder::new_rgba(&job.rgb, job.info.width, job.info.height)
+        let layout = if job.info.channels == 4 {
+            zenwebp::PixelLayout::Rgba8
         } else {
-            zenwebp::Encoder::new_rgb(&job.rgb, job.info.width, job.info.height)
+            zenwebp::PixelLayout::Rgb8
         };
-        let webp_bytes = encoder
-            .quality(f32::from(quality.get()))
-            .method(4)
-            .encode()
-            .map_err(|err| encode_error(path, format!("WebP encoding failed: {err}")))?;
+        let config = zenwebp::LossyConfig::new()
+            .with_quality(f32::from(quality.get()))
+            .with_method(4);
+        let webp_bytes = zenwebp::EncodeRequest::lossy(
+            &config,
+            &job.rgb,
+            layout,
+            job.info.width,
+            job.info.height,
+        )
+        .encode()
+        .map_err(|err| encode_error(path, format!("WebP encoding failed: {err}")))?;
         let (inner, has_alpha) = extract_inner_vp8_chunk(&webp_bytes)?;
         Ok(PreparedFrame::Webp {
             inner,
@@ -1916,7 +1923,7 @@ mod tests {
         let mut decoder = zenwebp::WebPDecoder::new(&bytes)
             .map_err(|err| decode_error(&path, format!("{err}")))?;
         assert!(decoder.is_animated());
-        assert_eq!(decoder.loop_count(), zenwebp::LoopCount::Forever);
+        assert_eq!(decoder.loop_count(), zenwebp::decoder::LoopCount::Forever);
         assert_eq!(decoder.dimensions(), (5, 5));
         let mut count = 0_u32;
         let mut buf = vec![0_u8; decoder.output_buffer_size().unwrap_or(0)];
@@ -1926,7 +1933,7 @@ mod tests {
                     assert_eq!(ms, 100, "100 ms per frame");
                     count = count.saturating_add(1);
                 }
-                Err(zenwebp::DecodingError::NoMoreFrames) => break,
+                Err(err) if matches!(err.error(), zenwebp::DecodeError::NoMoreFrames) => break,
                 Err(err) => return Err(decode_error(&path, format!("{err}"))),
             }
         }
@@ -2175,7 +2182,10 @@ mod tests {
         let bytes = fs::read(&webp).map_err(|source| io_error(&webp, source))?;
         let decoder = zenwebp::WebPDecoder::new(&bytes)
             .map_err(|err| decode_error(&webp, format!("{err}")))?;
-        assert_eq!(decoder.loop_count(), zenwebp::LoopCount::Times(times));
+        assert_eq!(
+            decoder.loop_count(),
+            zenwebp::decoder::LoopCount::Times(times)
+        );
 
         let gif = dir.join("loop.gif");
         let file = File::create(&gif).map_err(|source| io_error(&gif, source))?;

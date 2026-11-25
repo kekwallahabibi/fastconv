@@ -1811,7 +1811,7 @@ fn validate_single_webp_pair(
     let (src_rgb, src_w, src_h) = src_format.decode_to_rgb8(src_path)?;
     let webp_data = fs::read(webp_path)
         .map_err(|err| format!("failed to read WebP '{}': {err}", webp_path.display()))?;
-    let (webp_rgb, webp_w, webp_h) = zenwebp::decode_rgb(&webp_data)
+    let (webp_rgb, webp_w, webp_h) = zenwebp::oneshot::decode_rgb(&webp_data)
         .map_err(|err| format!("invalid WebP output '{}': {err}", webp_path.display()))?;
 
     let (exact_pixel_match, psnr_db) = check_dimensions_and_quality(
@@ -3115,7 +3115,14 @@ mod tests {
     use std::path::Path;
     use std::process;
     use std::time::Duration;
-    use zenwebp::{Encoder as WebpEncoder, EncoderConfig as WebpEncoderConfig};
+    use zenwebp::{EncodeRequest, LossyConfig, PixelLayout};
+
+    fn encode_rgb_webp(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+        let config = LossyConfig::new().with_quality(80.0).with_method(4);
+        EncodeRequest::lossy(&config, pixels, PixelLayout::Rgb8, width, height)
+            .encode()
+            .map_err(|err| err.to_string())
+    }
 
     fn write_rgb_png(path: &Path, width: u32, height: u32, pixels: &[u8]) -> Result<(), String> {
         let file = File::create(path).map_err(|err| err.to_string())?;
@@ -3198,11 +3205,7 @@ VmRSS:\t   42000 kB
         write_rgb_png(&png_path, 32, 24, &rgb)?;
 
         let valid_webp = root.join("valid.webp");
-        let cfg = WebpEncoderConfig::new().quality(80.0).method(4);
-        let encoded = WebpEncoder::new_rgb(&rgb, 32, 24)
-            .config(cfg.clone())
-            .encode()
-            .map_err(|err| err.to_string())?;
+        let encoded = encode_rgb_webp(&rgb, 32, 24)?;
         fs::write(&valid_webp, &encoded).map_err(|err| err.to_string())?;
 
         let policy = ValidationPolicy {
@@ -3224,10 +3227,7 @@ VmRSS:\t   42000 kB
         );
 
         let wrong_dim_webp = root.join("wrong_dim.webp");
-        let wrong_encoded = WebpEncoder::new_rgb(&rgb[..16 * 12 * 3], 16, 12)
-            .config(cfg.clone())
-            .encode()
-            .map_err(|err| err.to_string())?;
+        let wrong_encoded = encode_rgb_webp(&rgb[..16 * 12 * 3], 16, 12)?;
         fs::write(&wrong_dim_webp, &wrong_encoded).map_err(|err| err.to_string())?;
         assert!(
             validate_single_webp_pair(&png_path, SourceBatchFormat::Png, &wrong_dim_webp, policy)
@@ -3250,10 +3250,7 @@ VmRSS:\t   42000 kB
 
         let black_rgb = vec![0_u8; 32 * 24 * 3];
         let low_psnr_webp = root.join("black.webp");
-        let black_encoded = WebpEncoder::new_rgb(&black_rgb, 32, 24)
-            .config(cfg.clone())
-            .encode()
-            .map_err(|err| err.to_string())?;
+        let black_encoded = encode_rgb_webp(&black_rgb, 32, 24)?;
         fs::write(&low_psnr_webp, &black_encoded).map_err(|err| err.to_string())?;
         assert!(
             validate_single_webp_pair(&png_path, SourceBatchFormat::Png, &low_psnr_webp, policy)
@@ -3324,11 +3321,7 @@ VmRSS:\t   42000 kB
         fs::create_dir_all(&out_dir).map_err(|err| err.to_string())?;
 
         let rgb = make_pattern_rgb(32, 24);
-        let cfg = WebpEncoderConfig::new().quality(80.0).method(4);
-        let encoded = WebpEncoder::new_rgb(&rgb, 32, 24)
-            .config(cfg.clone())
-            .encode()
-            .map_err(|err| err.to_string())?;
+        let encoded = encode_rgb_webp(&rgb, 32, 24)?;
 
         for idx in 1..=2 {
             write_rgb_png(&src_dir.join(format!("img_{idx:02}.png")), 32, 24, &rgb)?;
@@ -3397,12 +3390,8 @@ VmRSS:\t   42000 kB
 
         let jpg_src = root.join("src_jpg.jpg");
         write_rgb_jpeg(&jpg_src, 32, 24, &rgb)?;
-        let cfg = WebpEncoderConfig::new().quality(80.0).method(4);
         let webp_from_jpg = root.join("from_jpg.webp");
-        let webp_bytes = WebpEncoder::new_rgb(&rgb, 32, 24)
-            .config(cfg)
-            .encode()
-            .map_err(|err| err.to_string())?;
+        let webp_bytes = encode_rgb_webp(&rgb, 32, 24)?;
         fs::write(&webp_from_jpg, &webp_bytes).map_err(|err| err.to_string())?;
         let webp_res =
             validate_single_webp_pair(&jpg_src, SourceBatchFormat::Jpeg, &webp_from_jpg, policy)?;
