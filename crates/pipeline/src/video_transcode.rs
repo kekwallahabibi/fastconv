@@ -2252,7 +2252,9 @@ mod tests {
     use crate::video_container::{ContainerMedia, mux_video};
     use fastconv_domain::{VideoContainerFormat, VideoStreamKind};
     use std::num::NonZeroUsize;
+    use std::process::{Command, ExitStatus, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -2934,8 +2936,20 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn audio_worker_error_propagates_and_cancels_cleanly() -> Result<(), PipelineError> {
+    const AUDIO_ERROR_CHILD_ENV: &str = "FASTCONV_AUDIO_ERROR_TEST_CHILD";
+    const AUDIO_ERROR_SENTINEL_ENV: &str = "FASTCONV_AUDIO_ERROR_TEST_SENTINEL";
+
+    fn read_child_log(log_path: &Path) -> String {
+        match fs::read_to_string(log_path) {
+            Ok(log) => log,
+            Err(err) => format!("<child log unreadable: {err}>"),
+        }
+    }
+
+    /// Runs the real assertions in-process in the child test binary. The
+    /// sentinel is the child's proof that this exact test actually executed:
+    /// libtest exits 0 even when `--exact` matches zero tests.
+    fn run_audio_error_test_body() -> Result<(), PipelineError> {
         let dir = temp_dir("audio-error")?;
         let source = dir.join("in.mp4");
         let target = dir.join("out.mp4");
@@ -2968,23 +2982,6 @@ mod tests {
         mux_video(&file, &source, VideoContainerFormat::Mp4, &media)?;
         drop(file);
 
-        // An in-process watchdog turns a deadlock into a bounded, reported
-        // failure instead of hanging the whole test runner until it is killed.
-        let finished = std::sync::Arc::new(AtomicBool::new(false));
-        let watchdog = std::sync::Arc::clone(&finished);
-        std::thread::spawn(move || {
-            for _ in 0..30 {
-                if watchdog.load(Ordering::Acquire) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-            if !watchdog.load(Ordering::Acquire) {
-                eprintln!("audio failure deadlocked the video worker; aborting test");
-                std::process::abort();
-            }
-        });
-        let started = Instant::now();
         let result = transcode(
             &source,
             &target,
@@ -2995,18 +2992,148 @@ mod tests {
             }),
             AudioTrackAction::Encode(TargetAudioCodec::Opus),
         );
-        finished.store(true, Ordering::Release);
         assert!(result.is_err(), "unsupported channel count must fail");
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(30),
-            "audio failure must not hang the video worker"
-        );
         assert!(!target.exists());
         fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
             path: dir.clone(),
             source,
         })?;
+        if let Some(sentinel) = std::env::var_os(AUDIO_ERROR_SENTINEL_ENV) {
+            File::create(Path::new(&sentinel)).map_err(|source| PipelineError::Io {
+                path: PathBuf::from(&sentinel),
+                source,
+            })?;
+        }
         Ok(())
+    }
+
+    fn finish_audio_error_test_child(
+        status: ExitStatus,
+        dir: &Path,
+        log_path: &Path,
+        sentinel_path: &Path,
+    ) -> Result<(), PipelineError> {
+        let sentinel_written = sentinel_path.exists();
+        if !status.success() {
+            let log = read_child_log(log_path);
+            let cleanup = fs::remove_dir_all(dir);
+            return Err(encode_error(
+                log_path,
+                format!(
+                    "audio-error test child failed with {status}; sentinel={sentinel_written}, cleanup={cleanup:?}: {log}"
+                ),
+            ));
+        }
+        let cleanup = fs::remove_dir_all(dir);
+        match cleanup {
+            Ok(()) if sentinel_written => Ok(()),
+            Ok(()) => Err(encode_error(
+                log_path,
+                format!(
+                    "audio-error test child exited successfully but sentinel {} is missing (the test name or module path no longer matches)",
+                    sentinel_path.display()
+                ),
+            )),
+            Err(source) => Err(PipelineError::Io {
+                path: dir.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
+    fn timeout_audio_error_test_child(
+        child: &mut std::process::Child,
+        dir: &Path,
+        log_path: &Path,
+    ) -> Result<(), PipelineError> {
+        let kill_result = match child.kill() {
+            Ok(()) => "ok".to_owned(),
+            Err(err) => format!("failed: {err}"),
+        };
+        let wait_result = match child.wait() {
+            Ok(status) => format!("exited with {status}"),
+            Err(err) => format!("failed: {err}"),
+        };
+        let log = read_child_log(log_path);
+        let cleanup = fs::remove_dir_all(dir);
+        Err(encode_error(
+            log_path,
+            format!(
+                "audio-error test child exceeded the 30s deadline; kill={kill_result}, wait={wait_result}, cleanup={cleanup:?}: {log}"
+            ),
+        ))
+    }
+
+    /// Parent supervision: a real child process owns the timeout, so a
+    /// deadlock kills only that child instead of aborting the test harness.
+    fn run_audio_error_test_parent() -> Result<(), PipelineError> {
+        let dir = temp_dir("audio-error-parent")?;
+        let log_path = dir.join("child.log");
+        let sentinel_path = dir.join("child.sentinel");
+        // Both child streams go to one file via cloned handles: no pipe buffer
+        // can fill up and deadlock a verbose child before it reaches the timeout.
+        let log_file = File::create(&log_path).map_err(|source| PipelineError::Io {
+            path: log_path.clone(),
+            source,
+        })?;
+        let stdout_file = log_file.try_clone().map_err(|source| PipelineError::Io {
+            path: log_path.clone(),
+            source,
+        })?;
+        let current_exe = std::env::current_exe().map_err(|source| PipelineError::Io {
+            path: PathBuf::from("current test executable"),
+            source,
+        })?;
+        let mut child = Command::new(current_exe)
+            .args([
+                "--exact",
+                "video_transcode::tests::audio_worker_error_propagates_and_cancels_cleanly",
+                "--nocapture",
+            ])
+            .env(AUDIO_ERROR_CHILD_ENV, "1")
+            .env(AUDIO_ERROR_SENTINEL_ENV, &sentinel_path)
+            .stdout(Stdio::from(stdout_file))
+            .stderr(Stdio::from(log_file))
+            .spawn()
+            .map_err(|source| PipelineError::Io {
+                path: PathBuf::from("audio-error test child"),
+                source,
+            })?;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return finish_audio_error_test_child(status, &dir, &log_path, &sentinel_path);
+                }
+                Ok(None) => {}
+                Err(source) => {
+                    let kill_result = child.kill();
+                    let wait_result = child.wait();
+                    let log = read_child_log(&log_path);
+                    let cleanup = fs::remove_dir_all(&dir);
+                    return Err(encode_error(
+                        &log_path,
+                        format!(
+                            "failed to poll audio-error test child: {source}; kill={kill_result:?}, wait={wait_result:?}, cleanup={cleanup:?}: {log}"
+                        ),
+                    ));
+                }
+            }
+            if Instant::now() >= deadline {
+                return timeout_audio_error_test_child(&mut child, &dir, &log_path);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn audio_worker_error_propagates_and_cancels_cleanly() -> Result<(), PipelineError> {
+        if std::env::var_os(AUDIO_ERROR_CHILD_ENV).is_some() {
+            run_audio_error_test_body()
+        } else {
+            run_audio_error_test_parent()
+        }
     }
 
     #[test]
