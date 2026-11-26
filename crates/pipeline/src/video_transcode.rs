@@ -22,7 +22,8 @@ use fastconv_domain::{
     VideoTranscodePlan, VideoTranscodeReport,
 };
 use opus_pure::{Application, MAX_PACKET_BYTES, OpusEncoder};
-use rubato::{FftFixedInOut, Resampler};
+use rubato::audioadapter_buffers::owned::InterleavedOwned;
+use rubato::{Fft, FixedSync, Indexing, Resampler};
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::formats::TrackType;
@@ -114,11 +115,12 @@ fn resample_interleaved(
             "resampling requires non-zero rates and channels",
         ));
     }
-    let mut resampler = FftFixedInOut::<f32>::new(
+    let mut resampler = Fft::<f32>::new(
         usize::try_from(from_rate).unwrap_or(usize::MAX),
         usize::try_from(to_rate).unwrap_or(usize::MAX),
         1024,
         channels,
+        FixedSync::Both,
     )
     .map_err(|err| {
         encode_error(
@@ -126,6 +128,9 @@ fn resample_interleaved(
             format!("failed to create resampler from {from_rate} Hz to {to_rate} Hz: {err}"),
         )
     })?;
+    let chunk_in = resampler.input_frames_next();
+    let chunk_out = resampler.output_frames_next().max(1);
+    let delay = resampler.output_delay();
     let input_frames = samples.len() / channels;
     let expected = usize::try_from(
         u64::try_from(input_frames)
@@ -134,73 +139,63 @@ fn resample_interleaved(
             / u64::from(from_rate),
     )
     .unwrap_or(usize::MAX);
-    let mut planar = Vec::with_capacity(channels);
-    for channel in 0..channels {
-        planar.push(
-            samples
-                .iter()
-                .skip(channel)
-                .step_by(channels)
-                .copied()
-                .collect::<Vec<f32>>(),
-        );
-    }
-    let block_frames = resampler.input_frames_next();
-    if block_frames == 0 {
-        return Err(encode_error(
-            Path::new("resampler"),
-            "resampler requires a non-zero input block size",
-        ));
-    }
-    let mut out: Vec<Vec<f32>> = Vec::with_capacity(channels);
-    for start in (0..input_frames).step_by(block_frames) {
-        let count = input_frames.saturating_sub(start).min(block_frames);
-        let mut block = Vec::with_capacity(channels);
-        for plane in &planar {
-            let mut padded = vec![0.0_f32; block_frames];
-            if let Some(source) = plane.get(start..start.saturating_add(count)) {
-                padded[..source.len()].copy_from_slice(source);
-            }
-            block.push(padded);
+    // A chunk always produces `chunk_out` frames. Feed zero chunks after the
+    // input ends until `expected` valid frames remain once the startup delay is
+    // dropped; a short clip (even an empty one) still needs those zero chunks.
+    let needed = expected.saturating_add(delay);
+    let max_calls = input_frames
+        .div_ceil(chunk_in.max(1))
+        .saturating_add(needed.div_ceil(chunk_out))
+        .saturating_add(4);
+    let mut raw = Vec::new();
+    let mut in_storage = vec![0.0_f32; chunk_in.saturating_mul(channels)];
+    let mut out_storage = vec![0.0_f32; chunk_out.saturating_mul(channels)];
+    let mut consumed = 0_usize;
+    let mut produced = 0_usize;
+    for _ in 0..max_calls {
+        if produced >= needed {
+            break;
         }
-        let processed = resampler.process(&block, None).map_err(|err| {
-            encode_error(Path::new("resampler"), format!("resampling failed: {err}"))
-        })?;
-        for (index, plane) in processed.into_iter().enumerate() {
-            if let Some(target) = out.get_mut(index) {
-                target.extend(plane);
-            } else {
-                out.push(plane);
+        let take = chunk_in.min(input_frames.saturating_sub(consumed));
+        in_storage.fill(0.0);
+        if take > 0 {
+            let start = consumed.saturating_mul(channels);
+            let end = start.saturating_add(take.saturating_mul(channels));
+            if let Some(source) = samples.get(start..end) {
+                in_storage[..source.len()].copy_from_slice(source);
             }
         }
+        let input = InterleavedOwned::new_from(std::mem::take(&mut in_storage), channels, chunk_in)
+            .map_err(|err| {
+                encode_error(
+                    Path::new("resampler"),
+                    format!("invalid resampler input: {err}"),
+                )
+            })?;
+        let mut output =
+            InterleavedOwned::new_from(std::mem::take(&mut out_storage), channels, chunk_out)
+                .map_err(|err| {
+                    encode_error(
+                        Path::new("resampler"),
+                        format!("invalid resampler output: {err}"),
+                    )
+                })?;
+        let indexing = Indexing::new().partial_len(take);
+        let (_, written) = resampler
+            .process_into_buffer(&input, &mut output, Some(&indexing))
+            .map_err(|err| {
+                encode_error(Path::new("resampler"), format!("resampling failed: {err}"))
+            })?;
+        in_storage = input.take_data();
+        out_storage = output.take_data();
+        let usable = written.saturating_mul(channels).min(out_storage.len());
+        raw.extend_from_slice(&out_storage[..usable]);
+        consumed = consumed.saturating_add(take);
+        produced = produced.saturating_add(written);
     }
-    // A single zero block pushes the FFT overlap tail out of the resampler;
-    // keeping those delayed frames is what makes the final block audible.
-    let drained = resampler
-        .process_partial::<Vec<f32>>(None, None)
-        .map_err(|err| {
-            encode_error(
-                Path::new("resampler"),
-                format!("resampler drain failed: {err}"),
-            )
-        })?;
-    for (index, plane) in drained.into_iter().enumerate() {
-        if let Some(target) = out.get_mut(index) {
-            target.extend(plane);
-        } else {
-            out.push(plane);
-        }
-    }
-    let frames = out.first().map_or(0, Vec::len).min(expected);
-    let mut interleaved = Vec::with_capacity(frames.saturating_mul(channels));
-    for frame in 0..frames {
-        for plane in &out {
-            if let Some(&sample) = plane.get(frame) {
-                interleaved.push(sample);
-            }
-        }
-    }
-    Ok(interleaved)
+    let start = delay.saturating_mul(channels);
+    let end = start.saturating_add(expected.saturating_mul(channels));
+    Ok(raw.get(start..end).unwrap_or(&[]).to_vec())
 }
 
 /// Incremental resampler. Only a rate change instantiates the FFT engine;
@@ -208,13 +203,18 @@ fn resample_interleaved(
 /// they arrive and the final partial block plus the FFT overlap tail are
 /// flushed in `finish`, capped to the exact `in * to / from` frame count.
 struct StreamingResampler {
-    resampler: Option<FftFixedInOut<f32>>,
+    resampler: Option<Fft<f32>>,
     channels: usize,
     from_rate: u32,
     to_rate: u32,
-    /// One staging plane per channel: each holds fewer than one input block
-    /// of samples between `push` calls.
-    staging: Vec<Vec<f32>>,
+    /// Interleaved samples not yet forming a complete input chunk.
+    staging: Vec<f32>,
+    chunk_in: usize,
+    chunk_out: usize,
+    /// Startup delay still to drop from the very front of the output stream.
+    skip_remaining: usize,
+    in_storage: Vec<f32>,
+    out_storage: Vec<f32>,
     total_in_frames: u64,
     emitted_out_frames: u64,
 }
@@ -227,134 +227,184 @@ impl StreamingResampler {
                 "resampling requires non-zero rates and channels",
             ));
         }
-        let resampler = if from_rate == to_rate {
-            None
-        } else {
-            Some(
-                FftFixedInOut::<f32>::new(
-                    usize::try_from(from_rate).unwrap_or(usize::MAX),
-                    usize::try_from(to_rate).unwrap_or(usize::MAX),
-                    1024,
-                    channels,
-                )
-                .map_err(|err| {
-                    encode_error(
-                        Path::new("resampler"),
-                        format!(
-                            "failed to create resampler from {from_rate} Hz to {to_rate} Hz: {err}"
-                        ),
-                    )
-                })?,
+        if from_rate == to_rate {
+            return Ok(Self {
+                resampler: None,
+                channels,
+                from_rate,
+                to_rate,
+                staging: Vec::new(),
+                chunk_in: 0,
+                chunk_out: 0,
+                skip_remaining: 0,
+                in_storage: Vec::new(),
+                out_storage: Vec::new(),
+                total_in_frames: 0,
+                emitted_out_frames: 0,
+            });
+        }
+        let resampler = Fft::<f32>::new(
+            usize::try_from(from_rate).unwrap_or(usize::MAX),
+            usize::try_from(to_rate).unwrap_or(usize::MAX),
+            1024,
+            channels,
+            FixedSync::Both,
+        )
+        .map_err(|err| {
+            encode_error(
+                Path::new("resampler"),
+                format!("failed to create resampler from {from_rate} Hz to {to_rate} Hz: {err}"),
             )
-        };
+        })?;
+        let chunk_in = resampler.input_frames_next();
+        let chunk_out = resampler.output_frames_next().max(1);
+        let delay = resampler.output_delay();
         Ok(Self {
-            resampler,
+            resampler: Some(resampler),
             channels,
             from_rate,
             to_rate,
-            staging: vec![Vec::new(); channels],
+            staging: Vec::new(),
+            chunk_in,
+            chunk_out,
+            skip_remaining: delay,
+            in_storage: vec![0.0_f32; chunk_in.saturating_mul(channels)],
+            out_storage: vec![0.0_f32; chunk_out.saturating_mul(channels)],
             total_in_frames: 0,
             emitted_out_frames: 0,
         })
     }
 
-    fn push(&mut self, samples: &[f32]) -> Result<Vec<f32>, PipelineError> {
-        self.total_in_frames = self
-            .total_in_frames
-            .saturating_add(u64::try_from(samples.len() / self.channels).unwrap_or(u64::MAX));
-        let Some(resampler) = self.resampler.as_mut() else {
-            return Ok(samples.to_vec());
-        };
-        for (channel, plane) in self.staging.iter_mut().enumerate() {
-            plane.extend(samples.iter().skip(channel).step_by(self.channels).copied());
+    /// Appends full output frames to `out`, dropping the leading startup delay
+    /// and never exceeding `budget` total emitted frames.
+    fn emit(&mut self, out: &mut Vec<f32>, raw: &[f32], budget: u64) {
+        let channels = self.channels.max(1);
+        for frame in raw.chunks(channels) {
+            if self.skip_remaining > 0 {
+                self.skip_remaining -= 1;
+                continue;
+            }
+            if self.emitted_out_frames >= budget {
+                break;
+            }
+            out.extend_from_slice(frame);
+            self.emitted_out_frames = self.emitted_out_frames.saturating_add(1);
         }
-        let block_frames = resampler.input_frames_next();
-        if block_frames == 0 {
+    }
+
+    /// Processes one zero-padded input chunk with `valid_frames` real frames at
+    /// the front and appends its output, trimmed to the frame budget.
+    fn process_block(
+        &mut self,
+        valid_frames: usize,
+        budget: u64,
+        out: &mut Vec<f32>,
+    ) -> Result<(), PipelineError> {
+        let input = InterleavedOwned::new_from(
+            std::mem::take(&mut self.in_storage),
+            self.channels,
+            self.chunk_in,
+        )
+        .map_err(|err| {
+            encode_error(
+                Path::new("resampler"),
+                format!("invalid resampler input: {err}"),
+            )
+        })?;
+        let mut output = InterleavedOwned::new_from(
+            std::mem::take(&mut self.out_storage),
+            self.channels,
+            self.chunk_out,
+        )
+        .map_err(|err| {
+            encode_error(
+                Path::new("resampler"),
+                format!("invalid resampler output: {err}"),
+            )
+        })?;
+        let indexing = Indexing::new().partial_len(valid_frames);
+        let (_, written) = self
+            .resampler
+            .as_mut()
+            .ok_or_else(|| encode_error(Path::new("resampler"), "resampler is not configured"))?
+            .process_into_buffer(&input, &mut output, Some(&indexing))
+            .map_err(|err| {
+                encode_error(Path::new("resampler"), format!("resampling failed: {err}"))
+            })?;
+        self.in_storage = input.take_data();
+        self.out_storage = output.take_data();
+        let usable = written
+            .saturating_mul(self.channels)
+            .min(self.out_storage.len());
+        let raw = self.out_storage[..usable].to_vec();
+        self.emit(out, &raw, budget);
+        Ok(())
+    }
+
+    fn push(&mut self, samples: &[f32]) -> Result<Vec<f32>, PipelineError> {
+        self.total_in_frames = self.total_in_frames.saturating_add(
+            u64::try_from(samples.len() / self.channels.max(1)).unwrap_or(u64::MAX),
+        );
+        if self.resampler.is_none() {
+            return Ok(samples.to_vec());
+        }
+        if self.chunk_in == 0 {
             return Err(encode_error(
                 Path::new("resampler"),
                 "resampler requires a non-zero input block size",
             ));
         }
+        self.staging.extend_from_slice(samples);
+        let block_samples = self.chunk_in.saturating_mul(self.channels);
         let mut out = Vec::new();
-        while self.staging.iter().all(|plane| plane.len() >= block_frames) {
-            let mut block = Vec::with_capacity(self.channels);
-            for plane in &mut self.staging {
-                let remainder = plane.split_off(block_frames);
-                block.push(std::mem::replace(plane, remainder));
-            }
-            let processed = resampler.process(&block, None).map_err(|err| {
-                encode_error(Path::new("resampler"), format!("resampling failed: {err}"))
-            })?;
-            Self::emit(
-                &mut out,
-                &processed,
-                self.channels,
-                &mut self.emitted_out_frames,
-            );
+        while self.staging.len() >= block_samples {
+            let rest = self.staging.split_off(block_samples);
+            let block = std::mem::replace(&mut self.staging, rest);
+            let copied = block_samples.min(self.in_storage.len());
+            self.in_storage[..copied].copy_from_slice(&block[..copied]);
+            self.process_block(self.chunk_in, u64::MAX, &mut out)?;
         }
         Ok(out)
     }
 
     fn finish(&mut self) -> Result<Vec<f32>, PipelineError> {
-        let Some(resampler) = self.resampler.as_mut() else {
+        if self.resampler.is_none() {
             return Ok(Vec::new());
-        };
-        let block_frames = resampler.input_frames_next();
-        // Cap the whole tail (padded block + drain) at the remaining output
-        // budget. Capping only the drain lets the padded block overshoot the
-        // whole-track resampler and stretch the audio timeline.
+        }
+        // Cap the whole tail (padded final chunk + zero drain) at the exact
+        // whole-track frame count so the timeline never stretches.
         let expected = self.total_in_frames.saturating_mul(u64::from(self.to_rate))
             / u64::from(self.from_rate.max(1));
-        let remaining_frames = expected.saturating_sub(self.emitted_out_frames);
+        let budget = expected;
+        let mut out = Vec::new();
+        let staged_frames = self.staging.len() / self.channels.max(1);
+        if staged_frames > 0 {
+            self.in_storage.fill(0.0);
+            let copied = staged_frames
+                .saturating_mul(self.channels)
+                .min(self.in_storage.len())
+                .min(self.staging.len());
+            self.in_storage[..copied].copy_from_slice(&self.staging[..copied]);
+            self.process_block(staged_frames, budget, &mut out)?;
+            self.staging.clear();
+        }
+        let chunk_out_u64 = u64::try_from(self.chunk_out.max(1)).unwrap_or(u64::MAX);
+        let max_flush = usize::try_from(budget.div_ceil(chunk_out_u64))
+            .unwrap_or(usize::MAX)
+            .saturating_add(8);
+        for _ in 0..max_flush {
+            if self.emitted_out_frames >= budget {
+                break;
+            }
+            self.in_storage.fill(0.0);
+            self.process_block(0, budget, &mut out)?;
+        }
         let allowed = usize::try_from(
-            remaining_frames.saturating_mul(u64::try_from(self.channels).unwrap_or(u64::MAX)),
+            budget.saturating_mul(u64::try_from(self.channels).unwrap_or(u64::MAX)),
         )
         .unwrap_or(usize::MAX);
-        let mut out = Vec::new();
-        if self.staging.first().is_some_and(|plane| !plane.is_empty()) {
-            let mut block = Vec::with_capacity(self.channels);
-            for plane in &mut self.staging {
-                plane.resize(block_frames, 0.0_f32);
-                block.push(std::mem::take(plane));
-            }
-            let processed = resampler.process(&block, None).map_err(|err| {
-                encode_error(Path::new("resampler"), format!("resampling failed: {err}"))
-            })?;
-            out.extend(Self::interleave(&processed));
-        }
-        let drained = resampler
-            .process_partial::<Vec<f32>>(None, None)
-            .map_err(|err| {
-                encode_error(
-                    Path::new("resampler"),
-                    format!("resampler drain failed: {err}"),
-                )
-            })?;
-        out.extend(Self::interleave(&drained));
         out.truncate(allowed);
-        self.emitted_out_frames = self
-            .emitted_out_frames
-            .saturating_add(u64::try_from(out.len() / self.channels).unwrap_or(0));
         Ok(out)
-    }
-
-    fn interleave(planes: &[Vec<f32>]) -> Vec<f32> {
-        let frames = planes.first().map_or(0, Vec::len);
-        let mut out = Vec::with_capacity(frames.saturating_mul(planes.len()));
-        for frame in 0..frames {
-            for plane in planes {
-                if let Some(&sample) = plane.get(frame) {
-                    out.push(sample);
-                }
-            }
-        }
-        out
-    }
-
-    fn emit(out: &mut Vec<f32>, processed: &[Vec<f32>], channels: usize, emitted: &mut u64) {
-        let tail = Self::interleave(processed);
-        *emitted = emitted.saturating_add(u64::try_from(tail.len() / channels).unwrap_or(0));
-        out.extend(tail);
     }
 }
 
@@ -2892,6 +2942,179 @@ mod tests {
             expected
         );
         Ok(())
+    }
+
+    fn expected_resampled_frames(input_frames: usize, from: u32, to: u32) -> usize {
+        usize::try_from(
+            u64::try_from(input_frames)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(u64::from(to))
+                / u64::from(from),
+        )
+        .unwrap_or(usize::MAX)
+    }
+
+    fn ramp(frames: usize, channels: usize) -> Vec<f32> {
+        (0..frames.saturating_mul(channels))
+            .map(|index| {
+                let step = i16::try_from(index % 997).unwrap_or(0);
+                f32::from(step) / 997.0_f32 - 0.5_f32
+            })
+            .collect()
+    }
+
+    /// Feeds the clip in caller-controlled chunk sizes so staging boundaries
+    /// never line up with the resampler block by accident.
+    fn stream_resampled(
+        samples: &[f32],
+        channels: usize,
+        from: u32,
+        to: u32,
+        push_frames: &[usize],
+    ) -> Result<Vec<f32>, PipelineError> {
+        let mut resampler = StreamingResampler::new(channels, from, to)?;
+        let total_frames = samples.len() / channels.max(1);
+        let mut out = Vec::new();
+        let mut offset = 0_usize;
+        for &frames in push_frames {
+            let count = frames.min(total_frames.saturating_sub(offset));
+            let start = offset.saturating_mul(channels);
+            let end = start.saturating_add(count.saturating_mul(channels));
+            if let Some(chunk) = samples.get(start..end) {
+                out.extend(resampler.push(chunk)?);
+            }
+            offset = offset.saturating_add(count);
+        }
+        if let Some(chunk) = samples.get(offset.saturating_mul(channels)..) {
+            out.extend(resampler.push(chunk)?);
+        }
+        out.extend(resampler.finish()?);
+        Ok(out)
+    }
+
+    #[test]
+    fn resampling_same_rate_is_a_passthrough() -> Result<(), PipelineError> {
+        let samples = ramp(2_000, 2);
+        assert_eq!(resample_interleaved(&samples, 2, 48_000, 48_000)?, samples);
+        let mut streaming = StreamingResampler::new(2, 48_000, 48_000)?;
+        let mut out = streaming.push(&samples[..100])?;
+        out.extend(streaming.push(&samples[100..])?);
+        out.extend(streaming.finish()?);
+        assert_eq!(out, samples);
+        Ok(())
+    }
+
+    #[test]
+    fn resampling_zero_sample_input_is_empty() -> Result<(), PipelineError> {
+        for channels in [1_usize, 2, 6] {
+            assert_eq!(
+                resample_interleaved(&[], channels, 44_100, 48_000)?,
+                Vec::<f32>::new(),
+                "empty whole-track input must stay empty"
+            );
+            let mut streaming = StreamingResampler::new(channels, 44_100, 48_000)?;
+            assert_eq!(streaming.push(&[])?, Vec::<f32>::new());
+            assert_eq!(
+                streaming.finish()?,
+                Vec::<f32>::new(),
+                "empty streamed input must stay empty"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resampling_short_input_below_one_chunk_matches_whole_track() -> Result<(), PipelineError> {
+        for channels in [1_usize, 2, 3, 6] {
+            let frames = 137_usize;
+            let samples = ramp(frames, channels);
+            let whole = resample_interleaved(&samples, channels, 44_100, 48_000)?;
+            let streamed = stream_resampled(&samples, channels, 44_100, 48_000, &[frames])?;
+            assert_eq!(
+                whole.len(),
+                expected_resampled_frames(frames, 44_100, 48_000) * channels
+            );
+            assert_eq!(streamed, whole, "channels={channels}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resampling_partial_final_block_has_exact_frame_count() -> Result<(), PipelineError> {
+        let chunk = Fft::<f32>::new(44_100, 48_000, 1024, 2, FixedSync::Both)
+            .map_err(|err| encode_error(Path::new("resampler"), err.to_string()))?
+            .input_frames_next();
+        assert!(chunk > 1, "resampler must have a usable input block");
+        for frames in [
+            chunk - 1,
+            chunk,
+            chunk + 1,
+            chunk.saturating_mul(2),
+            chunk.saturating_mul(2).saturating_add(137),
+        ] {
+            let samples = ramp(frames, 2);
+            let whole = resample_interleaved(&samples, 2, 44_100, 48_000)?;
+            let streamed = stream_resampled(
+                &samples,
+                2,
+                44_100,
+                48_000,
+                &[chunk + 1, chunk.saturating_sub(1), 7],
+            )?;
+            assert_eq!(
+                whole.len(),
+                expected_resampled_frames(frames, 44_100, 48_000) * 2,
+                "frames={frames}"
+            );
+            assert_eq!(streamed, whole, "frames={frames}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resampling_multichannel_streaming_matches_whole_track() -> Result<(), PipelineError> {
+        for channels in [1_usize, 2, 3, 5, 6, 8] {
+            let frames = 5_000_usize;
+            let samples = ramp(frames, channels);
+            let whole = resample_interleaved(&samples, channels, 48_000, 44_100)?;
+            let streamed =
+                stream_resampled(&samples, channels, 48_000, 44_100, &[1, 997, 2_048, 13])?;
+            assert_eq!(
+                whole.len(),
+                expected_resampled_frames(frames, 48_000, 44_100) * channels
+            );
+            assert_eq!(streamed, whole, "channels={channels}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resampling_trims_startup_delay_from_the_front() -> Result<(), PipelineError> {
+        let frames = 4_000_usize;
+        let mut samples = vec![0.0_f32; frames];
+        samples[0] = 1.0;
+        let out = resample_interleaved(&samples, 1, 48_000, 96_000)?;
+        assert_eq!(out.len(), frames * 2);
+        let peak = out
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.abs().total_cmp(&right.abs()))
+            .map_or(0, |(index, _)| index);
+        assert!(
+            peak < 64,
+            "impulse peak landed at frame {peak}; the resampler delay was not trimmed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resampling_rejects_invalid_configuration() {
+        assert!(resample_interleaved(&[0.0], 0, 44_100, 48_000).is_err());
+        assert!(resample_interleaved(&[0.0], 2, 0, 48_000).is_err());
+        assert!(resample_interleaved(&[0.0], 2, 44_100, 0).is_err());
+        assert!(StreamingResampler::new(0, 44_100, 48_000).is_err());
+        assert!(StreamingResampler::new(2, 0, 48_000).is_err());
+        assert!(StreamingResampler::new(2, 44_100, 0).is_err());
     }
 
     // Non-empty PCM assertion documents the successful decode roundtrip.
