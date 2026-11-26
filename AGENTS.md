@@ -1,59 +1,45 @@
-# fastconv — Engineering-Regeln
+# fastconv — engineering rules
 
-`fastconv` ist ein CPU/GPU-Media-Konvertierungstool in Rust. Halte die Architektur flach, explizit und beweisbar korrekt.
+`fastconv` is a Rust CPU/GPU media converter. Keep the architecture flat, explicit, provably correct.
 
-## Crate-Routing & erlaubte Abhängigkeiten
+## Crate routing & allowed workspace deps
 
-| Crate | Pfad | Zuständigkeit | Erlaubte Workspace-Deps |
+| Crate | Path | Role | Allowed workspace deps |
 | :--- | :--- | :--- | :--- |
-| `fastconv-domain` | `crates/domain` | Reine Datenmodelle, Invarianten, Fehler-Enums (zero I/O, zero GPU/FFmpeg) | Keine |
-| `fastconv-probe` | `crates/probe` | Systemgrenze: externen Input (Dateien, Media-Header, HW-Erkennung) parsen & validieren | `fastconv-domain` |
-| `fastconv-pipeline` | `crates/pipeline` | Konkrete CPU- und GPU-Backends für validierte `ExecutionPlan`s | `fastconv-domain` |
-| `fastconv-cli` (`fastconv`) | `crates/cli` | Dünne Binary zur Orchestrierung (`probe` → `domain` → `pipeline`) | `fastconv-domain`, `fastconv-probe`, `fastconv-pipeline` |
-| `xtask` | `xtask` | Lokale Automation (`cargo xtask verify`, `cargo xtask gen-fixtures`, `cargo xtask bench`) | `fastconv-domain`, `fastconv-probe` |
+| `fastconv-domain` | `crates/domain` | Pure data models, invariants, error enums (no I/O, GPU or FFmpeg) | none |
+| `fastconv-probe` | `crates/probe` | System boundary: parse and validate external input (files, media headers, HW detection) | `fastconv-domain` |
+| `fastconv-pipeline` | `crates/pipeline` | Concrete CPU/GPU backends for validated `ExecutionPlan`s | `fastconv-domain` |
+| `fastconv-cli` (`fastconv`) | `crates/cli` | Thin binary orchestrating `probe` → `domain` → `pipeline` | `fastconv-domain`, `fastconv-probe`, `fastconv-pipeline` |
+| `xtask` | `xtask` | Local automation (`cargo xtask verify`, `gen-fixtures`, `bench`) | `fastconv-domain`, `fastconv-probe` |
 
-## Harte Invarianten
+## Hard invariants
 
-1. **`fastconv` ist KEIN FFmpeg-Wrapper**
-   In `crates/` darf niemals ein `ffmpeg`- oder `ffprobe`-Subprozess aufgerufen werden. `ffmpeg` darf ausschließlich in `xtask` als externer Benchmark-Gegner (sowie zur synthetischen Video-Fixture-Erzeugung) genutzt werden, um unsere Baseline zu messen, die wir mit nativem Rust + moderner CPU/GPU schlagen wollen.
+1. **Not an FFmpeg wrapper.** Never spawn `ffmpeg`/`ffprobe` in `crates/`. `ffmpeg` is allowed only in `xtask` as an external benchmark opponent and for synthetic video fixtures — to measure the baseline our native Rust + CPU/GPU path must beat.
+2. **Make illegal states unrepresentable.** Use narrow enums and validated constructors instead of stacked booleans/`Option`s (e.g. `ExecutionPlan::GpuZeroCopy` must reject CPU filters and audio).
+3. **Boundary discipline.** Parse and validate external input (CLI args, filesystem, media headers, driver/system APIs) exactly once in `crates/probe`. From `crates/domain` onward only valid types exist.
+4. **Laziness protocol.** No trait, wrapper or layer for a single caller; no speculative hooks. Comment only the *why* of real driver/codec/OS quirks.
+5. **Prove it works.** A task is done only when `cargo xtask verify` is fully green. Conversions and optimizations also need real throughput (FPS / MB/s), target format and the actual hardware path demonstrated on `fixtures/`.
+6. **Fix root causes.** No silent fallbacks (especially no silent CPU fallback on failed GPU setup), no `let _ = ...`, no workarounds masking driver/parser bugs.
+7. **Lints.** Workspace lints (`unsafe_code = "forbid"`, `unwrap_used = "deny"`, `expect_used = "deny"`, `panic = "deny"`, `pedantic = "warn"`) apply everywhere. No local `#[allow(...)]` without a documented, compelling reason.
+8. **License policy (default build).** `fastconv` is **AGPL-3.0-only** (`LICENSE`). The default dependency tree allows permissive licenses (MIT, Apache-2.0, BSD-2/3-Clause, Zlib, ISC, Unlicense, CC0, MPL-2.0) and AGPL-compatible copyleft (AGPL-3.0, GPL-3.0, LGPL-3.0, including dual licenses like `AGPL-3.0-only OR Commercial`). Forbidden: missing/unknown licenses, purely proprietary or non-commercial-without-AGPL licenses, and incompatible copyleft (e.g. `GPL-2.0-only`). `cargo xtask verify` checks `cargo metadata` and fails on violations.
+9. **Fair benchmarks (no preset cheating).** Do not win by dropping compression or quality while `ffmpeg` runs its slow default. Compare the same compression class for lossless formats (both Deflate, or both uncompressed/PackBits). For lossy formats (AVIF, JXL, WebP, JPEG), keep file size and PSNR in a comparable range — no 5–10x larger output just to make the bar faster. Cap worker concurrency for memory-hungry 4K codecs (AVIF/JXL): no 3+ GB peak RAM for marginal speed gains.
 
-2. **Model the Domain & Type System Discipline**
-   Illegale Zustände (z. B. ein GPU-Zero-Copy-Plan mit CPU-Filter oder GPU-Backend für Audio) müssen über Rust-Enums zur Compile-Zeit unmöglich sein statt Booleans oder `Option`-Ketten zu stapeln.
+## Git workflow
 
-3. **Boundary Discipline**
-   Externer Input (CLI-Argumente, Dateisystem, Media-Header, Treiber-/System-APIs) wird exakt einmal an der Systemgrenze in `crates/probe` geparst und validiert. Ab `crates/domain` existieren nur gültige Typen.
+No direct changes or commits on `main`. Before and after every task:
+1. **Check the branch:** `git branch --show-current` before any code edit.
+2. **Create a branch:** if on `main`, first `git checkout -b feat/<short-name>` or `fix/<short-name>`.
+3. **Verify & PR:** merge every feature and fix via PR only after green `cargo xtask verify`. Use the project skills in `.agents/skills/` (`rust-architecture`, `prove-it-works`) and global skills in `~/.agents/skills/` (`orchestrate`, `benchmark`, `babysit`, `cleanuptree`, `queue-features`, `rebenchmark-main`).
+4. **Clean up after merge:** `git checkout main`, `git pull`, `git branch -d <branch>`.
 
-4. **Laziness Protocol & Minimize Reader Load**
-   Keine Traits, Wrapper oder Abstraktionsschichten für nur einen Aufrufer. Keine spekulativen Hooks. Keine redundanten Kommentare — kommentiere ausschließlich das „Warum“ bei echten Treiber-, Codec- oder OS-Quirks.
+Note: a local `.git/hooks/pre-commit` hook also blocks accidental commits on `main`.
 
-5. **Prove It Works**
-   Kein Task ist abgeschlossen, solange `cargo xtask verify` nicht vollständig grün ist. Bei Konvertierungen oder Optimierungen müssen zusätzlich realer Durchsatz (FPS / MB/s), Ziel-Format und der tatsächlich genutzte Hardware-Pfad an `fixtures/` belegt werden.
+## Model & delegation discipline
 
-6. **Fix Root Causes**
-   Keine stummen Fallbacks (insbesondere kein stiller CPU-Fallback bei fehlgeschlagenem GPU-Setup), kein Wegfangen von Fehlern mit `let _ = ...` und keine Workarounds, die Treiber- oder Parser-Bugs kaschieren.
-
-7. **Lint-Disziplin**
-   Workspace-Lints (`unsafe_code = "forbid"`, `unwrap_used = "deny"`, `expect_used = "deny"`, `panic = "deny"`, `pedantic = "warn"`) gelten überall. Keine lokalen `#[allow(...)]`-Umgehungen ohne zwingenden, dokumentierten Grund.
-
-8. **Lizenz-Policy (Default-Build)**
-   `fastconv` selbst steht unter **AGPL-3.0-only** (siehe `LICENSE`). Im Standard-Dependency-Baum sind erlaubt:
-   - permissive Lizenzen: MIT, Apache-2.0, BSD-2/3-Clause, Zlib, ISC, Unlicense, CC0, MPL-2.0;
-   - AGPL-3.0-kompatibles Copyleft: AGPL-3.0, GPL-3.0, LGPL-3.0 — auch in Dual-License-Ausdrücken wie `AGPL-3.0-only OR Commercial`.
-   Hart verboten bleiben fehlende/unbekannte Lizenzen, rein proprietäre oder rein nicht-kommerzielle Lizenzen ohne AGPL-Option sowie AGPL-3.0-inkompatible Lizenzen (z. B. `GPL-2.0-only`). `cargo xtask verify` prüft den `cargo metadata`-Dependency-Baum entsprechend und bricht bei Verstößen ab.
-
-9. **Faire Benchmark-Regeln (Anti-Preset-Cheating)**
-   - Geschwindigkeitsgewinne dürfen nicht dadurch erschummelt werden, dass `fastconv` die Kompression oder Qualität massiv absenkt, während `ffmpeg` im langsamen Default-Preset läuft.
-   - Bei verlustfreien Formaten (z. B. TIFF, PNG) müssen beide Tools dieselbe Kompressionsklasse vergleichen (z. B. beide Deflate oder beide unkomprimiert/PackBits).
-   - Bei verlustbehafteten Formaten (z. B. AVIF, JXL, WebP, JPEG) müssen Dateigröße und PSNR beider Tools in einer realistischen, vergleichbaren Größenordnung liegen (kein 5x bis 10x größerer Output bei `fastconv`, nur um den Balken schneller zu machen).
-   - **RAM-Disziplin:** Bei speicherhungrigen 4K-Codecs (wie AVIF/JXL) darf Parallelität den Peak-RAM nicht unkontrolliert explodieren lassen (kein 3+ GB Peak-RAM für marginale Speed-Gewinne). Wo nötig, Worker-Concurrency für schwere Encoder sauber deckeln.
-
-## Git-Workflow
-
-Direkte Änderungen und Commits auf `main` sind nicht erlaubt. Halte vor und nach jeder Aufgabe strikt folgenden Ablauf ein:
-
-1. **Branch vorab prüfen:** Prüfe vor jeder Code-Änderung mit `git branch --show-current`, auf welchem Branch du bist.
-2. **Branch automatisch anlegen:** Wenn du auf `main` bist, erstelle automatisch zuerst einen passenden Branch (z. B. `git checkout -b feat/<kurzer-name>` oder `git checkout -b fix/<kurzer-name>`), bevor du Dateien bearbeitest.
-3. **Verifikation & PR:** Jedes Feature und jeder Fix wird erst nach grüner Verifikation (`cargo xtask verify`) per PR gemerged. Nutze die Projekt-Skills unter `.agents/skills/` (`rust-architecture`, `prove-it-works`, `adversarial-review`, `pr-shipping`).
-4. **Nach einem gemergten PR aufräumen:** Wechsle zurück auf `main` (`git checkout main`), ziehe per `git pull` den neuesten Stand und lösche den alten lokalen Branch (`git branch -d <branch-name>`).
-
-> Hinweis: Ein lokaler `.git/hooks/pre-commit`-Hook blockiert zusätzlich versehentliche Commits direkt auf `main`.
+- **Decisions vs loops:** use expensive/limited models for decisions, architecture, deep performance audits and final diff reviews (1–2 turns). Cheap/unlimited models do the loops: coding, compiling, Clippy/pedantic sweeps, tests, fixtures, benchmarks, rebases, merge conflicts, PR babysitting.
+- **Architect → worker → reviewer:** the expensive model designs the plan/APIs and delegates implementation to a cheap model in an isolated worktree (`isolation: worktree`) with exact paths, crate APIs and edge cases. The cheap model runs `cargo xtask verify` (never parallel benchmarks across worktrees). The expensive model reviews the resulting diff before merge.
+- **Benchmark handoff → separate worker:** performance, codec or conversion changes also get a dedicated top-level `opencode/hy4-flash-free` thread running `$benchmark` (fair `cargo xtask bench` / `--audio` head-to-head → validated numbers in `STATE.md`) before the `$babysit` PR thread. Run the two threads serially, never concurrently.
+- **PR hygiene (mandatory):** never merge while GitHub CI or CodeRabbit is still running; resolve every CodeRabbit thread before merge (`0 unresolved`); only after green CI and finished CodeRabbit, squash-merge, update `main`, delete the local branch/worktree.
+- **Pre-PR hardening (especially cheap models):** cap allocations before `Vec::resize`; exclusive atomic staging (`create_new(true)` everywhere, `.mode(0o600)`/`OpenOptionsExt` behind `#[cfg(unix)]`); reject path aliases in `probe`; never swallow decode errors; buffer file I/O (`BufWriter`/reusable buffers).
+- **Babysitting is never a subagent:** `$babysit` (and any PR watch) runs in a top-level thread of the executing model — delegated children cannot hold PR watches.
+- **Read-only spelunking:** when the expensive model needs crate-API facts from `~/.cargo/registry/src` or a large refactor, delegate a read-only researcher that returns a compact report with line numbers — keeps the expensive model's context small.
