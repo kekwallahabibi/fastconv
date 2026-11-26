@@ -22,30 +22,28 @@ fastconv-probe = { path = "crates/probe" }
 fastconv-pipeline = { path = "crates/pipeline" }
 flacenc = { version = "0.5.1", default-features = false }
 hound = "3.5.1"
-jpeg-encoder = { version = "0.7.1", features = ["std", "simd"] }
+jpeg-encoder = { version = "0.7.1", features = ["simd"] }
 # JPEG XL decode is the pure-Rust `jxl` (jxl-rs) port; encode is the pure-Rust
 jxl = "0.8.0"
 # `jixel` is the pure-Rust JPEG XL encoder used for JXL output.
 # It is dual-licensed BSD-3-Clause OR Apache-2.0.
 jixel = { version = "0.5.13", default-features = false, features = ["avx", "sse"] }
-libloading = "0.8"
+libloading = "0.9"
 nvidia-video-codec-sdk = "0.4"
 ogg = "0.9.2"
-opus-pure = "0.2.3"
-png = "0.18"
-pollster = "1"
-rubato = "0.16.2"
+opus-pure = "0.2.5"
+png = { version = "0.18", features = ["zlib-rs"] }
+rubato = "5.1.0"
 # Pure-Rust video codecs for native transcoding (no C/FFI, AGPL-compatible licenses).
 rav1d-safe = "0.5.7"
 rusty_h264 = "0.17.4"
 rusty_h265 = "0.7.2"
 rusty_vp9 = "0.3.0"
-# Direct AVIF pipeline: avif-serialize (BSD-3-Clause) writes ISOBMFF boxes,
-# rav1e (BSD-2-Clause) encodes AV1 frames, flate2 (MIT/Apache-2.0) is zlib-rs based.
+# Direct AVIF pipeline: avif-serialize (BSD-3-Clause) writes ISOBMFF boxes and
+# rav1e (BSD-2-Clause) encodes AV1 frames. flate2 stays zlib-rs based via png/tiff.
 avif-serialize = "0.8.9"
-flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 rav1e = { version = "0.8.1", default-features = false, features = ["asm", "threading"] }
-rusty_aac = "2.1.5"
+rusty_aac = "2.2.0"
 rusty_mp3 = "1.2.2"
 gif = "0.14.2"
 ico = "0.6.0"
@@ -59,8 +57,7 @@ symphonia = { version = "0.6.1", default-features = false, features = ["opt-simd
 tiff = { version = "0.11.3", default-features = false, features = ["deflate", "lzw"] }
 vorbis-enc = "0.1.1"
 # SIMD RGB/RGBA -> YUV420/NV12 conversion (BSD-3-Clause OR Apache-2.0).
-yuv = "0.8.20"
-wgpu = { version = "30", default-features = false, features = ["std", "vulkan", "metal", "dx12"] }
+yuv = "0.8.21"
 zenwebp = { version = "0.4.6", default-features = false, features = ["std"] }
 # Pin 0.5.16-rc3 until stable 0.5.16 ships: fixes silent wrong-color decoding in 0.5.15 (zune-image#496).
 zune-jpeg = "0.5.16-rc3"

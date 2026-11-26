@@ -2709,15 +2709,15 @@ fn print_hardware_summary(hardware: &HostHardware) {
         cpu.logical_threads(),
         cpu.simd_level()
     );
-    if hardware.wgpu_adapters().is_empty() {
-        println!("wgpu adapters : none");
+    if hardware.gpu_adapters().is_empty() {
+        println!("gpu adapters  : none");
     } else {
-        for adapter in hardware.wgpu_adapters() {
+        for adapter in hardware.gpu_adapters() {
             println!(
-                "wgpu adapter  : {} [{} | {} | driver={}]",
+                "gpu adapter   : {} [vendor={} device=0x{:04x} | driver={}]",
                 adapter.name(),
-                adapter.graphics_api(),
-                adapter.device_type(),
+                adapter.vendor(),
+                adapter.device_id(),
                 adapter.driver()
             );
         }

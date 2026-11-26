@@ -1496,8 +1496,8 @@ pub fn probe_image(path: &Path) -> Result<ProbedImage, ProbeError> {
 /// Validates a single image file or mixed image folder at the boundary against live host
 /// hardware and returns a compile-time-legal [`ImageBatchPlan`].
 ///
-/// Avoids initializing GPU probing (`wgpu`/Vulkan) when [`HardwareBackend::Cpu`] is explicitly
-/// requested so CPU invocations incur zero loader overhead. Never performs silent CPU fallbacks.
+/// Avoids hardware probing entirely when [`HardwareBackend::Cpu`] is explicitly requested
+/// so CPU invocations incur zero loader overhead. Never performs silent CPU fallbacks.
 ///
 /// # Errors
 ///
@@ -1832,10 +1832,9 @@ mod tests {
     use super::{ProbedImage, prepare_image_batch, prepare_image_batch_inner, probe_image};
     use crate::ProbeError;
     use fastconv_domain::{
-        CpuInfo, DetectedGpuBackend, DomainError, GpuBackend, GpuCapability, GpuDeviceType,
-        GpuVendor, GraphicsApi, HardwareBackend, HostHardware, ImageCompression, ImageDimensions,
+        CpuInfo, DetectedGpuBackend, DomainError, GpuAdapterInfo, GpuBackend, GpuCapability,
+        GpuVendor, HardwareBackend, HostHardware, ImageCompression, ImageDimensions,
         ImageExecutionMode, ImageInputFormat, ImageOutputFormat, ImageQuality, PathRole, SimdLevel,
-        WgpuAdapterInfo,
     };
     use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
     use std::env;
@@ -2160,14 +2159,12 @@ mod tests {
             SimdLevel::X86Avx2Fma,
             NonZeroU64::new(16 * 1024 * 1024 * 1024),
         )?;
-        let adapter = WgpuAdapterInfo::new(
+        let adapter = GpuAdapterInfo::new(
             "NVIDIA GeForce RTX 2060",
             GpuVendor::Nvidia,
             0x1e89,
-            GpuDeviceType::Discrete,
-            GraphicsApi::Vulkan,
-            "NVIDIA",
-            "620.73.04",
+            "nvidia",
+            "590.48.01",
         )?;
         let backends = vec![
             DetectedGpuBackend::new(
@@ -2180,7 +2177,7 @@ mod tests {
                 GpuBackend::Vulkan,
                 GpuCapability::ComputeOnly,
                 "NVIDIA GeForce RTX 2060",
-                "wgpu vulkan",
+                "vulkan (nvidia)",
             )?,
             DetectedGpuBackend::new(
                 GpuBackend::Vaapi,

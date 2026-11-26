@@ -24,7 +24,7 @@ const GLOBAL_HELP: &str = r"Usage:
   fastconv -h, --help
 
 Commands:
-  probe    Inspect CPU, wgpu adapters, and GPU media backends
+  probe    Inspect CPU, GPU adapters, and GPU media backends
   convert  Convert still images (lossy/lossless; CPU or NVENC HEIC)
   audio    Convert audio files (CPU encoders only)
   remux    Losslessly remux video containers (no re-encoding)
@@ -47,8 +47,7 @@ Prints the hardware available to conversion pipelines:
 
   CPU        model, architecture, physical cores / logical threads, SIMD level,
              and total memory
-  wgpu       graphics adapters (name, graphics API, device type, vendor, device
-             id, and driver)
+  GPU        detected gpu adapters (name, vendor, device id, and kernel driver)
   GPU media  detected media backends with capability and device name: nvenc,
              vaapi, qsv, amf, videotoolbox, vulkan
 
@@ -322,22 +321,19 @@ fn run_probe() -> Result<(), String> {
         println!("  memory       : unavailable");
     }
 
-    println!("wgpu Adapters ({}):", hardware.wgpu_adapters().len());
-    for adapter in hardware.wgpu_adapters() {
+    println!("GPU Adapters ({}):", hardware.gpu_adapters().len());
+    for adapter in hardware.gpu_adapters() {
+        let driver = if adapter.driver_info().is_empty() {
+            adapter.driver().to_owned()
+        } else {
+            format!("{} {}", adapter.driver(), adapter.driver_info())
+        };
         println!(
-            "  - {} [{} | {} | {} | vendor={} device=0x{:04x} | driver={} {}]",
+            "  - {} [vendor={} device=0x{:04x} | driver={}]",
             adapter.name(),
-            adapter.graphics_api(),
-            adapter.device_type(),
-            if adapter.is_hardware() {
-                "hardware"
-            } else {
-                "software"
-            },
             adapter.vendor(),
             adapter.device_id(),
-            adapter.driver(),
-            adapter.driver_info()
+            driver
         );
     }
 
@@ -351,6 +347,11 @@ fn run_probe() -> Result<(), String> {
             backend.evidence()
         );
     }
+    #[cfg(not(target_os = "linux"))]
+    println!(
+        "  note: GPU adapter/media backend detection uses Linux DRM sysfs and NVIDIA procfs; \
+         no adapters or backends are reported on this host"
+    );
 
     Ok(())
 }

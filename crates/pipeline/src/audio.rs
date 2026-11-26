@@ -26,7 +26,8 @@ use opus_pure::{
     Application, DEFAULT_WARMUP_MS, MAX_PACKET_BYTES, MAX_PACKET_SAMPLES, OggOpusReader,
     OggOpusWriter, OpusEncoder, OpusHead, ParallelConfig, Trim, encode_parallel,
 };
-use rubato::{FftFixedInOut, Resampler};
+use rubato::audioadapter_buffers::owned::InterleavedOwned;
+use rubato::{Fft, FixedSync, Indexing, Resampler};
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::formats::TrackType;
@@ -1011,24 +1012,12 @@ fn resample_f32(
         reason,
     };
 
-    let mut planar_in = Vec::with_capacity(channels);
-    let mut planar_out = Vec::with_capacity(channels);
-    for channel in 0..channels {
-        let values: Vec<f32> = input
-            .iter()
-            .skip(channel)
-            .step_by(channels)
-            .copied()
-            .collect();
-        planar_in.push(values);
-        planar_out.push(Vec::new());
-    }
-
-    let mut resampler = FftFixedInOut::<f32>::new(
+    let mut resampler = Fft::<f32>::new(
         usize_from(from_rate),
         usize_from(to_rate),
         RESAMPLE_CHUNK,
         channels,
+        FixedSync::Both,
     )
     .map_err(|err| {
         fail(format!(
@@ -1037,7 +1026,6 @@ fn resample_f32(
     })?;
     let chunk_in = resampler.input_frames_next();
     let chunk_out = resampler.output_frames_next().max(1);
-    let mut out_chunk = resampler.output_buffer_allocate(true);
     let input_frames = input.len() / channels;
     let expected_u64 = (u64::try_from(input_frames).unwrap_or(u64::MAX))
         .saturating_mul(u64::from(to_rate))
@@ -1046,70 +1034,66 @@ fn resample_f32(
     let delay = resampler.output_delay();
     let needed = expected.saturating_add(delay);
     let max_calls = input_frames
-        .div_ceil(chunk_in)
+        .div_ceil(chunk_in.max(1))
         .saturating_add(needed.div_ceil(chunk_out))
         .saturating_add(4);
     let max_f32_samples = usize::try_from(MAX_PCM_BYTES_PER_FILE / 4).unwrap_or(usize::MAX);
-    let plane_reserve = needed.saturating_add(4).min(max_f32_samples);
-    let interleaved_reserve = plane_reserve.saturating_mul(channels).min(max_f32_samples);
-    for plane in &mut planar_out {
-        plane.reserve(plane_reserve);
-    }
+    let interleaved_reserve = needed
+        .saturating_add(chunk_out)
+        .saturating_mul(channels)
+        .min(max_f32_samples);
+    buf.resampled_f32.clear();
     if buf.resampled_f32.capacity() < interleaved_reserve {
         buf.resampled_f32
             .reserve(interleaved_reserve.saturating_sub(buf.resampled_f32.len()));
     }
 
-    let mut calls = 0_usize;
-    let mut chunk = vec![vec![0_f32; chunk_in]; channels];
-    loop {
-        let produced_frames = planar_out.first().map_or(0, Vec::len);
-        if produced_frames >= needed || calls >= max_calls {
+    let mut in_storage = vec![0.0_f32; chunk_in.saturating_mul(channels)];
+    let mut out_storage = vec![0.0_f32; chunk_out.saturating_mul(channels)];
+    let mut consumed = 0_usize;
+    let mut produced = 0_usize;
+    for _ in 0..max_calls {
+        if produced >= needed {
             break;
         }
-        let offset = calls.saturating_mul(chunk_in);
-        let take = chunk_in.min(input_frames.saturating_sub(offset));
-        for slot in &mut out_chunk {
-            slot.fill(0.0);
-        }
-        for channel in 0..channels {
-            if let Some(dst) = chunk.get_mut(channel) {
-                let copied = if let Some(src) = planar_in.get(channel) {
-                    let available = src.len().saturating_sub(offset).min(take).min(dst.len());
-                    if available > 0 {
-                        dst[..available].copy_from_slice(&src[offset..offset + available]);
-                    }
-                    available
-                } else {
-                    0
-                };
-                if copied < dst.len() {
-                    dst[copied..].fill(0.0);
-                }
+        let take = chunk_in.min(input_frames.saturating_sub(consumed));
+        in_storage.fill(0.0);
+        if take > 0 {
+            let start = consumed.saturating_mul(channels);
+            let end = start.saturating_add(take.saturating_mul(channels));
+            if let Some(source) = input.get(start..end) {
+                in_storage[..source.len()].copy_from_slice(source);
             }
         }
-        let (_, produced) = resampler
-            .process_into_buffer(&chunk, &mut out_chunk, None)
+        let in_view =
+            InterleavedOwned::new_from(std::mem::take(&mut in_storage), channels, chunk_in)
+                .map_err(|err| fail(format!("invalid resampler input: {err}")))?;
+        let mut out_view =
+            InterleavedOwned::new_from(std::mem::take(&mut out_storage), channels, chunk_out)
+                .map_err(|err| fail(format!("invalid resampler output: {err}")))?;
+        let indexing = Indexing::new().partial_len(take);
+        let (_, written) = resampler
+            .process_into_buffer(&in_view, &mut out_view, Some(&indexing))
             .map_err(|err| fail(format!("resampling failed: {err}")))?;
-        for channel in 0..channels {
-            if let (Some(dst), Some(src)) = (planar_out.get_mut(channel), out_chunk.get(channel)) {
-                dst.extend_from_slice(&src[..produced.min(src.len())]);
-            }
-        }
-        calls += 1;
+        in_storage = in_view.take_data();
+        out_storage = out_view.take_data();
+        let usable = written.saturating_mul(channels).min(out_storage.len());
+        buf.resampled_f32.extend_from_slice(&out_storage[..usable]);
+        consumed = consumed.saturating_add(take);
+        produced = produced.saturating_add(written);
     }
 
-    let available = planar_out.first().map_or(0, Vec::len);
-    let skip = delay.min(available);
-    let total_frames = expected.min(available.saturating_sub(skip));
-    buf.resampled_f32.clear();
-    for frame in skip..skip.saturating_add(total_frames) {
-        for channel in 0..channels {
-            if let Some(value) = planar_out.get(channel).and_then(|v| v.get(frame)) {
-                buf.resampled_f32.push(*value);
-            }
-        }
+    drop(input);
+    let start = delay.saturating_mul(channels);
+    let end = start.saturating_add(expected.saturating_mul(channels));
+    if buf.resampled_f32.len() < end {
+        return Err(fail(format!(
+            "resampler produced {} samples, expected at least {end}",
+            buf.resampled_f32.len()
+        )));
     }
+    buf.resampled_f32.truncate(end);
+    buf.resampled_f32.drain(..start);
     std::mem::swap(&mut buf.samples_f32, &mut buf.resampled_f32);
     buf.resampled_f32.clear();
     Ok(())
@@ -2069,6 +2053,59 @@ mod tests {
         assert_eq!(buffer.decoded_len(), 0);
         assert_eq!(buffer.samples_i16.len(), 0);
         assert!(buffer.capacity_of_samples() >= capacity);
+    }
+
+    #[test]
+    fn resample_f32_same_rate_is_a_noop() -> Result<(), PipelineError> {
+        let mut buffer = AudioWorkerBuffer::new();
+        buffer.samples_f32.extend([0.1_f32, -0.2, 0.3, -0.4]);
+        resample_f32(48_000, 48_000, 2, &mut buffer, "resample-test")?;
+        assert_eq!(buffer.samples_f32, [0.1_f32, -0.2, 0.3, -0.4]);
+        Ok(())
+    }
+
+    #[test]
+    fn resample_f32_produces_exact_frame_count_for_edge_inputs() -> Result<(), PipelineError> {
+        for channels in [1_usize, 2, 3, 6] {
+            for frames in [0_usize, 1, 137, 2_049] {
+                let mut buffer = AudioWorkerBuffer::new();
+                buffer
+                    .samples_f32
+                    .extend((0..frames.saturating_mul(channels)).map(|index| {
+                        let step = i16::try_from(index % 251).unwrap_or(0);
+                        f32::from(step) / 251.0_f32 - 0.5_f32
+                    }));
+                resample_f32(44_100, 48_000, channels, &mut buffer, "resample-test")?;
+                let expected = usize::try_from(
+                    u64::try_from(frames)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(48_000)
+                        / 44_100,
+                )
+                .unwrap_or(usize::MAX);
+                assert_eq!(
+                    buffer.samples_f32.len(),
+                    expected.saturating_mul(channels),
+                    "channels={channels}, frames={frames}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resample_f32_keeps_signal_after_trimming_the_delay() -> Result<(), PipelineError> {
+        let mut buffer = AudioWorkerBuffer::new();
+        buffer.samples_f32.extend((0..8_000_usize).map(|index| {
+            let step = i16::try_from(index % 251).unwrap_or(0);
+            f32::from(step) / 251.0_f32 - 0.5_f32
+        }));
+        resample_f32(44_100, 48_000, 1, &mut buffer, "resample-test")?;
+        assert!(
+            buffer.samples_f32.iter().any(|&sample| sample.abs() > 0.1),
+            "trimming the FFT startup delay must not remove the whole signal"
+        );
+        Ok(())
     }
 
     #[test]

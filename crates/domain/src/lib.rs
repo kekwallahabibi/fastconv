@@ -9,8 +9,7 @@ pub use audio::{
     AudioOutputFormat, AudioStreamInfo,
 };
 pub use hardware::{
-    CpuInfo, DetectedGpuBackend, GpuCapability, GpuDeviceType, GpuVendor, GraphicsApi,
-    HostHardware, SimdLevel, WgpuAdapterInfo,
+    CpuInfo, DetectedGpuBackend, GpuAdapterInfo, GpuCapability, GpuVendor, HostHardware, SimdLevel,
 };
 pub use image::{
     ImageBatchItem, ImageBatchPlan, ImageCompression, ImageConversionReport, ImageDimensions,
