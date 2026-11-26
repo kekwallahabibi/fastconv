@@ -347,6 +347,11 @@ fn run_probe() -> Result<(), String> {
             backend.evidence()
         );
     }
+    #[cfg(not(target_os = "linux"))]
+    println!(
+        "  note: GPU adapter/media backend detection uses Linux DRM sysfs and NVIDIA procfs; \
+         no adapters or backends are reported on this host"
+    );
 
     Ok(())
 }

@@ -1083,11 +1083,17 @@ fn resample_f32(
         produced = produced.saturating_add(written);
     }
 
+    drop(input);
     let start = delay.saturating_mul(channels);
     let end = start.saturating_add(expected.saturating_mul(channels));
-    let valid = buf.resampled_f32.get(start..end).unwrap_or(&[]).to_vec();
-    buf.resampled_f32.clear();
-    buf.resampled_f32.extend(valid);
+    if buf.resampled_f32.len() < end {
+        return Err(fail(format!(
+            "resampler produced {} samples, expected at least {end}",
+            buf.resampled_f32.len()
+        )));
+    }
+    buf.resampled_f32.truncate(end);
+    buf.resampled_f32.drain(..start);
     std::mem::swap(&mut buf.samples_f32, &mut buf.resampled_f32);
     buf.resampled_f32.clear();
     Ok(())

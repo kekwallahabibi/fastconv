@@ -53,7 +53,7 @@ zenavif = "0.1.6"
 zenavif-parse = "0.6.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-symphonia = { version = "0.6.1", default-features = false, features = ["opt-simd", "pcm", "wav", "aiff", "flac", "vorbis", "mp3", "ogg", "aac", "alac", "isomp4"] }
+symphonia = { version = "0.6.1", default-features = false, features = ["opt-simd", "pcm", "wav", "aiff", "flac", "vorbis", "mp3", "ogg", "aac", "alac", "isomp4", "id3v2"] }
 tiff = { version = "0.11.3", default-features = false, features = ["deflate", "lzw"] }
 vorbis-enc = "0.1.1"
 # SIMD RGB/RGBA -> YUV420/NV12 conversion (BSD-3-Clause OR Apache-2.0).
