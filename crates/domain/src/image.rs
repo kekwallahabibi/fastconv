@@ -704,9 +704,8 @@ mod tests {
         ImageInputFormat, ImageOutputFormat, ImageQuality,
     };
     use crate::{
-        CpuInfo, DetectedGpuBackend, DomainError, GpuBackend, GpuCapability, GpuDeviceType,
-        GpuVendor, GraphicsApi, HardwareBackend, HostHardware, PathRole, SimdLevel,
-        WgpuAdapterInfo,
+        CpuInfo, DetectedGpuBackend, DomainError, GpuAdapterInfo, GpuBackend, GpuCapability,
+        GpuVendor, HardwareBackend, HostHardware, PathRole, SimdLevel,
     };
     use std::num::{NonZeroU64, NonZeroUsize};
     use std::path::PathBuf;
@@ -725,14 +724,12 @@ mod tests {
     }
 
     fn rtx_2060_hardware() -> Result<HostHardware, DomainError> {
-        let adapter = WgpuAdapterInfo::new(
+        let adapter = GpuAdapterInfo::new(
             "NVIDIA GeForce RTX 2060",
             GpuVendor::Nvidia,
             0x1e89,
-            GpuDeviceType::Discrete,
-            GraphicsApi::Vulkan,
-            "NVIDIA",
-            "620.73.04",
+            "nvidia",
+            "590.48.01",
         )?;
         let backends = vec![
             DetectedGpuBackend::new(
@@ -745,7 +742,7 @@ mod tests {
                 GpuBackend::Vulkan,
                 GpuCapability::ComputeOnly,
                 "NVIDIA GeForce RTX 2060",
-                "wgpu vulkan",
+                "vulkan (nvidia)",
             )?,
             DetectedGpuBackend::new(
                 GpuBackend::Vaapi,

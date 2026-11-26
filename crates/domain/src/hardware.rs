@@ -146,64 +146,18 @@ impl fmt::Display for GpuVendor {
     }
 }
 
-/// Adapter device category reported by `wgpu`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-pub enum GpuDeviceType {
-    Discrete,
-    Integrated,
-    Virtual,
-    CpuFallback,
-    Other,
-}
-
-impl fmt::Display for GpuDeviceType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let label = match self {
-            Self::Discrete => "discrete",
-            Self::Integrated => "integrated",
-            Self::Virtual => "virtual",
-            Self::CpuFallback => "cpu",
-            Self::Other => "other",
-        };
-        f.write_str(label)
-    }
-}
-
-/// Graphics/compute backend API exposed by a `wgpu` adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-pub enum GraphicsApi {
-    Vulkan,
-    Metal,
-    Dx12,
-    Gl,
-}
-
-impl fmt::Display for GraphicsApi {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let label = match self {
-            Self::Vulkan => "vulkan",
-            Self::Metal => "metal",
-            Self::Dx12 => "dx12",
-            Self::Gl => "gl",
-        };
-        f.write_str(label)
-    }
-}
-
-/// Validated `wgpu` adapter description enumerated without display handles.
+/// Validated description of a GPU adapter discovered from host sysfs/DRM data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct WgpuAdapterInfo {
+pub struct GpuAdapterInfo {
     name: String,
     vendor: GpuVendor,
     device_id: u32,
-    device_type: GpuDeviceType,
-    graphics_api: GraphicsApi,
     driver: String,
     driver_info: String,
 }
 
-impl WgpuAdapterInfo {
-    /// Creates a validated [`WgpuAdapterInfo`] record.
+impl GpuAdapterInfo {
+    /// Creates a validated [`GpuAdapterInfo`] record.
     ///
     /// # Errors
     ///
@@ -212,29 +166,17 @@ impl WgpuAdapterInfo {
         name: &str,
         vendor: GpuVendor,
         device_id: u32,
-        device_type: GpuDeviceType,
-        graphics_api: GraphicsApi,
         driver: &str,
         driver_info: &str,
     ) -> Result<Self, DomainError> {
-        let name = require_non_empty(name, "wgpu_adapter.name")?;
+        let name = require_non_empty(name, "gpu_adapter.name")?;
         Ok(Self {
             name,
             vendor,
             device_id,
-            device_type,
-            graphics_api,
             driver: driver.trim().to_owned(),
             driver_info: driver_info.trim().to_owned(),
         })
-    }
-
-    #[must_use]
-    pub const fn is_hardware(&self) -> bool {
-        matches!(
-            self.device_type,
-            GpuDeviceType::Discrete | GpuDeviceType::Integrated
-        )
     }
 
     #[must_use]
@@ -250,16 +192,6 @@ impl WgpuAdapterInfo {
     #[must_use]
     pub const fn device_id(&self) -> u32 {
         self.device_id
-    }
-
-    #[must_use]
-    pub const fn device_type(&self) -> GpuDeviceType {
-        self.device_type
-    }
-
-    #[must_use]
-    pub const fn graphics_api(&self) -> GraphicsApi {
-        self.graphics_api
     }
 
     #[must_use]
@@ -358,11 +290,11 @@ impl DetectedGpuBackend {
     }
 }
 
-/// Complete, validated snapshot of the host CPU, `wgpu` adapters, and native GPU backends.
+/// Complete, validated snapshot of the host CPU, GPU adapters, and native GPU backends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HostHardware {
     cpu: CpuInfo,
-    wgpu_adapters: Vec<WgpuAdapterInfo>,
+    gpu_adapters: Vec<GpuAdapterInfo>,
     gpu_backends: Vec<DetectedGpuBackend>,
 }
 
@@ -370,12 +302,12 @@ impl HostHardware {
     #[must_use]
     pub const fn new(
         cpu: CpuInfo,
-        wgpu_adapters: Vec<WgpuAdapterInfo>,
+        gpu_adapters: Vec<GpuAdapterInfo>,
         gpu_backends: Vec<DetectedGpuBackend>,
     ) -> Self {
         Self {
             cpu,
-            wgpu_adapters,
+            gpu_adapters,
             gpu_backends,
         }
     }
@@ -386,8 +318,8 @@ impl HostHardware {
     }
 
     #[must_use]
-    pub fn wgpu_adapters(&self) -> &[WgpuAdapterInfo] {
-        &self.wgpu_adapters
+    pub fn gpu_adapters(&self) -> &[GpuAdapterInfo] {
+        &self.gpu_adapters
     }
 
     #[must_use]
@@ -397,7 +329,7 @@ impl HostHardware {
 
     #[must_use]
     pub fn has_hardware_gpu(&self) -> bool {
-        self.wgpu_adapters.iter().any(WgpuAdapterInfo::is_hardware) || !self.gpu_backends.is_empty()
+        !self.gpu_adapters.is_empty() || !self.gpu_backends.is_empty()
     }
 
     #[must_use]
@@ -429,8 +361,8 @@ impl HostHardware {
 #[cfg(test)]
 mod tests {
     use super::{
-        CpuInfo, DetectedGpuBackend, GpuCapability, GpuDeviceType, GpuVendor, GraphicsApi,
-        HostHardware, SimdLevel, WgpuAdapterInfo,
+        CpuInfo, DetectedGpuBackend, GpuAdapterInfo, GpuCapability, GpuVendor, HostHardware,
+        SimdLevel,
     };
     use crate::{DomainError, GpuBackend};
     use std::num::{NonZeroU64, NonZeroUsize};
@@ -450,14 +382,12 @@ mod tests {
             mem,
         )?;
 
-        let adapter = WgpuAdapterInfo::new(
+        let adapter = GpuAdapterInfo::new(
             "NVIDIA GeForce RTX 2060",
             GpuVendor::from_pci_id(0x10de),
             0x1e89,
-            GpuDeviceType::Discrete,
-            GraphicsApi::Vulkan,
-            "NVIDIA",
-            "620.73.04",
+            "nvidia",
+            "590.48.01",
         )?;
 
         let nvenc = DetectedGpuBackend::new(
@@ -515,18 +445,10 @@ mod tests {
         let blank_arch = CpuInfo::new("CPU", "  ", cores, cores, SimdLevel::Scalar, None);
         assert_eq!(blank_arch, Err(DomainError::EmptyField("cpu.architecture")));
 
-        let blank_adapter = WgpuAdapterInfo::new(
-            "",
-            GpuVendor::Nvidia,
-            0,
-            GpuDeviceType::Discrete,
-            GraphicsApi::Vulkan,
-            "",
-            "",
-        );
+        let blank_adapter = GpuAdapterInfo::new("", GpuVendor::Nvidia, 0, "", "");
         assert_eq!(
             blank_adapter,
-            Err(DomainError::EmptyField("wgpu_adapter.name"))
+            Err(DomainError::EmptyField("gpu_adapter.name"))
         );
 
         let blank_device_name =
@@ -569,21 +491,20 @@ mod tests {
     }
 
     #[test]
-    fn distinguishes_software_rasterizer_from_hardware_gpu() -> Result<(), DomainError> {
+    fn has_hardware_gpu_reflects_detected_adapters_and_backends() -> Result<(), DomainError> {
         let cores = NonZeroUsize::new(2).ok_or(DomainError::EmptyField("test"))?;
-        let cpu = CpuInfo::new("CI CPU", "x86_64", cores, cores, SimdLevel::X86Avx2, None)?;
-        let llvmpipe = WgpuAdapterInfo::new(
-            "llvmpipe",
-            GpuVendor::Other(0x10005),
-            0,
-            GpuDeviceType::CpuFallback,
-            GraphicsApi::Vulkan,
-            "llvmpipe",
-            "Mesa",
+        let cpu_a = CpuInfo::new("CI CPU", "x86_64", cores, cores, SimdLevel::X86Avx2, None)?;
+        let cpu_b = CpuInfo::new("CI CPU", "x86_64", cores, cores, SimdLevel::X86Avx2, None)?;
+        let adapter = GpuAdapterInfo::new(
+            "NVIDIA GeForce RTX 2060",
+            GpuVendor::Nvidia,
+            0x1e89,
+            "nvidia",
+            "590.48.01",
         )?;
 
-        let host = HostHardware::new(cpu, vec![llvmpipe], Vec::new());
-        assert!(!host.has_hardware_gpu());
+        assert!(!HostHardware::new(cpu_a, Vec::new(), Vec::new()).has_hardware_gpu());
+        assert!(HostHardware::new(cpu_b, vec![adapter], Vec::new()).has_hardware_gpu());
         assert_eq!(GpuVendor::from_pci_id(0x10de), GpuVendor::Nvidia);
         assert_eq!(GpuVendor::from_pci_id(0x1002), GpuVendor::Amd);
         assert_eq!(GpuVendor::from_pci_id(0x8086), GpuVendor::Intel);

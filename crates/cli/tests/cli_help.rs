@@ -107,7 +107,7 @@ fn probe_help_documents_detected_hardware() -> Result<(), String> {
         "logical threads",
         "SIMD",
         "memory",
-        "wgpu",
+        "gpu adapter",
         "nvenc",
         "vaapi",
         "qsv",

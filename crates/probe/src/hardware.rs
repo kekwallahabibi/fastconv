@@ -6,13 +6,13 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
 use fastconv_domain::{
-    CpuInfo, DetectedGpuBackend, DomainError, GpuBackend, GpuCapability, GpuDeviceType, GpuVendor,
-    GraphicsApi, HostHardware, SimdLevel, WgpuAdapterInfo,
+    CpuInfo, DetectedGpuBackend, DomainError, GpuAdapterInfo, GpuBackend, GpuCapability, GpuVendor,
+    HostHardware, SimdLevel,
 };
 
 use crate::{ProbeError, available_cpu_threads};
 
-/// Probes the local host for CPU topology, SIMD level, `wgpu` adapters, and native GPU media backends.
+/// Probes the local host for CPU topology, SIMD level, GPU adapters, and native GPU media backends.
 ///
 /// Never spawns `ffmpeg`, `ffprobe`, or any external subprocess.
 ///
@@ -22,9 +22,9 @@ use crate::{ProbeError, available_cpu_threads};
 /// validation fail.
 pub fn detect_host_hardware() -> Result<HostHardware, ProbeError> {
     let cpu = detect_cpu()?;
-    let wgpu_adapters = detect_wgpu_adapters()?;
-    let gpu_backends = detect_gpu_backends(&wgpu_adapters)?;
-    Ok(HostHardware::new(cpu, wgpu_adapters, gpu_backends))
+    let gpu_adapters = detect_gpu_adapters()?;
+    let gpu_backends = detect_gpu_backends(&gpu_adapters)?;
+    Ok(HostHardware::new(cpu, gpu_adapters, gpu_backends))
 }
 
 fn detect_cpu() -> Result<CpuInfo, ProbeError> {
@@ -195,96 +195,194 @@ fn parse_linux_meminfo_bytes(content: &str) -> Option<NonZeroU64> {
     None
 }
 
-fn detect_wgpu_adapters() -> Result<Vec<WgpuAdapterInfo>, ProbeError> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapters =
-        pollster::block_on(instance.enumerate_adapters(
-            wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12,
-        ));
+#[cfg(target_os = "linux")]
+struct NvidiaGpuInfo {
+    slot: String,
+    model: String,
+    firmware: String,
+}
 
-    let mut results = Vec::with_capacity(adapters.len());
-    for adapter in adapters {
-        let info = adapter.get_info();
-        let Some(graphics_api) = map_graphics_api(info.backend) else {
+/// Enumerates DRM card adapters once; vendor facts for backend classification reuse this scan.
+#[cfg(target_os = "linux")]
+fn detect_gpu_adapters() -> Result<Vec<GpuAdapterInfo>, ProbeError> {
+    let drm_dir = Path::new("/sys/class/drm");
+    let entries = match fs::read_dir(drm_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(ProbeError::Io {
+                path: drm_dir.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    let nvidia_info = read_nvidia_gpu_information();
+    let mut adapters = Vec::new();
+    for entry_result in entries {
+        let entry = entry_result.map_err(|source| ProbeError::Io {
+            path: drm_dir.to_path_buf(),
+            source,
+        })?;
+        let file_name = entry.file_name();
+        let Some(card) = file_name.to_str() else {
             continue;
         };
-        let device_type = map_device_type(info.device_type);
-        let vendor = GpuVendor::from_pci_id(info.vendor);
+        if !card.starts_with("card") || card.contains('-') {
+            continue;
+        }
 
-        results.push(WgpuAdapterInfo::new(
-            &info.name,
+        let device_dir = entry.path().join("device");
+        let Some(vendor_id) = read_pci_id(&device_dir.join("vendor")) else {
+            continue;
+        };
+        let device_id = read_pci_id(&device_dir.join("device")).unwrap_or(0);
+        let vendor = GpuVendor::from_pci_id(vendor_id);
+        let slot = device_dir.canonicalize().ok().and_then(|resolved| {
+            resolved
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        });
+        let (name, driver_info) = if vendor == GpuVendor::Nvidia {
+            nvidia_adapter_details(&nvidia_info, slot.as_deref(), device_id)
+        } else {
+            (vendor_fallback_name(vendor, device_id), String::new())
+        };
+        let driver = read_kernel_driver(&device_dir.join("uevent"));
+
+        adapters.push(GpuAdapterInfo::new(
+            &name,
             vendor,
-            info.device,
-            device_type,
-            graphics_api,
-            &info.driver,
-            &info.driver_info,
+            device_id,
+            &driver,
+            &driver_info,
         )?);
     }
 
-    Ok(results)
+    Ok(adapters)
 }
 
-const fn map_device_type(device_type: wgpu::DeviceType) -> GpuDeviceType {
-    match device_type {
-        wgpu::DeviceType::DiscreteGpu => GpuDeviceType::Discrete,
-        wgpu::DeviceType::IntegratedGpu => GpuDeviceType::Integrated,
-        wgpu::DeviceType::VirtualGpu => GpuDeviceType::Virtual,
-        wgpu::DeviceType::Cpu => GpuDeviceType::CpuFallback,
-        wgpu::DeviceType::Other => GpuDeviceType::Other,
+#[cfg(not(target_os = "linux"))]
+fn detect_gpu_adapters() -> Result<Vec<GpuAdapterInfo>, ProbeError> {
+    Ok(Vec::new())
+}
+
+#[cfg(target_os = "linux")]
+fn read_pci_id(path: &Path) -> Option<u32> {
+    let content = fs::read_to_string(path).ok()?;
+    let trimmed = content.trim();
+    let hex = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    u32::from_str_radix(hex, 16).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn read_kernel_driver(uevent_path: &Path) -> String {
+    let Ok(content) = fs::read_to_string(uevent_path) else {
+        return String::new();
+    };
+    for line in content.lines() {
+        if let Some(driver) = line.strip_prefix("DRIVER=") {
+            return driver.trim().to_owned();
+        }
+    }
+    String::new()
+}
+
+#[cfg(target_os = "linux")]
+fn read_nvidia_gpu_information() -> Vec<NvidiaGpuInfo> {
+    let Ok(entries) = fs::read_dir(Path::new("/proc/driver/nvidia/gpus")) else {
+        return Vec::new();
+    };
+
+    let mut result = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(content) = fs::read_to_string(entry.path().join("information")) else {
+            continue;
+        };
+        let mut slot = None;
+        let mut model = None;
+        let mut firmware = None;
+        for line in content.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            match key.trim() {
+                "Bus Location" => slot = Some(value.trim().to_owned()),
+                "Model" => model = Some(value.trim().to_owned()),
+                "GPU Firmware" | "Firmware Version" => firmware = Some(value.trim().to_owned()),
+                _ => {}
+            }
+        }
+        if let (Some(slot), Some(model)) = (slot, model) {
+            result.push(NvidiaGpuInfo {
+                slot,
+                model,
+                firmware: firmware.unwrap_or_default(),
+            });
+        }
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn nvidia_adapter_details(
+    info: &[NvidiaGpuInfo],
+    slot: Option<&str>,
+    device_id: u32,
+) -> (String, String) {
+    let Some(slot) = slot else {
+        return (
+            vendor_fallback_name(GpuVendor::Nvidia, device_id),
+            String::new(),
+        );
+    };
+    match info
+        .iter()
+        .find(|entry| entry.slot.eq_ignore_ascii_case(slot))
+    {
+        Some(entry) => {
+            let driver_info = if entry.firmware.is_empty() {
+                format!("PCI 0x{device_id:04x}")
+            } else {
+                entry.firmware.clone()
+            };
+            (entry.model.clone(), driver_info)
+        }
+        None => (
+            vendor_fallback_name(GpuVendor::Nvidia, device_id),
+            String::new(),
+        ),
     }
 }
 
-const fn map_graphics_api(backend: wgpu::Backend) -> Option<GraphicsApi> {
-    match backend {
-        wgpu::Backend::Vulkan => Some(GraphicsApi::Vulkan),
-        wgpu::Backend::Metal => Some(GraphicsApi::Metal),
-        wgpu::Backend::Dx12 => Some(GraphicsApi::Dx12),
-        wgpu::Backend::Gl => Some(GraphicsApi::Gl),
-        wgpu::Backend::BrowserWebGpu | wgpu::Backend::Noop => None,
-    }
+#[cfg(target_os = "linux")]
+fn vendor_fallback_name(vendor: GpuVendor, device_id: u32) -> String {
+    let label = match vendor {
+        GpuVendor::Nvidia => "NVIDIA GPU",
+        GpuVendor::Amd => "AMD GPU",
+        GpuVendor::Intel => "Intel GPU",
+        GpuVendor::Apple => "Apple GPU",
+        GpuVendor::Other(_) => "GPU",
+    };
+    format!("{label} (PCI 0x{device_id:04x})")
 }
 
+#[cfg(target_os = "linux")]
+fn detect_gpu_backends(adapters: &[GpuAdapterInfo]) -> Result<Vec<DetectedGpuBackend>, ProbeError> {
+    let facts = gather_linux_probe_facts(adapters)?;
+    Ok(classify_linux_gpu_backends(&facts, adapters)?)
+}
+
+// Off Linux there is no DRM sysfs to scan, so no backend can be confirmed without guessing.
+#[cfg(not(target_os = "linux"))]
 fn detect_gpu_backends(
-    adapters: &[WgpuAdapterInfo],
+    _adapters: &[GpuAdapterInfo],
 ) -> Result<Vec<DetectedGpuBackend>, ProbeError> {
-    #[cfg(target_os = "linux")]
-    {
-        let facts = gather_linux_probe_facts()?;
-        Ok(classify_linux_gpu_backends(&facts, adapters)?)
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let mut backends = Vec::new();
-        for adapter in adapters {
-            if adapter.is_hardware() && adapter.graphics_api() == GraphicsApi::Metal {
-                backends.push(DetectedGpuBackend::new(
-                    GpuBackend::VideoToolbox,
-                    GpuCapability::VideoEncodeAndDecode,
-                    adapter.name(),
-                    "Apple Metal hardware adapter",
-                )?);
-            }
-        }
-        Ok(backends)
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let mut backends = Vec::new();
-        for adapter in adapters {
-            if adapter.is_hardware() && adapter.graphics_api() == GraphicsApi::Vulkan {
-                backends.push(DetectedGpuBackend::new(
-                    GpuBackend::Vulkan,
-                    GpuCapability::ComputeOnly,
-                    adapter.name(),
-                    &format!("wgpu vulkan ({})", adapter.driver()),
-                )?);
-            }
-        }
-        Ok(backends)
-    }
+    Ok(Vec::new())
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -304,8 +402,14 @@ struct LinuxProbeFacts {
 }
 
 #[cfg(target_os = "linux")]
-fn gather_linux_probe_facts() -> Result<LinuxProbeFacts, ProbeError> {
-    let drm_vendors = read_drm_vendors(Path::new("/sys/class/drm"))?;
+fn gather_linux_probe_facts(adapters: &[GpuAdapterInfo]) -> Result<LinuxProbeFacts, ProbeError> {
+    let mut drm_vendors = Vec::new();
+    for adapter in adapters {
+        let vendor = adapter.vendor();
+        if !drm_vendors.contains(&vendor) {
+            drm_vendors.push(vendor);
+        }
+    }
     let has_render_node = has_drm_render_node(Path::new("/dev/dri"))?;
     let has_nvidia_ctl = Path::new("/dev/nvidiactl").exists();
 
@@ -325,58 +429,6 @@ fn gather_linux_probe_facts() -> Result<LinuxProbeFacts, ProbeError> {
         amd_vaapi_driver: find_first_file(&dri_dirs, &["radeonsi_drv_video.so"]),
         nvidia_vaapi_driver: find_first_file(&dri_dirs, &["nvidia_drv_video.so"]),
     })
-}
-
-#[cfg(target_os = "linux")]
-fn read_drm_vendors(drm_dir: &Path) -> Result<Vec<GpuVendor>, ProbeError> {
-    let entries = match fs::read_dir(drm_dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => {
-            return Err(ProbeError::Io {
-                path: drm_dir.to_path_buf(),
-                source,
-            });
-        }
-    };
-
-    let mut vendors = Vec::new();
-    for entry_result in entries {
-        let entry = entry_result.map_err(|source| ProbeError::Io {
-            path: drm_dir.to_path_buf(),
-            source,
-        })?;
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        if !name_str.starts_with("card") || name_str.contains('-') {
-            continue;
-        }
-
-        let vendor_path = entry.path().join("device/vendor");
-        let raw_vendor = match fs::read_to_string(&vendor_path) {
-            Ok(content) => content,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Err(source) => {
-                return Err(ProbeError::Io {
-                    path: vendor_path,
-                    source,
-                });
-            }
-        };
-
-        let trimmed = raw_vendor.trim();
-        let hex = trimmed
-            .strip_prefix("0x")
-            .or_else(|| trimmed.strip_prefix("0X"))
-            .unwrap_or(trimmed);
-        if let Ok(vendor_id) = u32::from_str_radix(hex, 16) {
-            vendors.push(GpuVendor::from_pci_id(vendor_id));
-        }
-    }
-
-    Ok(vendors)
 }
 
 #[cfg(target_os = "linux")]
@@ -466,12 +518,10 @@ fn find_first_file(dirs: &[PathBuf], candidates: &[&str]) -> Option<PathBuf> {
 #[cfg(any(target_os = "linux", test))]
 fn classify_linux_gpu_backends(
     facts: &LinuxProbeFacts,
-    adapters: &[WgpuAdapterInfo],
+    adapters: &[GpuAdapterInfo],
 ) -> Result<Vec<DetectedGpuBackend>, DomainError> {
     let has_vendor = |target: GpuVendor| {
-        adapters
-            .iter()
-            .any(|adapter| adapter.is_hardware() && adapter.vendor() == target)
+        adapters.iter().any(|adapter| adapter.vendor() == target)
             || facts.drm_vendors.contains(&target)
     };
 
@@ -498,26 +548,6 @@ fn classify_linux_gpu_backends(
             &device_name_for(adapters, GpuVendor::Nvidia, "NVIDIA GPU"),
             &evidence,
         )?);
-    }
-
-    for adapter in adapters {
-        if adapter.is_hardware() && adapter.graphics_api() == GraphicsApi::Vulkan {
-            let evidence = if adapter.driver_info().is_empty() {
-                format!("wgpu vulkan ({})", adapter.driver())
-            } else {
-                format!(
-                    "wgpu vulkan ({} {})",
-                    adapter.driver(),
-                    adapter.driver_info()
-                )
-            };
-            backends.push(DetectedGpuBackend::new(
-                GpuBackend::Vulkan,
-                GpuCapability::ComputeOnly,
-                adapter.name(),
-                &evidence,
-            )?);
-        }
     }
 
     push_vaapi_backends(
@@ -554,17 +584,17 @@ fn classify_linux_gpu_backends(
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn device_name_for(adapters: &[WgpuAdapterInfo], target: GpuVendor, fallback: &str) -> String {
+fn device_name_for(adapters: &[GpuAdapterInfo], target: GpuVendor, fallback: &str) -> String {
     adapters
         .iter()
-        .find(|adapter| adapter.is_hardware() && adapter.vendor() == target)
+        .find(|adapter| adapter.vendor() == target)
         .map_or_else(|| fallback.to_owned(), |adapter| adapter.name().to_owned())
 }
 
 #[cfg(any(target_os = "linux", test))]
 fn push_vaapi_backends(
     facts: &LinuxProbeFacts,
-    adapters: &[WgpuAdapterInfo],
+    adapters: &[GpuAdapterInfo],
     has_intel: bool,
     has_amd: bool,
     has_nvidia: bool,
@@ -623,10 +653,7 @@ mod tests {
         parse_linux_meminfo_bytes,
     };
     use crate::ProbeError;
-    use fastconv_domain::{
-        DomainError, GpuBackend, GpuCapability, GpuDeviceType, GpuVendor, GraphicsApi,
-        WgpuAdapterInfo,
-    };
+    use fastconv_domain::{DomainError, GpuAdapterInfo, GpuBackend, GpuCapability, GpuVendor};
     use std::num::{NonZeroU64, NonZeroUsize};
     use std::path::PathBuf;
 
@@ -684,14 +711,12 @@ MemFree:          840080 kB
 
     #[test]
     fn classifies_nvidia_system_without_qsv_false_positive() -> Result<(), DomainError> {
-        let adapter = WgpuAdapterInfo::new(
+        let adapter = GpuAdapterInfo::new(
             "NVIDIA GeForce RTX 2060",
             GpuVendor::Nvidia,
             0x1e89,
-            GpuDeviceType::Discrete,
-            GraphicsApi::Vulkan,
-            "NVIDIA",
-            "620.73.04",
+            "nvidia",
+            "590.48.01",
         )?;
 
         let facts = LinuxProbeFacts {
@@ -712,10 +737,9 @@ MemFree:          840080 kB
         assert!(backends.iter().any(|b| {
             b.backend() == GpuBackend::Nvenc
                 && b.capability() == GpuCapability::VideoEncodeAndDecode
+                && b.device_name() == "NVIDIA GeForce RTX 2060"
         }));
-        assert!(backends.iter().any(|b| {
-            b.backend() == GpuBackend::Vulkan && b.capability() == GpuCapability::ComputeOnly
-        }));
+        assert!(!backends.iter().any(|b| b.backend() == GpuBackend::Vulkan));
         assert!(backends.iter().any(|b| {
             b.backend() == GpuBackend::Vaapi && b.capability() == GpuCapability::VideoDecodeOnly
         }));
@@ -839,5 +863,25 @@ core id\t\t: 3
             b.backend() == GpuBackend::Nvenc && b.capability() == GpuCapability::VideoEncodeOnly
         }));
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolves_nvidia_adapter_details_by_pci_slot() {
+        use super::{NvidiaGpuInfo, nvidia_adapter_details, vendor_fallback_name};
+
+        let info = [NvidiaGpuInfo {
+            slot: "0000:01:00.0".to_owned(),
+            model: "NVIDIA GeForce RTX 2060".to_owned(),
+            firmware: "90.15.117.0.9".to_owned(),
+        }];
+        let (name, firmware) = nvidia_adapter_details(&info, Some("0000:01:00.0"), 0x1e89);
+        assert_eq!(name, "NVIDIA GeForce RTX 2060");
+        assert_eq!(firmware, "90.15.117.0.9");
+
+        let (fallback, firmware) = nvidia_adapter_details(&info, Some("0000:02:00.0"), 0x1e89);
+        assert_eq!(fallback, vendor_fallback_name(GpuVendor::Nvidia, 0x1e89));
+        assert_eq!(firmware, "");
+        assert!(fallback.contains("0x1e89"));
     }
 }
