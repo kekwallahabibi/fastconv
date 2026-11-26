@@ -27,5 +27,5 @@ Before writing boundary or pipeline code, show the user: the proposed domain typ
 
 ## 5. Thin orchestration (`crates/cli`) & dependency check
 1. `crates/cli` only parses the invocation, wires `probe` → `domain` → `pipeline` and maps errors to exit codes.
-2. Check crate boundaries against `AGENTS.md`: `domain` has no workspace deps and zero I/O; `probe` and `pipeline` depend only on `fastconv-domain`, never on each other; `unsafe_code = "forbid"` stays the default — if FFI/GPU drivers later force `unsafe`, contain it minimally with a safety invariant in the module.
+2. Check crate boundaries against `AGENTS.md`: `domain` has no workspace deps and zero I/O; `probe` and `pipeline` depend only on `fastconv-domain`, never on each other; `unsafe_code = "forbid"` applies everywhere. Introducing `unsafe` requires an `AGENTS.md`-level policy decision with a documented, narrowly scoped FFI exception (the existing `--features nvenc` blocks in `gpu/nvenc.rs`/`gpu/nvdec.rs` are the precedent); otherwise redesign to stay safe.
 3. Minimize reader load: no comments restating code — document only the *why* of real driver/codec quirks.

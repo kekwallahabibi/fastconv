@@ -78,7 +78,7 @@ Host: `Intel Core i7-6700` (4C/8T AVX2/FMA, 32 GiB) + `RTX 2060` (6 GB, driver `
 | `jpeg_to_heic` | `fastconv (gpu:nvenc q=80)` | 877.4 | 30.61 MB/s | 525.4 MiB | 26.86 MB | 19.24 MB | 38.16 dB | **13.50x** vs ff(webp) / **4.42x** vs cpu(webp) |
 | `webp_to_heic` | `fastconv (gpu:nvenc q=80)` | 919.7 | 6.18 MB/s | 783.8 MiB | 5.69 MB | 13.21 MB | 38.10 dB | NVENC 20× 4K (no ffmpeg HEIC opponent) |
 
-### Audio — 60 s stereo 48 kHz/16-bit, matched bitrate/quality (34/34 outputs validated: 16 single-file + 18 batch)
+### Audio — 60 s stereo 48 kHz/16-bit, target-matched bitrate/quality (achieved size/PSNR per row; 34/34 outputs validated: 16 single-file + 18 batch)
 | Workload | Tool | Time (ms) | Throughput | Peak RAM | Input | Output | Quality | Speedup |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `wav_to_flac` | `fastconv (flacenc pure rust)` | 50.9 | 226.24 MB/s | 71.4 MiB | 11.52 MB | 4.12 MB | bit-exact | **3.66x** |
@@ -129,6 +129,7 @@ Host: `Intel Core i7-6700` (4C/8T AVX2/FMA, 32 GiB) + `RTX 2060` (6 GB, driver `
 | `webp_to_mkv_nv` | `ffmpeg (hevc_nvenc cq23)` | 424.3 | 141.4 | 0.84 | 291.6 MiB | 0.18 MB | 36.56 dB | Baseline |
 
 ## Known caveats & gaps
+- Audio lossy rows are target-matched, not result-matched: Opus uses 128 kbps on both sides but VBR complexity 9 (fastconv) vs 10 (libopus), so achieved sizes differ (0.98 vs 1.35 MB); per-row PSNR is fastconv-only where ffmpeg shows `—`.
 - WebP animation-input PSNR lag: 29.79 vs 48.94 dB (CPU), 29.63 vs 36.56 dB (NVENC) — known `zenwebp` vs `libwebp` color-conversion delta (still-image repro 30.1 dB); not bought with lower compression (0.30 vs 0.27 MB).
 - Turing AV1 is CPU-decoded; `--hwdecode nvdec` is rejected with no fallback. CPU HEVC encode rejected; NVENC image output is HEIC-only.
 - GPU probe is Linux-only (DRM sysfs / NVIDIA procfs); other OSes report no adapters/backends. Animation bench not yet in `xtask` (external 3-run scripts); not re-run in PR #22.
