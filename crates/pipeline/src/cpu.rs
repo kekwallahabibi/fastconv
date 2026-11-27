@@ -32,6 +32,7 @@ use crate::decode::{
     precreate_target_directories,
 };
 use crate::gif::encode_gif_into;
+use crate::heic::encode_heic_into;
 use crate::ico::encode_ico_into;
 use crate::pnm::encode_pnm_to_writer;
 use crate::qoi::encode_qoi_into;
@@ -80,6 +81,9 @@ pub(crate) enum CpuImageEncoder {
     Gif,
     Ico,
     Pnm,
+    Heic {
+        quality: ImageQuality,
+    },
 }
 
 static STAGING_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -293,6 +297,14 @@ pub(crate) fn execute_cpu_image_batch(
             // while small batches assign remaining cores to inner tile threads.
             let count = configured_workers.min(items.len()).clamp(1, 8);
             let inner = (configured_workers / count).clamp(1, 8);
+            (count, inner)
+        }
+        CpuImageEncoder::Heic { .. } => {
+            // Cap concurrent image workers so HEVC tile state plus the RGB/RGBA
+            // scratch buffers of a 4K batch stay well below 3 GiB. A single large
+            // image still gets every configured core via heifer's tile threading.
+            let count = configured_workers.min(items.len()).clamp(1, 8);
+            let inner = (configured_workers / count).max(1);
             (count, inner)
         }
         _ => (effective_workers, 1),
@@ -515,6 +527,14 @@ fn encode_item_pixels(
             write_encoded_buffer(item.target(), buffers.encoded)
         }
         CpuImageEncoder::Pnm => encode_pnm_streaming(item.target(), pixels, decoded, buffers.aux),
+        CpuImageEncoder::Heic { quality } => encode_heic_streaming(
+            item.target(),
+            quality,
+            encode_threads,
+            pixels,
+            decoded,
+            buffers.aux,
+        ),
     }
 }
 
@@ -687,6 +707,39 @@ fn encode_pnm_streaming(
     }
     staging.commit(target, file)?;
     Ok(bytes)
+}
+
+fn encode_heic_streaming(
+    target: &Path,
+    quality: ImageQuality,
+    threads: usize,
+    pixels: &[u8],
+    decoded: DecodedFrameMeta,
+    aux_buf: &mut Vec<u8>,
+) -> Result<u64, PipelineError> {
+    let encoded = encode_heic_into(target, quality, threads, pixels, decoded, aux_buf)?;
+    if encoded.is_empty() {
+        return Err(PipelineError::EmptyOutput(target.to_path_buf()));
+    }
+
+    let (staging, file) = StagingFile::create_for(target)?;
+    let mut writer = BufWriter::with_capacity(STREAM_IO_BUF_BYTES, file);
+    writer
+        .write_all(&encoded)
+        .map_err(|source| PipelineError::Io {
+            path: target.to_path_buf(),
+            source,
+        })?;
+    writer.flush().map_err(|source| PipelineError::Io {
+        path: target.to_path_buf(),
+        source,
+    })?;
+    let file = writer.into_inner().map_err(|err| PipelineError::Io {
+        path: target.to_path_buf(),
+        source: err.into_error(),
+    })?;
+    staging.commit(target, file)?;
+    Ok(u64::try_from(encoded.len()).unwrap_or(u64::MAX))
 }
 
 /// Prepares the whole BMP frame in parallel, then flushes it to disk under a

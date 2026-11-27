@@ -158,6 +158,8 @@ fn convert_help_documents_accepted_flags_and_rules() -> Result<(), String> {
         "ppm/pgm/pbm/pam -> pnm",
         "256-color",
         "HEIC",
+        "pure Rust HEVC-Intra encoder",
+        "GPU-accelerated HEIC only",
         "no silent CPU fallback",
         "directory batches default to webp",
         "vaapi",
@@ -178,6 +180,10 @@ fn convert_help_documents_accepted_flags_and_rules() -> Result<(), String> {
     assert!(
         !text.contains("required for directory batches"),
         "convert --to is optional for directory batches (defaults to webp)"
+    );
+    assert!(
+        !text.contains("CPU has no native HEIC encoder"),
+        "convert help must not claim the CPU backend lacks a HEIC encoder"
     );
     Ok(())
 }

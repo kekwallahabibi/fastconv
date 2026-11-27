@@ -21,6 +21,9 @@ fastconv-domain = { path = "crates/domain" }
 fastconv-probe = { path = "crates/probe" }
 fastconv-pipeline = { path = "crates/pipeline" }
 flacenc = { version = "0.5.1", default-features = false }
+# Pure-Rust HEIC/HEIF encoder (`MIT OR Apache-2.0`, MSRV 1.85, `#![forbid(unsafe_code)]`).
+# `default-features = false` keeps the optional `image` crate out of the dependency tree.
+heifer = { version = "0.7.3", default-features = false, features = ["encoder"] }
 hound = "3.5.1"
 jpeg-encoder = { version = "0.7.1", features = ["simd"] }
 # JPEG XL decode is the pure-Rust `jxl` (jxl-rs) port; encode is the pure-Rust
@@ -66,6 +69,20 @@ zune-jpeg = "0.5.16-rc3"
 lto = "thin"
 
 [profile.dev.package.alac-encoder]
+opt-level = 3
+
+# HEVC intra encoding is CPU-bound; keep debug-profile tests fast without
+# changing the encoder's fair Medium speed/quality preset.
+[profile.dev.package.heifer]
+opt-level = 3
+
+[profile.dev.package.heifer-hevc-enc]
+opt-level = 3
+
+[profile.dev.package.heifer-hevc-dec]
+opt-level = 3
+
+[profile.dev.package.heifer-isobmff]
 opt-level = 3
 
 [profile.dev.package.rusty_aac]

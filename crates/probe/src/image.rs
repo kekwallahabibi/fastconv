@@ -33,6 +33,14 @@ const GIF89A_MAGIC: [u8; 6] = *b"GIF89a";
 const ICO_MAGIC: [u8; 4] = [0x00, 0x00, 0x01, 0x00];
 // 128 Mi pixels = 512 MiB RGBA8 budget, matching `MAX_QOI_PIXELS`.
 const MAX_STILL_IMAGE_PIXELS: u64 = 128 * 1024 * 1024;
+// CPU HEIC hands pixels to `heifer` (half its 2^28-pixel limit) and expands L8/La8
+// into a reusable per-worker RGB/RGBA scratch buffer capped at 128 MiB, so eight
+// workers stay under ~1 GiB. Checked here, before the source pixels are decoded.
+const MAX_HEIC_PIXELS: u64 = 128 * 1024 * 1024;
+const MAX_HEIC_EXPANSION_BYTES: u64 = 128 * 1024 * 1024;
+// `heifer` encodes images as a grid of 512x512 tiles capped at 256 columns/rows;
+// a single axis above 256*512 is rejected only after decode, so screen it here.
+const MAX_HEIC_DIMENSION: u32 = 256 * 512;
 const MAX_GIF_DECODE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PNM_HEADER_BYTES: usize = 64 * 1024;
 const KNOWN_IMAGE_EXTENSIONS: &[&str] = &[
@@ -1562,6 +1570,55 @@ struct ImageBatchRequest<'a> {
     hardware: Option<&'a HostHardware>,
 }
 
+/// Rejects CPU-HEIC sources whose header geometry cannot fit the encoder's pixel
+/// and per-worker expansion budgets before any pixels are decoded.
+fn validate_cpu_heic_admission(
+    path: &Path,
+    mode: ImageExecutionMode,
+    dimensions: ImageDimensions,
+) -> Result<(), ProbeError> {
+    if !matches!(mode, ImageExecutionMode::CpuHeic { .. }) {
+        return Ok(());
+    }
+
+    if dimensions.width().get() > MAX_HEIC_DIMENSION
+        || dimensions.height().get() > MAX_HEIC_DIMENSION
+    {
+        return Err(invalid_image(
+            path,
+            format!(
+                "HEIC dimensions {}x{} exceed the {MAX_HEIC_DIMENSION}-pixel per-axis limit",
+                dimensions.width(),
+                dimensions.height()
+            ),
+        ));
+    }
+
+    let pixels = u64::from(dimensions.width().get())
+        .checked_mul(u64::from(dimensions.height().get()))
+        .ok_or_else(|| invalid_image(path, "HEIC dimensions overflow pixel count".to_owned()))?;
+    if pixels > MAX_HEIC_PIXELS {
+        return Err(invalid_image(
+            path,
+            format!("HEIC pixel count ({pixels}) exceeds the {MAX_HEIC_PIXELS}-pixel limit"),
+        ));
+    }
+    // Header dimensions do not carry the decoded channel layout, so budget the
+    // worst case (L8/La8 expanded 3x/4x) conservatively for every CPU-HEIC source.
+    let scratch = pixels
+        .checked_mul(4)
+        .ok_or_else(|| invalid_image(path, "HEIC expansion scratch overflow".to_owned()))?;
+    if scratch > MAX_HEIC_EXPANSION_BYTES {
+        return Err(invalid_image(
+            path,
+            format!(
+                "HEIC pixel count ({pixels}) needs {scratch} bytes of expansion scratch (limit {MAX_HEIC_EXPANSION_BYTES})"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn prepare_image_batch_inner(
     request: &ImageBatchRequest<'_>,
 ) -> Result<ImageBatchPlan, ProbeError> {
@@ -1602,6 +1659,7 @@ fn prepare_image_batch_inner(
         let mode =
             resolve_execution_mode(resolved_format, compression, options, backend, hardware)?;
         let probed = probe_image(source)?;
+        validate_cpu_heic_admission(source, mode, probed.dimensions)?;
         reject_canonical_same_path(source, &resolved_target)?;
         let item = ImageBatchItem::new(
             source.to_path_buf(),
@@ -1700,6 +1758,7 @@ fn prepare_directory_batch(
     let format = mode.output_format();
     let mut items = Vec::with_capacity(probed_entries.len());
     for (src_path, probed) in probed_entries {
+        validate_cpu_heic_admission(&src_path, mode, probed.dimensions)?;
         let out_path = derive_target_in_dir(&src_path, target_dir, format)?;
         reject_canonical_same_path(&src_path, &out_path)?;
         items.push(ImageBatchItem::new(
@@ -1884,7 +1943,7 @@ fn reject_canonical_same_path(source: &Path, target: &Path) -> Result<(), ProbeE
 mod tests {
     use super::{
         ImageBatchRequest, ProbedImage, prepare_image_batch, prepare_image_batch_inner,
-        prepare_image_batch_with_options, probe_image,
+        prepare_image_batch_with_options, probe_image, validate_cpu_heic_admission,
     };
     use crate::ProbeError;
     use fastconv_domain::{
@@ -2352,6 +2411,91 @@ mod tests {
         let into_dir =
             prepare_image_batch(&jpg_path, &out_dir, lossy, None, None, HardwareBackend::Cpu)?;
         assert_eq!(into_dir.items()[0].target(), out_dir.join("beta.webp"));
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_heic_admission_bounds_pixels_and_expansion() -> Result<(), ProbeError> {
+        let path = Path::new("oversized.heic");
+        let heic = ImageExecutionMode::CpuHeic {
+            quality: ImageQuality::DEFAULT,
+        };
+
+        // A 4K source is well inside both budgets.
+        validate_cpu_heic_admission(path, heic, ImageDimensions::new(3840, 2160)?)?;
+
+        // Non-HEIC targets are unaffected by the HEIC budgets.
+        validate_cpu_heic_admission(
+            path,
+            ImageExecutionMode::CpuPnm,
+            ImageDimensions::new(20_000, 20_000)?,
+        )?;
+
+        // A wide-but-small-area image fits both budgets, but `heifer` would reject
+        // its 257 tile columns only after decode; screen the per-axis limit here.
+        assert!(matches!(
+            validate_cpu_heic_admission(path, heic, ImageDimensions::new(131_073, 128)?),
+            Err(ProbeError::InvalidImage { ref reason, .. })
+                if reason.contains("per-axis limit")
+        ));
+
+        // 16384^2 = 2^28 pixels exceeds the HEIC pixel cap.
+        assert!(matches!(
+            validate_cpu_heic_admission(path, heic, ImageDimensions::new(16_384, 16_384)?),
+            Err(ProbeError::InvalidImage { .. })
+        ));
+
+        // 40M pixels pass the pixel cap and both axes, but the worst-case 4-byte
+        // L8/La8 expansion (160 MiB) exceeds the per-worker scratch budget.
+        assert!(matches!(
+            validate_cpu_heic_admission(path, heic, ImageDimensions::new(100_000, 400)?),
+            Err(ProbeError::InvalidImage { ref reason, .. })
+                if reason.contains("expansion scratch")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn prepares_cpu_heic_single_targets() -> Result<(), ProbeError> {
+        let root = create_temp_dir("cpu-heic-single")?;
+        let png_path = root.join("alpha.png");
+        write_tiny_png(&png_path, 16, 12)?;
+
+        let cpu_heic = prepare_image_batch(
+            &png_path,
+            &root.join("cpu.heic"),
+            None,
+            Some(ImageOutputFormat::Heic),
+            None,
+            HardwareBackend::Cpu,
+        )?;
+        assert_eq!(
+            cpu_heic.mode(),
+            ImageExecutionMode::CpuHeic {
+                quality: ImageQuality::DEFAULT,
+            }
+        );
+        assert_eq!(cpu_heic.output_format(), ImageOutputFormat::Heic);
+        assert_eq!(cpu_heic.backend(), HardwareBackend::Cpu);
+
+        let cpu_heic_explicit = prepare_image_batch(
+            &png_path,
+            &root.join("cpu_q90.heic"),
+            Some(ImageCompression::Lossy {
+                quality: ImageQuality::new(90)?,
+            }),
+            Some(ImageOutputFormat::Heic),
+            None,
+            HardwareBackend::Cpu,
+        )?;
+        assert_eq!(
+            cpu_heic_explicit.mode(),
+            ImageExecutionMode::CpuHeic {
+                quality: ImageQuality::new(90)?,
+            }
+        );
 
         fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
         Ok(())
