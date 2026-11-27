@@ -21,7 +21,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::thread;
 
 use fastconv_domain::{ConversionRequest, DomainError, HardwareBackend, MediaKind};
@@ -55,6 +55,7 @@ pub enum ProbeError {
         path: PathBuf,
         expected: &'static str,
     },
+    UnresolvedParentComponent(PathBuf),
     ParallelismUnavailable(io::Error),
     InvalidDomain(DomainError),
 }
@@ -119,6 +120,13 @@ impl fmt::Display for ProbeError {
                     path.display()
                 )
             }
+            Self::UnresolvedParentComponent(path) => {
+                write!(
+                    f,
+                    "cannot resolve '..' through a missing directory in '{}'",
+                    path.display()
+                )
+            }
             Self::ParallelismUnavailable(source) => {
                 write!(f, "failed to determine host CPU parallelism: {source}")
             }
@@ -141,7 +149,8 @@ impl Error for ProbeError {
             | Self::InvalidVideo { .. }
             | Self::EmptyVideoDirectory(_)
             | Self::InvalidAudio { .. }
-            | Self::UnsupportedTargetFormat { .. } => None,
+            | Self::UnsupportedTargetFormat { .. }
+            | Self::UnresolvedParentComponent(_) => None,
         }
     }
 }
@@ -183,7 +192,8 @@ pub fn validate_source_file(path: &Path) -> Result<PathBuf, ProbeError> {
 /// Resolves a path to an absolute location, using the nearest existing ancestor
 /// for outputs that do not exist yet. This makes relative/absolute aliases
 /// comparable at the boundary, so alias checks can reject in-place overwrites
-/// and missing-parent targets still resolve deterministically.
+/// and missing-parent targets still resolve deterministically. A `..` that
+/// falls in the unresolved suffix is rejected rather than silently dropped.
 pub(crate) fn canonical_or_parent(path: &Path) -> Result<PathBuf, ProbeError> {
     let mut cursor = path.to_path_buf();
     let mut missing = std::collections::VecDeque::new();
@@ -195,7 +205,14 @@ pub(crate) fn canonical_or_parent(path: &Path) -> Result<PathBuf, ProbeError> {
                 }
                 return Ok(canonical);
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                // `..` requires its preceding directory to exist: dropping it
+                // here would rewrite e.g. `new/../clip.mp4` (with `new` absent)
+                // into a different path and defeat the alias check.
+                if matches!(cursor.components().next_back(), Some(Component::ParentDir)) {
+                    return Err(ProbeError::UnresolvedParentComponent(path.to_path_buf()));
+                }
+            }
             Err(source) => {
                 return Err(ProbeError::Io {
                     path: cursor,
@@ -256,7 +273,7 @@ pub fn prepare_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{ProbeError, available_cpu_threads, validate_source_file};
+    use super::{ProbeError, available_cpu_threads, canonical_or_parent, validate_source_file};
     use std::path::Path;
 
     #[test]
@@ -272,6 +289,32 @@ mod tests {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let result = validate_source_file(dir);
         assert!(matches!(result, Err(ProbeError::NotAFile(_))));
+    }
+
+    #[test]
+    fn rejects_unresolved_parent_component_in_target() {
+        let unresolved = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("missing-alias-parent")
+            .join("..")
+            .join("Cargo.toml");
+        assert!(matches!(
+            canonical_or_parent(&unresolved),
+            Err(ProbeError::UnresolvedParentComponent(_))
+        ));
+    }
+
+    #[test]
+    fn resolves_parent_component_through_existing_directory() -> Result<(), ProbeError> {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let with_parent = manifest_dir
+            .join("src")
+            .join("..")
+            .join("not-there-yet.txt");
+        assert_eq!(
+            canonical_or_parent(&with_parent)?,
+            manifest_dir.join("not-there-yet.txt")
+        );
+        Ok(())
     }
 
     #[test]
