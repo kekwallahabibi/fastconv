@@ -296,8 +296,9 @@ pub(crate) fn decode_heic_slice_into(
     match hint {
         DecodeTargetHint::Native => {
             if image.has_alpha {
-                reserve_pixel_buf(source, pixel_buf, expected)?;
-                pixel_buf.copy_from_slice(&image.data);
+                // The decoder already owns a roomy RGBA8 allocation; handing it
+                // to the reusable scratch avoids copying up to 33 MiB per 4K frame.
+                *pixel_buf = image.data;
                 Ok((width, height, DecodedPixelFormat::Rgba8, expected))
             } else {
                 let rgb_len = pixels
@@ -330,8 +331,7 @@ pub(crate) fn decode_heic_slice_into(
                     format: "non-opaque alpha channel (NVENC HEVC-Intra HEIC currently supports opaque images)".to_owned(),
                 });
             }
-            reserve_pixel_buf(source, pixel_buf, expected)?;
-            pixel_buf.copy_from_slice(&image.data);
+            *pixel_buf = image.data;
             Ok((width, height, DecodedPixelFormat::Rgba8, expected))
         }
     }

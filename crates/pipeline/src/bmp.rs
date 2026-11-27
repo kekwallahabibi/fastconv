@@ -3,6 +3,8 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Condvar, Mutex};
 
+use yuv::{rgb_to_bgr, rgba_to_bgra};
+
 use crate::PipelineError;
 use crate::decode::{DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat};
 
@@ -132,6 +134,14 @@ fn swizzle_rgb24_to_bgr24(src_row: &[u8], dst_row: &mut [u8]) {
     }
 }
 
+#[inline]
+fn swizzle_error(target: &Path, err: &yuv::YuvError) -> PipelineError {
+    PipelineError::EncodeFailed {
+        path: target.to_path_buf(),
+        reason: format!("BMP channel swizzle failed: {err}"),
+    }
+}
+
 #[cfg(test)]
 #[inline]
 fn flush_slice<W: Write>(target: &Path, bytes: &[u8], writer: &mut W) -> Result<(), PipelineError> {
@@ -177,19 +187,204 @@ pub(crate) fn encode_bmp_into_frame(
     })?;
 
     match decoded.format {
-        DecodedPixelFormat::Rgb8 => {
-            encode_bmp_rgb24(target, pixels, width, height, width_i32, height_i32, frame)
-        }
+        DecodedPixelFormat::Rgb8 => encode_bmp_rgb24(
+            target,
+            pixels,
+            width,
+            height,
+            width_i32,
+            height_i32,
+            decoded.width,
+            frame,
+        ),
         DecodedPixelFormat::Rgba8 => encode_bmp_bgra32(
-            target, pixels, width, height, width_i32, height_i32, false, frame,
+            target,
+            pixels,
+            width,
+            height,
+            width_i32,
+            height_i32,
+            decoded.width,
+            false,
+            frame,
         ),
         DecodedPixelFormat::L8 => {
             encode_bmp_gray8(target, pixels, width, height, width_i32, height_i32, frame)
         }
         DecodedPixelFormat::La8 => encode_bmp_bgra32(
-            target, pixels, width, height, width_i32, height_i32, true, frame,
+            target,
+            pixels,
+            width,
+            height,
+            width_i32,
+            height_i32,
+            decoded.width,
+            true,
+            frame,
         ),
     }
+}
+
+/// Header and total byte count for a BMP whose pixels were transformed in place.
+pub(crate) struct BmpInPlaceHeader {
+    pub(crate) bytes: [u8; BMP_FILE_HEADER_LEN + BMP_V4_HEADER_LEN],
+    pub(crate) len: usize,
+    pub(crate) total_bytes: u64,
+}
+
+type RowSwizzle = fn(&[u8], u32, &mut [u8], u32, u32, u32) -> Result<(), yuv::YuvError>;
+
+fn build_in_place_header(
+    bpp: usize,
+    width_i32: i32,
+    height_i32: i32,
+    file_size_u32: u32,
+    image_size_u32: u32,
+) -> BmpInPlaceHeader {
+    let header_len = if bpp == 3 {
+        BMP_FILE_HEADER_LEN + BMP_INFO_HEADER_LEN
+    } else {
+        BMP_FILE_HEADER_LEN + BMP_V4_HEADER_LEN
+    };
+    let mut header = [0_u8; BMP_FILE_HEADER_LEN + BMP_V4_HEADER_LEN];
+    header[0..2].copy_from_slice(b"BM");
+    header[2..6].copy_from_slice(&file_size_u32.to_le_bytes());
+    header[18..22].copy_from_slice(&width_i32.to_le_bytes());
+    header[22..26].copy_from_slice(&height_i32.to_le_bytes());
+    header[26..28].copy_from_slice(&1_u16.to_le_bytes());
+    header[34..38].copy_from_slice(&image_size_u32.to_le_bytes());
+    if bpp == 3 {
+        header[10..14].copy_from_slice(&54_u32.to_le_bytes());
+        header[14..18].copy_from_slice(&40_u32.to_le_bytes());
+        header[28..30].copy_from_slice(&24_u16.to_le_bytes());
+    } else {
+        header[10..14].copy_from_slice(&122_u32.to_le_bytes());
+        header[14..18].copy_from_slice(&108_u32.to_le_bytes()); // BITMAPV4HEADER
+        header[28..30].copy_from_slice(&32_u16.to_le_bytes());
+        header[30..34].copy_from_slice(&3_u32.to_le_bytes()); // BI_BITFIELDS
+        header[54..58].copy_from_slice(&0x00FF_0000_u32.to_le_bytes()); // R
+        header[58..62].copy_from_slice(&0x0000_FF00_u32.to_le_bytes()); // G
+        header[62..66].copy_from_slice(&0x0000_00FF_u32.to_le_bytes()); // B
+        header[66..70].copy_from_slice(&0xFF00_0000_u32.to_le_bytes()); // A
+        header[70..74].copy_from_slice(b"BGRs"); // LCS_sRGB
+    }
+    BmpInPlaceHeader {
+        bytes: header,
+        len: header_len,
+        total_bytes: u64::from(file_size_u32),
+    }
+}
+
+/// Flips the decoded rows bottom-up and swizzles them in place, using a single
+/// auxiliary row. Returns the BMP header when the format is directly supported;
+/// `None` means the caller must use the full-frame encoder (palettized grayscale
+/// or 24-bit rows that need scanline padding).
+pub(crate) fn prepare_bmp_in_place(
+    target: &Path,
+    pixels: &mut [u8],
+    decoded: DecodedFrameMeta,
+    aux_row: &mut Vec<u8>,
+) -> Result<Option<BmpInPlaceHeader>, PipelineError> {
+    let (bpp, swizzle) = match decoded.format {
+        // A width divisible by four makes RGB24 rows already 4-byte aligned, so
+        // no padding bytes are needed between scanlines.
+        DecodedPixelFormat::Rgb8 if decoded.width.is_multiple_of(4) => {
+            (3_usize, rgb_to_bgr as RowSwizzle)
+        }
+        DecodedPixelFormat::Rgba8 => (4_usize, rgba_to_bgra as RowSwizzle),
+        _ => return Ok(None),
+    };
+
+    let width_i32 = i32::try_from(decoded.width).map_err(|_| PipelineError::EncodeFailed {
+        path: target.to_path_buf(),
+        reason: format!("BMP width exceeds i32::MAX: {}", decoded.width),
+    })?;
+    let height_i32 = i32::try_from(decoded.height).map_err(|_| PipelineError::EncodeFailed {
+        path: target.to_path_buf(),
+        reason: format!("BMP height exceeds i32::MAX: {}", decoded.height),
+    })?;
+    let width = usize::try_from(decoded.width).map_err(|_| PipelineError::EncodeFailed {
+        path: target.to_path_buf(),
+        reason: "BMP width exceeds addressable memory".to_owned(),
+    })?;
+    let height = usize::try_from(decoded.height).map_err(|_| PipelineError::EncodeFailed {
+        path: target.to_path_buf(),
+        reason: "BMP height exceeds addressable memory".to_owned(),
+    })?;
+    let row_bytes = width
+        .checked_mul(bpp)
+        .ok_or_else(|| PipelineError::EncodeFailed {
+            path: target.to_path_buf(),
+            reason: "BMP row size overflow".to_owned(),
+        })?;
+    let pixel_bytes = row_bytes
+        .checked_mul(height)
+        .ok_or_else(|| PipelineError::EncodeFailed {
+            path: target.to_path_buf(),
+            reason: "BMP pixel size overflow".to_owned(),
+        })?;
+    if pixels.len() != pixel_bytes {
+        return Err(PipelineError::EncodeFailed {
+            path: target.to_path_buf(),
+            reason: format!(
+                "pixel buffer length {} does not match expected {pixel_bytes}",
+                pixels.len()
+            ),
+        });
+    }
+    let header_len = if bpp == 3 {
+        BMP_FILE_HEADER_LEN + BMP_INFO_HEADER_LEN
+    } else {
+        BMP_FILE_HEADER_LEN + BMP_V4_HEADER_LEN
+    };
+    let total_bytes =
+        header_len
+            .checked_add(pixel_bytes)
+            .ok_or_else(|| PipelineError::EncodeFailed {
+                path: target.to_path_buf(),
+                reason: "BMP file size overflow".to_owned(),
+            })?;
+    let file_size_u32 = u32::try_from(total_bytes).map_err(|_| PipelineError::EncodeFailed {
+        path: target.to_path_buf(),
+        reason: format!("BMP file size {total_bytes} exceeds 4 GiB BMP format limit"),
+    })?;
+    let image_size_u32 = u32::try_from(pixel_bytes).map_err(|_| PipelineError::EncodeFailed {
+        path: target.to_path_buf(),
+        reason: "BMP image payload exceeds u32::MAX".to_owned(),
+    })?;
+    let stride = u32::try_from(row_bytes).map_err(|_| PipelineError::EncodeFailed {
+        path: target.to_path_buf(),
+        reason: "BMP row stride exceeds u32::MAX".to_owned(),
+    })?;
+
+    let header = build_in_place_header(bpp, width_i32, height_i32, file_size_u32, image_size_u32);
+
+    if aux_row.len() < row_bytes {
+        aux_row.resize(row_bytes, 0);
+    }
+    let aux = &mut aux_row[..row_bytes];
+    for top in 0..height / 2 {
+        let bottom = height - 1 - top;
+        let (head, tail) = pixels.split_at_mut((top + 1) * row_bytes);
+        let top_row = &mut head[top * row_bytes..];
+        let bottom_row = &mut tail[(bottom - top - 1) * row_bytes..(bottom - top) * row_bytes];
+        // aux <- swizzled top; top <- swizzled bottom; bottom <- aux. The two
+        // source rows never overlap, so no second full-row buffer is needed.
+        swizzle(top_row, stride, aux, stride, decoded.width, 1)
+            .map_err(|err| swizzle_error(target, &err))?;
+        swizzle(bottom_row, stride, top_row, stride, decoded.width, 1)
+            .map_err(|err| swizzle_error(target, &err))?;
+        bottom_row.copy_from_slice(aux);
+    }
+    if height % 2 == 1 {
+        let mid = height / 2;
+        let row = &mut pixels[mid * row_bytes..(mid + 1) * row_bytes];
+        swizzle(row, stride, aux, stride, decoded.width, 1)
+            .map_err(|err| swizzle_error(target, &err))?;
+        row.copy_from_slice(aux);
+    }
+
+    Ok(Some(header))
 }
 
 /// Test helper: writes a complete BMP frame into `writer`.
@@ -218,6 +413,7 @@ fn encode_bmp_rgb24(
     height: usize,
     width_i32: i32,
     height_i32: i32,
+    source_width: u32,
     frame: &mut BmpFrameScratch,
 ) -> Result<u64, PipelineError> {
     let src_row_bytes = width
@@ -286,9 +482,22 @@ fn encode_bmp_rgb24(
     let buf = &mut frame.bytes[..total_bytes];
     buf[..header_len].copy_from_slice(&header);
     let mut cursor = header_len;
+    let src_stride = u32::try_from(src_row_bytes).map_err(|_| PipelineError::EncodeFailed {
+        path: target.to_path_buf(),
+        reason: "BMP RGB row stride exceeds u32::MAX".to_owned(),
+    })?;
+    let dst_stride = u32::try_from(row_stride).unwrap_or(u32::MAX);
 
     for row in pixels.chunks_exact(src_row_bytes).rev() {
-        swizzle_rgb24_to_bgr24(row, &mut buf[cursor..cursor + src_row_bytes]);
+        rgb_to_bgr(
+            row,
+            src_stride,
+            &mut buf[cursor..cursor + row_stride],
+            dst_stride,
+            source_width,
+            1,
+        )
+        .map_err(|err| swizzle_error(target, &err))?;
         if row_stride > src_row_bytes {
             buf[cursor + src_row_bytes..cursor + row_stride].fill(0);
         }
@@ -307,6 +516,7 @@ fn encode_bmp_bgra32(
     height: usize,
     width_i32: i32,
     height_i32: i32,
+    source_width: u32,
     from_la8: bool,
     frame: &mut BmpFrameScratch,
 ) -> Result<u64, PipelineError> {
@@ -389,19 +599,23 @@ fn encode_bmp_bgra32(
     let buf = &mut frame.bytes[..total_bytes];
     buf[..header_len].copy_from_slice(&header);
     let mut cursor = header_len;
+    let src_stride = u32::try_from(src_row_bytes).map_err(|_| PipelineError::EncodeFailed {
+        path: target.to_path_buf(),
+        reason: "BMP BGRA row stride exceeds u32::MAX".to_owned(),
+    })?;
+    let dst_stride = u32::try_from(row_stride).unwrap_or(u32::MAX);
 
     for row in pixels.chunks_exact(src_row_bytes).rev() {
-        let (dst_quads, _) = buf[cursor..cursor + row_stride].as_chunks_mut::<4>();
+        let dst = &mut buf[cursor..cursor + row_stride];
         if from_la8 {
+            let (dst_quads, _) = dst.as_chunks_mut::<4>();
             let (src_pairs, _) = row.as_chunks::<2>();
-            for (&[v, a], dst) in src_pairs.iter().zip(dst_quads.iter_mut()) {
-                *dst = [v, v, v, a];
+            for (&[v, a], out) in src_pairs.iter().zip(dst_quads.iter_mut()) {
+                *out = [v, v, v, a];
             }
         } else {
-            let (src_quads, _) = row.as_chunks::<4>();
-            for (&[r, g, b, a], dst) in src_quads.iter().zip(dst_quads.iter_mut()) {
-                *dst = [b, g, r, a];
-            }
+            rgba_to_bgra(row, src_stride, dst, dst_stride, source_width, 1)
+                .map_err(|err| swizzle_error(target, &err))?;
         }
         cursor += row_stride;
     }
@@ -1305,9 +1519,61 @@ fn decode_bmp_indexed(
 
 #[cfg(test)]
 mod tests {
-    use super::{BmpFrameScratch, decode_bmp_slice_into, encode_bmp_to_writer};
+    use super::{
+        BmpFrameScratch, decode_bmp_slice_into, encode_bmp_into_frame, encode_bmp_to_writer,
+        prepare_bmp_in_place,
+    };
     use crate::decode::{DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat};
     use std::path::Path;
+
+    #[test]
+    fn in_place_bmp_matches_full_frame_byte_for_byte() -> Result<(), Box<dyn std::error::Error>> {
+        let p = Path::new("parity.bmp");
+        for (width, height) in [(4_u32, 4_u32), (4, 5), (8, 7), (13, 9), (16, 1), (3, 2)] {
+            for format in [
+                DecodedPixelFormat::Rgb8,
+                DecodedPixelFormat::Rgba8,
+                DecodedPixelFormat::L8,
+                DecodedPixelFormat::La8,
+            ] {
+                let bpp = match format {
+                    DecodedPixelFormat::L8 => 1_usize,
+                    DecodedPixelFormat::La8 => 2,
+                    DecodedPixelFormat::Rgb8 => 3,
+                    DecodedPixelFormat::Rgba8 => 4,
+                };
+                let pixels: Vec<u8> = (0..width as usize * height as usize * bpp)
+                    .map(|i| u8::try_from((i * 31 + 17) % 256).unwrap_or(0))
+                    .collect();
+                let decoded = DecodedFrameMeta {
+                    width,
+                    height,
+                    format,
+                    byte_len: pixels.len(),
+                    input_file_bytes: 1,
+                    has_non_opaque_native_alpha: false,
+                };
+
+                let mut frame = BmpFrameScratch::new();
+                let written = encode_bmp_into_frame(p, &pixels, decoded, &mut frame)?;
+                let expected = frame.bytes()[..usize::try_from(written)?].to_vec();
+
+                let mut in_place_pixels = pixels.clone();
+                let mut aux = Vec::new();
+                match prepare_bmp_in_place(p, &mut in_place_pixels, decoded, &mut aux)? {
+                    Some(header) => {
+                        let mut actual = Vec::with_capacity(expected.len());
+                        actual.extend_from_slice(&header.bytes[..header.len]);
+                        actual.extend_from_slice(&in_place_pixels);
+                        assert_eq!(actual, expected, "{format:?} {width}x{height}");
+                        assert_eq!(header.total_bytes, written);
+                    }
+                    None => assert_eq!(in_place_pixels, pixels),
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn roundtrips_odd_width_rgb24_rgba32_and_gray8_bmp() -> Result<(), Box<dyn std::error::Error>> {

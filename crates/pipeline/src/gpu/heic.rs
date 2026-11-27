@@ -105,15 +105,15 @@ pub fn mux_annex_b_hevc_to_heic(
     let sps_info = parse_sps_config(first_sps)?;
     let hvcc_payload = build_hvcc_payload(&sps_info, &vps_nals, &sps_nals, &pps_nals)?;
 
-    let mut mdat_payload = Vec::with_capacity(annex_b.len());
-    for nal in &picture_nals {
-        let len_u32 =
-            u32::try_from(nal.len()).map_err(|_| HeicMuxError::SizeOverflow("mdat NAL length"))?;
-        mdat_payload.extend_from_slice(&len_u32.to_be_bytes());
-        mdat_payload.extend_from_slice(nal);
-    }
-    let mdat_len_u32 = u32::try_from(mdat_payload.len())
-        .map_err(|_| HeicMuxError::SizeOverflow("mdat payload"))?;
+    // Each picture NAL is prefixed by its 4-byte length inside `mdat`. Computing
+    // the length first lets us size the final container once and stream NALs
+    // straight into it instead of assembling (and copying) an intermediate mdat.
+    let mdat_len = picture_nals.iter().try_fold(0_usize, |acc, nal| {
+        acc.checked_add(4).and_then(|n| n.checked_add(nal.len()))
+    });
+    let mdat_len = mdat_len.ok_or(HeicMuxError::SizeOverflow("mdat payload"))?;
+    let mdat_len_u32 =
+        u32::try_from(mdat_len).map_err(|_| HeicMuxError::SizeOverflow("mdat payload"))?;
 
     let ftyp = build_ftyp_box()?;
     let hdlr = build_hdlr_box()?;
@@ -123,12 +123,16 @@ pub fn mux_annex_b_hevc_to_heic(
     let placeholder_iloc = build_iloc_box(0, mdat_len_u32)?;
 
     // `iloc` uses a fixed 4-byte `base_offset`, so `meta` size is invariant to the offset value.
-    let meta_size = 12_usize
-        .checked_add(hdlr.len())
-        .and_then(|n| n.checked_add(pitm.len()))
+    let meta_children_len = hdlr
+        .len()
+        .checked_add(pitm.len())
         .and_then(|n| n.checked_add(placeholder_iloc.len()))
         .and_then(|n| n.checked_add(iinf.len()))
         .and_then(|n| n.checked_add(iprp.len()))
+        .ok_or(HeicMuxError::SizeOverflow("meta box"))?;
+    // FullBox header (size + fourcc + version/flags) adds 12 bytes.
+    let meta_size = meta_children_len
+        .checked_add(12)
         .ok_or(HeicMuxError::SizeOverflow("meta box"))?;
 
     let mdat_payload_offset = ftyp
@@ -140,19 +144,38 @@ pub fn mux_annex_b_hevc_to_heic(
         .map_err(|_| HeicMuxError::SizeOverflow("iloc offset"))?;
     let iloc = build_iloc_box(mdat_offset_u32, mdat_len_u32)?;
 
-    let mut meta_children = Vec::with_capacity(meta_size);
-    meta_children.extend_from_slice(&hdlr);
-    meta_children.extend_from_slice(&pitm);
-    meta_children.extend_from_slice(&iloc);
-    meta_children.extend_from_slice(&iinf);
-    meta_children.extend_from_slice(&iprp);
-    let meta = wrap_full_box(*b"meta", 0, 0, &meta_children)?;
-    let mdat = wrap_box(*b"mdat", &mdat_payload)?;
+    let total_len = ftyp
+        .len()
+        .checked_add(meta_size)
+        .and_then(|n| n.checked_add(8))
+        .and_then(|n| n.checked_add(mdat_len))
+        .ok_or(HeicMuxError::SizeOverflow("HEIC container"))?;
+    let meta_size_u32 =
+        u32::try_from(meta_size).map_err(|_| HeicMuxError::SizeOverflow("box size"))?;
+    let mdat_size_u32 = mdat_len_u32
+        .checked_add(8)
+        .ok_or(HeicMuxError::SizeOverflow("box size"))?;
 
-    let mut output = Vec::with_capacity(ftyp.len() + meta.len() + mdat.len());
+    let mut output = Vec::with_capacity(total_len);
     output.extend_from_slice(&ftyp);
-    output.extend_from_slice(&meta);
-    output.extend_from_slice(&mdat);
+    // FullBox `meta` header: size, fourcc, version 0, flags 0.
+    output.extend_from_slice(&meta_size_u32.to_be_bytes());
+    output.extend_from_slice(b"meta");
+    output.extend_from_slice(&0_u32.to_be_bytes());
+    output.extend_from_slice(&hdlr);
+    output.extend_from_slice(&pitm);
+    output.extend_from_slice(&iloc);
+    output.extend_from_slice(&iinf);
+    output.extend_from_slice(&iprp);
+    output.extend_from_slice(&mdat_size_u32.to_be_bytes());
+    output.extend_from_slice(b"mdat");
+    for nal in &picture_nals {
+        let len_u32 =
+            u32::try_from(nal.len()).map_err(|_| HeicMuxError::SizeOverflow("mdat NAL length"))?;
+        output.extend_from_slice(&len_u32.to_be_bytes());
+        output.extend_from_slice(nal);
+    }
+    debug_assert_eq!(output.len(), total_len);
     Ok(output)
 }
 

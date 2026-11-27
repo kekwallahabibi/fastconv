@@ -16,6 +16,10 @@ use rav1e::prelude::{
     BlockSize, ChromaSampling, Config, EncoderConfig, Frame, PartitionRange, SceneDetectionSpeed,
     SegmentationLevel, SpeedSettings, Tune,
 };
+use yuv::{
+    BufferStoreMut, YuvConversionMode, YuvPlanarImageMut, YuvRange, YuvStandardMatrix,
+    rgb_to_yuv420, rgb_to_yuv444, rgba_to_yuv420, rgba_to_yuv444,
+};
 
 use crate::PipelineError;
 use crate::decode::{DecodedFrameMeta, DecodedPixelFormat};
@@ -47,7 +51,7 @@ fn encode_av1_frame(
     quantizer: usize,
     level: CompressionLevel,
     threads: usize,
-    fill_planes: impl FnOnce(&mut Frame<u8>),
+    fill_planes: impl FnOnce(&mut Frame<u8>) -> Result<(), PipelineError>,
 ) -> Result<Vec<u8>, PipelineError> {
     // Presets 10/8/6 keep the still-frame invariants below while trading encode
     // effort for compression. Preset 10 additionally disables tools that only
@@ -123,7 +127,7 @@ fn encode_av1_frame(
         })?;
 
     let mut frame = ctx.new_frame();
-    fill_planes(&mut frame);
+    fill_planes(&mut frame)?;
     ctx.send_frame(frame)
         .map_err(|err| PipelineError::EncodeFailed {
             path: target.to_path_buf(),
@@ -442,6 +446,120 @@ fn fill_yuv444(
     }
 }
 
+/// SIMD RGB→YUV conversion written straight into rav1e's padded planes. Only
+/// opaque RGB8/RGBA8 use this path: the scalar path's alpha-weighted chroma is
+/// required for partially transparent blocks, and grayscale needs no RGB matrix.
+fn fill_yuv_simd(
+    target: &Path,
+    frame: &mut Frame<u8>,
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    format: DecodedPixelFormat,
+    chroma: ChromaSubsampling,
+) -> Result<(), PipelineError> {
+    let encode_error = |reason: String| PipelineError::EncodeFailed {
+        path: target.to_path_buf(),
+        reason,
+    };
+    let strides = {
+        let [y, u, v] = &frame.planes;
+        (
+            u32::try_from(y.cfg.stride)
+                .map_err(|_| encode_error("AVIF luma stride overflow".to_owned()))?,
+            u32::try_from(u.cfg.stride)
+                .map_err(|_| encode_error("AVIF chroma stride overflow".to_owned()))?,
+            u32::try_from(v.cfg.stride)
+                .map_err(|_| encode_error("AVIF chroma stride overflow".to_owned()))?,
+        )
+    };
+    let bpp = match format {
+        DecodedPixelFormat::Rgb8 => 3_usize,
+        DecodedPixelFormat::Rgba8 => 4_usize,
+        _ => return Err(encode_error("SIMD YUV requires RGB8 or RGBA8".to_owned())),
+    };
+    let src_stride = width
+        .checked_mul(bpp)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| encode_error("AVIF source row stride overflow".to_owned()))?;
+    let w =
+        u32::try_from(width).map_err(|_| encode_error("AVIF width exceeds u32::MAX".to_owned()))?;
+    let h = u32::try_from(height)
+        .map_err(|_| encode_error("AVIF height exceeds u32::MAX".to_owned()))?;
+
+    // `yuv` uses `.last()` on the row iterator to find the final row when the
+    // height is odd, so the borrowed slices must end at the last visible row;
+    // rav1e's bottom padding would otherwise be mistaken for that row.
+    let chroma_h = match chroma {
+        ChromaSubsampling::Yuv420 => height.div_ceil(2),
+        ChromaSubsampling::Yuv444 => height,
+    };
+    let y_len = usize::try_from(strides.0)
+        .ok()
+        .and_then(|s| s.checked_mul(height))
+        .ok_or_else(|| encode_error("AVIF luma plane length overflow".to_owned()))?;
+    let c_len = usize::try_from(strides.1)
+        .ok()
+        .and_then(|s| s.checked_mul(chroma_h))
+        .ok_or_else(|| encode_error("AVIF chroma plane length overflow".to_owned()))?;
+
+    let [y_plane, u_plane, v_plane] = &mut frame.planes;
+    let y_data = y_plane.data_origin_mut();
+    let u_data = u_plane.data_origin_mut();
+    let v_data = v_plane.data_origin_mut();
+    if y_data.len() < y_len || u_data.len() < c_len || v_data.len() < c_len {
+        return Err(encode_error(
+            "AVIF plane smaller than the visible frame".to_owned(),
+        ));
+    }
+    let mut image = YuvPlanarImageMut {
+        y_plane: BufferStoreMut::Borrowed(&mut y_data[..y_len]),
+        y_stride: strides.0,
+        u_plane: BufferStoreMut::Borrowed(&mut u_data[..c_len]),
+        u_stride: strides.1,
+        v_plane: BufferStoreMut::Borrowed(&mut v_data[..c_len]),
+        v_stride: strides.2,
+        width: w,
+        height: h,
+    };
+    let result = match (format, chroma) {
+        (DecodedPixelFormat::Rgb8, ChromaSubsampling::Yuv420) => rgb_to_yuv420(
+            &mut image,
+            pixels,
+            src_stride,
+            YuvRange::Full,
+            YuvStandardMatrix::Bt601,
+            YuvConversionMode::Balanced,
+        ),
+        (DecodedPixelFormat::Rgba8, ChromaSubsampling::Yuv420) => rgba_to_yuv420(
+            &mut image,
+            pixels,
+            src_stride,
+            YuvRange::Full,
+            YuvStandardMatrix::Bt601,
+            YuvConversionMode::Balanced,
+        ),
+        (DecodedPixelFormat::Rgb8, ChromaSubsampling::Yuv444) => rgb_to_yuv444(
+            &mut image,
+            pixels,
+            src_stride,
+            YuvRange::Full,
+            YuvStandardMatrix::Bt601,
+            YuvConversionMode::Balanced,
+        ),
+        (DecodedPixelFormat::Rgba8, ChromaSubsampling::Yuv444) => rgba_to_yuv444(
+            &mut image,
+            pixels,
+            src_stride,
+            YuvRange::Full,
+            YuvStandardMatrix::Bt601,
+            YuvConversionMode::Balanced,
+        ),
+        _ => return Err(encode_error("unsupported SIMD YUV source".to_owned())),
+    };
+    result.map_err(|err| encode_error(format!("SIMD RGB to YUV conversion failed: {err}")))
+}
+
 fn fill_alpha(
     frame: &mut Frame<u8>,
     pixels: &[u8],
@@ -562,17 +680,13 @@ fn encode_avif_alpha(
     width: usize,
     height: usize,
     bpp: usize,
+    opaque: bool,
     settings: &AvifFrameSettings,
 ) -> Result<Option<Vec<u8>>, PipelineError> {
-    let alpha_offset = bpp - 1;
-    let opaque = pixels
-        .iter()
-        .skip(alpha_offset)
-        .step_by(bpp)
-        .all(|&a| a == u8::MAX);
     if opaque {
         return Ok(None);
     }
+    let alpha_offset = bpp - 1;
     encode_av1_frame(
         target,
         width,
@@ -582,7 +696,10 @@ fn encode_avif_alpha(
         settings.quantizer,
         settings.level,
         settings.threads,
-        |frame| fill_alpha(frame, pixels, width, height, bpp, alpha_offset),
+        |frame| {
+            fill_alpha(frame, pixels, width, height, bpp, alpha_offset);
+            Ok(())
+        },
     )
     .map(Some)
 }
@@ -642,6 +759,18 @@ pub(crate) fn encode_avif_into(request: AvifEncodeRequest<'_>) -> Result<(), Pip
         threads,
     };
     let plan = AvifColorPlan::new(chroma);
+    // One alpha scan drives both the SIMD decision and the auxiliary plane
+    // decision; opaque RGBA8 otherwise paid for the same scan twice.
+    let has_alpha = matches!(
+        decoded.format,
+        DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8
+    );
+    let opaque = !has_alpha
+        || pixels
+            .chunks_exact(bpp)
+            .all(|pixel| pixel[bpp - 1] == u8::MAX);
+    let simd_rgb = matches!(decoded.format, DecodedPixelFormat::Rgb8)
+        || (opaque && decoded.format == DecodedPixelFormat::Rgba8);
     let color = encode_av1_frame(
         target,
         width,
@@ -651,13 +780,19 @@ pub(crate) fn encode_avif_into(request: AvifEncodeRequest<'_>) -> Result<(), Pip
         settings.quantizer,
         settings.level,
         settings.threads,
-        |frame| (plan.fill)(frame, pixels, width, height, decoded.format),
+        |frame| {
+            if simd_rgb {
+                fill_yuv_simd(target, frame, pixels, width, height, decoded.format, chroma)
+            } else {
+                (plan.fill)(frame, pixels, width, height, decoded.format);
+                Ok(())
+            }
+        },
     )?;
-    let alpha = match decoded.format {
-        DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8 => {
-            encode_avif_alpha(target, pixels, width, height, bpp, &settings)?
-        }
-        _ => None,
+    let alpha = if has_alpha {
+        encode_avif_alpha(target, pixels, width, height, bpp, opaque, &settings)?
+    } else {
+        None
     };
     serialize_avif(
         target,
@@ -916,6 +1051,95 @@ mod tests {
         let cb = first_chroma(&frame, 1).ok_or_else(missing_chroma)?;
         let cr = first_chroma(&frame, 2).ok_or_else(missing_chroma)?;
         assert_eq!((cb, cr), (128, 128));
+        Ok(())
+    }
+
+    #[test]
+    fn simd_yuv_matches_scalar_within_one_step() -> Result<(), PipelineError> {
+        let target = Path::new("test.avif");
+        for (width, height) in [(16_u32, 16_u32), (53, 37), (17, 17), (19, 16)] {
+            for chroma in [ChromaSubsampling::Yuv420, ChromaSubsampling::Yuv444] {
+                let sampling = match chroma {
+                    ChromaSubsampling::Yuv420 => ChromaSampling::Cs420,
+                    ChromaSubsampling::Yuv444 => ChromaSampling::Cs444,
+                };
+                let cfg = EncoderConfig {
+                    width: width as usize,
+                    height: height as usize,
+                    bit_depth: 8,
+                    chroma_sampling: sampling,
+                    ..Default::default()
+                };
+                let ctx = Config::new()
+                    .with_encoder_config(cfg)
+                    .with_threads(1)
+                    .new_context::<u8>()
+                    .map_err(|err| PipelineError::EncodeFailed {
+                        path: target.to_path_buf(),
+                        reason: format!("failed to create test AV1 context: {err}"),
+                    })?;
+                for format in [DecodedPixelFormat::Rgb8, DecodedPixelFormat::Rgba8] {
+                    let bpp = if format == DecodedPixelFormat::Rgb8 {
+                        3
+                    } else {
+                        4
+                    };
+                    let mut pixels: Vec<u8> = (0..width as usize * height as usize * bpp)
+                        .map(|i| u8::try_from((i * 37 + 11) % 256).unwrap_or(0))
+                        .collect();
+                    if bpp == 4 {
+                        for pixel in pixels.as_chunks_mut::<4>().0 {
+                            pixel[3] = u8::MAX;
+                        }
+                    }
+                    let mut scalar = ctx.new_frame();
+                    let mut simd = ctx.new_frame();
+                    match chroma {
+                        ChromaSubsampling::Yuv420 => {
+                            fill_yuv420(
+                                &mut scalar,
+                                &pixels,
+                                width as usize,
+                                height as usize,
+                                format,
+                            );
+                        }
+                        ChromaSubsampling::Yuv444 => {
+                            fill_yuv444(
+                                &mut scalar,
+                                &pixels,
+                                width as usize,
+                                height as usize,
+                                format,
+                            );
+                        }
+                    }
+                    fill_yuv_simd(
+                        target,
+                        &mut simd,
+                        &pixels,
+                        width as usize,
+                        height as usize,
+                        format,
+                        chroma,
+                    )?;
+                    for (index, (splane, dplane)) in
+                        scalar.planes.iter().zip(simd.planes.iter()).enumerate()
+                    {
+                        for (row_idx, (srow, drow)) in
+                            splane.rows_iter().zip(dplane.rows_iter()).enumerate()
+                        {
+                            for (col_idx, (&s, &d)) in srow.iter().zip(drow.iter()).enumerate() {
+                                assert!(
+                                    s.abs_diff(d) <= 1,
+                                    "{format:?} {chroma:?} {width}x{height} plane {index} at ({row_idx},{col_idx}): scalar {s} vs SIMD {d}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
