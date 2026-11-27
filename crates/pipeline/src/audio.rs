@@ -2410,7 +2410,10 @@ fn quantizes_to_second_array(
     }
     let stream = item.stream();
     if stream.sample_format() != AudioSampleFormat::Int {
-        return true;
+        // WAV/AIFF keep float streams as Float32 unless an integer depth is forced;
+        // `quantize_for` then leaves the float buffer untouched.
+        return !(matches!(output, AudioOutputFormat::Wav | AudioOutputFormat::Aiff)
+            && options.bit_depth().is_none());
     }
     let bits = usize::from(stream.bits_per_sample().map_or(0, NonZeroU16::get));
     let no_transform = options
@@ -5094,5 +5097,39 @@ mod tests {
         );
         assert_eq!(direct.peak_bytes, 8_000);
         assert_eq!(quantized.peak_bytes, 16_000);
+    }
+
+    #[test]
+    fn implicit_float_output_does_not_reserve_integer_array() {
+        let item = AudioBatchItem::new(
+            PathBuf::from("in.wav"),
+            PathBuf::from("out.wav"),
+            AudioInputFormat::Wav,
+            fastconv_domain::AudioStreamInfo::with_sample_format(
+                NonZeroU16::new(2).unwrap_or(NonZeroU16::MIN),
+                NonZeroU32::new(48_000).unwrap_or(NonZeroU32::MIN),
+                NonZeroU16::new(32),
+                AudioSampleFormat::Float,
+                Some(1_000),
+            )
+            .unwrap_or_else(|_| unreachable!()),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let defaults = AudioEncodingOptions::default();
+        for output in [AudioOutputFormat::Wav, AudioOutputFormat::Aiff] {
+            let estimate = estimate_pcm_bytes(&item, output, &defaults);
+            assert_eq!(estimate.peak_bytes, 8_000, "{output} implicit Float32");
+            assert_eq!(
+                estimate.largest_buffer_bytes, 8_000,
+                "{output} implicit Float32"
+            );
+        }
+        // A forced integer depth still quantizes and needs the second array.
+        let forced = estimate_pcm_bytes(
+            &item,
+            AudioOutputFormat::Wav,
+            &options_depth(AudioOutputFormat::Wav, AudioBitDepth::Int32),
+        );
+        assert_eq!(forced.peak_bytes, 16_000);
     }
 }
