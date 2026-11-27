@@ -154,6 +154,399 @@ impl fmt::Display for AudioOutputFormat {
     }
 }
 
+/// Validated lossy-audio target bitrate in bits per second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct AudioOptionBitrate(NonZeroU32);
+
+impl AudioOptionBitrate {
+    /// Creates a bitrate from an exact bits-per-second value.
+    ///
+    /// CLI syntax parsing belongs at the system boundary in `fastconv-probe`; this
+    /// constructor only accepts an already-resolved exact rate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidAudioOptionBitrate`] when `bps` is zero.
+    pub fn new(bps: u32) -> Result<Self, DomainError> {
+        NonZeroU32::new(bps)
+            .map(Self)
+            .ok_or_else(|| DomainError::InvalidAudioOptionBitrate {
+                raw: bps.to_string(),
+                expected: "a positive bits-per-second value",
+            })
+    }
+
+    #[must_use]
+    pub const fn bps(self) -> u32 {
+        self.0.get()
+    }
+
+    /// Rounds to whole kbps for encoders whose configuration is expressed in kbps.
+    #[must_use]
+    pub fn kbps_rounded(self) -> u32 {
+        (self.0.get().saturating_add(500) / 1_000).max(1)
+    }
+}
+
+/// Maximum bitrate the AAC frame model can carry at a rate/channel pair.
+///
+/// `rusty_aac` stores at most 6144 bits per channel in each 1024-sample frame,
+/// i.e. 6 bits per sample per channel. Asking for more makes the encoder silently
+/// lower the bitrate, so both the domain and the pipeline reject such pairs.
+#[must_use]
+pub const fn aac_frame_capacity_bps(hz: u32, channels: u16) -> u32 {
+    hz.saturating_mul(channels as u32).saturating_mul(6)
+}
+
+/// Validated lossy-audio quality on a 0..=100 scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct AudioQuality(u8);
+
+impl AudioQuality {
+    pub const MAX: u8 = 100;
+
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidAudioQuality`] when `value` exceeds 100.
+    pub fn new(value: u8) -> Result<Self, DomainError> {
+        if value <= Self::MAX {
+            Ok(Self(value))
+        } else {
+            Err(DomainError::InvalidAudioQuality {
+                value,
+                max: Self::MAX,
+            })
+        }
+    }
+
+    #[must_use]
+    pub const fn value(self) -> u8 {
+        self.0
+    }
+}
+
+/// Mutually exclusive rate-control choice for lossy audio encoders.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
+pub enum AudioRateControl {
+    #[default]
+    Default,
+    Bitrate(AudioOptionBitrate),
+    Quality(AudioQuality),
+}
+
+/// Validated audio sample rate in Hz plus the rate tables of the native encoders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct AudioOptionSampleRate(NonZeroU32);
+
+impl AudioOptionSampleRate {
+    /// The nine MPEG Layer III sample rates accepted by `rusty_mp3`.
+    pub const MP3_RATES: [u32; 9] = [
+        8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000,
+    ];
+    /// MPEG-2/2.5 Layer III rates. `rusty_mp3` caps Layer III at 160 kbps here and
+    /// silently snaps a higher bitrate down, so the domain rejects that combination.
+    pub const MP3_MPEG2_RATES: [u32; 6] = [8_000, 11_025, 12_000, 16_000, 22_050, 24_000];
+    /// The AAC sample-rate table (`rusty_aac::SAMPLE_RATES`), including 7.35 kHz.
+    pub const AAC_RATES: [u32; 13] = [
+        7_350, 8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 64_000,
+        88_200, 96_000,
+    ];
+    pub const OPUS_RATE_HZ: u32 = 48_000;
+    pub const MIN_HZ: u32 = 8_000;
+    pub const MAX_HZ: u32 = 192_000;
+
+    /// Creates a sample rate. The absolute ceiling is enforced here; per-format
+    /// tables and the 8 kHz floor are enforced by [`AudioEncodingOptions::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidAudioOptionSampleRate`] for zero or rates above 192 kHz.
+    pub fn new(hz: u32) -> Result<Self, DomainError> {
+        NonZeroU32::new(hz)
+            .filter(|rate| rate.get() <= Self::MAX_HZ)
+            .map(Self)
+            .ok_or(DomainError::InvalidAudioOptionSampleRate {
+                hz,
+                expected: "1..=192000 Hz",
+            })
+    }
+
+    #[must_use]
+    pub const fn hz(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// Validated channel count for audio conversion (1..=8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct AudioOptionChannels(NonZeroU16);
+
+impl AudioOptionChannels {
+    pub const MAX: u16 = 8;
+
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidAudioOptionChannels`] for zero or more than eight channels.
+    pub fn new(channels: u16) -> Result<Self, DomainError> {
+        if (1..=Self::MAX).contains(&channels) {
+            NonZeroU16::new(channels)
+                .map(Self)
+                .ok_or(DomainError::InvalidAudioOptionChannels {
+                    channels,
+                    expected: "1..=8",
+                })
+        } else {
+            Err(DomainError::InvalidAudioOptionChannels {
+                channels,
+                expected: "1..=8",
+            })
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
+}
+
+/// Validated encoding options carried by an [`AudioBatchPlan`].
+///
+/// A default instance selects the exact encoder settings used before these
+/// options existed, so the type carries no behaviour change on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AudioEncodingOptions {
+    rate_control: AudioRateControl,
+    sample_rate: Option<AudioOptionSampleRate>,
+    channels: Option<AudioOptionChannels>,
+}
+
+impl Default for AudioEncodingOptions {
+    fn default() -> Self {
+        Self {
+            rate_control: AudioRateControl::Default,
+            sample_rate: None,
+            channels: None,
+        }
+    }
+}
+
+impl AudioEncodingOptions {
+    /// Highest Layer III bitrate available at MPEG-2/2.5 sample rates.
+    const MP3_MPEG2_MAX_BPS: u32 = 160_000;
+
+    /// Creates options and validates every field against the output format.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DomainError`] for any bitrate, quality, sample-rate, or
+    /// channel count the native encoder for `format` cannot represent.
+    pub fn new(
+        format: AudioOutputFormat,
+        rate_control: AudioRateControl,
+        sample_rate: Option<AudioOptionSampleRate>,
+        channels: Option<AudioOptionChannels>,
+    ) -> Result<Self, DomainError> {
+        let options = Self {
+            rate_control,
+            sample_rate,
+            channels,
+        };
+        options.validate(format)?;
+        Ok(options)
+    }
+
+    #[must_use]
+    pub const fn rate_control(&self) -> AudioRateControl {
+        self.rate_control
+    }
+
+    #[must_use]
+    pub const fn sample_rate(&self) -> Option<AudioOptionSampleRate> {
+        self.sample_rate
+    }
+
+    #[must_use]
+    pub const fn channels(&self) -> Option<AudioOptionChannels> {
+        self.channels
+    }
+
+    fn validate(&self, format: AudioOutputFormat) -> Result<(), DomainError> {
+        Self::validate_rate_control(format, self.rate_control)?;
+        if let Some(rate) = self.sample_rate {
+            Self::validate_sample_rate(format, rate)?;
+        }
+        if let Some(channels) = self.channels {
+            Self::validate_channels(format, channels)?;
+        }
+        // Cross-field check: an explicit MPEG-2/2.5 rate cannot carry more than
+        // 160 kbps through rusty_mp3 without a silent downgrade to 160 kbps.
+        // Without an explicit rate the pipeline resolves the effective rate itself.
+        if format == AudioOutputFormat::Mp3
+            && let AudioRateControl::Bitrate(bitrate) = self.rate_control
+            && let Some(rate) = self.sample_rate
+            && AudioOptionSampleRate::MP3_MPEG2_RATES.contains(&rate.hz())
+            && bitrate.bps() > Self::MP3_MPEG2_MAX_BPS
+        {
+            return Err(DomainError::IncompatibleAudioBitrateRate {
+                bps: bitrate.bps(),
+                hz: rate.hz(),
+                max_bps: Self::MP3_MPEG2_MAX_BPS,
+            });
+        }
+        // AAC stores at most 6144 bits per channel per 1024-sample frame. With an
+        // explicit rate and channel count the limit is knowable before any I/O;
+        // without either one the pipeline checks it against the effective values.
+        if matches!(format, AudioOutputFormat::Aac | AudioOutputFormat::M4a)
+            && let AudioRateControl::Bitrate(bitrate) = self.rate_control
+            && let Some(rate) = self.sample_rate
+            && let Some(channels) = self.channels
+        {
+            let max_bps = aac_frame_capacity_bps(rate.hz(), channels.get());
+            if bitrate.bps() > max_bps {
+                return Err(DomainError::IncompatibleAacBitrateRate {
+                    bps: bitrate.bps(),
+                    hz: rate.hz(),
+                    channels: channels.get(),
+                    max_bps,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_rate_control(
+        format: AudioOutputFormat,
+        control: AudioRateControl,
+    ) -> Result<(), DomainError> {
+        let unsupported =
+            |flag: &'static str, reason: &'static str| DomainError::UnsupportedAudioRateControl {
+                format,
+                control: flag,
+                reason,
+            };
+        match control {
+            AudioRateControl::Default => {}
+            AudioRateControl::Bitrate(bitrate) => {
+                if format.is_lossless() {
+                    return Err(unsupported(
+                        "--bitrate",
+                        "lossless formats store the source PCM unchanged",
+                    ));
+                }
+                let (min, max, expected) = match format {
+                    AudioOutputFormat::Mp3 => (32_000, 320_000, "32000..=320000 bps for MP3"),
+                    AudioOutputFormat::Aac | AudioOutputFormat::M4a => {
+                        (32_000, 512_000, "32000..=512000 bps for AAC/M4A")
+                    }
+                    AudioOutputFormat::Ogg => (32_000, 512_000, "32000..=512000 bps for Ogg"),
+                    AudioOutputFormat::Opus => (6_000, 510_000, "6000..=510000 bps for Opus"),
+                    AudioOutputFormat::Wav
+                    | AudioOutputFormat::Flac
+                    | AudioOutputFormat::Alac
+                    | AudioOutputFormat::Aiff => {
+                        return Err(unsupported(
+                            "--bitrate",
+                            "lossless formats store the source PCM unchanged",
+                        ));
+                    }
+                };
+                let bps = bitrate.bps();
+                if !(min..=max).contains(&bps) {
+                    return Err(DomainError::InvalidAudioOptionBitrate {
+                        raw: bps.to_string(),
+                        expected,
+                    });
+                }
+            }
+            AudioRateControl::Quality(quality) => {
+                if format.is_lossless() {
+                    return Err(unsupported(
+                        "--quality",
+                        "lossless formats store the source PCM unchanged",
+                    ));
+                }
+                if matches!(format, AudioOutputFormat::Aac | AudioOutputFormat::M4a) {
+                    return Err(unsupported(
+                        "--quality",
+                        "the AAC encoder exposes only bitrate_bps; use --bitrate",
+                    ));
+                }
+                // 0..=100 is guaranteed by AudioQuality's validated constructor.
+                debug_assert!(quality.value() <= AudioQuality::MAX);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_sample_rate(
+        format: AudioOutputFormat,
+        rate: AudioOptionSampleRate,
+    ) -> Result<(), DomainError> {
+        let hz = rate.hz();
+        if format == AudioOutputFormat::Opus && hz != AudioOptionSampleRate::OPUS_RATE_HZ {
+            return Err(DomainError::InvalidAudioOptionSampleRate {
+                hz,
+                expected: "exactly 48000 Hz (Ogg Opus always encodes at 48 kHz)",
+            });
+        }
+        let valid = match format {
+            AudioOutputFormat::Opus => true,
+            AudioOutputFormat::Mp3 => AudioOptionSampleRate::MP3_RATES.contains(&hz),
+            AudioOutputFormat::Aac | AudioOutputFormat::M4a => {
+                AudioOptionSampleRate::AAC_RATES.contains(&hz)
+            }
+            AudioOutputFormat::Ogg
+            | AudioOutputFormat::Wav
+            | AudioOutputFormat::Flac
+            | AudioOutputFormat::Alac
+            | AudioOutputFormat::Aiff => {
+                (AudioOptionSampleRate::MIN_HZ..=AudioOptionSampleRate::MAX_HZ).contains(&hz)
+            }
+        };
+        if valid {
+            return Ok(());
+        }
+        let expected = match format {
+            AudioOutputFormat::Mp3 => {
+                "one of 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, or 48000 Hz"
+            }
+            AudioOutputFormat::Aac | AudioOutputFormat::M4a => {
+                "one of 7350, 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, or 96000 Hz"
+            }
+            _ => "8000..=192000 Hz",
+        };
+        Err(DomainError::InvalidAudioOptionSampleRate { hz, expected })
+    }
+
+    fn validate_channels(
+        format: AudioOutputFormat,
+        channels: AudioOptionChannels,
+    ) -> Result<(), DomainError> {
+        let count = channels.get();
+        let (valid, expected) = match format {
+            AudioOutputFormat::Mp3 | AudioOutputFormat::Opus => {
+                ((1..=2).contains(&count), "1 or 2 channels")
+            }
+            AudioOutputFormat::Aac | AudioOutputFormat::M4a | AudioOutputFormat::Ogg => (
+                (1..=6).contains(&count) && count != 4,
+                "1, 2, 3, 5, or 6 channels",
+            ),
+            AudioOutputFormat::Wav
+            | AudioOutputFormat::Flac
+            | AudioOutputFormat::Alac
+            | AudioOutputFormat::Aiff => ((1..=8).contains(&count), "1..=8 channels"),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(DomainError::InvalidAudioOptionChannels {
+                channels: count,
+                expected,
+            })
+        }
+    }
+}
+
 /// Validated decoded stream metadata produced by the boundary probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct AudioStreamInfo {
@@ -362,10 +755,11 @@ pub struct AudioBatchPlan {
     items: Vec<AudioBatchItem>,
     mode: AudioExecutionMode,
     worker_threads: NonZeroUsize,
+    options: AudioEncodingOptions,
 }
 
 impl AudioBatchPlan {
-    /// Creates a validated [`AudioBatchPlan`].
+    /// Creates a validated [`AudioBatchPlan`] with default encoder options.
     ///
     /// # Errors
     ///
@@ -376,6 +770,22 @@ impl AudioBatchPlan {
         items: Vec<AudioBatchItem>,
         mode: AudioExecutionMode,
         worker_threads: NonZeroUsize,
+    ) -> Result<Self, DomainError> {
+        Self::with_options(items, mode, worker_threads, AudioEncodingOptions::default())
+    }
+
+    /// Creates a validated plan whose encoder options are checked against the
+    /// mode's output format, so a mode/options mismatch cannot be represented.
+    ///
+    /// # Errors
+    ///
+    /// Returns all errors of [`Self::new`] plus any [`DomainError`] raised when
+    /// revalidating `options` for `mode.output_format()`.
+    pub fn with_options(
+        items: Vec<AudioBatchItem>,
+        mode: AudioExecutionMode,
+        worker_threads: NonZeroUsize,
+        options: AudioEncodingOptions,
     ) -> Result<Self, DomainError> {
         if items.is_empty() {
             return Err(DomainError::EmptyBatch);
@@ -393,10 +803,12 @@ impl AudioBatchPlan {
                 ));
             }
         }
+        options.validate(mode.output_format())?;
         Ok(Self {
             items,
             mode,
             worker_threads,
+            options,
         })
     }
 
@@ -418,6 +830,11 @@ impl AudioBatchPlan {
     #[must_use]
     pub const fn worker_threads(&self) -> NonZeroUsize {
         self.worker_threads
+    }
+
+    #[must_use]
+    pub const fn options(&self) -> AudioEncodingOptions {
+        self.options
     }
 
     #[must_use]
@@ -615,5 +1032,380 @@ mod tests {
         )
         .unwrap_or_else(|_| unreachable!());
         assert!((report.megabytes_per_sec() - 1.0).abs() < 1e-9);
+    }
+
+    fn default_options() -> AudioEncodingOptions {
+        AudioEncodingOptions::default()
+    }
+
+    #[test]
+    fn bitrate_constructor_accepts_only_exact_nonzero_bps() -> Result<(), DomainError> {
+        assert_eq!(AudioOptionBitrate::new(191_500)?.bps(), 191_500);
+        assert_eq!(AudioOptionBitrate::new(191_500)?.kbps_rounded(), 192);
+        assert_eq!(AudioOptionBitrate::new(1)?.kbps_rounded(), 1);
+        assert!(matches!(
+            AudioOptionBitrate::new(0),
+            Err(DomainError::InvalidAudioOptionBitrate { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn validates_quality_sample_rate_and_channel_bounds() -> Result<(), DomainError> {
+        assert_eq!(AudioQuality::new(100)?.value(), AudioQuality::MAX);
+        assert!(matches!(
+            AudioQuality::new(101),
+            Err(DomainError::InvalidAudioQuality {
+                value: 101,
+                max: 100
+            })
+        ));
+        assert!(matches!(
+            AudioOptionSampleRate::new(0),
+            Err(DomainError::InvalidAudioOptionSampleRate { .. })
+        ));
+        assert!(matches!(
+            AudioOptionSampleRate::new(AudioOptionSampleRate::MAX_HZ + 1),
+            Err(DomainError::InvalidAudioOptionSampleRate { .. })
+        ));
+        assert_eq!(AudioOptionSampleRate::new(44_100)?.hz(), 44_100);
+        assert!(matches!(
+            AudioOptionChannels::new(0),
+            Err(DomainError::InvalidAudioOptionChannels { .. })
+        ));
+        assert!(matches!(
+            AudioOptionChannels::new(9),
+            Err(DomainError::InvalidAudioOptionChannels { .. })
+        ));
+        assert_eq!(AudioOptionChannels::new(8)?.get(), 8);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_illegal_encoding_options_per_format() -> Result<(), DomainError> {
+        let bitrate = |bps| AudioOptionBitrate::new(bps).map(AudioRateControl::Bitrate);
+        let quality = |value| AudioQuality::new(value).map(AudioRateControl::Quality);
+
+        for format in [
+            AudioOutputFormat::Wav,
+            AudioOutputFormat::Flac,
+            AudioOutputFormat::Alac,
+            AudioOutputFormat::Aiff,
+        ] {
+            assert!(matches!(
+                AudioEncodingOptions::new(format, bitrate(128_000)?, None, None),
+                Err(DomainError::UnsupportedAudioRateControl { .. })
+            ));
+            assert!(matches!(
+                AudioEncodingOptions::new(format, quality(80)?, None, None),
+                Err(DomainError::UnsupportedAudioRateControl { .. })
+            ));
+        }
+        for format in [AudioOutputFormat::Aac, AudioOutputFormat::M4a] {
+            assert!(matches!(
+                AudioEncodingOptions::new(format, quality(80)?, None, None),
+                Err(DomainError::UnsupportedAudioRateControl { .. })
+            ));
+        }
+
+        for (format, rejected) in [
+            (AudioOutputFormat::Mp3, 31_000),
+            (AudioOutputFormat::Mp3, 321_000),
+            (AudioOutputFormat::Aac, 31_000),
+            (AudioOutputFormat::M4a, 513_000),
+            (AudioOutputFormat::Ogg, 5_000),
+            (AudioOutputFormat::Opus, 5_999),
+            (AudioOutputFormat::Opus, 511_000),
+        ] {
+            assert!(
+                matches!(
+                    AudioEncodingOptions::new(format, bitrate(rejected)?, None, None),
+                    Err(DomainError::InvalidAudioOptionBitrate { .. })
+                ),
+                "{format} must reject {rejected} bps"
+            );
+        }
+        assert!(
+            AudioEncodingOptions::new(AudioOutputFormat::Mp3, bitrate(32_000)?, None, None).is_ok()
+        );
+        assert!(
+            AudioEncodingOptions::new(AudioOutputFormat::Mp3, bitrate(320_000)?, None, None)
+                .is_ok()
+        );
+        assert!(
+            AudioEncodingOptions::new(AudioOutputFormat::Opus, bitrate(6_000)?, None, None).is_ok()
+        );
+        assert!(
+            AudioEncodingOptions::new(AudioOutputFormat::Opus, bitrate(510_000)?, None, None)
+                .is_ok()
+        );
+        for format in [
+            AudioOutputFormat::Mp3,
+            AudioOutputFormat::Ogg,
+            AudioOutputFormat::Opus,
+        ] {
+            assert!(AudioEncodingOptions::new(format, quality(0)?, None, None).is_ok());
+            assert!(AudioEncodingOptions::new(format, quality(100)?, None, None).is_ok());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mp3_high_bitrate_at_mpeg2_sample_rates() -> Result<(), DomainError> {
+        let bitrate = |bps| AudioOptionBitrate::new(bps).map(AudioRateControl::Bitrate);
+        let rate = |hz| AudioOptionSampleRate::new(hz).map(Some);
+
+        for hz in AudioOptionSampleRate::MP3_MPEG2_RATES {
+            assert!(
+                matches!(
+                    AudioEncodingOptions::new(
+                        AudioOutputFormat::Mp3,
+                        bitrate(320_000)?,
+                        rate(hz)?,
+                        None
+                    ),
+                    Err(DomainError::IncompatibleAudioBitrateRate {
+                        bps: 320_000,
+                        max_bps: 160_000,
+                        ..
+                    })
+                ),
+                "MP3 at {hz} Hz must reject 320000 bps"
+            );
+            assert!(
+                AudioEncodingOptions::new(
+                    AudioOutputFormat::Mp3,
+                    bitrate(160_000)?,
+                    rate(hz)?,
+                    None
+                )
+                .is_ok(),
+                "MP3 at {hz} Hz must accept 160000 bps"
+            );
+        }
+        for hz in [32_000, 44_100, 48_000] {
+            assert!(
+                AudioEncodingOptions::new(
+                    AudioOutputFormat::Mp3,
+                    bitrate(320_000)?,
+                    rate(hz)?,
+                    None
+                )
+                .is_ok(),
+                "MP3 at {hz} Hz (MPEG-1) must accept 320000 bps"
+            );
+        }
+        assert!(
+            AudioEncodingOptions::new(AudioOutputFormat::Mp3, bitrate(320_000)?, None, None)
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_aac_bitrate_above_the_frame_capacity() -> Result<(), DomainError> {
+        let bitrate = |bps| AudioOptionBitrate::new(bps).map(AudioRateControl::Bitrate);
+        let rate = |hz| AudioOptionSampleRate::new(hz).map(Some);
+        let channels = |count| AudioOptionChannels::new(count).map(Some);
+        for format in [AudioOutputFormat::Aac, AudioOutputFormat::M4a] {
+            assert!(matches!(
+                AudioEncodingOptions::new(format, bitrate(512_000)?, rate(8_000)?, channels(1)?),
+                Err(DomainError::IncompatibleAacBitrateRate {
+                    bps: 512_000,
+                    hz: 8_000,
+                    channels: 1,
+                    max_bps: 48_000,
+                })
+            ));
+            assert!(
+                AudioEncodingOptions::new(format, bitrate(256_000)?, rate(48_000)?, channels(2)?)
+                    .is_ok()
+            );
+        }
+        assert_eq!(aac_frame_capacity_bps(8_000, 1), 48_000);
+        assert_eq!(aac_frame_capacity_bps(48_000, 2), 576_000);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_illegal_sample_rates_per_format() -> Result<(), DomainError> {
+        let rate = |hz| AudioOptionSampleRate::new(hz).map(Some);
+
+        assert!(
+            AudioEncodingOptions::new(
+                AudioOutputFormat::Opus,
+                AudioRateControl::Default,
+                rate(48_000)?,
+                None
+            )
+            .is_ok()
+        );
+        for hz in [8_000, 44_100, 96_000] {
+            assert!(
+                matches!(
+                    AudioEncodingOptions::new(
+                        AudioOutputFormat::Opus,
+                        AudioRateControl::Default,
+                        rate(hz)?,
+                        None
+                    ),
+                    Err(DomainError::InvalidAudioOptionSampleRate { .. })
+                ),
+                "Opus must reject {hz} Hz"
+            );
+        }
+        for hz in [8_000, 11_025, 48_000] {
+            assert!(
+                AudioEncodingOptions::new(
+                    AudioOutputFormat::Mp3,
+                    AudioRateControl::Default,
+                    rate(hz)?,
+                    None
+                )
+                .is_ok()
+            );
+        }
+        assert!(matches!(
+            AudioEncodingOptions::new(
+                AudioOutputFormat::Mp3,
+                AudioRateControl::Default,
+                rate(7_350)?,
+                None
+            ),
+            Err(DomainError::InvalidAudioOptionSampleRate { .. })
+        ));
+        assert!(
+            AudioEncodingOptions::new(
+                AudioOutputFormat::M4a,
+                AudioRateControl::Default,
+                rate(7_350)?,
+                None
+            )
+            .is_ok()
+        );
+        for format in [
+            AudioOutputFormat::Wav,
+            AudioOutputFormat::Flac,
+            AudioOutputFormat::Ogg,
+        ] {
+            assert!(
+                AudioEncodingOptions::new(format, AudioRateControl::Default, rate(44_100)?, None)
+                    .is_ok()
+            );
+            assert!(matches!(
+                AudioEncodingOptions::new(format, AudioRateControl::Default, rate(7_999)?, None),
+                Err(DomainError::InvalidAudioOptionSampleRate { .. })
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_illegal_channels_per_format() -> Result<(), DomainError> {
+        let channels = |count| AudioOptionChannels::new(count).map(Some);
+        for format in [AudioOutputFormat::Mp3, AudioOutputFormat::Opus] {
+            assert!(
+                AudioEncodingOptions::new(format, AudioRateControl::Default, None, channels(2)?)
+                    .is_ok()
+            );
+            assert!(matches!(
+                AudioEncodingOptions::new(format, AudioRateControl::Default, None, channels(3)?),
+                Err(DomainError::InvalidAudioOptionChannels { .. })
+            ));
+        }
+        for format in [
+            AudioOutputFormat::Aac,
+            AudioOutputFormat::M4a,
+            AudioOutputFormat::Ogg,
+        ] {
+            for count in [1, 2, 3, 5, 6] {
+                assert!(
+                    AudioEncodingOptions::new(
+                        format,
+                        AudioRateControl::Default,
+                        None,
+                        channels(count)?
+                    )
+                    .is_ok()
+                );
+            }
+            assert!(matches!(
+                AudioEncodingOptions::new(format, AudioRateControl::Default, None, channels(4)?),
+                Err(DomainError::InvalidAudioOptionChannels { .. })
+            ));
+        }
+        assert!(
+            AudioEncodingOptions::new(
+                AudioOutputFormat::Wav,
+                AudioRateControl::Default,
+                None,
+                channels(8)?
+            )
+            .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_rejects_mp3_high_bitrate_at_low_rate_before_io() {
+        let workers = NonZeroUsize::MIN;
+        let options = AudioEncodingOptions {
+            rate_control: AudioRateControl::Bitrate(
+                AudioOptionBitrate::new(320_000).unwrap_or_else(|_| unreachable!()),
+            ),
+            sample_rate: Some(
+                AudioOptionSampleRate::new(24_000).unwrap_or_else(|_| unreachable!()),
+            ),
+            channels: None,
+        };
+        let result = AudioBatchPlan::with_options(
+            vec![item("a")],
+            AudioExecutionMode::CpuMp3,
+            workers,
+            options,
+        );
+        assert!(matches!(
+            result,
+            Err(DomainError::IncompatibleAudioBitrateRate { .. })
+        ));
+    }
+
+    #[test]
+    fn plan_revalidates_options_against_its_mode() {
+        let workers = NonZeroUsize::MIN;
+        let bitrate = AudioOptionBitrate::new(128_000).unwrap_or_else(|_| unreachable!());
+        let invalid_for_wav = AudioEncodingOptions::new(
+            AudioOutputFormat::Mp3,
+            AudioRateControl::Bitrate(bitrate),
+            None,
+            None,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let result = AudioBatchPlan::with_options(
+            vec![item("a")],
+            AudioExecutionMode::CpuWav,
+            workers,
+            invalid_for_wav,
+        );
+        assert!(matches!(
+            result,
+            Err(DomainError::UnsupportedAudioRateControl { .. })
+        ));
+        let valid = AudioEncodingOptions::new(
+            AudioOutputFormat::Mp3,
+            AudioRateControl::Bitrate(bitrate),
+            None,
+            None,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let plan = AudioBatchPlan::with_options(
+            vec![item("a")],
+            AudioExecutionMode::CpuMp3,
+            workers,
+            valid,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        assert_eq!(plan.options(), valid);
+        assert_eq!(default_options(), AudioEncodingOptions::default());
     }
 }

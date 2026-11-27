@@ -183,13 +183,18 @@ fn convert_help_documents_accepted_flags_and_rules() -> Result<(), String> {
 }
 
 #[test]
-fn audio_help_documents_only_implemented_flags() -> Result<(), String> {
+fn audio_help_documents_all_encoding_flags_and_rules() -> Result<(), String> {
     let text = stdout(&["audio", "--help"])?;
     for needle in [
-        "fastconv audio <source> <target> [--to <format>] [--threads <N>] [--backend <name>]",
+        "fastconv audio <source> <target> [--to <format>] [--bitrate <rate> | --quality <0..=100>]",
+        "[--sample-rate <hz>] [--channels <1..=8>] [--threads <N>] [--backend <name>]",
         "<source>",
         "<target>",
         "--to <format>",
+        "--bitrate <rate>",
+        "--quality <0..=100>",
+        "--sample-rate <hz>",
+        "--channels <1..=8>",
         "--threads <N>",
         "--backend <name>",
         "-h, --help",
@@ -212,6 +217,10 @@ fn audio_help_documents_only_implemented_flags() -> Result<(), String> {
         "CPU only",
         "no silent CPU fallback",
         "directory batches default to flac",
+        "mutually exclusive with --bitrate",
+        "use --bitrate",
+        "Opus accepts only 48000",
+        "excluding 4",
         "nvenc",
         "vaapi",
         "qsv",
@@ -221,10 +230,6 @@ fn audio_help_documents_only_implemented_flags() -> Result<(), String> {
     ] {
         assert!(text.contains(needle), "audio help missing '{needle}'");
     }
-    assert!(
-        !text.contains("--quality"),
-        "audio help must not claim --quality"
-    );
     assert!(
         !text.contains("--lossless"),
         "audio help must not claim --lossless"
@@ -306,5 +311,103 @@ fn invalid_probe_arguments_fail() -> Result<(), String> {
     }
     assert!(failure(&["probe", "magic"])?.contains("expected `fastconv probe`"));
     assert!(failure(&["probe", "--verbose"])?.contains("unknown flag '--verbose'"));
+    Ok(())
+}
+
+#[test]
+fn invalid_audio_encoding_flags_fail_before_io() -> Result<(), String> {
+    let cases: [(&[&str], &str); 11] = [
+        (
+            &[
+                "audio",
+                "in.wav",
+                "out.flac",
+                "--bitrate",
+                "128k",
+                "--quality",
+                "80",
+            ],
+            "cannot combine --bitrate with --quality",
+        ),
+        (
+            &[
+                "audio",
+                "in.wav",
+                "out.mp3",
+                "--bitrate",
+                "128k",
+                "--bitrate",
+                "192k",
+            ],
+            "duplicate flag",
+        ),
+        (
+            &[
+                "audio",
+                "in.wav",
+                "out.mp3",
+                "--quality",
+                "40",
+                "--quality",
+                "60",
+            ],
+            "duplicate flag",
+        ),
+        (
+            &["audio", "in.wav", "out.mp3", "--bitrate"],
+            "missing value",
+        ),
+        (
+            &["audio", "in.wav", "out.mp3", "--bitrate", "abc"],
+            "invalid audio bitrate",
+        ),
+        (
+            &["audio", "in.wav", "out.mp3", "--quality", "101"],
+            "invalid --quality",
+        ),
+        (
+            &["audio", "in.wav", "out.mp3", "--sample-rate", "0"],
+            "invalid --sample-rate",
+        ),
+        (
+            &[
+                "audio",
+                "in.wav",
+                "out.mp3",
+                "--sample-rate",
+                "44100",
+                "--sample-rate",
+                "48000",
+            ],
+            "duplicate flag",
+        ),
+        (
+            &["audio", "in.wav", "out.mp3", "--channels", "0"],
+            "invalid --channels",
+        ),
+        (
+            &["audio", "in.wav", "out.mp3", "--channels", "9"],
+            "invalid --channels",
+        ),
+        (
+            &[
+                "audio",
+                "in.wav",
+                "out.mp3",
+                "--channels",
+                "2",
+                "--channels",
+                "1",
+            ],
+            "duplicate flag",
+        ),
+    ];
+    for (args, expected) in cases {
+        let stderr = failure(args)?;
+        assert!(
+            stderr.contains(expected),
+            "expected '{expected}' for {args:?}, got: {stderr}"
+        );
+    }
     Ok(())
 }

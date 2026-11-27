@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use fastconv_domain::{
-    AudioBatchItem, AudioBatchPlan, AudioExecutionMode, AudioInputFormat, AudioOutputFormat,
-    AudioStreamInfo, DomainError, HardwareBackend, PathRole,
+    AudioBatchItem, AudioBatchPlan, AudioEncodingOptions, AudioExecutionMode, AudioInputFormat,
+    AudioOptionBitrate, AudioOptionChannels, AudioOptionSampleRate, AudioOutputFormat,
+    AudioQuality, AudioRateControl, AudioStreamInfo, DomainError, HardwareBackend, PathRole,
 };
 use symphonia::core::codecs::audio::{AudioDecoderOptions, well_known::CODEC_ID_ALAC};
 use symphonia::core::formats::FormatOptions;
@@ -19,6 +20,122 @@ use crate::ProbeError;
 
 const MAGIC_PREFIX_BYTES: usize = 4096;
 const SUPPORTED_AUDIO_TARGETS: &str = "flac, wav, opus, ogg, mp3, aac, m4a, alac, or aiff";
+
+/// Raw encoder knobs collected at the CLI boundary before the output format is known.
+///
+/// Field-level validity is established by the domain constructors; compatibility with the
+/// resolved output format is checked once in [`prepare_audio_batch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AudioEncodingRequest {
+    pub rate_control: AudioRateControl,
+    pub sample_rate: Option<AudioOptionSampleRate>,
+    pub channels: Option<AudioOptionChannels>,
+}
+
+const BITRATE_PARSE_EXPECTED: &str =
+    "a positive rate such as 128k, 192k, 320k, 128kbps, 128, or 128000";
+
+/// Parses the raw `--bitrate` value at the system boundary into a validated domain rate.
+///
+/// A `k`/`kbps` suffix (case-insensitive) means kbps, a bare value below `1_000` is kbps,
+/// and a bare value of at least `1_000` is bps.
+///
+/// # Errors
+///
+/// Returns [`DomainError::InvalidAudioOptionBitrate`] for empty, zero, non-digit, overflowing,
+/// or otherwise malformed input.
+pub fn parse_audio_bitrate(raw: &str) -> Result<AudioOptionBitrate, DomainError> {
+    let invalid = || DomainError::InvalidAudioOptionBitrate {
+        raw: raw.to_owned(),
+        expected: BITRATE_PARSE_EXPECTED,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(invalid());
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    let (digits, suffix_kbps) = if let Some(rest) = lowered.strip_suffix("kbps") {
+        (rest, true)
+    } else if let Some(rest) = lowered.strip_suffix('k') {
+        (rest, true)
+    } else {
+        (trimmed, false)
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let value = digits.parse::<u32>().map_err(|_| invalid())?;
+    if value == 0 {
+        return Err(invalid());
+    }
+    let bps = if suffix_kbps || value < 1_000 {
+        value.checked_mul(1_000).ok_or_else(invalid)?
+    } else {
+        value
+    };
+    AudioOptionBitrate::new(bps)
+}
+
+/// Parses and validates the four raw encoding flag values into an [`AudioEncodingRequest`].
+///
+/// This is the single boundary where the CLI's raw `--bitrate`, `--quality`,
+/// `--sample-rate`, and `--channels` strings become domain types; the CLI only collects
+/// raw values and flag presence.
+///
+/// # Errors
+///
+/// Returns a diagnostic for a bitrate/quality conflict or any malformed flag value.
+pub fn parse_audio_encoding_request(
+    bitrate: Option<&str>,
+    quality: Option<&str>,
+    sample_rate: Option<&str>,
+    channels: Option<&str>,
+) -> Result<AudioEncodingRequest, String> {
+    if bitrate.is_some() && quality.is_some() {
+        return Err("cannot combine --bitrate with --quality".to_owned());
+    }
+    let rate_control = if let Some(raw) = bitrate {
+        AudioRateControl::Bitrate(parse_audio_bitrate(raw).map_err(|err| err.to_string())?)
+    } else if let Some(raw) = quality {
+        let value = raw
+            .parse::<u8>()
+            .map_err(|err| format!("invalid --quality '{raw}': {err}"))?;
+        AudioRateControl::Quality(
+            AudioQuality::new(value).map_err(|err| format!("invalid --quality '{raw}': {err}"))?,
+        )
+    } else {
+        AudioRateControl::Default
+    };
+    let sample_rate = match sample_rate {
+        Some(raw) => {
+            let hz = raw
+                .parse::<u32>()
+                .map_err(|err| format!("invalid --sample-rate '{raw}': {err}"))?;
+            Some(
+                AudioOptionSampleRate::new(hz)
+                    .map_err(|err| format!("invalid --sample-rate '{raw}': {err}"))?,
+            )
+        }
+        None => None,
+    };
+    let channels = match channels {
+        Some(raw) => {
+            let count = raw
+                .parse::<u16>()
+                .map_err(|err| format!("invalid --channels '{raw}': {err}"))?;
+            Some(
+                AudioOptionChannels::new(count)
+                    .map_err(|err| format!("invalid --channels '{raw}': {err}"))?,
+            )
+        }
+        None => None,
+    };
+    Ok(AudioEncodingRequest {
+        rate_control,
+        sample_rate,
+        channels,
+    })
+}
 
 /// Validated input metadata produced at the file-system boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -403,6 +520,7 @@ fn prepare_directory_batch(
     target_dir: &Path,
     format: AudioOutputFormat,
     threads: NonZeroUsize,
+    options: AudioEncodingOptions,
 ) -> Result<AudioBatchPlan, ProbeError> {
     match fs::metadata(target_dir) {
         Ok(meta) if meta.is_dir() => {}
@@ -480,7 +598,7 @@ fn prepare_directory_batch(
     }
 
     let mode = AudioExecutionMode::resolve(format, HardwareBackend::Cpu)?;
-    Ok(AudioBatchPlan::new(items, mode, threads)?)
+    Ok(AudioBatchPlan::with_options(items, mode, threads, options)?)
 }
 
 /// Resolves a path to an absolute location, using the parent directory for outputs that do not
@@ -540,6 +658,7 @@ pub fn prepare_audio_batch(
     to: Option<AudioOutputFormat>,
     worker_threads: Option<NonZeroUsize>,
     backend: HardwareBackend,
+    request: AudioEncodingRequest,
 ) -> Result<AudioBatchPlan, ProbeError> {
     if source.as_os_str().is_empty() {
         return Err(DomainError::EmptyPath(PathRole::Source).into());
@@ -560,13 +679,26 @@ pub fn prepare_audio_batch(
     if source_meta.is_dir() {
         let format = to.unwrap_or(AudioOutputFormat::Flac);
         AudioExecutionMode::resolve(format, backend)?;
-        return prepare_directory_batch(source, target, format, threads);
+        // Validate encoding options before touching any input file in the batch.
+        let options = AudioEncodingOptions::new(
+            format,
+            request.rate_control,
+            request.sample_rate,
+            request.channels,
+        )?;
+        return prepare_directory_batch(source, target, format, threads, options);
     }
     if !source_meta.is_file() {
         return Err(ProbeError::NotAFileOrDirectory(source.to_path_buf()));
     }
 
     let (resolved_target, format) = resolve_single_target(source, target, to)?;
+    let options = AudioEncodingOptions::new(
+        format,
+        request.rate_control,
+        request.sample_rate,
+        request.channels,
+    )?;
     let canonical_source = canonical_or_parent(source)?;
     let canonical_target = canonical_or_parent(&resolved_target)?;
     if canonical_source == canonical_target {
@@ -580,12 +712,18 @@ pub fn prepare_audio_batch(
         probed.format,
         probed.stream,
     )?;
-    Ok(AudioBatchPlan::new(vec![item], mode, threads)?)
+    Ok(AudioBatchPlan::with_options(
+        vec![item],
+        mode,
+        threads,
+        options,
+    )?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastconv_domain::AudioOptionBitrate;
 
     #[test]
     fn detects_magic_without_extension_help() {
@@ -678,7 +816,14 @@ mod tests {
             .strip_prefix(&cwd)
             .unwrap_or(&absolute)
             .to_path_buf();
-        let result = prepare_audio_batch(&relative, &absolute, None, None, HardwareBackend::Cpu);
+        let result = prepare_audio_batch(
+            &relative,
+            &absolute,
+            None,
+            None,
+            HardwareBackend::Cpu,
+            AudioEncodingRequest::default(),
+        );
         let _ = fs::remove_dir_all(&dir);
         assert!(matches!(
             result,
@@ -704,6 +849,7 @@ mod tests {
             Some(AudioOutputFormat::Flac),
             Some(NonZeroUsize::MIN),
             HardwareBackend::Gpu(fastconv_domain::GpuBackend::Nvenc),
+            AudioEncodingRequest::default(),
         );
         assert!(matches!(
             result,
@@ -849,6 +995,197 @@ mod tests {
             assert_eq!(probed.format, AudioInputFormat::Aac, "tag_len={tag_len}");
         }
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_bitrate_syntax_at_the_boundary() -> Result<(), DomainError> {
+        for (raw, bps) in [
+            ("128k", 128_000),
+            ("192K", 192_000),
+            ("320kbps", 320_000),
+            ("128KBPS", 128_000),
+            (" 6 ", 6_000),
+            ("510", 510_000),
+            ("999", 999_000),
+            ("128000", 128_000),
+            ("6000", 6_000),
+        ] {
+            assert_eq!(parse_audio_bitrate(raw)?.bps(), bps, "raw={raw}");
+        }
+        for raw in [
+            "",
+            " ",
+            "0",
+            "0k",
+            "k",
+            "kbps",
+            "-128k",
+            "128kb",
+            "12x8k",
+            "4294967296k",
+            "4294967296",
+        ] {
+            assert!(
+                matches!(
+                    parse_audio_bitrate(raw),
+                    Err(DomainError::InvalidAudioOptionBitrate { .. })
+                ),
+                "'{raw}' must be rejected"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parses_raw_encoding_request_and_rejects_conflicts() -> Result<(), String> {
+        let expected = AudioEncodingRequest {
+            rate_control: AudioRateControl::Bitrate(
+                AudioOptionBitrate::new(192_000).map_err(|err| err.to_string())?,
+            ),
+            sample_rate: Some(AudioOptionSampleRate::new(48_000).map_err(|err| err.to_string())?),
+            channels: Some(AudioOptionChannels::new(2).map_err(|err| err.to_string())?),
+        };
+        assert_eq!(
+            parse_audio_encoding_request(Some("192k"), None, Some("48000"), Some("2"))?,
+            expected
+        );
+        assert_eq!(
+            parse_audio_encoding_request(None, None, None, None)?,
+            AudioEncodingRequest::default()
+        );
+        assert_eq!(
+            parse_audio_encoding_request(None, Some("85"), None, None)?.rate_control,
+            AudioRateControl::Quality(AudioQuality::new(85).map_err(|err| err.to_string())?)
+        );
+
+        for (bitrate, quality) in [(Some("128k"), Some("80")), (Some("128k"), Some("101"))] {
+            let Err(err) = parse_audio_encoding_request(bitrate, quality, None, None) else {
+                return Err("bitrate/quality must be rejected".to_owned());
+            };
+            assert!(
+                err.contains("cannot combine --bitrate with --quality"),
+                "unexpected diagnostic: {err}"
+            );
+        }
+        for (args, needle) in [
+            ((None, Some("101"), None, None), "invalid --quality"),
+            ((None, Some("abc"), None, None), "invalid --quality"),
+            ((None, None, Some("0"), None), "invalid --sample-rate"),
+            ((None, None, Some("abc"), None), "invalid --sample-rate"),
+            ((None, None, None, Some("0")), "invalid --channels"),
+            ((None, None, None, Some("9")), "invalid --channels"),
+            ((Some("abc"), None, None, None), "invalid audio bitrate"),
+        ] {
+            let Err(err) = parse_audio_encoding_request(args.0, args.1, args.2, args.3) else {
+                return Err(format!("malformed value must be rejected: {args:?}"));
+            };
+            assert!(err.contains(needle), "expected '{needle}' in '{err}'");
+        }
+        Ok(())
+    }
+
+    fn bitrate_request(bps: u32) -> AudioEncodingRequest {
+        AudioEncodingRequest {
+            rate_control: AudioRateControl::Bitrate(
+                AudioOptionBitrate::new(bps).unwrap_or_else(|_| unreachable!()),
+            ),
+            ..AudioEncodingRequest::default()
+        }
+    }
+
+    #[test]
+    fn rejects_illegal_options_before_probing_single_file() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let target = Path::new("target/rejected.flac");
+        let result = prepare_audio_batch(
+            &source,
+            target,
+            Some(AudioOutputFormat::Flac),
+            Some(NonZeroUsize::MIN),
+            HardwareBackend::Cpu,
+            bitrate_request(128_000),
+        );
+        assert!(matches!(
+            result,
+            Err(ProbeError::InvalidDomain(
+                DomainError::UnsupportedAudioRateControl { .. }
+            ))
+        ));
+
+        let opus_target = Path::new("target/rejected.opus");
+        let request = AudioEncodingRequest {
+            sample_rate: Some(
+                AudioOptionSampleRate::new(44_100).unwrap_or_else(|_| unreachable!()),
+            ),
+            ..AudioEncodingRequest::default()
+        };
+        let result = prepare_audio_batch(
+            &source,
+            opus_target,
+            Some(AudioOutputFormat::Opus),
+            Some(NonZeroUsize::MIN),
+            HardwareBackend::Cpu,
+            request,
+        );
+        assert!(matches!(
+            result,
+            Err(ProbeError::InvalidDomain(
+                DomainError::InvalidAudioOptionSampleRate { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn rejects_illegal_options_before_probing_directory_batch() -> Result<(), String> {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source_dir = manifest
+            .join("target")
+            .join(format!("fastconv-audio-options-src-{}", std::process::id()));
+        let target_dir = manifest
+            .join("target")
+            .join(format!("fastconv-audio-options-dst-{}", std::process::id()));
+        fs::create_dir_all(&source_dir).map_err(|err| err.to_string())?;
+        fs::create_dir_all(&target_dir).map_err(|err| err.to_string())?;
+        fs::write(source_dir.join("dummy.wav"), b"not decoded").map_err(|err| err.to_string())?;
+
+        let result = prepare_audio_batch(
+            &source_dir,
+            &target_dir,
+            Some(AudioOutputFormat::Flac),
+            Some(NonZeroUsize::MIN),
+            HardwareBackend::Cpu,
+            bitrate_request(192_000),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ProbeError::InvalidDomain(
+                    DomainError::UnsupportedAudioRateControl { .. }
+                ))
+            ),
+            "directory batches must reject illegal options before probing files"
+        );
+
+        let result = prepare_audio_batch(
+            &source_dir,
+            &target_dir,
+            Some(AudioOutputFormat::Mp3),
+            Some(NonZeroUsize::MIN),
+            HardwareBackend::Cpu,
+            AudioEncodingRequest {
+                channels: Some(AudioOptionChannels::new(4).unwrap_or_else(|_| unreachable!())),
+                ..AudioEncodingRequest::default()
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ProbeError::InvalidDomain(
+                DomainError::InvalidAudioOptionChannels { .. }
+            ))
+        ));
+        let _ = fs::remove_dir_all(&source_dir);
+        let _ = fs::remove_dir_all(&target_dir);
         Ok(())
     }
 }

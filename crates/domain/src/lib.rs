@@ -5,8 +5,10 @@ pub mod metrics;
 pub mod video;
 
 pub use audio::{
-    AudioBatchItem, AudioBatchPlan, AudioConversionReport, AudioExecutionMode, AudioInputFormat,
-    AudioOutputFormat, AudioStreamInfo,
+    AudioBatchItem, AudioBatchPlan, AudioConversionReport, AudioEncodingOptions,
+    AudioExecutionMode, AudioInputFormat, AudioOptionBitrate, AudioOptionChannels,
+    AudioOptionSampleRate, AudioOutputFormat, AudioQuality, AudioRateControl, AudioStreamInfo,
+    aac_frame_capacity_bps,
 };
 pub use hardware::{
     CpuInfo, DetectedGpuBackend, GpuAdapterInfo, GpuCapability, GpuVendor, HostHardware, SimdLevel,
@@ -152,6 +154,38 @@ pub enum DomainError {
         backend: HardwareBackend,
         reason: String,
     },
+    InvalidAudioOptionBitrate {
+        raw: String,
+        expected: &'static str,
+    },
+    InvalidAudioQuality {
+        value: u8,
+        max: u8,
+    },
+    InvalidAudioOptionSampleRate {
+        hz: u32,
+        expected: &'static str,
+    },
+    InvalidAudioOptionChannels {
+        channels: u16,
+        expected: &'static str,
+    },
+    IncompatibleAudioBitrateRate {
+        bps: u32,
+        hz: u32,
+        max_bps: u32,
+    },
+    IncompatibleAacBitrateRate {
+        bps: u32,
+        hz: u32,
+        channels: u16,
+        max_bps: u32,
+    },
+    UnsupportedAudioRateControl {
+        format: AudioOutputFormat,
+        control: &'static str,
+        reason: &'static str,
+    },
 }
 
 pub(crate) fn require_non_empty(value: &str, field: &'static str) -> Result<String, DomainError> {
@@ -211,13 +245,11 @@ impl fmt::Display for DomainError {
         match self {
             Self::EmptyPath(role) => write!(f, "{role} path must not be empty"),
             Self::EmptyField(field) => write!(f, "field '{field}' must not be blank"),
-            Self::IdenticalSourceAndTarget(path) => {
-                write!(
-                    f,
-                    "source and target path must differ to avoid in-place corruption: {}",
-                    path.display()
-                )
-            }
+            Self::IdenticalSourceAndTarget(path) => write!(
+                f,
+                "source and target path must differ to avoid in-place corruption: {}",
+                path.display()
+            ),
             Self::InvalidCpuTopology {
                 physical_cores,
                 logical_threads,
@@ -250,20 +282,16 @@ impl fmt::Display for DomainError {
             Self::EmptyBatch => {
                 f.write_str("image conversion batch must contain at least one file")
             }
-            Self::DuplicateTargetPath(path) => {
-                write!(
-                    f,
-                    "multiple batch items target the same output path: {}",
-                    path.display()
-                )
-            }
-            Self::TargetOverwritesSource(path) => {
-                write!(
-                    f,
-                    "batch output path would overwrite a source file: {}",
-                    path.display()
-                )
-            }
+            Self::DuplicateTargetPath(path) => write!(
+                f,
+                "multiple batch items target the same output path: {}",
+                path.display()
+            ),
+            Self::TargetOverwritesSource(path) => write!(
+                f,
+                "batch output path would overwrite a source file: {}",
+                path.display()
+            ),
             Self::UnsupportedBackend {
                 media_kind,
                 backend,
@@ -287,6 +315,30 @@ impl fmt::Display for DomainError {
                 f,
                 "backend '{backend}' cannot encode {format} audio: {reason}"
             ),
+            Self::InvalidAudioOptionBitrate { raw, expected } => {
+                write!(f, "invalid audio bitrate '{raw}' (expected {expected})")
+            }
+            Self::InvalidAudioQuality { value, max } => {
+                write!(f, "audio quality must be in 0..={max}, got {value}")
+            }
+            Self::InvalidAudioOptionSampleRate { hz, expected } => {
+                write!(f, "invalid audio sample rate {hz} Hz (expected {expected})")
+            }
+            Self::InvalidAudioOptionChannels { channels, expected } => {
+                write!(
+                    f,
+                    "invalid audio channel count {channels} (expected {expected})"
+                )
+            }
+            Self::IncompatibleAudioBitrateRate { bps, hz, max_bps } => write!(
+                f,
+                "audio bitrate {bps} bps at {hz} Hz is incompatible with MP3 (MPEG-2/2.5 Layer III caps at {max_bps} bps)"
+            ),
+            Self::UnsupportedAudioRateControl {
+                format,
+                control,
+                reason,
+            } => write!(f, "{control} is not supported for {format} audio: {reason}"),
             _ => fmt_encoding_error(self, f),
         }
     }
@@ -325,6 +377,15 @@ fn fmt_encoding_error(err: &DomainError, f: &mut fmt::Formatter<'_>) -> fmt::Res
         DomainError::ConflictingAudioEncodeOptions { reason } => {
             write!(f, "conflicting audio encoding options: {reason}")
         }
+        DomainError::IncompatibleAacBitrateRate {
+            bps,
+            hz,
+            channels,
+            max_bps,
+        } => write!(
+            f,
+            "audio bitrate {bps} bps at {hz} Hz with {channels} channels exceeds the AAC frame capacity of {max_bps} bps"
+        ),
         _ => Err(fmt::Error),
     }
 }

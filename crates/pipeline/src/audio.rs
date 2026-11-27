@@ -14,8 +14,9 @@ use std::thread;
 use std::time::Instant;
 
 use fastconv_domain::{
-    AudioBatchItem, AudioBatchPlan, AudioConversionReport, AudioInputFormat, AudioOutputFormat,
-    HardwareBackend,
+    AudioBatchItem, AudioBatchPlan, AudioConversionReport, AudioEncodingOptions, AudioInputFormat,
+    AudioOptionChannels, AudioOptionSampleRate, AudioOutputFormat, AudioRateControl,
+    HardwareBackend, aac_frame_capacity_bps,
 };
 use flacenc::bitsink::ByteSink;
 use flacenc::component::BitRepr;
@@ -24,7 +25,7 @@ use flacenc::source::{Fill, Source};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use opus_pure::{
     Application, DEFAULT_WARMUP_MS, MAX_PACKET_BYTES, MAX_PACKET_SAMPLES, OggOpusReader,
-    OggOpusWriter, OpusEncoder, OpusHead, ParallelConfig, Trim, encode_parallel,
+    OggOpusWriter, OpusEncoder, OpusHead, ParallelConfig, RateControl, Trim, encode_parallel,
 };
 use rubato::audioadapter_buffers::owned::InterleavedOwned;
 use rubato::{Fft, FixedSync, Indexing, Resampler};
@@ -47,6 +48,8 @@ const WAV_WRITE_BUF_BYTES: usize = 256 * 1024;
 const OPUS_WRITE_BUF_BYTES: usize = 64 * 1024;
 const MAX_PCM_BYTES_PER_FILE: u64 = 512 * 1024 * 1024;
 const MAX_PCM_BYTES_PER_BATCH: u64 = 1024 * 1024 * 1024;
+/// `MAX_PCM_BYTES_PER_FILE / 4`, expressed as `usize` so caps are checked before allocation.
+const MAX_F32_SAMPLES_PER_FILE: usize = 128 * 1024 * 1024;
 
 /// Per-worker scratch space. All buffers are retained across files so a batch does not
 /// reallocate its decode/encode working set for every item.
@@ -118,6 +121,170 @@ fn quantize_i16(sample: f32) -> i16 {
 
 fn quantize_i24(sample: f32) -> i32 {
     to_i32_saturating(sample.clamp(-1.0, 1.0) * 8_388_608.0).clamp(-8_388_608, 8_388_607)
+}
+
+/// Checks the post-transform sample count *before* any buffer is grown. Both resampling
+/// and channel remixing can increase the sample count, so neither may allocate first.
+fn checked_f32_capacity(frames: u64, channels: usize, path: &Path) -> Result<usize, PipelineError> {
+    let samples = frames.saturating_mul(u64::try_from(channels.max(1)).unwrap_or(u64::MAX));
+    if samples > u64::try_from(MAX_F32_SAMPLES_PER_FILE).unwrap_or(u64::MAX) {
+        return Err(PipelineError::EncodeFailed {
+            path: path.to_path_buf(),
+            reason: format!(
+                "transformed PCM would exceed the {MAX_PCM_BYTES_PER_FILE}-byte per-file limit"
+            ),
+        });
+    }
+    Ok(usize::try_from(samples).unwrap_or(MAX_F32_SAMPLES_PER_FILE))
+}
+
+const ITU_CENTER: f32 = std::f32::consts::FRAC_1_SQRT_2;
+const ITU_SURROUND: f32 = 0.5;
+
+const SPEAKER_FL: u8 = 0;
+const SPEAKER_FR: u8 = 1;
+const SPEAKER_FC: u8 = 2;
+const SPEAKER_LFE: u8 = 3;
+const SPEAKER_BL: u8 = 4;
+const SPEAKER_BR: u8 = 5;
+const SPEAKER_SL: u8 = 6;
+const SPEAKER_SR: u8 = 7;
+
+/// Canonical speaker positions for the layouts the native encoders understand.
+/// Four- and seven-channel layouts are ambiguous, so they are deliberately absent.
+fn speaker_layout(channels: usize) -> Option<&'static [u8]> {
+    match channels {
+        1 => Some(&[SPEAKER_FC]),
+        2 => Some(&[SPEAKER_FL, SPEAKER_FR]),
+        3 => Some(&[SPEAKER_FL, SPEAKER_FR, SPEAKER_FC]),
+        5 => Some(&[SPEAKER_FL, SPEAKER_FR, SPEAKER_FC, SPEAKER_BL, SPEAKER_BR]),
+        6 => Some(&[
+            SPEAKER_FL,
+            SPEAKER_FR,
+            SPEAKER_FC,
+            SPEAKER_LFE,
+            SPEAKER_BL,
+            SPEAKER_BR,
+        ]),
+        8 => Some(&[
+            SPEAKER_FL,
+            SPEAKER_FR,
+            SPEAKER_FC,
+            SPEAKER_LFE,
+            SPEAKER_BL,
+            SPEAKER_BR,
+            SPEAKER_SL,
+            SPEAKER_SR,
+        ]),
+        _ => None,
+    }
+}
+
+/// Per-input-channel contribution to [left, right] for an ITU-style stereo downmix.
+/// `0` is FL, `1` FR, `2` FC, `3` LFE (omitted for 6/8-channel layouts), then
+/// BL/BR and optional surround channels. Positive weights only means the output
+/// can be normalized by its own weight sum so full-scale inputs cannot clip.
+fn downmix_pair(channels: usize, index: usize) -> [f32; 2] {
+    match (channels, index) {
+        (_, 0) => [1.0, 0.0],
+        (_, 1) => [0.0, 1.0],
+        (4, 2) | (5, 3) | (6..=8, 4) => [ITU_CENTER, 0.0],
+        (_, 2) => [ITU_CENTER, ITU_CENTER],
+        (4, 3) | (5, 4) | (6..=8, 5) => [0.0, ITU_CENTER],
+        (7, 6) => [ITU_SURROUND, ITU_SURROUND],
+        (8, 6) => [ITU_SURROUND, 0.0],
+        (8, 7) => [0.0, ITU_SURROUND],
+        // Index 3 is LFE for 6/7/8-channel layouts and is deliberately omitted.
+        _ => [0.0, 0.0],
+    }
+}
+
+/// Remixes interleaved `f32` samples in place. Downmixes (fewer output channels)
+/// happen before resampling; upmixes happen after it, as orchestrated by `convert_item`.
+fn remix_channels_f32(
+    from: usize,
+    to: usize,
+    buf: &mut AudioWorkerBuffer,
+    path: &Path,
+) -> Result<(), PipelineError> {
+    if from == 0 || to == 0 {
+        return Err(PipelineError::DecodeFailed {
+            path: path.to_path_buf(),
+            reason: format!("cannot remix {from} channels to {to}"),
+        });
+    }
+    if from == to {
+        return Ok(());
+    }
+    let source_layout = speaker_layout(from);
+    let target_layout = speaker_layout(to);
+    if from > 2 && to > 1 && (source_layout.is_none() || target_layout.is_none()) {
+        // Copying the first N channels would silently move LFE samples into a
+        // surround slot (or drop a surround channel) for 5/6/7/8-source layouts.
+        return Err(PipelineError::DecodeFailed {
+            path: path.to_path_buf(),
+            reason: format!(
+                "ambiguous channel remix from {from} to {to}: speaker layout is not defined"
+            ),
+        });
+    }
+    let frames = buf.samples_f32.len() / from;
+    let capacity = checked_f32_capacity(u64::try_from(frames).unwrap_or(u64::MAX), to, path)?;
+    let input = std::mem::take(&mut buf.samples_f32);
+    let mut output = Vec::with_capacity(capacity);
+
+    if to == 1 {
+        // Arithmetic mean of every input channel: bounded by the input range,
+        // so it cannot clip regardless of source layout.
+        let scale = 1.0 / f32::from(u16::try_from(from).unwrap_or(u16::MAX));
+        for frame in input.chunks_exact(from) {
+            let sum = frame.iter().copied().sum::<f32>();
+            output.push(sum * scale);
+        }
+    } else if to == 2 && from > 2 {
+        let mut weights = [[0.0_f32; 2]; 8];
+        let mut sums = [0.0_f32; 2];
+        for (index, slot) in weights.iter_mut().enumerate().take(from.min(8)) {
+            *slot = downmix_pair(from, index);
+            sums[0] += slot[0];
+            sums[1] += slot[1];
+        }
+        let divisors = [
+            sums[0].max(f32::MIN_POSITIVE),
+            sums[1].max(f32::MIN_POSITIVE),
+        ];
+        for frame in input.chunks_exact(from) {
+            let mut mixed = [0.0_f32; 2];
+            for (index, &value) in frame.iter().enumerate().take(8) {
+                let weight = weights[index];
+                mixed[0] += value * weight[0];
+                mixed[1] += value * weight[1];
+            }
+            output.push(mixed[0] / divisors[0]);
+            output.push(mixed[1] / divisors[1]);
+        }
+    } else {
+        for frame in input.chunks_exact(from) {
+            for index in 0..to {
+                // Mono is duplicated to FL/FR. Otherwise map by speaker identity so
+                // a dropped LFE never becomes a surround channel (and vice versa).
+                let value = if from == 1 {
+                    if index < 2 { frame[0] } else { 0.0 }
+                } else if let (Some(src), Some(dst)) = (source_layout, target_layout) {
+                    dst.get(index)
+                        .and_then(|speaker| src.iter().position(|s| s == speaker))
+                        .map_or(0.0, |source_index| frame[source_index])
+                } else if index < from {
+                    frame[index]
+                } else {
+                    0.0
+                };
+                output.push(value);
+            }
+        }
+    }
+    buf.samples_f32 = output;
+    Ok(())
 }
 
 fn decode_opus(path: &Path, buf: &mut AudioWorkerBuffer) -> Result<(u32, usize), PipelineError> {
@@ -321,6 +488,7 @@ fn decode_symphonia(
     path: &Path,
     format: AudioInputFormat,
     target: AudioOutputFormat,
+    options: &AudioEncodingOptions,
     buf: &mut AudioWorkerBuffer,
 ) -> Result<(u32, usize, usize), PipelineError> {
     let file = File::open(path).map_err(|source| PipelineError::Io {
@@ -380,6 +548,14 @@ fn decode_symphonia(
                 | symphonia::core::audio::sample::SampleFormat::F64,
         )
     );
+    // A resample or channel remix needs the normalized f32 path: the direct-i16 copy
+    // is bit-exact only when samples pass through untouched.
+    let transforming = options
+        .sample_rate()
+        .is_some_and(|rate| rate.hz() != sample_rate)
+        || options
+            .channels()
+            .is_some_and(|channels_opt| usize::from(channels_opt.get()) != channels);
     let direct_i16 = matches!(
         target,
         AudioOutputFormat::Wav
@@ -387,7 +563,8 @@ fn decode_symphonia(
             | AudioOutputFormat::Aiff
             | AudioOutputFormat::Alac
     ) && bits == 16
-        && integer_pcm;
+        && integer_pcm
+        && !transforming;
     let sample_bytes = if direct_i16 { 2_u64 } else { 4_u64 };
     let max_samples = usize::try_from(MAX_PCM_BYTES_PER_FILE / sample_bytes).unwrap_or(usize::MAX);
     let reserve = total_samples
@@ -466,6 +643,7 @@ fn decode_symphonia(
 fn decode_audio(
     item: &AudioBatchItem,
     target: AudioOutputFormat,
+    options: &AudioEncodingOptions,
     buf: &mut AudioWorkerBuffer,
 ) -> Result<(u32, usize, usize), PipelineError> {
     buf.reset();
@@ -478,7 +656,7 @@ fn decode_audio(
             let (rate, channels) = decode_adts_aac(item.source(), buf)?;
             (rate, channels, 16)
         }
-        _ => decode_symphonia(item.source(), item.input_format(), target, buf)?,
+        _ => decode_symphonia(item.source(), item.input_format(), target, options, buf)?,
     };
 
     if channels == 0 {
@@ -1030,18 +1208,21 @@ fn resample_f32(
     let expected_u64 = (u64::try_from(input_frames).unwrap_or(u64::MAX))
         .saturating_mul(u64::from(to_rate))
         / u64::from(from_rate);
-    let expected = usize::try_from(expected_u64).unwrap_or(usize::MAX);
+    // Check the grown sample count before reserving or extending any buffer.
+    let expected_cap = checked_f32_capacity(expected_u64, channels, Path::new(label))?;
+    let expected = usize::try_from(expected_u64)
+        .unwrap_or(usize::MAX)
+        .min(expected_cap);
     let delay = resampler.output_delay();
     let needed = expected.saturating_add(delay);
     let max_calls = input_frames
         .div_ceil(chunk_in.max(1))
         .saturating_add(needed.div_ceil(chunk_out))
         .saturating_add(4);
-    let max_f32_samples = usize::try_from(MAX_PCM_BYTES_PER_FILE / 4).unwrap_or(usize::MAX);
     let interleaved_reserve = needed
         .saturating_add(chunk_out)
         .saturating_mul(channels)
-        .min(max_f32_samples);
+        .min(MAX_F32_SAMPLES_PER_FILE);
     buf.resampled_f32.clear();
     if buf.resampled_f32.capacity() < interleaved_reserve {
         buf.resampled_f32
@@ -1078,6 +1259,11 @@ fn resample_f32(
         in_storage = in_view.take_data();
         out_storage = out_view.take_data();
         let usable = written.saturating_mul(channels).min(out_storage.len());
+        if buf.resampled_f32.len().saturating_add(usable) > MAX_F32_SAMPLES_PER_FILE {
+            return Err(fail(format!(
+                "resampled PCM exceeds the {MAX_PCM_BYTES_PER_FILE}-byte per-file limit"
+            )));
+        }
         buf.resampled_f32.extend_from_slice(&out_storage[..usable]);
         consumed = consumed.saturating_add(take);
         produced = produced.saturating_add(written);
@@ -1107,6 +1293,7 @@ fn encode_opus(
     channels: usize,
     buf: &mut AudioWorkerBuffer,
     batch_workers: usize,
+    options: &AudioEncodingOptions,
 ) -> Result<(), PipelineError> {
     if channels > 2 {
         return Err(PipelineError::EncodeFailed {
@@ -1129,7 +1316,9 @@ fn encode_opus(
         path: path.to_path_buf(),
         reason: format!("failed to create Opus encoder: {err}"),
     })?;
-    encoder.bitrate_bps = OPUS_BITRATE;
+    let (bitrate_bps, rate_control) = opus_settings(options.rate_control());
+    encoder.bitrate_bps = bitrate_bps;
+    encoder.rate_control = rate_control;
     encoder.complexity = 9;
     let head = OpusHead::for_encoder(&encoder, OPUS_RATE);
     let pre_skip = usize::from(head.pre_skip);
@@ -1138,8 +1327,25 @@ fn encode_opus(
     let packet_count = total_frames.saturating_add(pre_skip).div_ceil(frame);
     let final_granule = u64::from(u16::try_from(pre_skip).unwrap_or(u16::MAX))
         + u64::try_from(total_frames).unwrap_or(u64::MAX);
-    buf.samples_f32
-        .resize(packet_count.saturating_mul(per_frame), 0.0_f32);
+    let padded_samples = u64::try_from(packet_count)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(frame).unwrap_or(u64::MAX));
+    // Pre-skip plus tail rounding pads by less than two Opus frames. Allow that
+    // small, bounded slack above the decoded-PCM cap instead of rejecting a file
+    // that fit before packet alignment; larger padding still fails up front.
+    let padding_allowance = per_frame.saturating_mul(3);
+    let padded_limit = MAX_F32_SAMPLES_PER_FILE.saturating_add(padding_allowance);
+    let padded_samples = usize::try_from(padded_samples)
+        .ok()
+        .and_then(|frames| frames.checked_mul(channels))
+        .filter(|&samples| samples <= padded_limit)
+        .ok_or_else(|| PipelineError::EncodeFailed {
+            path: path.to_path_buf(),
+            reason: format!(
+                "Opus packet padding would exceed the {MAX_PCM_BYTES_PER_FILE}-byte per-file limit"
+            ),
+        })?;
+    buf.samples_f32.resize(padded_samples, 0.0_f32);
 
     let file = File::create(path).map_err(|source| PipelineError::Io {
         path: path.to_path_buf(),
@@ -1160,7 +1366,8 @@ fn encode_opus(
         channels,
         Application::Audio,
     );
-    pcfg.bitrate_bps = OPUS_BITRATE;
+    pcfg.bitrate_bps = bitrate_bps;
+    pcfg.rate_control = rate_control;
     pcfg.complexity = 9;
     pcfg.warmup_ms = DEFAULT_WARMUP_MS;
     pcfg.threads = inner_threads;
@@ -1250,12 +1457,137 @@ const MP3_RATES: [u32; 9] = [
 const OGG_MAX_RATE: u32 = 192_000;
 const OGG_CHUNK_FRAMES: usize = 4096;
 
+fn mp3_config(rate_control: AudioRateControl) -> rusty_mp3::Mp3EncoderConfig {
+    match rate_control {
+        AudioRateControl::Default => rusty_mp3::Mp3EncoderConfig {
+            bitrate_kbps: MP3_BITRATE_KBPS,
+            vbr_quality: None,
+        },
+        AudioRateControl::Bitrate(bitrate) => rusty_mp3::Mp3EncoderConfig {
+            bitrate_kbps: bitrate.kbps_rounded(),
+            vbr_quality: None,
+        },
+        AudioRateControl::Quality(quality) => {
+            let lame_q = 9.0 * (100.0 - f32::from(quality.value())) / 100.0;
+            rusty_mp3::Mp3EncoderConfig {
+                bitrate_kbps: 0,
+                vbr_quality: Some(rusty_mp3::vbr_quality_index(lame_q)),
+            }
+        }
+    }
+}
+
+fn aac_bitrate_bps(rate_control: AudioRateControl) -> u32 {
+    match rate_control {
+        AudioRateControl::Default | AudioRateControl::Quality(_) => AAC_BITRATE_BPS,
+        AudioRateControl::Bitrate(bitrate) => bitrate.bps(),
+    }
+}
+
+/// Rejects a bitrate the AAC frame cannot carry, using the effective rate and
+/// channel count when the caller did not pin them explicitly.
+fn check_aac_bitrate(
+    path: &Path,
+    rate: u32,
+    channels: usize,
+    options: &AudioEncodingOptions,
+) -> Result<(), PipelineError> {
+    if let AudioRateControl::Bitrate(bitrate) = options.rate_control() {
+        let max_bps = aac_frame_capacity_bps(rate, u16::try_from(channels).unwrap_or(u16::MAX));
+        if bitrate.bps() > max_bps {
+            return Err(PipelineError::EncodeFailed {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "AAC bitrate {} bps at {rate} Hz with {channels} channels exceeds the frame capacity of {max_bps} bps",
+                    bitrate.bps()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn opus_settings(rate_control: AudioRateControl) -> (i32, RateControl) {
+    match rate_control {
+        AudioRateControl::Default => (OPUS_BITRATE, RateControl::ConstrainedVbr),
+        AudioRateControl::Bitrate(bitrate) => (
+            i32::try_from(bitrate.bps()).unwrap_or(i32::MAX),
+            RateControl::ConstrainedVbr,
+        ),
+        AudioRateControl::Quality(quality) => {
+            let bps = 16_000_i32.saturating_add(i32::from(quality.value()).saturating_mul(2_400));
+            (bps, RateControl::Vbr)
+        }
+    }
+}
+
+fn vorbis_strategy(
+    rate_control: AudioRateControl,
+) -> Result<vorbis_enc::BitrateManagementStrategy, PipelineError> {
+    let strategy = match rate_control {
+        AudioRateControl::Default => vorbis_enc::BitrateManagementStrategy::QualityVbr {
+            target_quality: 0.4,
+        },
+        AudioRateControl::Bitrate(bitrate) => {
+            let average =
+                NonZeroU32::new(bitrate.bps()).ok_or_else(|| PipelineError::EncodeFailed {
+                    path: Path::new("ogg-bitrate").to_path_buf(),
+                    reason: "Ogg average bitrate must be non-zero".to_owned(),
+                })?;
+            vorbis_enc::BitrateManagementStrategy::Abr {
+                average_bitrate: average,
+            }
+        }
+        AudioRateControl::Quality(quality) => {
+            let target = (-0.1_f32 + f32::from(quality.value()) * 0.011_f32).clamp(-0.1, 1.0);
+            vorbis_enc::BitrateManagementStrategy::QualityVbr {
+                target_quality: target,
+            }
+        }
+    };
+    Ok(strategy)
+}
+
 fn aac_rate(rate: u32) -> u32 {
     if rusty_aac::sf_index_for_rate(rate).is_some() {
         rate
     } else {
         OPUS_RATE
     }
+}
+
+/// Single source of truth for the rate fed to the encoder. Explicit options win;
+/// otherwise every format keeps the codec default it used before these options existed.
+fn effective_sample_rate(
+    output: AudioOutputFormat,
+    rate: u32,
+    options: &AudioEncodingOptions,
+) -> u32 {
+    let codec_default = match output {
+        AudioOutputFormat::Opus => OPUS_RATE,
+        AudioOutputFormat::Aac | AudioOutputFormat::M4a => aac_rate(rate),
+        AudioOutputFormat::Mp3 => {
+            if MP3_RATES.contains(&rate) {
+                rate
+            } else {
+                OPUS_RATE
+            }
+        }
+        AudioOutputFormat::Ogg => {
+            if rate <= OGG_MAX_RATE {
+                rate
+            } else {
+                OPUS_RATE
+            }
+        }
+        AudioOutputFormat::Wav
+        | AudioOutputFormat::Flac
+        | AudioOutputFormat::Alac
+        | AudioOutputFormat::Aiff => rate,
+    };
+    options
+        .sample_rate()
+        .map_or(codec_default, AudioOptionSampleRate::hz)
 }
 
 fn check_channels(
@@ -1297,16 +1629,18 @@ fn encode_aac(
     rate: u32,
     channels: usize,
     buf: &mut AudioWorkerBuffer,
+    options: &AudioEncodingOptions,
 ) -> Result<(), PipelineError> {
     check_aac_channels(path, channels, "AAC")?;
-    let target_rate = aac_rate(rate);
+    let target_rate = effective_sample_rate(AudioOutputFormat::Aac, rate, options);
+    check_aac_bitrate(path, target_rate, channels, options)?;
     resample_f32(rate, target_rate, channels, buf, "aac-resampler")?;
     if buf.samples_f32.is_empty() {
         return Err(PipelineError::EmptyOutput(path.to_path_buf()));
     }
     let ch_u16 = u16::try_from(channels).unwrap_or(u16::MAX);
     let mut encoder = rusty_aac::AacEncoder::new(rusty_aac::AacEncoderConfig {
-        bitrate_bps: AAC_BITRATE_BPS,
+        bitrate_bps: aac_bitrate_bps(options.rate_control()),
         ..rusty_aac::AacEncoderConfig::default()
     });
     encoder
@@ -1364,17 +1698,20 @@ fn encode_m4a(
     rate: u32,
     channels: usize,
     buf: &mut AudioWorkerBuffer,
+    options: &AudioEncodingOptions,
 ) -> Result<(), PipelineError> {
     check_aac_channels(path, channels, "M4A/AAC")?;
-    let target_rate = aac_rate(rate);
+    let target_rate = effective_sample_rate(AudioOutputFormat::M4a, rate, options);
+    check_aac_bitrate(path, target_rate, channels, options)?;
     resample_f32(rate, target_rate, channels, buf, "m4a-resampler")?;
     if buf.samples_f32.is_empty() {
         return Err(PipelineError::EmptyOutput(path.to_path_buf()));
     }
     let ch_u16 = u16::try_from(channels).unwrap_or(u16::MAX);
     let total_input_frames = u64::try_from(buf.samples_f32.len() / channels).unwrap_or(u64::MAX);
+    let aac_bitrate = aac_bitrate_bps(options.rate_control());
     let mut encoder = rusty_aac::AacEncoder::new(rusty_aac::AacEncoderConfig {
-        bitrate_bps: AAC_BITRATE_BPS,
+        bitrate_bps: aac_bitrate,
         ..rusty_aac::AacEncoderConfig::default()
     });
     encoder
@@ -1402,7 +1739,7 @@ fn encode_m4a(
         path,
         target_rate,
         ch_u16,
-        AAC_BITRATE_BPS,
+        aac_bitrate,
         total_input_frames,
         priming,
         &packets,
@@ -1414,22 +1751,32 @@ fn encode_mp3(
     rate: u32,
     channels: usize,
     buf: &mut AudioWorkerBuffer,
+    options: &AudioEncodingOptions,
 ) -> Result<(), PipelineError> {
     check_channels(path, channels, 1, 2, "MP3")?;
-    let target_rate = if MP3_RATES.contains(&rate) {
-        rate
-    } else {
-        OPUS_RATE
-    };
+    let target_rate = effective_sample_rate(AudioOutputFormat::Mp3, rate, options);
+    if target_rate < 32_000
+        && matches!(
+            options.rate_control(),
+            AudioRateControl::Bitrate(bitrate) if bitrate.bps() > 160_000
+        )
+    {
+        // Domain validation can only pair the bitrate with an explicitly requested
+        // rate. With the codec-derived rate, reject here instead of letting the
+        // encoder silently snap 320 kbps down to the MPEG-2/2.5 maximum of 160.
+        return Err(PipelineError::EncodeFailed {
+            path: path.to_path_buf(),
+            reason: format!(
+                "MP3 at {target_rate} Hz supports at most 160000 bps (MPEG-2/2.5 Layer III limit)"
+            ),
+        });
+    }
     resample_f32(rate, target_rate, channels, buf, "mp3-resampler")?;
     if buf.samples_f32.is_empty() {
         return Err(PipelineError::EmptyOutput(path.to_path_buf()));
     }
     let ch_u16 = u16::try_from(channels).unwrap_or(u16::MAX);
-    let mut encoder = rusty_mp3::Mp3Encoder::new(rusty_mp3::Mp3EncoderConfig {
-        bitrate_kbps: MP3_BITRATE_KBPS,
-        vbr_quality: None,
-    });
+    let mut encoder = rusty_mp3::Mp3Encoder::new(mp3_config(options.rate_control()));
     encoder
         .push_pcm_f32(&buf.samples_f32, ch_u16, target_rate)
         .map_err(|err| PipelineError::EncodeFailed {
@@ -1488,6 +1835,7 @@ fn encode_ogg(
     rate: u32,
     channels: usize,
     buf: &mut AudioWorkerBuffer,
+    options: &AudioEncodingOptions,
 ) -> Result<(), PipelineError> {
     check_channels(path, channels, 1, usize::from(u8::MAX), "Ogg Vorbis")?;
     let channel_order =
@@ -1503,11 +1851,7 @@ fn encode_ogg(
             reason: "Ogg Vorbis requires a positive sample rate".to_owned(),
         });
     }
-    let target_rate = if rate <= OGG_MAX_RATE {
-        rate
-    } else {
-        OPUS_RATE
-    };
+    let target_rate = effective_sample_rate(AudioOutputFormat::Ogg, rate, options);
     resample_f32(rate, target_rate, channels, buf, "ogg-resampler")?;
     if buf.samples_f32.is_empty() {
         return Err(PipelineError::EmptyOutput(path.to_path_buf()));
@@ -1529,9 +1873,7 @@ fn encode_ogg(
     })?;
     let writer = BufWriter::with_capacity(64 * 1024, file);
     let mut encoder = vorbis_enc::EncoderBuilder::new(rate_nz, ch_nz, writer)
-        .bitrate_management_strategy(vorbis_enc::BitrateManagementStrategy::QualityVbr {
-            target_quality: 0.4,
-        })
+        .bitrate_management_strategy(vorbis_strategy(options.rate_control())?)
         .build()
         .map_err(|err| PipelineError::EncodeFailed {
             path: path.to_path_buf(),
@@ -1674,6 +2016,13 @@ fn encode_staged(
     result
 }
 
+/// Bundles the batch-level encoder inputs so `encode_audio` stays within the
+/// project's argument-count limit without hiding either value behind a global.
+struct AudioEncodeSettings<'a> {
+    options: &'a AudioEncodingOptions,
+    batch_workers: usize,
+}
+
 fn encode_audio(
     item: &AudioBatchItem,
     mode: fastconv_domain::AudioExecutionMode,
@@ -1681,8 +2030,10 @@ fn encode_audio(
     channels: usize,
     bits: usize,
     buf: &mut AudioWorkerBuffer,
-    batch_workers: usize,
+    settings: &AudioEncodeSettings<'_>,
 ) -> Result<u64, PipelineError> {
+    let options = settings.options;
+    let batch_workers = settings.batch_workers;
     let output = mode.output_format();
     if output == AudioOutputFormat::Alac && bits == 24 {
         return Err(PipelineError::EncodeFailed {
@@ -1732,11 +2083,11 @@ fn encode_audio(
     encode_staged(item, |temp| match output {
         AudioOutputFormat::Wav => encode_wav(temp, rate, channels, bits, buf),
         AudioOutputFormat::Flac => encode_flac(temp, rate, channels, bits, buf, batch_workers),
-        AudioOutputFormat::Opus => encode_opus(temp, rate, channels, buf, batch_workers),
-        AudioOutputFormat::Ogg => encode_ogg(temp, rate, channels, buf),
-        AudioOutputFormat::Mp3 => encode_mp3(temp, rate, channels, buf),
-        AudioOutputFormat::Aac => encode_aac(temp, rate, channels, buf),
-        AudioOutputFormat::M4a => encode_m4a(temp, rate, channels, buf),
+        AudioOutputFormat::Opus => encode_opus(temp, rate, channels, buf, batch_workers, options),
+        AudioOutputFormat::Ogg => encode_ogg(temp, rate, channels, buf, options),
+        AudioOutputFormat::Mp3 => encode_mp3(temp, rate, channels, buf, options),
+        AudioOutputFormat::Aac => encode_aac(temp, rate, channels, buf, options),
+        AudioOutputFormat::M4a => encode_m4a(temp, rate, channels, buf, options),
         AudioOutputFormat::Alac => encode_alac(temp, rate, channels, buf, batch_workers),
         AudioOutputFormat::Aiff => encode_aiff(temp, rate, channels, bits, buf),
     })
@@ -1780,6 +2131,7 @@ fn convert_item(
     mode: fastconv_domain::AudioExecutionMode,
     buf: &mut AudioWorkerBuffer,
     batch_workers: usize,
+    options: &AudioEncodingOptions,
 ) -> Result<(u64, u64), PipelineError> {
     let input_bytes = fs::metadata(item.source())
         .map_err(|source| PipelineError::Io {
@@ -1787,49 +2139,230 @@ fn convert_item(
             source,
         })?
         .len();
+    let output = mode.output_format();
     if item.input_format() == AudioInputFormat::Wav
-        && mode.output_format() == AudioOutputFormat::Flac
+        && output == AudioOutputFormat::Flac
         && let Some(stream) = try_open_pcm_wav(item.source())?
     {
-        let output_bytes = convert_pcm_wav_to_flac(item, stream, buf, batch_workers)?;
-        return Ok((input_bytes, output_bytes));
+        // The streaming fast path preserves the source rate/channels exactly; any
+        // transform needs the full decode/quantize pipeline instead.
+        let transforming = options
+            .sample_rate()
+            .is_some_and(|rate| rate.hz() != stream.rate)
+            || options
+                .channels()
+                .is_some_and(|channels| usize::from(channels.get()) != stream.channels);
+        if !transforming {
+            let output_bytes = convert_pcm_wav_to_flac(item, stream, buf, batch_workers)?;
+            return Ok((input_bytes, output_bytes));
+        }
     }
-    let (rate, channels, bits) = decode_audio(item, mode.output_format(), buf)?;
-    let output_bytes = encode_audio(item, mode, rate, channels, bits, buf, batch_workers)?;
+    let (rate, channels, bits) = decode_audio(item, output, options, buf)?;
+    let wanted_channels = options
+        .channels()
+        .map_or(channels, |channels| usize::from(channels.get()));
+
+    // Downmix before resampling: the FFT resampler then runs with the smaller plane
+    // count, which keeps its scratch buffers proportional to the encoded output.
+    let mut current_channels = channels;
+    if wanted_channels < current_channels {
+        remix_channels_f32(current_channels, wanted_channels, buf, item.source())?;
+        current_channels = wanted_channels;
+    }
+    let target_rate = effective_sample_rate(output, rate, options);
+    if target_rate != rate {
+        let label = match output {
+            AudioOutputFormat::Wav => "wav-resampler",
+            AudioOutputFormat::Flac => "flac-resampler",
+            AudioOutputFormat::Alac => "alac-resampler",
+            AudioOutputFormat::Aiff => "aiff-resampler",
+            AudioOutputFormat::Opus => "opus-resampler",
+            AudioOutputFormat::Ogg => "ogg-resampler",
+            AudioOutputFormat::Mp3 => "mp3-resampler",
+            AudioOutputFormat::Aac => "aac-resampler",
+            AudioOutputFormat::M4a => "m4a-resampler",
+        };
+        resample_f32(rate, target_rate, current_channels, buf, label)?;
+        if buf.samples_f32.is_empty() {
+            // A very short input can resample to zero frames; writing a header-only
+            // file would report a successful conversion with no audio in it.
+            return Err(PipelineError::EmptyOutput(item.target().to_path_buf()));
+        }
+    }
+    // Upmix last: extra planes are generated at the final sample rate.
+    if wanted_channels > current_channels {
+        remix_channels_f32(current_channels, wanted_channels, buf, item.source())?;
+    }
+    let output_bytes = encode_audio(
+        item,
+        mode,
+        target_rate,
+        wanted_channels,
+        bits,
+        buf,
+        &AudioEncodeSettings {
+            options,
+            batch_workers,
+        },
+    )?;
     Ok((input_bytes, output_bytes))
 }
 
-fn estimate_pcm_bytes(item: &AudioBatchItem) -> u64 {
+/// Peak live PCM for a batch item. `largest_buffer_bytes` is the biggest single
+/// allocation and is checked against the per-file cap; `peak_bytes` is the sum of
+/// buffers that coexist during a transform and is used for the batch budget.
+struct PcmEstimate {
+    peak_bytes: u64,
+    largest_buffer_bytes: u64,
+}
+
+fn estimate_pcm_bytes(
+    item: &AudioBatchItem,
+    output: AudioOutputFormat,
+    options: &AudioEncodingOptions,
+) -> PcmEstimate {
     let stream = item.stream();
+    let unknown = PcmEstimate {
+        // Without a frame count we cannot prove a rate change is absent, so reserve
+        // the decoded input and a simultaneous resample output.
+        peak_bytes: MAX_PCM_BYTES_PER_FILE.saturating_mul(2),
+        largest_buffer_bytes: MAX_PCM_BYTES_PER_FILE,
+    };
     let Some(frames) = stream.total_samples() else {
         // A compressed file size is not a PCM frame count: probed AAC streams, for
         // example, expose no decoded length. Reserve the full per-file allowance so
         // unknown-length inputs cannot over-subscribe the batch memory budget.
-        return MAX_PCM_BYTES_PER_FILE;
+        return unknown;
     };
-    let channels = u64::from(stream.channels().get()).max(1);
-    frames.saturating_mul(channels).saturating_mul(4)
+    let source_rate = stream.sample_rate().get();
+    let target_rate = effective_sample_rate(output, source_rate, options);
+    let source_channels = u64::from(stream.channels().get()).max(1);
+    let target_channels = u64::from(
+        options
+            .channels()
+            .map_or(stream.channels().get(), AudioOptionChannels::get),
+    )
+    .max(1);
+    let bytes =
+        |frame_count: u64, channels: u64| frame_count.saturating_mul(channels).saturating_mul(4);
+    let scaled_frames = frames
+        .saturating_mul(u64::from(target_rate))
+        .div_ceil(u64::from(source_rate).max(1));
+    let source_bytes = bytes(frames, source_channels);
+    let final_bytes = bytes(scaled_frames, target_channels);
+    let mut largest_buffer_bytes = source_bytes.max(final_bytes);
+    let mut peak_bytes = largest_buffer_bytes;
+
+    if target_rate != source_rate {
+        // The decoded input remains live while the resampler grows its output.
+        // Downmixes run before resampling and upmixes after it, so the plane count
+        // at that point is the smaller of the source and target counts.
+        let resample_channels = source_channels.min(target_channels);
+        let resampled_bytes = bytes(scaled_frames, resample_channels);
+        largest_buffer_bytes = largest_buffer_bytes.max(resampled_bytes);
+        let resample_input_bytes = if target_channels < source_channels {
+            bytes(frames, target_channels)
+        } else {
+            source_bytes
+        };
+        peak_bytes = peak_bytes
+            .max(resample_input_bytes.saturating_add(resampled_bytes))
+            .max(resampled_bytes.saturating_add(final_bytes));
+    }
+    if source_channels != target_channels {
+        // A downmix runs before resampling and sizes its output from the input
+        // frame count; an upmix runs after resampling and uses the final count.
+        // A remix holds its input and output at the same time.
+        let remix_output_bytes = if target_channels < source_channels {
+            bytes(frames, target_channels)
+        } else {
+            final_bytes
+        };
+        peak_bytes = peak_bytes.max(source_bytes.saturating_add(remix_output_bytes));
+    }
+    PcmEstimate {
+        peak_bytes,
+        largest_buffer_bytes,
+    }
 }
 
 fn resolve_worker_count(
     items: &[AudioBatchItem],
     requested: usize,
+    output: AudioOutputFormat,
+    options: &AudioEncodingOptions,
 ) -> Result<usize, PipelineError> {
-    let largest_pcm = items.iter().map(estimate_pcm_bytes).max().unwrap_or(0);
-    if largest_pcm > MAX_PCM_BYTES_PER_FILE {
+    let estimates: Vec<PcmEstimate> = items
+        .iter()
+        .map(|item| estimate_pcm_bytes(item, output, options))
+        .collect();
+    let largest_buffer = estimates
+        .iter()
+        .map(|estimate| estimate.largest_buffer_bytes)
+        .max()
+        .unwrap_or(0);
+    if largest_buffer > MAX_PCM_BYTES_PER_FILE {
         return Err(PipelineError::DecodeFailed {
             path: items[0].source().to_path_buf(),
             reason: format!(
-                "estimated PCM working set {largest_pcm} bytes exceeds the {MAX_PCM_BYTES_PER_FILE} byte per-file limit"
+                "estimated PCM buffer {largest_buffer} bytes exceeds the {MAX_PCM_BYTES_PER_FILE} byte per-file limit"
             ),
         });
     }
+    let largest_peak = estimates
+        .iter()
+        .map(|estimate| estimate.peak_bytes)
+        .max()
+        .unwrap_or(0);
     let budget_workers = u64::try_from(requested)
         .unwrap_or(u64::MAX)
-        .min(MAX_PCM_BYTES_PER_BATCH / largest_pcm.max(1));
+        .min(MAX_PCM_BYTES_PER_BATCH / largest_peak.max(1));
     Ok(usize::try_from(budget_workers.max(1))
         .unwrap_or(usize::MAX)
         .min(requested))
+}
+
+/// Shared queue, cancellation flag and totals owned by the batch coordinator.
+struct AudioWorkerShared<'a> {
+    next: &'a AtomicUsize,
+    abort: &'a AtomicBool,
+    first_error: &'a Mutex<Option<PipelineError>>,
+    input_total: &'a AtomicU64,
+    output_total: &'a AtomicU64,
+}
+
+/// Drains the shared work queue for one worker until it is empty or another worker fails.
+fn run_audio_worker(
+    items: &[AudioBatchItem],
+    mode: fastconv_domain::AudioExecutionMode,
+    options: &AudioEncodingOptions,
+    batch_workers: usize,
+    shared: &AudioWorkerShared<'_>,
+) {
+    let mut buffer = AudioWorkerBuffer::new();
+    loop {
+        if shared.abort.load(Ordering::Relaxed)
+            || shared.first_error.lock().is_ok_and(|guard| guard.is_some())
+        {
+            break;
+        }
+        let index = shared.next.fetch_add(1, Ordering::Relaxed);
+        let Some(item) = items.get(index) else { break };
+        match convert_item(item, mode, &mut buffer, batch_workers, options) {
+            Ok((in_bytes, out_bytes)) => {
+                shared.input_total.fetch_add(in_bytes, Ordering::Relaxed);
+                shared.output_total.fetch_add(out_bytes, Ordering::Relaxed);
+            }
+            Err(err) => {
+                if let Ok(mut guard) = shared.first_error.lock()
+                    && guard.is_none()
+                {
+                    *guard = Some(err);
+                }
+                break;
+            }
+        }
+    }
 }
 
 /// Executes a validated [`AudioBatchPlan`] on reusable per-worker sample buffers.
@@ -1845,46 +2378,37 @@ pub fn execute_audio_batch(plan: &AudioBatchPlan) -> Result<AudioConversionRepor
     let first_error: Mutex<Option<PipelineError>> = Mutex::new(None);
     let input_total = AtomicU64::new(0);
     let output_total = AtomicU64::new(0);
-    let worker_count = resolve_worker_count(items, plan.effective_workers().get())?;
+    let options = plan.options();
+    let shared = AudioWorkerShared {
+        next: &next,
+        abort: &abort,
+        first_error: &first_error,
+        input_total: &input_total,
+        output_total: &output_total,
+    };
+    let worker_count = resolve_worker_count(
+        items,
+        plan.effective_workers().get(),
+        plan.mode().output_format(),
+        &options,
+    )?;
     // Idle workers must not shrink the inner-encoder budget of the active files.
-    let active_workers = worker_count.min(items.len());
 
     thread::scope(|scope| {
+        let shared = &shared;
         let mut handles = Vec::with_capacity(worker_count);
         let mut startup_error = None;
         for worker_id in 0..worker_count {
-            let next = &next;
-            let abort = &abort;
-            let first_error = &first_error;
-            let input_total = &input_total;
-            let output_total = &output_total;
             let worker = thread::Builder::new()
                 .name(format!("fastconv-audio-{worker_id}"))
                 .spawn_scoped(scope, move || {
-                    let mut buffer = AudioWorkerBuffer::new();
-                    loop {
-                        if abort.load(Ordering::Relaxed)
-                            || first_error.lock().is_ok_and(|guard| guard.is_some())
-                        {
-                            break;
-                        }
-                        let index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(item) = items.get(index) else { break };
-                        match convert_item(item, plan.mode(), &mut buffer, active_workers) {
-                            Ok((in_bytes, out_bytes)) => {
-                                input_total.fetch_add(in_bytes, Ordering::Relaxed);
-                                output_total.fetch_add(out_bytes, Ordering::Relaxed);
-                            }
-                            Err(err) => {
-                                if let Ok(mut guard) = first_error.lock()
-                                    && guard.is_none()
-                                {
-                                    *guard = Some(err);
-                                }
-                                break;
-                            }
-                        }
-                    }
+                    run_audio_worker(
+                        items,
+                        plan.mode(),
+                        &options,
+                        worker_count.min(items.len()),
+                        shared,
+                    );
                 });
             match worker {
                 Ok(handle) => handles.push(handle),
@@ -1917,11 +2441,9 @@ pub fn execute_audio_batch(plan: &AudioBatchPlan) -> Result<AudioConversionRepor
         return Err(err);
     }
 
-    let input_bytes = input_total.load(Ordering::Relaxed);
-    let output_bytes = output_total.load(Ordering::Relaxed);
-    let input = NonZeroU64::new(input_bytes)
+    let input = NonZeroU64::new(input_total.load(Ordering::Relaxed))
         .ok_or_else(|| PipelineError::EmptyOutput(items[0].source().to_path_buf()))?;
-    let output = NonZeroU64::new(output_bytes)
+    let output = NonZeroU64::new(output_total.load(Ordering::Relaxed))
         .ok_or_else(|| PipelineError::EmptyOutput(items[0].target().to_path_buf()))?;
     let files = NonZeroUsize::new(items.len())
         .ok_or_else(|| PipelineError::EmptyOutput(items[0].target().to_path_buf()))?;
@@ -1942,6 +2464,7 @@ pub fn execute_audio_batch(plan: &AudioBatchPlan) -> Result<AudioConversionRepor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastconv_domain::{AudioOptionBitrate, AudioQuality};
     use std::num::{NonZeroU16, NonZeroU32};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2220,12 +2743,18 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(estimate_pcm_bytes(&items[0]), MAX_PCM_BYTES_PER_FILE);
-        let workers = resolve_worker_count(&items, 8).unwrap_or(0);
+        let defaults = AudioEncodingOptions::default();
+        let estimate = estimate_pcm_bytes(&items[0], AudioOutputFormat::Wav, &defaults);
+        assert_eq!(estimate.largest_buffer_bytes, MAX_PCM_BYTES_PER_FILE);
         assert_eq!(
-            workers,
-            usize::try_from(MAX_PCM_BYTES_PER_BATCH / MAX_PCM_BYTES_PER_FILE).unwrap_or(usize::MAX),
-            "unknown decoded lengths must reserve the full per-file budget"
+            estimate.peak_bytes,
+            MAX_PCM_BYTES_PER_FILE.saturating_mul(2)
+        );
+        let workers =
+            resolve_worker_count(&items, 8, AudioOutputFormat::Wav, &defaults).unwrap_or(0);
+        assert_eq!(
+            workers, 1,
+            "unknown decoded lengths must reserve two coexisting buffers"
         );
     }
 
@@ -2875,7 +3404,13 @@ mod tests {
         encoder_buf
             .samples_f32
             .extend(samples.iter().map(|&value| f32::from(value) / 32_768.0));
-        encode_ogg(&ogg, 48_000, 2, &mut encoder_buf)?;
+        encode_ogg(
+            &ogg,
+            48_000,
+            2,
+            &mut encoder_buf,
+            &AudioEncodingOptions::default(),
+        )?;
 
         let packets = ogg_packets(&ogg)?;
         assert!(packets.len() > 4, "expected ident/comment/setup and audio");
@@ -2904,6 +3439,7 @@ mod tests {
             &ogg,
             AudioInputFormat::Vorbis,
             AudioOutputFormat::Wav,
+            &AudioEncodingOptions::default(),
             &mut decoded_buf,
         )?;
         assert_eq!(rate, 48_000);
@@ -2948,12 +3484,19 @@ mod tests {
         mono_buf
             .samples_f32
             .extend(tone(8_192, 1).iter().map(|&v| f32::from(v) / 32_768.0));
-        encode_ogg(&mono, 48_000, 1, &mut mono_buf)?;
+        encode_ogg(
+            &mono,
+            48_000,
+            1,
+            &mut mono_buf,
+            &AudioEncodingOptions::default(),
+        )?;
         let mut decoded = AudioWorkerBuffer::new();
         let (rate, channels, _) = decode_symphonia(
             &mono,
             AudioInputFormat::Vorbis,
             AudioOutputFormat::Wav,
+            &AudioEncodingOptions::default(),
             &mut decoded,
         )?;
         assert_eq!((rate, channels), (48_000, 1));
@@ -2964,12 +3507,19 @@ mod tests {
         short_buf
             .samples_f32
             .extend(tone(2_048, 2).iter().map(|&v| f32::from(v) / 32_768.0));
-        encode_ogg(&short, 48_000, 2, &mut short_buf)?;
+        encode_ogg(
+            &short,
+            48_000,
+            2,
+            &mut short_buf,
+            &AudioEncodingOptions::default(),
+        )?;
         let mut decoded_short = AudioWorkerBuffer::new();
         let (rate, channels, _) = decode_symphonia(
             &short,
             AudioInputFormat::Vorbis,
             AudioOutputFormat::Wav,
+            &AudioEncodingOptions::default(),
             &mut decoded_short,
         )?;
         assert_eq!((rate, channels), (48_000, 2));
@@ -3006,13 +3556,25 @@ mod tests {
     fn ogg_rejects_channel_counts_without_a_known_layout() {
         let mut buf = AudioWorkerBuffer::new();
         buf.samples_f32 = vec![0.0; 4];
-        let result = encode_ogg(Path::new("reject4.ogg"), 48_000, 4, &mut buf);
+        let result = encode_ogg(
+            Path::new("reject4.ogg"),
+            48_000,
+            4,
+            &mut buf,
+            &AudioEncodingOptions::default(),
+        );
         assert!(
             matches!(result, Err(PipelineError::EncodeFailed { .. })),
             "ambiguous 4-channel layout must be rejected instead of mislabeled"
         );
         buf.samples_f32 = vec![0.0; 7];
-        let result = encode_ogg(Path::new("reject.ogg"), 48_000, 7, &mut buf);
+        let result = encode_ogg(
+            Path::new("reject.ogg"),
+            48_000,
+            7,
+            &mut buf,
+            &AudioEncodingOptions::default(),
+        );
         assert!(
             matches!(result, Err(PipelineError::EncodeFailed { .. })),
             "more than 6 channels must be rejected instead of mislabeled"
@@ -3107,5 +3669,627 @@ mod tests {
         }
         let _ = fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    fn br(bps: u32) -> AudioOptionBitrate {
+        AudioOptionBitrate::new(bps).unwrap_or_else(|_| unreachable!())
+    }
+
+    fn ql(value: u8) -> AudioQuality {
+        AudioQuality::new(value).unwrap_or_else(|_| unreachable!())
+    }
+
+    #[test]
+    fn checked_f32_capacity_rejects_oversized_transform_before_allocation() {
+        let path = Path::new("cap.wav");
+        assert_eq!(checked_f32_capacity(1_000, 2, path).unwrap_or(0), 2_000);
+        assert_eq!(checked_f32_capacity(u64::MAX, 8, path).unwrap_or(0), 0);
+        assert!(checked_f32_capacity(u64::MAX, 8, path).is_err());
+        assert!(
+            checked_f32_capacity(
+                u64::try_from(MAX_F32_SAMPLES_PER_FILE).unwrap_or(u64::MAX) + 1,
+                1,
+                path
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn remix_channels_handles_edge_layouts_without_clipping() -> Result<(), PipelineError> {
+        let path = Path::new("remix.wav");
+        let mut buf = AudioWorkerBuffer::new();
+
+        buf.samples_f32 = vec![1.0, -1.0, 0.5, 0.5];
+        remix_channels_f32(2, 1, &mut buf, path)?;
+        assert_eq!(buf.samples_f32, [0.0, 0.5]);
+
+        buf.samples_f32 = vec![0.25, -0.5];
+        remix_channels_f32(1, 2, &mut buf, path)?;
+        assert_eq!(buf.samples_f32, [0.25, 0.25, -0.5, -0.5]);
+
+        // Full-scale 5.1 must stay inside [-1, 1] after the normalized downmix.
+        buf.samples_f32 = vec![1.0; 6 * 3];
+        remix_channels_f32(6, 2, &mut buf, path)?;
+        assert_eq!(buf.samples_f32.len(), 6);
+        assert!(
+            buf.samples_f32
+                .iter()
+                .all(|&value| value.is_finite() && value.abs() <= 1.0 + 1e-6),
+            "normalized 5.1 downmix must not clip: {:?}",
+            buf.samples_f32
+        );
+        assert!(
+            buf.samples_f32
+                .iter()
+                .all(|&value| (value - 1.0).abs() < 1e-6),
+            "all channels at full scale must stay at full scale: {:?}",
+            buf.samples_f32
+        );
+
+        // LFE is omitted for 6/8-channel layouts: a lone LFE signal is silence.
+        buf.samples_f32 = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        remix_channels_f32(6, 2, &mut buf, path)?;
+        assert_eq!(buf.samples_f32, [0.0, 0.0]);
+
+        // Mono upmix duplicates into FL/FR; general upmix copies and zero-fills.
+        buf.samples_f32 = vec![0.75, -0.25];
+        remix_channels_f32(1, 5, &mut buf, path)?;
+        assert_eq!(
+            buf.samples_f32,
+            [0.75, 0.75, 0.0, 0.0, 0.0, -0.25, -0.25, 0.0, 0.0, 0.0]
+        );
+        buf.samples_f32 = vec![0.1, 0.2, 0.3];
+        remix_channels_f32(3, 5, &mut buf, path)?;
+        assert_eq!(buf.samples_f32, [0.1, 0.2, 0.3, 0.0, 0.0]);
+
+        // An odd trailing partial frame cannot panic or produce extra samples.
+        buf.samples_f32 = vec![0.9, 0.1, 0.7];
+        remix_channels_f32(2, 1, &mut buf, path)?;
+        assert_eq!(buf.samples_f32, [0.5]);
+        Ok(())
+    }
+
+    #[test]
+    fn rate_control_helpers_match_the_codec_apis() -> Result<(), PipelineError> {
+        let mp3_default = mp3_config(AudioRateControl::Default);
+        assert_eq!(mp3_default.bitrate_kbps, MP3_BITRATE_KBPS);
+        assert_eq!(mp3_default.vbr_quality, None);
+        let mp3_bitrate = mp3_config(AudioRateControl::Bitrate(br(191_500)));
+        assert_eq!(mp3_bitrate.bitrate_kbps, 192);
+        assert_eq!(mp3_bitrate.vbr_quality, None);
+        let mp3_best = mp3_config(AudioRateControl::Quality(ql(100)));
+        assert_eq!(mp3_best.bitrate_kbps, 0);
+        assert_eq!(
+            mp3_best.vbr_quality,
+            Some(rusty_mp3::vbr_quality_index(0.0))
+        );
+        let mp3_small = mp3_config(AudioRateControl::Quality(ql(0)));
+        assert_eq!(
+            mp3_small.vbr_quality,
+            Some(rusty_mp3::vbr_quality_index(9.0))
+        );
+
+        assert_eq!(aac_bitrate_bps(AudioRateControl::Default), 128_000);
+        assert_eq!(
+            aac_bitrate_bps(AudioRateControl::Bitrate(br(256_000))),
+            256_000
+        );
+
+        assert_eq!(
+            opus_settings(AudioRateControl::Default),
+            (128_000, RateControl::ConstrainedVbr)
+        );
+        assert_eq!(
+            opus_settings(AudioRateControl::Bitrate(br(6_000))),
+            (6_000, RateControl::ConstrainedVbr)
+        );
+        assert_eq!(
+            opus_settings(AudioRateControl::Quality(ql(100))),
+            (256_000, RateControl::Vbr)
+        );
+        assert_eq!(
+            opus_settings(AudioRateControl::Quality(ql(0))),
+            (16_000, RateControl::Vbr)
+        );
+
+        assert!(matches!(
+            vorbis_strategy(AudioRateControl::Default)?,
+            vorbis_enc::BitrateManagementStrategy::QualityVbr { target_quality }
+                if (target_quality - 0.4).abs() < 1e-6
+        ));
+        assert!(matches!(
+            vorbis_strategy(AudioRateControl::Bitrate(br(128_000)))?,
+            vorbis_enc::BitrateManagementStrategy::Abr { average_bitrate }
+                if average_bitrate.get() == 128_000
+        ));
+        assert!(matches!(
+            vorbis_strategy(AudioRateControl::Quality(ql(100)))?,
+            vorbis_enc::BitrateManagementStrategy::QualityVbr { target_quality }
+                if (target_quality - 1.0).abs() < 1e-6
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn effective_sample_rate_and_worker_estimate_respect_options() {
+        let explicit = options_with(
+            AudioOutputFormat::Wav,
+            Some(44_100),
+            None,
+            AudioRateControl::Default,
+        );
+        assert_eq!(
+            effective_sample_rate(AudioOutputFormat::Wav, 48_000, &explicit),
+            44_100
+        );
+        assert_eq!(
+            effective_sample_rate(
+                AudioOutputFormat::Opus,
+                44_100,
+                &AudioEncodingOptions::default()
+            ),
+            48_000
+        );
+        assert_eq!(
+            effective_sample_rate(
+                AudioOutputFormat::Mp3,
+                44_100,
+                &AudioEncodingOptions::default()
+            ),
+            44_100
+        );
+
+        let item = item_frames(
+            PathBuf::from("in.wav"),
+            PathBuf::from("out.wav"),
+            AudioInputFormat::Wav,
+            2,
+            44_100,
+            1_000,
+        );
+        let defaults = AudioEncodingOptions::default();
+        let plain = estimate_pcm_bytes(&item, AudioOutputFormat::Wav, &defaults);
+        assert_eq!(
+            (plain.peak_bytes, plain.largest_buffer_bytes),
+            (8_000, 8_000)
+        );
+        let upsampled = options_with(
+            AudioOutputFormat::Wav,
+            Some(88_200),
+            Some(6),
+            AudioRateControl::Default,
+        );
+        let grown = estimate_pcm_bytes(&item, AudioOutputFormat::Wav, &upsampled);
+        assert_eq!(grown.largest_buffer_bytes, 2_000 * 6 * 4);
+        // Decoded input and the growing resample output coexist with the upmix output.
+        assert_eq!(grown.peak_bytes, 2_000 * 2 * 4 + 2_000 * 6 * 4);
+        let huge = item_frames(
+            PathBuf::from("in.wav"),
+            PathBuf::from("out.wav"),
+            AudioInputFormat::Wav,
+            2,
+            8_000,
+            MAX_PCM_BYTES_PER_FILE / 8,
+        );
+        let huge_estimate = estimate_pcm_bytes(&huge, AudioOutputFormat::Wav, &upsampled);
+        assert!(huge_estimate.largest_buffer_bytes > MAX_PCM_BYTES_PER_FILE);
+        assert!(resolve_worker_count(&[huge], 4, AudioOutputFormat::Wav, &upsampled).is_err());
+    }
+
+    fn plan_with_options(
+        items: Vec<AudioBatchItem>,
+        mode: fastconv_domain::AudioExecutionMode,
+        options: AudioEncodingOptions,
+    ) -> AudioBatchPlan {
+        AudioBatchPlan::with_options(items, mode, NonZeroUsize::MIN, options)
+            .unwrap_or_else(|_| unreachable!())
+    }
+
+    fn options_with(
+        format: AudioOutputFormat,
+        rate: Option<u32>,
+        channels: Option<u16>,
+        control: AudioRateControl,
+    ) -> AudioEncodingOptions {
+        let rate = rate.map(|hz| AudioOptionSampleRate::new(hz).unwrap_or_else(|_| unreachable!()));
+        let channels = channels
+            .map(|count| AudioOptionChannels::new(count).unwrap_or_else(|_| unreachable!()));
+        AudioEncodingOptions::new(format, control, rate, channels)
+            .unwrap_or_else(|_| unreachable!())
+    }
+
+    fn wav_spec(path: &Path) -> Result<hound::WavSpec, PipelineError> {
+        hound::WavReader::open(path)
+            .map(|reader| reader.spec())
+            .map_err(|err| PipelineError::DecodeFailed {
+                path: path.to_path_buf(),
+                reason: format!("failed to reopen WAV: {err}"),
+            })
+    }
+
+    #[test]
+    fn resamples_and_remixes_lossless_outputs() -> Result<(), PipelineError> {
+        let dir = temp_dir("transform-lossless");
+        let wav = dir.join("in.wav");
+        let mono = dir.join("mono.wav");
+        let stereo = dir.join("stereo.wav");
+        let deep = dir.join("deep.wav");
+        let deep_out = dir.join("deep-out.wav");
+        write_wav(&wav, &tone(16_384, 2), 44_100, 2);
+
+        let downmix = options_with(
+            AudioOutputFormat::Wav,
+            Some(24_000),
+            Some(1),
+            AudioRateControl::Default,
+        );
+        execute_audio_batch(&plan_with_options(
+            vec![item(
+                wav.clone(),
+                mono.clone(),
+                AudioInputFormat::Wav,
+                2,
+                44_100,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuWav,
+            downmix,
+        ))?;
+        let spec = wav_spec(&mono)?;
+        assert_eq!((spec.sample_rate, spec.channels), (24_000, 1));
+        assert_ne!(read_wav(&mono).len(), 0);
+
+        let upmix = options_with(
+            AudioOutputFormat::Wav,
+            Some(96_000),
+            Some(2),
+            AudioRateControl::Default,
+        );
+        write_wav(&wav, &tone(8_192, 1), 48_000, 1);
+        execute_audio_batch(&plan_with_options(
+            vec![item(
+                wav.clone(),
+                stereo.clone(),
+                AudioInputFormat::Wav,
+                1,
+                48_000,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuWav,
+            upmix,
+        ))?;
+        let spec = wav_spec(&stereo)?;
+        assert_eq!((spec.sample_rate, spec.channels), (96_000, 2));
+        let upmixed = read_wav(&stereo);
+        assert_eq!(upmixed.len(), 16_384 * 2);
+        assert!(
+            upmixed
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|pair| pair[0] == pair[1])
+        );
+
+        write_wav24(&deep, &deep_tone(8_192, 2), 44_100, 2)?;
+        let resample_24 = options_with(
+            AudioOutputFormat::Wav,
+            Some(24_000),
+            None,
+            AudioRateControl::Default,
+        );
+        execute_audio_batch(&plan_with_options(
+            vec![item_bits(
+                deep,
+                deep_out.clone(),
+                AudioInputFormat::Wav,
+                2,
+                44_100,
+                24,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuWav,
+            resample_24,
+        ))?;
+        let spec = wav_spec(&deep_out)?;
+        assert_eq!(
+            (spec.sample_rate, spec.channels, spec.bits_per_sample),
+            (24_000, 2, 24)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn wav_to_flac_resamples_instead_of_taking_the_streaming_fast_path() -> Result<(), PipelineError>
+    {
+        let dir = temp_dir("transform-flac");
+        let wav = dir.join("in.wav");
+        let flac = dir.join("out.flac");
+        let back = dir.join("back.wav");
+        write_wav(&wav, &tone(16_384, 2), 44_100, 2);
+
+        let options = options_with(
+            AudioOutputFormat::Flac,
+            Some(24_000),
+            Some(1),
+            AudioRateControl::Default,
+        );
+        execute_audio_batch(&plan_with_options(
+            vec![item_bits(
+                wav,
+                flac.clone(),
+                AudioInputFormat::Wav,
+                2,
+                44_100,
+                16,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuFlac,
+            options,
+        ))?;
+        execute_audio_batch(&plan(
+            vec![item(flac, back.clone(), AudioInputFormat::Flac, 1, 24_000)],
+            fastconv_domain::AudioExecutionMode::CpuWav,
+        ))?;
+        let spec = wav_spec(&back)?;
+        assert_eq!((spec.sample_rate, spec.channels), (24_000, 1));
+        assert_ne!(read_wav(&back).len(), 0);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn lossy_codecs_honor_bitrate_and_quality_options() -> Result<(), PipelineError> {
+        let dir = temp_dir("lossy-options");
+        let wav = dir.join("in.wav");
+        write_wav(&wav, &tone(16_384, 2), 48_000, 2);
+
+        let cases = [
+            (
+                "mp3-bitrate",
+                "mp3",
+                AudioOutputFormat::Mp3,
+                fastconv_domain::AudioExecutionMode::CpuMp3,
+                AudioInputFormat::Mp3,
+                AudioRateControl::Bitrate(br(320_000)),
+            ),
+            (
+                "mp3-quality",
+                "mp3q",
+                AudioOutputFormat::Mp3,
+                fastconv_domain::AudioExecutionMode::CpuMp3,
+                AudioInputFormat::Mp3,
+                AudioRateControl::Quality(ql(80)),
+            ),
+            (
+                "aac-bitrate",
+                "aac",
+                AudioOutputFormat::Aac,
+                fastconv_domain::AudioExecutionMode::CpuAac,
+                AudioInputFormat::Aac,
+                AudioRateControl::Bitrate(br(256_000)),
+            ),
+            (
+                "m4a-bitrate",
+                "m4a",
+                AudioOutputFormat::M4a,
+                fastconv_domain::AudioExecutionMode::CpuM4a,
+                AudioInputFormat::M4a,
+                AudioRateControl::Bitrate(br(160_000)),
+            ),
+            (
+                "ogg-bitrate",
+                "ogg",
+                AudioOutputFormat::Ogg,
+                fastconv_domain::AudioExecutionMode::CpuOgg,
+                AudioInputFormat::Vorbis,
+                AudioRateControl::Bitrate(br(128_000)),
+            ),
+            (
+                "ogg-quality",
+                "oggq",
+                AudioOutputFormat::Ogg,
+                fastconv_domain::AudioExecutionMode::CpuOgg,
+                AudioInputFormat::Vorbis,
+                AudioRateControl::Quality(ql(80)),
+            ),
+            (
+                "opus-bitrate",
+                "opus",
+                AudioOutputFormat::Opus,
+                fastconv_domain::AudioExecutionMode::CpuOpus,
+                AudioInputFormat::Opus,
+                AudioRateControl::Bitrate(br(96_000)),
+            ),
+            (
+                "opus-quality",
+                "opusq",
+                AudioOutputFormat::Opus,
+                fastconv_domain::AudioExecutionMode::CpuOpus,
+                AudioInputFormat::Opus,
+                AudioRateControl::Quality(ql(90)),
+            ),
+        ];
+        for (label, ext, format, mode, decoded_format, control) in cases {
+            let encoded = dir.join(format!("{label}.{ext}"));
+            let back = dir.join(format!("{label}.wav"));
+            let options = options_with(format, None, None, control);
+            execute_audio_batch(&plan_with_options(
+                vec![item(
+                    wav.clone(),
+                    encoded.clone(),
+                    AudioInputFormat::Wav,
+                    2,
+                    48_000,
+                )],
+                mode,
+                options,
+            ))?;
+            execute_audio_batch(&plan(
+                vec![item(encoded, back.clone(), decoded_format, 2, 48_000)],
+                fastconv_domain::AudioExecutionMode::CpuWav,
+            ))?;
+            assert_ne!(read_wav(&back).len(), 0, "{label}: decoded output is empty");
+            let spec = wav_spec(&back)?;
+            assert_eq!((spec.sample_rate, spec.channels), (48_000, 2), "{label}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    fn mp3_first_frame_bitrate_kbps(path: &Path) -> Result<u32, PipelineError> {
+        const MPEG1_KBPS: [u32; 16] = [
+            0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
+        ];
+        const MPEG2_KBPS: [u32; 16] = [
+            0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
+        ];
+        let bytes = fs::read(path).map_err(|source| PipelineError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        for (index, pair) in bytes.windows(2).enumerate() {
+            if pair[0] != 0xFF || pair[1] & 0xE0 != 0xE0 {
+                continue;
+            }
+            let version = (pair[1] >> 3) & 0b11;
+            if version == 1 {
+                continue;
+            }
+            let Some(header) = bytes.get(index + 2) else {
+                break;
+            };
+            let bitrate_index = usize::from((header >> 4) & 0x0F);
+            let table = if version == 3 { MPEG1_KBPS } else { MPEG2_KBPS };
+            return Ok(table[bitrate_index]);
+        }
+        Err(PipelineError::DecodeFailed {
+            path: path.to_path_buf(),
+            reason: "no MP3 frame sync found".to_owned(),
+        })
+    }
+
+    #[test]
+    fn mp3_bitrate_control_reaches_the_encoded_frame_header() -> Result<(), PipelineError> {
+        let dir = temp_dir("mp3-rate-control");
+        let wav = dir.join("in.wav");
+        write_wav(&wav, &tone(16_384, 2), 48_000, 2);
+        let high = dir.join("high.mp3");
+        let default = dir.join("default.mp3");
+        for (path, control) in [
+            (&high, AudioRateControl::Bitrate(br(320_000))),
+            (&default, AudioRateControl::Default),
+        ] {
+            let options = options_with(AudioOutputFormat::Mp3, None, None, control);
+            execute_audio_batch(&plan_with_options(
+                vec![item(
+                    wav.clone(),
+                    path.clone(),
+                    AudioInputFormat::Wav,
+                    2,
+                    48_000,
+                )],
+                fastconv_domain::AudioExecutionMode::CpuMp3,
+                options,
+            ))?;
+        }
+        assert_eq!(mp3_first_frame_bitrate_kbps(&high)?, 320);
+        assert_eq!(mp3_first_frame_bitrate_kbps(&default)?, MP3_BITRATE_KBPS);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn aac_rejects_bitrate_above_frame_capacity_without_explicit_options() {
+        let dir = temp_dir("aac-frame-capacity");
+        let aac = dir.join("out.aac");
+        let mut buf = AudioWorkerBuffer::new();
+        buf.samples_f32 = vec![0.0_f32; 2_048];
+        let options = options_with(
+            AudioOutputFormat::Aac,
+            None,
+            None,
+            AudioRateControl::Bitrate(br(512_000)),
+        );
+        let result = encode_aac(&aac, 8_000, 1, &mut buf, &options);
+        assert!(
+            matches!(result, Err(PipelineError::EncodeFailed { .. })),
+            "512 kbps at 8 kHz mono must be rejected instead of silently reduced"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mp3_rejects_bitrate_above_mpeg2_limit_without_an_explicit_rate() {
+        let dir = temp_dir("mp3-low-rate");
+        let wav = dir.join("in.wav");
+        write_wav(&wav, &tone(4_096, 2), 24_000, 2);
+        let mp3 = dir.join("out.mp3");
+        let options = options_with(
+            AudioOutputFormat::Mp3,
+            None,
+            None,
+            AudioRateControl::Bitrate(br(320_000)),
+        );
+        let result = execute_audio_batch(&plan_with_options(
+            vec![item(wav, mp3, AudioInputFormat::Wav, 2, 24_000)],
+            fastconv_domain::AudioExecutionMode::CpuMp3,
+            options,
+        ));
+        assert!(
+            matches!(result, Err(PipelineError::EncodeFailed { .. })),
+            "320 kbps at 24 kHz must be rejected instead of silently snapped to 160"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remix_maps_speaker_positions_when_dropping_channels() -> Result<(), PipelineError> {
+        let path = Path::new("remix.wav");
+        let mut buf = AudioWorkerBuffer::new();
+        buf.samples_f32 = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        remix_channels_f32(6, 5, &mut buf, path)?;
+        assert_eq!(
+            buf.samples_f32,
+            vec![0.0; 5],
+            "LFE must be dropped, not moved to BL"
+        );
+
+        buf.samples_f32 = vec![0.0, 0.0, 0.0, 1.0, 0.0];
+        remix_channels_f32(5, 6, &mut buf, path)?;
+        assert_eq!(
+            buf.samples_f32,
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            "BL must stay BL when an LFE plane is inserted before it"
+        );
+
+        buf.samples_f32 = vec![0.0; 4];
+        assert!(matches!(
+            remix_channels_f32(4, 2, &mut buf, path),
+            Err(PipelineError::DecodeFailed { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn downsampling_a_short_input_rejects_empty_output() {
+        let dir = temp_dir("empty-resample");
+        let wav = dir.join("in.wav");
+        write_wav(&wav, &tone(2, 2), 48_000, 2);
+        let out = dir.join("out.wav");
+        let options = options_with(
+            AudioOutputFormat::Wav,
+            Some(8_000),
+            None,
+            AudioRateControl::Default,
+        );
+        let result = execute_audio_batch(&plan_with_options(
+            vec![item(wav, out, AudioInputFormat::Wav, 2, 48_000)],
+            fastconv_domain::AudioExecutionMode::CpuWav,
+            options,
+        ));
+        assert!(
+            matches!(result, Err(PipelineError::EmptyOutput(_))),
+            "a zero-frame resample must not publish a header-only WAV"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
