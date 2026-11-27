@@ -40,9 +40,10 @@ const MAX_STILL_IMAGE_PIXELS: u64 = 128 * 1024 * 1024;
 // into a reusable per-worker RGB/RGBA scratch buffer capped at 128 MiB, so eight
 // workers stay under ~1 GiB. Checked here, before the source pixels are decoded.
 const MAX_HEIC_PIXELS: u64 = 128 * 1024 * 1024;
-// A grid/overlay decoder retains every decoded input plus its canvas at once.
-// Sum the coded+display pixels of the whole reference tree so repeated or
-// nested `dimg` entries cannot multiply retained memory past one image budget.
+// A grid/overlay decoder keeps decoded inputs plus its canvas alive at once, but plain
+// grid tiles use per-worker scratch and are not retained. This is deliberately a
+// cumulative-work budget: every visited item (plain tiles included) is charged so a
+// hostile reference tree cannot multiply probe/decode work past one image's pixels.
 const MAX_HEIC_RETAINED_PIXELS: u64 = 128 * 1024 * 1024;
 // Repeatable `dimg` references can fan out exponentially while the final budget is
 // still small. Bound total visits so probing stays cheap regardless of fan-out.
@@ -1488,8 +1489,69 @@ fn heic_overlay_canvas(data: &[u8]) -> Option<(u32, u32)> {
     Some((field()?, field()?))
 }
 
+/// Canvas and tile geometry from a `grid` descriptor, mirroring heifer's `Grid::parse`:
+/// version, flags (bit 0 selects 32-bit output dimensions), rows-1, columns-1,
+/// then output width/height. Heifer uses the descriptor canvas, not `ispe`.
+fn heic_grid_canvas(data: &[u8]) -> Option<(u32, u32, u16, u16)> {
+    let mut bytes = data.iter().copied();
+    if bytes.next()? != 0 {
+        return None;
+    }
+    let large = bytes.next()? & 1 != 0;
+    let rows = u16::from(bytes.next()?) + 1;
+    let columns = u16::from(bytes.next()?) + 1;
+    let mut field = || -> Option<u32> {
+        if large {
+            Some(u32::from_be_bytes([
+                bytes.next()?,
+                bytes.next()?,
+                bytes.next()?,
+                bytes.next()?,
+            ]))
+        } else {
+            Some(u32::from(u16::from_be_bytes([
+                bytes.next()?,
+                bytes.next()?,
+            ])))
+        }
+    };
+    Some((field()?, field()?, rows, columns))
+}
+
+/// Total byte length of an item's extents, matching how heifer concatenates them.
+/// Extent bounds were already checked for every item before the graph walk.
+fn heic_item_data_len(
+    path: &Path,
+    item: &Item,
+    idat_len: Option<u64>,
+    file_len: u64,
+) -> Result<u64, ProbeError> {
+    let location = item
+        .location
+        .as_ref()
+        .ok_or_else(|| invalid_image(path, "HEIC derived item has no data location"))?;
+    let limit = if location.construction_method == ConstructionMethod::Idat {
+        idat_len
+            .ok_or_else(|| invalid_image(path, "HEIC derived item uses idat without an idat box"))?
+    } else {
+        file_len
+    };
+    let mut total = 0_u64;
+    for extent in &location.extents {
+        let length = if extent.length == 0 {
+            limit.saturating_sub(extent.offset)
+        } else {
+            extent.length
+        };
+        total = total
+            .checked_add(length)
+            .ok_or_else(|| invalid_image(path, "HEIC derived item data length overflow"))?;
+    }
+    Ok(total)
+}
+
 /// Shared traversal state: visit cap, retained-pixel tally, active recursion path,
-/// pre-resolved `idat` slice, and lazy overlay-canvas cache.
+/// pre-resolved `idat` slice, and lazy derived-canvas caches.
 struct HeicWalk<'a> {
     visits: u64,
     retained: u64,
@@ -1498,6 +1560,7 @@ struct HeicWalk<'a> {
     file_len: u64,
     idat: Option<&'a [u8]>,
     overlay_canvases: HashMap<ItemId, (u32, u32)>,
+    grid_canvases: HashMap<ItemId, (u32, u32)>,
 }
 
 fn charge_heic_visit(visits: &mut u64, path: &Path) -> Result<(), ProbeError> {
@@ -1513,11 +1576,11 @@ fn charge_heic_visit(visits: &mut u64, path: &Path) -> Result<(), ProbeError> {
     Ok(())
 }
 
-/// Reads only the bounded prefix of an `iovl` descriptor from its real storage.
-/// File-backed extents are read from the original file and idat-backed extents
-/// from the pre-resolved `idat` slice. No full item data is ever materialised
-/// and `header_buf` is never re-scanned.
-fn read_heic_overlay_descriptor(
+/// Reads only the bounded prefix of a derived-item (`iovl`/`grid`) descriptor from
+/// its real storage. File-backed extents are read from the original file and
+/// idat-backed extents from the pre-resolved `idat` slice. No full item data is
+/// ever materialised and `header_buf` is never re-scanned.
+fn read_heic_item_descriptor(
     file: &mut File,
     path: &Path,
     item: &Item,
@@ -1607,15 +1670,65 @@ fn read_heic_overlay_descriptor(
 fn resolve_heic_overlay_canvas(
     walk: &mut HeicWalk<'_>,
     item: &Item,
+    input_count: usize,
     path: &Path,
 ) -> Result<(u32, u32), ProbeError> {
     if let Some(&canvas) = walk.overlay_canvases.get(&item.id) {
         return Ok(canvas);
     }
-    let descriptor = read_heic_overlay_descriptor(walk.file, path, item, walk.idat, walk.file_len)?;
+    let descriptor = read_heic_item_descriptor(walk.file, path, item, walk.idat, walk.file_len)?;
     let canvas = heic_overlay_canvas(&descriptor)
         .ok_or_else(|| invalid_image(path, "invalid or truncated HEIC iovl descriptor"))?;
+    // Heifer reads one signed offset pair after the canvas header for every `dimg`
+    // input. Validate the full extent length against that table so probing rejects
+    // a file the decoder would reject with `truncated iovl data`, without reading
+    // the offsets themselves.
+    let large = descriptor.get(1).is_some_and(|flags| flags & 1 != 0);
+    let header_bytes = if large { 18 } else { 14 };
+    let pair_bytes = if large { 8 } else { 4 };
+    let required = u64::try_from(input_count)
+        .ok()
+        .and_then(|count| count.checked_mul(pair_bytes))
+        .and_then(|offsets| offsets.checked_add(header_bytes))
+        .ok_or_else(|| invalid_image(path, "HEIC iovl offset table size overflow"))?;
+    let idat_len = walk.idat.and_then(|data| u64::try_from(data.len()).ok());
+    let data_len = heic_item_data_len(path, item, idat_len, walk.file_len)?;
+    if data_len < required {
+        return Err(invalid_image(
+            path,
+            "HEIC iovl descriptor is missing input offsets",
+        ));
+    }
     walk.overlay_canvases.insert(item.id, canvas);
+    Ok(canvas)
+}
+
+/// Lazily resolves and caches the descriptor canvas and tile geometry of a `grid`
+/// item. Heifer sizes the canvas from the descriptor, so a mismatch with `ispe`
+/// or a stale tile count is rejected here rather than at decode time.
+fn resolve_heic_grid_canvas(
+    walk: &mut HeicWalk<'_>,
+    item: &Item,
+    input_count: usize,
+    path: &Path,
+) -> Result<(u32, u32), ProbeError> {
+    if let Some(&canvas) = walk.grid_canvases.get(&item.id) {
+        return Ok(canvas);
+    }
+    let descriptor = read_heic_item_descriptor(walk.file, path, item, walk.idat, walk.file_len)?;
+    let (width, height, rows, columns) = heic_grid_canvas(&descriptor)
+        .ok_or_else(|| invalid_image(path, "invalid or truncated HEIC grid descriptor"))?;
+    let expected = usize::from(rows)
+        .checked_mul(usize::from(columns))
+        .ok_or_else(|| invalid_image(path, "HEIC grid geometry overflow"))?;
+    if input_count != expected {
+        return Err(invalid_image(
+            path,
+            format!("HEIC grid has {input_count} tiles but its descriptor requires {expected}"),
+        ));
+    }
+    let canvas = (width, height);
+    walk.grid_canvases.insert(item.id, canvas);
     Ok(canvas)
 }
 
@@ -1647,6 +1760,9 @@ fn heic_item_dimensions(
 
     // `heifer` attaches direct `auxl` alpha planes (`referencing_items(id, b"auxl")`);
     // reject non-HEVC alpha leaves and derived alpha on coded `hvc1` owners.
+    // Keep the first alpha's post-transform dimensions: heifer attaches it to a
+    // derived owner before applying the owner's own transforms.
+    let mut alpha_dims = None;
     for &aux in index.alpha_or_invalid_auxl(id) {
         let aux_item = index.item(aux, path, "invalid HEIC auxiliary item")?;
         // heifer attaches a coded primary's alpha via `decode_hvc1`, which
@@ -1662,8 +1778,11 @@ fn heic_item_dimensions(
         // rejects non-HEVC leaves, validates geometry and charges the
         // retained-pixel budget.
         walk.visiting.push(id);
-        heic_item_dimensions(index, aux, depth + 1, walk, path)?;
+        let dims = heic_item_dimensions(index, aux, depth + 1, walk, path)?;
         walk.visiting.pop();
+        if alpha_dims.is_none() {
+            alpha_dims = Some(dims);
+        }
     }
 
     // Follow derives to their coded leaves: non-HEVC codecs must be rejected even
@@ -1700,15 +1819,29 @@ fn heic_item_dimensions(
             base = Some(source_dims);
         }
         b"grid" | b"iovl" => {
-            if item.item_type.0 == *b"iovl" {
-                overlay_canvas = Some(resolve_heic_overlay_canvas(walk, item, path)?);
-            }
             let inputs = index.dimg_targets(id);
             if inputs.is_empty() {
                 return Err(invalid_image(
                     path,
                     "HEIC derived image item has no input images",
                 ));
+            }
+            if item.item_type.0 == *b"iovl" {
+                overlay_canvas = Some(resolve_heic_overlay_canvas(walk, item, inputs.len(), path)?);
+            } else {
+                let canvas = resolve_heic_grid_canvas(walk, item, inputs.len(), path)?;
+                let ispe = index.image_size(item).ok_or_else(|| {
+                    invalid_image(path, "HEIC image item is missing its ispe property")
+                })?;
+                if canvas != ispe {
+                    return Err(invalid_image(
+                        path,
+                        format!(
+                            "HEIC grid canvas {}x{} does not match ispe {}x{}",
+                            canvas.0, canvas.1, ispe.0, ispe.1
+                        ),
+                    ));
+                }
             }
             walk.visiting.push(id);
             for &input in inputs {
@@ -1734,6 +1867,17 @@ fn heic_item_dimensions(
             .image_size(item)
             .ok_or_else(|| invalid_image(path, "HEIC image item is missing its ispe property"))?
     };
+    // Heifer attaches alpha to a derived image before applying that image's
+    // transforms, so the alpha must cover the pre-transform dimensions.
+    if !matches!(&item.item_type.0, b"hvc1")
+        && let Some((alpha_w, alpha_h)) = alpha_dims
+        && (alpha_w < width || alpha_h < height)
+    {
+        return Err(invalid_image(
+            path,
+            "HEIC alpha image is smaller than the image it covers",
+        ));
+    }
     if let Some((canvas_w, canvas_h)) = overlay_canvas
         && (canvas_w, canvas_h) != (width, height)
     {
@@ -2034,10 +2178,12 @@ fn probe_heic(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeErro
         file_len,
         idat,
         overlay_canvases: HashMap::new(),
+        grid_canvases: HashMap::new(),
     };
     let (width, height) = heic_item_dimensions(&index, container.primary_id, 0, &mut walk, path)?;
-    // Plain coded images are already bounded per item. A derived primary keeps
-    // its canvas and every decoded input alive at once, so enforce the sum there.
+    // Plain coded images are already bounded per item. For a derived primary this
+    // tally is a cumulative work budget (plain grid tiles are counted deliberately
+    // even though they use per-worker scratch), so enforce it there.
     let primary_type = index
         .item(container.primary_id, path, "invalid HEIC primary item")?
         .item_type
@@ -2046,7 +2192,7 @@ fn probe_heic(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeErro
         return Err(invalid_image(
             path,
             format!(
-                "HEIC retained pixels ({}) exceed {MAX_HEIC_RETAINED_PIXELS}-pixel limit",
+                "HEIC cumulative retained-pixel work budget ({}) exceeds {MAX_HEIC_RETAINED_PIXELS}-pixel limit",
                 walk.retained
             ),
         ));
@@ -2976,6 +3122,11 @@ fn probe_directory_entry(path: &Path) -> Result<Option<ProbedImage>, ProbeError>
         return match probe_opened_image(file, path, resolved.format) {
             Ok(probed) => Ok(Some(probed)),
             Err(err) => {
+                // An unreadable file is an I/O failure, not an unknown image: the
+                // batch must report it instead of silently dropping the entry.
+                if matches!(err, ProbeError::Io { .. }) {
+                    return Err(err);
+                }
                 // Generic `mif1`/`mif2` brands alone do not confirm a still image.
                 // Without a known extension a failed probe is a non-image entry;
                 // a specific brand or a known extension still reports the error.
@@ -3140,9 +3291,10 @@ mod tests {
     use super::{
         HeicBrandKind, ImageBatchRequest, MAX_HEIC_AUXC_BYTES, MAX_HEIC_ITEM_VISITS,
         MAX_HEIC_META_ITEMS, MAX_HEIC_TRACK_TABLE_ENTRIES, ProbedImage, charge_heic_visit,
-        heic_overlay_canvas, inspect_heic_meta, is_alpha_auxiliary_urn, prepare_image_batch,
-        prepare_image_batch_inner, prepare_image_batch_with_options, probe_directory_entry,
-        probe_image, resolve_sniffed_input, screen_heic_moov_tracks, validate_cpu_heic_admission,
+        heic_grid_canvas, heic_overlay_canvas, inspect_heic_meta, is_alpha_auxiliary_urn,
+        prepare_image_batch, prepare_image_batch_inner, prepare_image_batch_with_options,
+        probe_directory_entry, probe_image, resolve_sniffed_input, screen_heic_moov_tracks,
+        validate_cpu_heic_admission,
     };
     use crate::ProbeError;
     use fastconv_domain::{
@@ -4884,6 +5036,19 @@ mod tests {
         // `heifer` shares one `ispe` among equally sized tiles, so three distinct
         // boxes cover the tiles, the grid canvas and the thumbnail.
         assert!(patch_all_ispe(&mut grid, 11_000, 11_000) >= 3);
+        // Patch the grid descriptor canvas too: heifer writes [0, flags, rows-1,
+        // columns-1, width u16, height u16], and this 600x600 grid has 2x2 tiles.
+        // Without this the new canvas-vs-ispe check fires before the budget check.
+        let old_canvas = [0_u8, 0, 1, 1, 0x02, 0x58, 0x02, 0x58];
+        let new_canvas = [0_u8, 0, 1, 1, 0x2A, 0xF8, 0x2A, 0xF8];
+        let mut patched_canvas = 0_usize;
+        for pos in 0..=grid.len().saturating_sub(old_canvas.len()) {
+            if grid[pos..pos + old_canvas.len()] == old_canvas {
+                grid[pos..pos + old_canvas.len()].copy_from_slice(&new_canvas);
+                patched_canvas += 1;
+            }
+        }
+        assert_eq!(patched_canvas, 1);
         write_test_file(&path, &grid)?;
         assert!(matches!(
             probe_image(&path),
@@ -4987,6 +5152,21 @@ mod tests {
         large[14..18].copy_from_slice(&50_000_u32.to_be_bytes());
         assert_eq!(heic_overlay_canvas(&large), Some((70_000, 50_000)));
         assert_eq!(heic_overlay_canvas(&[0, 2]), None);
+
+        // Grid descriptors carry their own canvas and tile geometry (heifer's
+        // `Grid::parse` layout), independent of `ispe`.
+        let mut grid = vec![0_u8; 8];
+        grid[2] = 1;
+        grid[3] = 3;
+        grid[4..6].copy_from_slice(&4032_u16.to_be_bytes());
+        grid[6..8].copy_from_slice(&3024_u16.to_be_bytes());
+        assert_eq!(heic_grid_canvas(&grid), Some((4032, 3024, 2, 4)));
+        let mut large_grid = vec![0_u8; 12];
+        large_grid[1] = 1;
+        large_grid[4..8].copy_from_slice(&70_000_u32.to_be_bytes());
+        large_grid[8..12].copy_from_slice(&50_000_u32.to_be_bytes());
+        assert_eq!(heic_grid_canvas(&large_grid), Some((70_000, 50_000, 1, 1)));
+        assert_eq!(heic_grid_canvas(&[0, 0, 1]), None);
         assert!(is_alpha_auxiliary_urn("urn:mpeg:hevc:2015:auxid:1"));
         assert!(!is_alpha_auxiliary_urn("urn:mpeg:hevc:2015:auxid:2"));
         Ok(())
@@ -5284,6 +5464,18 @@ mod tests {
             probe_image(&trunc_path),
             Err(ProbeError::InvalidImage { ref reason, .. })
                 if reason.contains("invalid or truncated HEIC iovl descriptor")
+        ));
+
+        // A descriptor ending after the canvas header lacks the offset pair
+        // heifer reads for its single `dimg` input; reject it before decode.
+        let missing_offsets_path = root.join("missing_offsets_iovl.heic");
+        let missing_offsets_bytes =
+            build_synthetic_idat_overlay_heic(64, 48, 1_000, 0, Some(&valid_desc[..14]));
+        write_test_file(&missing_offsets_path, &missing_offsets_bytes)?;
+        assert!(matches!(
+            probe_image(&missing_offsets_path),
+            Err(ProbeError::InvalidImage { ref reason, .. })
+                if reason.contains("missing input offsets")
         ));
 
         fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
