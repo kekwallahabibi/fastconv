@@ -548,6 +548,7 @@ pub(crate) fn demux_ts(path: &Path) -> Result<DemuxedMedia, PipelineError> {
             config,
             timescale: US_TIMESCALE,
             presentation_edit: None,
+            pcm_format: None,
         });
     }
     if media.tracks.is_empty() {
@@ -1433,6 +1434,7 @@ mod tests {
                 config: Vec::new(),
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: [30_000_i64, 0, 10_000]
                 .into_iter()
@@ -1504,6 +1506,7 @@ mod tests {
                     config: config.to_vec(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Aac,
@@ -1514,6 +1517,7 @@ mod tests {
                     config: vec![0x12, 0x10],
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
             ],
             packets: vec![
@@ -1625,6 +1629,7 @@ mod tests {
                 config: h264_config(),
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: vec![ContainerPacket {
                 track: 0,
@@ -1674,6 +1679,7 @@ mod tests {
                     config: h264_config(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Aac,
@@ -1684,6 +1690,7 @@ mod tests {
                     config: vec![0x12, 0x10],
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
             ],
             packets: vec![
@@ -1742,6 +1749,7 @@ mod tests {
                     config: hevc_config(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Mp3,
@@ -1752,6 +1760,7 @@ mod tests {
                     config: Vec::new(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
             ],
             packets: vec![
@@ -1800,6 +1809,7 @@ mod tests {
                     config: Vec::new(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Opus,
@@ -1810,6 +1820,7 @@ mod tests {
                     config: default_opus_head(2, 0),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
             ],
             packets: vec![
@@ -1854,6 +1865,7 @@ mod tests {
                     config: h264_config(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 })
                 .collect(),
             packets: Vec::new(),
@@ -1907,6 +1919,7 @@ mod tests {
                 config: vec![0x12, 0x10],
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: Vec::new(),
         };
@@ -1964,6 +1977,7 @@ mod tests {
                 config: vec![0x12, 0x10],
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: (0..100)
                 .map(|index| ContainerPacket {
@@ -2018,6 +2032,7 @@ mod tests {
                 config: vec![0x12, 0x38],
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: vec![ContainerPacket {
                 track: 0,
@@ -2046,6 +2061,7 @@ mod tests {
                 config: h264_full_config(),
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: vec![ContainerPacket {
                 track: 0,
@@ -2074,6 +2090,7 @@ mod tests {
                 config: h264_config(),
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: (0..2)
                 .map(|index| ContainerPacket {
@@ -2196,6 +2213,7 @@ mod tests {
                     config: h264_config(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Aac,
@@ -2206,6 +2224,7 @@ mod tests {
                     config: vec![0x12, 0x10],
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
             ],
             // All video packets precede all audio packets in the input.
@@ -2323,6 +2342,7 @@ mod tests {
                 config: default_opus_head(2, 0),
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: vec![ContainerPacket {
                 track: 0,

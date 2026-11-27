@@ -1932,6 +1932,7 @@ mod enabled {
             config: Vec::new(),
             timescale: US_TIMESCALE,
             presentation_edit: None,
+            pcm_format: None,
         };
         let mut free_inputs: VecDeque<usize> = (0..slot_count).collect();
         let mut free_bitstreams: VecDeque<usize> = (0..slot_count).collect();
@@ -2231,6 +2232,7 @@ mod enabled {
             config: Vec::new(),
             timescale: US_TIMESCALE,
             presentation_edit: source_track.presentation_edit,
+            pcm_format: None,
         };
         let mut free_inputs: VecDeque<usize> = (0..slot_count).collect();
         let mut free_bitstreams: VecDeque<usize> = (0..slot_count).collect();
@@ -3661,6 +3663,7 @@ mod tests {
             config: Vec::new(),
             timescale: US_TIMESCALE,
             presentation_edit: None,
+            pcm_format: None,
         };
         let corrupt = vec![ContainerPacket {
             track: 0,

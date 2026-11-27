@@ -16,6 +16,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
+use flacenc::bitsink::ByteSink;
+use flacenc::component::{BitRepr, StreamInfo as FlacStreamInfo};
+use flacenc::error::Verify;
+use flacenc::source::{Fill, FrameBuf};
+
 use fastconv_domain::video::VideoDecodePaths;
 use fastconv_domain::{
     AnimationMeta, AudioBitrate, AudioChannels, AudioEncodeConfig, AudioSampleRate,
@@ -26,7 +31,7 @@ use fastconv_domain::{
 use opus_pure::{Application, MAX_PACKET_BYTES, OpusEncoder};
 use rubato::audioadapter_buffers::owned::InterleavedOwned;
 use rubato::{Fft, FixedSync, Indexing, Resampler};
-use symphonia::core::codecs::audio::well_known::CODEC_ID_VORBIS;
+use symphonia::core::codecs::audio::well_known::{CODEC_ID_FLAC, CODEC_ID_VORBIS};
 use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoderOptions};
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::formats::TrackType;
@@ -39,7 +44,8 @@ use symphonia::core::units::{Duration, Timestamp};
 use crate::PipelineError;
 use crate::video_anim::{self, AnimFrameInfo};
 use crate::video_bitstream::{
-    default_opus_head, pack_xiph_laced_vorbis_headers, unpack_xiph_laced_vorbis_headers,
+    PcmFormat, default_opus_head, extract_flac_streaminfo_from_mkv_codec_private,
+    pack_xiph_laced_vorbis_headers, parse_flac_streaminfo, unpack_xiph_laced_vorbis_headers,
     vorbis_ident_info, wrap_adts,
 };
 use crate::video_codecs::{
@@ -80,6 +86,11 @@ const VORBIS_FRAME_SAMPLE_CAP: usize = 8_192 * 32;
 const VORBIS_CHUNK_FRAMES: usize = 4_096;
 /// Upper bound on a Vorbis `CodecPrivate` blob held in memory.
 const VORBIS_CONFIG_CAP: usize = 1_048_576;
+/// Cap on a single decoded FLAC frame (65 535 samples, up to 8 channels).
+const FLAC_FRAME_SAMPLE_CAP: usize = 65_535 * 8;
+/// Number of FLAC/PCM frames encoded per block before flushing a packet.
+const FLAC_CHUNK_FRAMES: usize = 4_096;
+const PCM_CHUNK_FRAMES: usize = 1_024;
 
 /// Absolute presentation time of one codec frame, computed from its exact
 /// rational sample position so a long stream never accumulates rounding drift.
@@ -423,6 +434,62 @@ impl StreamingResampler {
     }
 }
 
+/// Converts interleaved container PCM bytes to bounded interleaved `f32`.
+/// The caller validates that `data` is a whole number of frames.
+// One arm per exact representation keeps endianness and depth explicit.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn pcm_bytes_to_f32(data: &[u8], format: PcmFormat) -> Vec<f32> {
+    let bytes = usize::from(format.bytes_per_sample());
+    let mut out = Vec::with_capacity(data.len() / bytes.max(1));
+    for sample in data.chunks_exact(bytes.max(1)) {
+        let value = match format {
+            PcmFormat::U8 => (f32::from(sample[0]) - 128.0_f32) / 128.0_f32,
+            PcmFormat::S16Le | PcmFormat::S16Be => {
+                let raw = if format == PcmFormat::S16Le {
+                    i16::from_le_bytes([sample[0], sample[1]])
+                } else {
+                    i16::from_be_bytes([sample[0], sample[1]])
+                };
+                f32::from(raw) / 32_768.0_f32
+            }
+            PcmFormat::S24Le => {
+                let raw = (i32::from(sample[2]) << 24
+                    | i32::from(sample[1]) << 16
+                    | i32::from(sample[0]) << 8)
+                    >> 8;
+                raw as f32 / 8_388_608.0_f32
+            }
+            PcmFormat::S24Be => {
+                let raw = (i32::from(sample[0]) << 24
+                    | i32::from(sample[1]) << 16
+                    | i32::from(sample[2]) << 8)
+                    >> 8;
+                raw as f32 / 8_388_608.0_f32
+            }
+            PcmFormat::S32Le => {
+                let raw = i32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
+                raw as f32 / 2_147_483_648.0_f32
+            }
+            PcmFormat::S32Be => {
+                let raw = i32::from_be_bytes([sample[0], sample[1], sample[2], sample[3]]);
+                raw as f32 / 2_147_483_648.0_f32
+            }
+            PcmFormat::F32Le => f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]),
+            PcmFormat::F32Be => f32::from_be_bytes([sample[0], sample[1], sample[2], sample[3]]),
+            PcmFormat::F64Le => match <[u8; 8]>::try_from(sample) {
+                Ok(bits) => f64::from_le_bytes(bits) as f32,
+                Err(_) => continue,
+            },
+        };
+        out.push(value);
+    }
+    out
+}
+
 /// Decodes a track in bounded PCM chunks. `on_chunk` receives interleaved
 /// `f32` samples at the decoder's native rate; cancellation is observed on
 /// every packet so a failing sibling worker can stop this one immediately.
@@ -441,18 +508,31 @@ where
     let ordered = decode_order(packets);
     let channels = track.channels.unwrap_or(2).max(1);
     let mut chunk = Vec::new();
+    // `cursor` advances past emitted blocks so a large chunk is not shifted
+    // from the front once per output block; the consumed prefix is compacted
+    // once per call instead.
+    let mut cursor = 0_usize;
     let mut last_rate = 0_u32;
     let mut last_channels = 0_u16;
     let emit_ready = |chunk: &mut Vec<f32>,
+                      cursor: &mut usize,
                       rate: u32,
                       decoded: u16,
                       on_chunk: &mut F|
      -> Result<(), PipelineError> {
         let ready = AUDIO_PCM_CHUNK_FRAMES.saturating_mul(usize::from(decoded.max(1)));
-        while chunk.len() >= ready {
-            let slice = chunk[..ready].to_vec();
-            on_chunk(&slice, rate, decoded)?;
-            chunk.drain(..ready);
+        loop {
+            let available = chunk.len().saturating_sub(*cursor);
+            if available < ready {
+                break;
+            }
+            let end = cursor.saturating_add(ready);
+            on_chunk(&chunk[*cursor..end], rate, decoded)?;
+            *cursor = end;
+        }
+        if *cursor > 0 {
+            chunk.drain(..*cursor);
+            *cursor = 0;
         }
         Ok(())
     };
@@ -501,7 +581,7 @@ where
                         chunk.extend_from_slice(samples);
                     }
                 }
-                emit_ready(&mut chunk, OPUS_RATE, channels, &mut on_chunk)?;
+                emit_ready(&mut chunk, &mut cursor, OPUS_RATE, channels, &mut on_chunk)?;
             }
             last_rate = OPUS_RATE;
             last_channels = channels;
@@ -520,7 +600,13 @@ where
                 last_rate = frame.sample_rate;
                 last_channels = frame.channels;
                 chunk.extend_from_slice(&frame.samples);
-                emit_ready(&mut chunk, last_rate, last_channels, &mut on_chunk)?;
+                emit_ready(
+                    &mut chunk,
+                    &mut cursor,
+                    last_rate,
+                    last_channels,
+                    &mut on_chunk,
+                )?;
             }
         }
         VideoCodec::Mp3 => {
@@ -591,7 +677,13 @@ where
                     audio_frame.copy_to_slice_interleaved(&mut *slot);
                     chunk.extend_from_slice(&slot[..count]);
                 }
-                emit_ready(&mut chunk, last_rate, last_channels, &mut on_chunk)?;
+                emit_ready(
+                    &mut chunk,
+                    &mut cursor,
+                    last_rate,
+                    last_channels,
+                    &mut on_chunk,
+                )?;
             }
         }
         VideoCodec::Vorbis => {
@@ -644,7 +736,133 @@ where
                 }
                 last_rate = ident_rate;
                 last_channels = ident_channels;
-                emit_ready(&mut chunk, last_rate, last_channels, &mut on_chunk)?;
+                emit_ready(
+                    &mut chunk,
+                    &mut cursor,
+                    last_rate,
+                    last_channels,
+                    &mut on_chunk,
+                )?;
+            }
+        }
+        VideoCodec::Flac => {
+            // A remuxed track may carry the full `fLaC` metadata chain (e.g. a
+            // VORBIS_COMMENT block). Walk it to the validated STREAMINFO body
+            // instead of demanding a bare 34-byte config; `track.config` itself
+            // stays untouched so a later mux preserves every native block.
+            let streaminfo: [u8; 34] = if track.config.starts_with(b"fLaC") {
+                extract_flac_streaminfo_from_mkv_codec_private(&track.config).map_err(|reason| {
+                    decode_error(path, format!("invalid FLAC metadata: {reason}"))
+                })?
+            } else {
+                track
+                    .config
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| decode_error(path, "FLAC track has no 34-byte STREAMINFO"))?
+            };
+            let (flac_channels, flac_rate, _) =
+                parse_flac_streaminfo(&streaminfo).map_err(|reason| decode_error(path, reason))?;
+            let mut params = AudioCodecParameters::new();
+            params.for_codec(CODEC_ID_FLAC).with_sample_rate(flac_rate);
+            // The decoder amends channels/bit depth from STREAMINFO itself.
+            // `symphonia-bundle-flac` reads the raw 34-byte STREAMINFO directly,
+            // so pass only the validated body, never the whole metadata chain.
+            params.with_extra_data(streaminfo.to_vec().into_boxed_slice());
+            let mut decoder = symphonia::default::get_codecs()
+                .make_audio_decoder(&params, &AudioDecoderOptions::default())
+                .map_err(|err| {
+                    decode_error(path, format!("failed to create FLAC decoder: {err}"))
+                })?;
+            let mut frame: Vec<f32> = Vec::new();
+            for packet in ordered {
+                if cancelled.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let audio_buf = decoder
+                    .decode_ref(&PacketRef::new(
+                        0,
+                        Timestamp::ZERO,
+                        Duration::ZERO,
+                        &packet.data,
+                    ))
+                    .map_err(|err| decode_error(path, format!("FLAC decode failed: {err}")))?;
+                let count = audio_buf.samples_interleaved();
+                if count > FLAC_FRAME_SAMPLE_CAP {
+                    return Err(decode_error(
+                        path,
+                        format!("FLAC frame of {count} samples exceeds the allocation cap"),
+                    ));
+                }
+                if frame.len() < count {
+                    frame.resize(count, 0.0_f32);
+                }
+                if let Some(slot) = frame.get_mut(..count) {
+                    audio_buf.copy_to_slice_interleaved(&mut *slot);
+                    chunk.extend_from_slice(&slot[..count]);
+                }
+                last_rate = flac_rate;
+                last_channels = flac_channels;
+                emit_ready(
+                    &mut chunk,
+                    &mut cursor,
+                    last_rate,
+                    last_channels,
+                    &mut on_chunk,
+                )?;
+            }
+        }
+        VideoCodec::Pcm => {
+            let format = track
+                .pcm_format
+                .ok_or_else(|| decode_error(path, "PCM track has no sample format"))?;
+            let frame_bytes =
+                usize::from(format.bytes_per_sample()).saturating_mul(usize::from(channels));
+            if frame_bytes == 0 {
+                return Err(decode_error(path, "PCM frame size is zero"));
+            }
+            last_rate = track.sample_rate.unwrap_or(0);
+            last_channels = channels;
+            // Convert at most one output block of whole frames at a time so a
+            // large packet is never duplicated wholesale as f32 and `chunk`
+            // stays at one block plus one slice.
+            let slice_bytes = AUDIO_PCM_CHUNK_FRAMES
+                .max(1)
+                .saturating_mul(frame_bytes)
+                .max(1);
+            for packet in ordered {
+                if cancelled.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                if packet.data.len() % frame_bytes != 0 {
+                    return Err(decode_error(
+                        path,
+                        "PCM packet is not a whole number of frames",
+                    ));
+                }
+                for slice in packet.data.chunks(slice_bytes) {
+                    if slice.len() % frame_bytes != 0 {
+                        return Err(decode_error(
+                            path,
+                            "PCM packet is not a whole number of frames",
+                        ));
+                    }
+                    let samples = u64::try_from(slice.len() / frame_bytes)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(u64::from(channels));
+                    // `emit_ready` hands off and compacts after every slice, so
+                    // budget the live f32 working set, not a cumulative counter
+                    // that would eventually reject a long, healthy stream.
+                    enforce_live_pcm_budget(path, &chunk, samples)?;
+                    chunk.extend_from_slice(&pcm_bytes_to_f32(slice, format));
+                    emit_ready(
+                        &mut chunk,
+                        &mut cursor,
+                        last_rate,
+                        last_channels,
+                        &mut on_chunk,
+                    )?;
+                }
             }
         }
         other => {
@@ -796,6 +1014,7 @@ fn encode_aac_track(
             config,
             timescale: US_TIMESCALE,
             presentation_edit: None,
+            pcm_format: None,
         },
         packets,
     ))
@@ -893,6 +1112,7 @@ fn encode_opus_track(
             config: default_opus_head(channels, pre_skip),
             timescale: US_TIMESCALE,
             presentation_edit: None,
+            pcm_format: None,
         },
         packets,
     ))
@@ -973,6 +1193,288 @@ fn encode_mp3_track(
             config: Vec::new(),
             timescale: US_TIMESCALE,
             presentation_edit: None,
+            pcm_format: None,
+        },
+        packets,
+    ))
+}
+
+/// Quantizes one `f32` sample to the signed 16-bit range flacenc expects.
+// Rounding/clamping is deliberate: the f32 decoder output is normalized.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn to_s16_i32(sample: f32) -> i32 {
+    // Decoding divides signed samples by 32768, so -1.0 must map back to
+    // -32768 (not -32767). Multiplying by 32768 keeps the negative endpoint
+    // exact; clamping still keeps +1.0 inside i16's asymmetric positive max.
+    (sample * 32_768.0).round().clamp(-32_768.0, 32_767.0) as i32
+}
+
+/// Interleaved `f32` to signed 16-bit little-endian PCM bytes.
+fn pcm_to_s16le(samples: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(samples.len().saturating_mul(2));
+    for &sample in samples {
+        let value = i16::try_from(to_s16_i32(sample)).unwrap_or(0);
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+/// Validated, single-threaded FLAC encoder settings for in-container audio.
+fn flac_encoder_config() -> Result<flacenc::error::Verified<flacenc::config::Encoder>, PipelineError>
+{
+    let mut config = flacenc::config::Encoder::default();
+    config.block_size = FLAC_CHUNK_FRAMES;
+    config.multithread = false;
+    config.subframe_coding.use_lpc = false;
+    config.into_verified().map_err(|(_, err)| {
+        encode_error(
+            Path::new("flac"),
+            format!("invalid FLAC encoder configuration: {err}"),
+        )
+    })
+}
+
+/// Builds the FLAC encoder's `StreamInfo`; `total_samples == 0` means unknown.
+fn flac_streaminfo(
+    rate: u32,
+    channels: u16,
+    total_samples: usize,
+) -> Result<FlacStreamInfo, PipelineError> {
+    let rate = usize::try_from(rate)
+        .map_err(|_| encode_error(Path::new("flac"), "FLAC rate exceeds usize"))?;
+    let mut info = FlacStreamInfo::new(rate, usize::from(channels), 16).map_err(|err| {
+        encode_error(Path::new("flac"), format!("invalid FLAC StreamInfo: {err}"))
+    })?;
+    // Fixed-block frames must declare equal min/max bounds: when they differ,
+    // readers treat frame numbers as absolute sample positions and a second
+    // 4096-sample block lands at sample 1 instead of 4096, breaking seeks.
+    // The final shorter block is excluded from the min-block-size rule.
+    info.set_block_sizes(FLAC_CHUNK_FRAMES, FLAC_CHUNK_FRAMES)
+        .map_err(|err| {
+            encode_error(
+                Path::new("flac"),
+                format!("invalid FLAC block sizes: {err}"),
+            )
+        })?;
+    info.set_total_samples(total_samples);
+    Ok(info)
+}
+
+/// Writes exactly the 34-byte raw FLAC STREAMINFO used as container config.
+fn flac_streaminfo_bytes(info: &FlacStreamInfo) -> Result<[u8; 34], PipelineError> {
+    let mut sink = ByteSink::new();
+    BitRepr::write(info, &mut sink).map_err(|err| {
+        encode_error(Path::new("flac"), format!("STREAMINFO write failed: {err}"))
+    })?;
+    let bytes = sink.into_inner();
+    <[u8; 34]>::try_from(bytes).map_err(|bytes| {
+        encode_error(
+            Path::new("flac"),
+            format!("STREAMINFO is {} bytes, expected 34", bytes.len()),
+        )
+    })
+}
+
+/// Minimum FLAC block size accepted by RFC 9639 / `flacenc`.
+const FLAC_MIN_BLOCK_FRAMES: usize = 16;
+
+/// Encodes complete FLAC frames from interleaved `f32` PCM into packets.
+///
+/// `start_frame_number` is the 0-based FLAC frame index (`0, 1, 2, ...`);
+/// `start_sample_offset` is the 0-based sample offset used for timestamps.
+/// Returns `(packets, frames_emitted, samples_emitted)`.
+fn encode_flac_frames(
+    pcm: &[f32],
+    channels: u16,
+    rate: u32,
+    start_frame_number: usize,
+    start_sample_offset: u64,
+    config: &flacenc::error::Verified<flacenc::config::Encoder>,
+    info: &FlacStreamInfo,
+) -> Result<(Vec<ContainerPacket>, usize, u64), PipelineError> {
+    let ch = usize::from(channels);
+    if ch == 0 || !pcm.len().is_multiple_of(ch) {
+        return Err(encode_error(
+            Path::new("flac"),
+            "FLAC input is not whole interleaved frames",
+        ));
+    }
+    let mut full_framebuf = FrameBuf::with_size(ch, FLAC_CHUNK_FRAMES).map_err(|err| {
+        encode_error(
+            Path::new("flac"),
+            format!("failed to allocate FLAC frame buffer: {err}"),
+        )
+    })?;
+    let mut packets = Vec::new();
+    let mut frame_index = start_frame_number;
+    let mut sample_offset = start_sample_offset;
+    for block in pcm.chunks(FLAC_CHUNK_FRAMES.saturating_mul(ch)) {
+        let frames = block.len() / ch;
+        if frames == 0 {
+            continue;
+        }
+        let encoded_frames = frames.max(FLAC_MIN_BLOCK_FRAMES);
+        let mut samples = Vec::with_capacity(encoded_frames.saturating_mul(ch));
+        samples.extend(block.iter().copied().map(to_s16_i32));
+        if encoded_frames > frames {
+            samples.resize(encoded_frames.saturating_mul(ch), 0);
+        }
+        let frame = if encoded_frames == FLAC_CHUNK_FRAMES {
+            full_framebuf.fill_interleaved(&samples).map_err(|err| {
+                encode_error(Path::new("flac"), format!("FLAC fill failed: {err}"))
+            })?;
+            flacenc::encode_fixed_size_frame(config, &full_framebuf, frame_index, info).map_err(
+                |err| encode_error(Path::new("flac"), format!("FLAC encoding failed: {err}")),
+            )?
+        } else {
+            let mut tail_buf = FrameBuf::with_size(ch, encoded_frames).map_err(|err| {
+                encode_error(
+                    Path::new("flac"),
+                    format!("failed to allocate final FLAC frame buffer: {err}"),
+                )
+            })?;
+            tail_buf.fill_interleaved(&samples).map_err(|err| {
+                encode_error(Path::new("flac"), format!("FLAC fill failed: {err}"))
+            })?;
+            flacenc::encode_fixed_size_frame(config, &tail_buf, frame_index, info).map_err(
+                |err| encode_error(Path::new("flac"), format!("FLAC encoding failed: {err}")),
+            )?
+        };
+        let mut sink = ByteSink::new();
+        BitRepr::write(&frame, &mut sink).map_err(|err| {
+            encode_error(Path::new("flac"), format!("FLAC frame write failed: {err}"))
+        })?;
+        let advance = u64::try_from(frames).unwrap_or(u64::MAX);
+        let pts = sample_pts_us(sample_offset, rate);
+        let next = sample_pts_us(sample_offset.saturating_add(advance), rate);
+        let duration = u64::try_from(next.saturating_sub(pts)).unwrap_or(1).max(1);
+        packets.push(ContainerPacket {
+            track: 0,
+            pts,
+            dts: pts,
+            duration,
+            keyframe: true,
+            data: sink.into_inner(),
+        });
+        frame_index = frame_index.saturating_add(1);
+        sample_offset = sample_offset.saturating_add(advance);
+    }
+    Ok((
+        packets,
+        frame_index.saturating_sub(start_frame_number),
+        sample_offset.saturating_sub(start_sample_offset),
+    ))
+}
+
+/// Whole-track FLAC encoder retained for codec round-trip tests. Production
+/// transcodes use [`StreamingAudioEncoder`] instead.
+#[cfg(test)]
+fn encode_flac_track(
+    path: &Path,
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+    config: AudioEncodeConfig,
+) -> Result<(ContainerTrack, Vec<ContainerPacket>), PipelineError> {
+    let rate = configured_audio_rate(TargetAudioCodec::Flac, sample_rate, config);
+    let target_channels = configured_audio_channels(channels, config);
+    let resampled = resample_interleaved(samples, usize::from(channels), sample_rate, rate)?;
+    let pcm = mix_to_channels(
+        &resampled,
+        usize::from(channels),
+        usize::from(target_channels),
+    )?;
+    if pcm.is_empty() {
+        return Err(encode_error(path, "no samples to encode as FLAC"));
+    }
+    let total = pcm.len() / usize::from(target_channels.max(1));
+    let encoder_config = flac_encoder_config()?;
+    let info = flac_streaminfo(rate, target_channels, total)?;
+    let streaminfo = flac_streaminfo_bytes(&info)?;
+    parse_flac_streaminfo(&streaminfo)
+        .map_err(|reason| encode_error(path, format!("invalid FLAC STREAMINFO: {reason}")))?;
+    let (mut packets, _, _) =
+        encode_flac_frames(&pcm, target_channels, rate, 0, 0, &encoder_config, &info)?;
+    for packet in &mut packets {
+        packet.track = 0;
+    }
+    if packets.is_empty() {
+        return Err(encode_error(path, "FLAC encoder produced no frames"));
+    }
+    Ok((
+        ContainerTrack {
+            codec: VideoCodec::Flac,
+            width: None,
+            height: None,
+            channels: Some(target_channels),
+            sample_rate: Some(rate),
+            config: streaminfo.to_vec(),
+            timescale: US_TIMESCALE,
+            presentation_edit: None,
+            pcm_format: None,
+        },
+        packets,
+    ))
+}
+
+/// Whole-track PCM encoder retained for codec round-trip tests.
+#[cfg(test)]
+fn encode_pcm_track(
+    path: &Path,
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+    config: AudioEncodeConfig,
+) -> Result<(ContainerTrack, Vec<ContainerPacket>), PipelineError> {
+    let rate = configured_audio_rate(TargetAudioCodec::Pcm, sample_rate, config);
+    let target_channels = configured_audio_channels(channels, config);
+    let resampled = resample_interleaved(samples, usize::from(channels), sample_rate, rate)?;
+    let pcm = mix_to_channels(
+        &resampled,
+        usize::from(channels),
+        usize::from(target_channels),
+    )?;
+    if pcm.is_empty() {
+        return Err(encode_error(path, "no samples to encode as PCM"));
+    }
+    let bytes = pcm_to_s16le(&pcm);
+    let frame_bytes = usize::from(target_channels).saturating_mul(2);
+    let mut packets = Vec::new();
+    for (index, chunk) in bytes
+        .chunks(frame_bytes.saturating_mul(PCM_CHUNK_FRAMES))
+        .enumerate()
+    {
+        let first = index.saturating_mul(PCM_CHUNK_FRAMES);
+        let frames = chunk.len() / frame_bytes;
+        let pts = sample_pts_us(u64::try_from(first).unwrap_or(u64::MAX), rate);
+        let next = sample_pts_us(
+            u64::try_from(first.saturating_add(frames)).unwrap_or(u64::MAX),
+            rate,
+        );
+        packets.push(ContainerPacket {
+            track: 0,
+            pts,
+            dts: pts,
+            duration: u64::try_from(next.saturating_sub(pts)).unwrap_or(1).max(1),
+            keyframe: true,
+            data: chunk.to_vec(),
+        });
+    }
+    Ok((
+        ContainerTrack {
+            codec: VideoCodec::Pcm,
+            width: None,
+            height: None,
+            channels: Some(target_channels),
+            sample_rate: Some(rate),
+            config: Vec::new(),
+            timescale: US_TIMESCALE,
+            presentation_edit: None,
+            pcm_format: Some(PcmFormat::S16Le),
         },
         packets,
     ))
@@ -1048,6 +1550,7 @@ fn encode_vorbis_track(
             config: parts.private,
             timescale: US_TIMESCALE,
             presentation_edit: None,
+            pcm_format: None,
         },
         packets,
     ))
@@ -1070,6 +1573,8 @@ pub(crate) fn encode_audio_track(
         TargetAudioCodec::Vorbis => {
             encode_vorbis_track(path, samples, sample_rate, channels, config)
         }
+        TargetAudioCodec::Flac => encode_flac_track(path, samples, sample_rate, channels, config),
+        TargetAudioCodec::Pcm => encode_pcm_track(path, samples, sample_rate, channels, config),
     }
 }
 
@@ -1105,6 +1610,20 @@ fn target_audio_rate(target: TargetAudioCodec, source_rate: u32) -> u32 {
                 source_rate
             } else {
                 OPUS_RATE
+            }
+        }
+        TargetAudioCodec::Flac => {
+            if (1..=655_350).contains(&source_rate) {
+                source_rate
+            } else {
+                44_100
+            }
+        }
+        TargetAudioCodec::Pcm => {
+            if (1..=384_000).contains(&source_rate) {
+                source_rate
+            } else {
+                48_000
             }
         }
     }
@@ -1581,6 +2100,21 @@ enum StreamingAudioEncoder {
         channel_order: &'static [usize],
         timestamps: VorbisTimestamps,
     },
+    Flac {
+        channels: u16,
+        rate: u32,
+        config: flacenc::error::Verified<flacenc::config::Encoder>,
+        info: FlacStreamInfo,
+        frame_number: usize,
+        sample_offset: u64,
+        pending: Vec<f32>,
+    },
+    Pcm {
+        channels: u16,
+        rate: u32,
+        sample_offset: u64,
+        pending: Vec<u8>,
+    },
 }
 
 impl StreamingAudioEncoder {
@@ -1618,6 +2152,7 @@ impl StreamingAudioEncoder {
                     config: asc,
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 };
                 Ok((
                     Self::Aac {
@@ -1660,6 +2195,7 @@ impl StreamingAudioEncoder {
                     config: default_opus_head(channels, pre_skip),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 };
                 Ok((
                     Self::Opus {
@@ -1696,6 +2232,7 @@ impl StreamingAudioEncoder {
                     config: Vec::new(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 };
                 Ok((
                     Self::Mp3 {
@@ -1733,6 +2270,7 @@ impl StreamingAudioEncoder {
                     config: parts.private,
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 };
                 Ok((
                     Self::Vorbis {
@@ -1742,6 +2280,61 @@ impl StreamingAudioEncoder {
                         planes: vec![Vec::with_capacity(VORBIS_CHUNK_FRAMES); usize::from(ch)],
                         channel_order,
                         timestamps: VorbisTimestamps::new(rate, parts.bs0, parts.bs1),
+                    },
+                    track,
+                ))
+            }
+            TargetAudioCodec::Flac => {
+                let encoder_config = flac_encoder_config()?;
+                let info = flac_streaminfo(rate, channels, 0)?;
+                let streaminfo = flac_streaminfo_bytes(&info)?;
+                parse_flac_streaminfo(&streaminfo).map_err(|reason| {
+                    encode_error(Path::new("flac"), format!("invalid STREAMINFO: {reason}"))
+                })?;
+                let track = ContainerTrack {
+                    codec: VideoCodec::Flac,
+                    width: None,
+                    height: None,
+                    channels: Some(channels),
+                    sample_rate: Some(rate),
+                    config: streaminfo.to_vec(),
+                    timescale: US_TIMESCALE,
+                    presentation_edit: None,
+                    pcm_format: None,
+                };
+                Ok((
+                    Self::Flac {
+                        channels,
+                        rate,
+                        config: encoder_config,
+                        info,
+                        frame_number: 0,
+                        sample_offset: 0,
+                        pending: Vec::with_capacity(
+                            FLAC_CHUNK_FRAMES.saturating_mul(usize::from(channels)),
+                        ),
+                    },
+                    track,
+                ))
+            }
+            TargetAudioCodec::Pcm => {
+                let track = ContainerTrack {
+                    codec: VideoCodec::Pcm,
+                    width: None,
+                    height: None,
+                    channels: Some(channels),
+                    sample_rate: Some(rate),
+                    config: Vec::new(),
+                    timescale: US_TIMESCALE,
+                    presentation_edit: None,
+                    pcm_format: Some(PcmFormat::S16Le),
+                };
+                Ok((
+                    Self::Pcm {
+                        channels,
+                        rate,
+                        sample_offset: 0,
+                        pending: Vec::new(),
                     },
                     track,
                 ))
@@ -1933,6 +2526,65 @@ impl StreamingAudioEncoder {
                     out.push(timestamps.next_packet(packet)?);
                 }
             }
+            Self::Flac {
+                channels,
+                rate,
+                config,
+                info,
+                frame_number,
+                sample_offset,
+                pending,
+            } => {
+                let ch = usize::from(*channels);
+                if ch == 0 || !pcm.len().is_multiple_of(ch) {
+                    return Err(encode_error(
+                        Path::new("flac"),
+                        "FLAC input is not whole interleaved frames",
+                    ));
+                }
+                pending.extend_from_slice(pcm);
+                let block_samples = FLAC_CHUNK_FRAMES.saturating_mul(ch);
+                while pending.len() >= block_samples {
+                    let block: Vec<f32> = pending.drain(..block_samples).collect();
+                    let (mut packets, emitted_frames, emitted_samples) = encode_flac_frames(
+                        &block,
+                        *channels,
+                        *rate,
+                        *frame_number,
+                        *sample_offset,
+                        config,
+                        info,
+                    )?;
+                    *frame_number = frame_number.saturating_add(emitted_frames);
+                    *sample_offset = sample_offset.saturating_add(emitted_samples);
+                    out.append(&mut packets);
+                }
+            }
+            Self::Pcm {
+                channels,
+                rate,
+                sample_offset,
+                pending,
+            } => {
+                let frame_bytes = usize::from(*channels).saturating_mul(2);
+                pending.extend_from_slice(&pcm_to_s16le(pcm));
+                let block_bytes = frame_bytes.saturating_mul(PCM_CHUNK_FRAMES);
+                while pending.len() >= block_bytes {
+                    let chunk: Vec<u8> = pending.drain(..block_bytes).collect();
+                    let frames = u64::try_from(PCM_CHUNK_FRAMES).unwrap_or(u64::MAX);
+                    let pts = sample_pts_us(*sample_offset, *rate);
+                    let next = sample_pts_us(sample_offset.saturating_add(frames), *rate);
+                    *sample_offset = sample_offset.saturating_add(frames);
+                    out.push(ContainerPacket {
+                        track: 0,
+                        pts,
+                        dts: pts,
+                        duration: u64::try_from(next.saturating_sub(pts)).unwrap_or(1).max(1),
+                        keyframe: true,
+                        data: chunk,
+                    });
+                }
+            }
         }
         Ok(out)
     }
@@ -2114,6 +2766,65 @@ impl StreamingAudioEncoder {
                     out.push(timestamps.next_packet(packet)?);
                 }
                 Ok(out)
+            }
+            Self::Flac {
+                channels,
+                rate,
+                config,
+                info,
+                frame_number,
+                sample_offset,
+                pending,
+            } => {
+                if pending.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let (mut out, emitted_frames, emitted_samples) = encode_flac_frames(
+                    pending,
+                    *channels,
+                    *rate,
+                    *frame_number,
+                    *sample_offset,
+                    config,
+                    info,
+                )?;
+                pending.clear();
+                *frame_number = frame_number.saturating_add(emitted_frames);
+                *sample_offset = sample_offset.saturating_add(emitted_samples);
+                for packet in &mut out {
+                    packet.track = 0;
+                }
+                Ok(out)
+            }
+            Self::Pcm {
+                channels,
+                rate,
+                sample_offset,
+                pending,
+            } => {
+                if pending.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let frame_bytes = usize::from(*channels).saturating_mul(2);
+                if frame_bytes == 0 || pending.len() % frame_bytes != 0 {
+                    return Err(encode_error(
+                        Path::new("pcm"),
+                        "PCM tail is not a whole number of frames",
+                    ));
+                }
+                let frames = u64::try_from(pending.len() / frame_bytes).unwrap_or(u64::MAX);
+                let pts = sample_pts_us(*sample_offset, *rate);
+                let next = sample_pts_us(sample_offset.saturating_add(frames), *rate);
+                *sample_offset = sample_offset.saturating_add(frames);
+                let data = std::mem::take(pending);
+                Ok(vec![ContainerPacket {
+                    track: 0,
+                    pts,
+                    dts: pts,
+                    duration: u64::try_from(next.saturating_sub(pts)).unwrap_or(1).max(1),
+                    keyframe: true,
+                    data,
+                }])
             }
         }
     }
@@ -2360,6 +3071,22 @@ fn enforce_decoded_budget(path: &Path, bytes: u64) -> Result<(), PipelineError> 
         ));
     }
     Ok(())
+}
+
+/// Checks the live PCM working set before a decoded slice is appended: the
+/// `f32` samples still retained in `chunk` plus the incoming slice's samples.
+/// Samples already handed to the caller were drained from `chunk`, so source
+/// duration never contributes to the cap.
+fn enforce_live_pcm_budget(
+    path: &Path,
+    chunk: &[f32],
+    incoming_samples: u64,
+) -> Result<(), PipelineError> {
+    let retained = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+    enforce_decoded_budget(
+        path,
+        retained.saturating_add(incoming_samples).saturating_mul(4),
+    )
 }
 
 fn estimated_decoded_bytes(track: &ContainerTrack, packet_count: usize) -> u64 {
@@ -4236,6 +4963,30 @@ mod tests {
         assert!(StreamingResampler::new(2, 44_100, 0).is_err());
     }
 
+    #[test]
+    fn pcm_decode_budget_tracks_live_samples_not_cumulative_throughput() -> Result<(), PipelineError>
+    {
+        let path = Path::new("pcm-budget");
+        // Just before `emit_ready` drains, `chunk` holds one block and the
+        // incoming slice holds another. Repeat for longer than a 48 kHz stereo
+        // stream needs to cross 1 GiB cumulatively (~46 minutes); the cap must
+        // stay bounded because every handed-off block left `chunk`.
+        let live: Vec<f32> = vec![0.0; AUDIO_PCM_CHUNK_FRAMES * 2];
+        let incoming = u64::try_from(live.len()).unwrap_or(u64::MAX);
+        let slices = 46_u64
+            .saturating_mul(60)
+            .saturating_mul(48_000)
+            .div_ceil(u64::try_from(AUDIO_PCM_CHUNK_FRAMES).unwrap_or(1));
+        for _ in 0..slices {
+            enforce_live_pcm_budget(path, &live, incoming)?;
+        }
+        assert!(
+            enforce_live_pcm_budget(path, &[], u64::MAX).is_err(),
+            "a genuinely oversized live slice must still be rejected"
+        );
+        Ok(())
+    }
+
     // Non-empty PCM assertion documents the successful decode roundtrip.
     #[allow(clippy::assert_is_empty)]
     #[test]
@@ -4318,6 +5069,7 @@ mod tests {
             config: Vec::new(),
             timescale: US_TIMESCALE,
             presentation_edit: None,
+            pcm_format: None,
         };
         let packets = vec![ContainerPacket {
             track: 0,
@@ -6074,6 +6826,524 @@ mod tests {
                 sizes[1]
             );
         }
+        Ok(())
+    }
+
+    fn h264_video() -> VideoTrackAction {
+        VideoTrackAction::Encode(VideoEncodeMode::CpuH264 {
+            rate_control: fastconv_domain::VideoRateControl::DEFAULT,
+        })
+    }
+
+    fn audio_facts(path: &Path, format: VideoContainerFormat) -> Result<(u32, u16), PipelineError> {
+        let media = demux_video(path, format)?;
+        let audio = media
+            .tracks
+            .iter()
+            .find(|track| track.codec.is_audio())
+            .ok_or_else(|| decode_error(path, "no audio track after transcode"))?;
+        Ok((
+            audio
+                .sample_rate
+                .ok_or_else(|| decode_error(path, "no sample rate"))?,
+            audio
+                .channels
+                .ok_or_else(|| decode_error(path, "no channels"))?,
+        ))
+    }
+
+    #[test]
+    fn aac_source_transcodes_to_flac_in_mkv_mp4_and_mov() -> Result<(), PipelineError> {
+        let dir = temp_dir("to-flac")?;
+        let source = dir.join("aac.mp4");
+        make_source(
+            &source,
+            VideoContainerFormat::Mp4,
+            VideoEncodeMode::CpuH264 {
+                rate_control: fastconv_domain::VideoRateControl::DEFAULT,
+            },
+            TargetAudioCodec::Aac,
+        )?;
+        for (name, format) in [
+            ("out.mkv", VideoContainerFormat::Mkv),
+            ("out.mp4", VideoContainerFormat::Mp4),
+            ("out.mov", VideoContainerFormat::Mov),
+        ] {
+            let target = dir.join(name);
+            transcode(
+                &source,
+                &target,
+                VideoContainerFormat::Mp4,
+                format,
+                h264_video(),
+                AudioTrackAction::Encode(default_config(TargetAudioCodec::Flac)),
+            )?;
+            assert_output(&target, format, VideoCodec::H264, VideoCodec::Flac)?;
+            let (rate, channels) = audio_facts(&target, format)?;
+            assert_eq!((rate, channels), (48_000, 2), "FLAC facts in {name}");
+            let media = demux_video(&target, format)?;
+            let audio = media
+                .tracks
+                .iter()
+                .find(|track| track.codec == VideoCodec::Flac)
+                .ok_or_else(|| decode_error(&target, "no FLAC track"))?;
+            // Fixed-size frames need equal STREAMINFO bounds; unequal bounds
+            // make readers treat frame numbers as absolute sample offsets.
+            let bounds: [u8; 4] = audio
+                .config
+                .get(..4)
+                .ok_or_else(|| decode_error(&target, "short FLAC STREAMINFO"))?
+                .try_into()
+                .map_err(|_| decode_error(&target, "invalid FLAC STREAMINFO bounds"))?;
+            let min_block = u16::from_be_bytes([bounds[0], bounds[1]]);
+            let max_block = u16::from_be_bytes([bounds[2], bounds[3]]);
+            assert_eq!(
+                (usize::from(min_block), usize::from(max_block)),
+                (FLAC_CHUNK_FRAMES, FLAC_CHUNK_FRAMES),
+                "FLAC STREAMINFO block bounds must both be {FLAC_CHUNK_FRAMES} in {name}"
+            );
+            let packets: Vec<_> = media
+                .packets
+                .iter()
+                .filter(|packet| packet.track == 1)
+                .cloned()
+                .collect();
+            let (pcm, decoded_rate, decoded_channels) =
+                decode_audio_track_pcm(&target, audio, &packets)?;
+            assert!(!pcm.is_empty(), "FLAC decoded to no PCM in {name}");
+            assert_eq!((decoded_rate, decoded_channels), (48_000, 2));
+        }
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn aac_source_transcodes_to_pcm_in_mkv_avi_and_mov() -> Result<(), PipelineError> {
+        let dir = temp_dir("to-pcm")?;
+        let source = dir.join("aac.mp4");
+        make_source(
+            &source,
+            VideoContainerFormat::Mp4,
+            VideoEncodeMode::CpuH264 {
+                rate_control: fastconv_domain::VideoRateControl::DEFAULT,
+            },
+            TargetAudioCodec::Aac,
+        )?;
+        for (name, format) in [
+            ("out.mkv", VideoContainerFormat::Mkv),
+            ("out.avi", VideoContainerFormat::Avi),
+            ("out.mov", VideoContainerFormat::Mov),
+        ] {
+            let target = dir.join(name);
+            transcode(
+                &source,
+                &target,
+                VideoContainerFormat::Mp4,
+                format,
+                h264_video(),
+                AudioTrackAction::Encode(default_config(TargetAudioCodec::Pcm)),
+            )?;
+            assert_output(&target, format, VideoCodec::H264, VideoCodec::Pcm)?;
+            let (rate, channels) = audio_facts(&target, format)?;
+            assert_eq!((rate, channels), (48_000, 2), "PCM facts in {name}");
+            let media = demux_video(&target, format)?;
+            let audio = media
+                .tracks
+                .iter()
+                .find(|track| track.codec == VideoCodec::Pcm)
+                .ok_or_else(|| decode_error(&target, "no PCM track"))?;
+            assert_eq!(
+                audio.pcm_format,
+                Some(PcmFormat::S16Le),
+                "PCM format in {name}"
+            );
+            let packets: Vec<_> = media
+                .packets
+                .iter()
+                .filter(|packet| packet.track == 1)
+                .cloned()
+                .collect();
+            let (pcm, decoded_rate, decoded_channels) =
+                decode_audio_track_pcm(&target, audio, &packets)?;
+            assert!(!pcm.is_empty(), "PCM decoded to no samples in {name}");
+            assert_eq!((decoded_rate, decoded_channels), (48_000, 2));
+        }
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn flac_and_pcm_sources_transcode_back_to_aac_and_opus() -> Result<(), PipelineError> {
+        let dir = temp_dir("from-lossless")?;
+        let flac = dir.join("flac.mkv");
+        let pcm = dir.join("pcm.mkv");
+        for (path, codec) in [
+            (&flac, TargetAudioCodec::Flac),
+            (&pcm, TargetAudioCodec::Pcm),
+        ] {
+            make_source(
+                path,
+                VideoContainerFormat::Mkv,
+                VideoEncodeMode::CpuH264 {
+                    rate_control: fastconv_domain::VideoRateControl::DEFAULT,
+                },
+                codec,
+            )?;
+        }
+
+        let aac_target = dir.join("back-aac.mp4");
+        transcode(
+            &flac,
+            &aac_target,
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Mp4,
+            h264_video(),
+            AudioTrackAction::Encode(default_config(TargetAudioCodec::Aac)),
+        )?;
+        assert_output(
+            &aac_target,
+            VideoContainerFormat::Mp4,
+            VideoCodec::H264,
+            VideoCodec::Aac,
+        )?;
+
+        let opus_target = dir.join("back-opus.webm");
+        transcode(
+            &pcm,
+            &opus_target,
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Webm,
+            VideoTrackAction::Encode(VideoEncodeMode::CpuVp9 {
+                rate_control: fastconv_domain::VideoRateControl::DEFAULT,
+            }),
+            AudioTrackAction::Encode(default_config(TargetAudioCodec::Opus)),
+        )?;
+        assert_output(
+            &opus_target,
+            VideoContainerFormat::Webm,
+            VideoCodec::Vp9,
+            VideoCodec::Opus,
+        )?;
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn flac_and_pcm_honour_sample_rate_and_channel_options() -> Result<(), PipelineError> {
+        let dir = temp_dir("lossless-options")?;
+        let source = dir.join("aac.mp4");
+        make_source(
+            &source,
+            VideoContainerFormat::Mp4,
+            VideoEncodeMode::CpuH264 {
+                rate_control: fastconv_domain::VideoRateControl::DEFAULT,
+            },
+            TargetAudioCodec::Aac,
+        )?;
+        let options = AudioEncodeOptions::new(
+            None,
+            Some(
+                AudioSampleRate::new(44_100)
+                    .map_err(|err| encode_error(&source, err.to_string()))?,
+            ),
+            Some(AudioChannels::new(1).map_err(|err| encode_error(&source, err.to_string()))?),
+        );
+        for (name, format, codec, expected) in [
+            (
+                "flac.mkv",
+                VideoContainerFormat::Mkv,
+                TargetAudioCodec::Flac,
+                VideoCodec::Flac,
+            ),
+            (
+                "pcm.mov",
+                VideoContainerFormat::Mov,
+                TargetAudioCodec::Pcm,
+                VideoCodec::Pcm,
+            ),
+        ] {
+            let target = dir.join(name);
+            let config = AudioEncodeConfig::new(codec, options)
+                .map_err(|err| encode_error(&target, err.to_string()))?;
+            transcode(
+                &source,
+                &target,
+                VideoContainerFormat::Mp4,
+                format,
+                h264_video(),
+                AudioTrackAction::Encode(config),
+            )?;
+            assert_output(&target, format, VideoCodec::H264, expected)?;
+            let (rate, channels) = audio_facts(&target, format)?;
+            assert_eq!((rate, channels), (44_100, 1), "options in {name}");
+        }
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn lossless_audio_remux_roundtrips() -> Result<(), PipelineError> {
+        let dir = temp_dir("lossless-remux")?;
+        let flac = dir.join("in.flac.mkv");
+        let pcm = dir.join("in.pcm.mkv");
+        for (path, codec) in [
+            (&flac, TargetAudioCodec::Flac),
+            (&pcm, TargetAudioCodec::Pcm),
+        ] {
+            make_source(
+                path,
+                VideoContainerFormat::Mkv,
+                VideoEncodeMode::CpuH264 {
+                    rate_control: fastconv_domain::VideoRateControl::DEFAULT,
+                },
+                codec,
+            )?;
+        }
+        let flac_mov = dir.join("flac.mov");
+        transcode(
+            &flac,
+            &flac_mov,
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Mov,
+            VideoTrackAction::Copy,
+            AudioTrackAction::Copy,
+        )?;
+        assert_output(
+            &flac_mov,
+            VideoContainerFormat::Mov,
+            VideoCodec::H264,
+            VideoCodec::Flac,
+        )?;
+        let pcm_avi = dir.join("pcm.avi");
+        transcode(
+            &pcm,
+            &pcm_avi,
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Avi,
+            VideoTrackAction::Copy,
+            AudioTrackAction::Copy,
+        )?;
+        assert_output(
+            &pcm_avi,
+            VideoContainerFormat::Avi,
+            VideoCodec::H264,
+            VideoCodec::Pcm,
+        )?;
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn flac_streaminfo_declares_equal_fixed_block_bounds() -> Result<(), PipelineError> {
+        let info = flac_streaminfo(48_000, 2, 0)?;
+        let bytes = flac_streaminfo_bytes(&info)?;
+        let min = u16::from_be_bytes([bytes[0], bytes[1]]);
+        let max = u16::from_be_bytes([bytes[2], bytes[3]]);
+        assert_eq!(
+            (usize::from(min), usize::from(max)),
+            (FLAC_CHUNK_FRAMES, FLAC_CHUNK_FRAMES),
+            "fixed-block FLAC must declare equal min/max block sizes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flac_decode_accepts_full_metadata_chain_config() -> Result<(), PipelineError> {
+        let dir = temp_dir("flac-full-metadata")?;
+        let path = dir.join("x");
+        let samples = sine(4_800, 48_000, 2);
+        let (mut track, packets) = encode_audio_track(
+            &path,
+            &samples,
+            48_000,
+            2,
+            TargetAudioCodec::Flac,
+            default_config(TargetAudioCodec::Flac),
+        )?;
+        let si: [u8; 34] = track
+            .config
+            .as_slice()
+            .try_into()
+            .map_err(|_| decode_error(&path, "encode helper emitted no bare STREAMINFO"))?;
+        parse_flac_streaminfo(&si).map_err(|reason| decode_error(&path, reason))?;
+
+        // Canonical MKV/MOV configs keep every native block. Put a minimal
+        // VORBIS_COMMENT after STREAMINFO: the decoder must still find the
+        // validated STREAMINFO body, while remuxing must keep the whole chain.
+        let mut config = Vec::new();
+        config.extend_from_slice(b"fLaC");
+        config.push(0x00); // STREAMINFO, more blocks follow
+        config.extend_from_slice(&[0, 0, 34]);
+        config.extend_from_slice(&si);
+        config.push(0x84); // VORBIS_COMMENT, last block
+        config.extend_from_slice(&[0, 0, 8]);
+        config.extend_from_slice(&[0_u8; 8]); // empty vendor, zero comments
+        track.config = config.clone();
+
+        let (decoded, rate, channels) = decode_audio_track_pcm(&path, &track, &packets)?;
+        assert_ne!(decoded, [] as [f32; 0]);
+        assert_eq!((rate, channels), (48_000, 2));
+        assert_eq!(
+            track.config, config,
+            "remux must keep the full metadata chain"
+        );
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn lossless_whole_track_encoders_resample_rate_overrides() -> Result<(), PipelineError> {
+        let dir = temp_dir("lossless-resample")?;
+        let path = dir.join("x");
+        let input_frames = 4_800_usize;
+        let expected = expected_resampled_frames(input_frames, 48_000, 44_100);
+        assert_eq!(expected, 4_410);
+        let samples = sine(input_frames, 48_000, 2);
+        let options = || -> Result<AudioEncodeOptions, PipelineError> {
+            Ok(AudioEncodeOptions::new(
+                None,
+                Some(
+                    AudioSampleRate::new(44_100)
+                        .map_err(|err| encode_error(&path, err.to_string()))?,
+                ),
+                None,
+            ))
+        };
+
+        let flac_config = AudioEncodeConfig::new(TargetAudioCodec::Flac, options()?)
+            .map_err(|err| encode_error(&path, err.to_string()))?;
+        let (flac, _) = encode_flac_track(&path, &samples, 48_000, 2, flac_config)?;
+        assert_eq!(flac.sample_rate, Some(44_100));
+        let packed = u64::from_be_bytes(
+            flac.config
+                .get(10..18)
+                .ok_or_else(|| encode_error(&path, "short FLAC STREAMINFO"))?
+                .try_into()
+                .map_err(|_| encode_error(&path, "invalid FLAC STREAMINFO bounds"))?,
+        );
+        assert_eq!(
+            packed & 0xF_FFFF_FFFF,
+            u64::try_from(expected).unwrap_or(u64::MAX),
+            "FLAC STREAMINFO must declare the resampled frame count"
+        );
+
+        let pcm_config = AudioEncodeConfig::new(TargetAudioCodec::Pcm, options()?)
+            .map_err(|err| encode_error(&path, err.to_string()))?;
+        let (pcm, packets) = encode_pcm_track(&path, &samples, 48_000, 2, pcm_config)?;
+        assert_eq!(pcm.sample_rate, Some(44_100));
+        let frames: usize = packets
+            .iter()
+            .map(|packet| packet.data.len())
+            .sum::<usize>()
+            / 4;
+        assert_eq!(frames, expected, "PCM packets must hold resampled frames");
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn s16_quantization_roundtrips_both_signed_endpoints() {
+        // -1.0 decodes from S16Le -32768 and must re-encode to -32768 exactly;
+        // the positive endpoint is 32767/32768 (i16 has no +32768).
+        let positive = 32_767.0_f32 / 32_768.0_f32;
+        assert_eq!(to_s16_i32(-1.0_f32), -32_768);
+        assert_eq!(to_s16_i32(positive), 32_767);
+        assert_eq!(to_s16_i32(1.0_f32), 32_767);
+
+        // PCM output and FLAC frames both consume these i32 samples directly,
+        // so the endpoints survive either output path.
+        let mut raw = Vec::with_capacity(4);
+        raw.extend_from_slice(&(-32_768_i16).to_le_bytes());
+        raw.extend_from_slice(&32_767_i16.to_le_bytes());
+        assert_eq!(pcm_to_s16le(&[-1.0_f32, positive]), raw);
+        assert_eq!(
+            pcm_bytes_to_f32(&raw, PcmFormat::S16Le),
+            [-1.0_f32, positive]
+        );
+    }
+
+    #[test]
+    fn pcm_large_packet_streams_bounded_blocks() -> Result<(), PipelineError> {
+        let dir = temp_dir("pcm-large-packet")?;
+        let path = dir.join("x");
+        let channels = 1_u16;
+        let blocks = 8_usize;
+        let frames = AUDIO_PCM_CHUNK_FRAMES.saturating_mul(blocks) + 13;
+        let mut data = Vec::with_capacity(frames.saturating_mul(2));
+        for frame in 0..frames {
+            let raw = if frame % 2 == 0 {
+                -32_768_i16
+            } else {
+                32_767_i16
+            };
+            data.extend_from_slice(&raw.to_le_bytes());
+        }
+        let track = ContainerTrack {
+            codec: VideoCodec::Pcm,
+            width: None,
+            height: None,
+            channels: Some(channels),
+            sample_rate: Some(48_000),
+            config: Vec::new(),
+            timescale: US_TIMESCALE,
+            presentation_edit: None,
+            pcm_format: Some(PcmFormat::S16Le),
+        };
+        let packets = vec![ContainerPacket {
+            track: 0,
+            pts: 0,
+            dts: 0,
+            duration: 0,
+            keyframe: true,
+            data,
+        }];
+        let mut block_lens = Vec::new();
+        let mut decoded = Vec::new();
+        decode_audio_track_chunks(
+            &path,
+            &track,
+            &packets,
+            &AtomicBool::new(false),
+            |chunk, rate, decoded_channels| {
+                assert_eq!(rate, 48_000);
+                assert_eq!(decoded_channels, channels);
+                block_lens.push(chunk.len());
+                decoded.extend_from_slice(chunk);
+                Ok(())
+            },
+        )?;
+        let ready = AUDIO_PCM_CHUNK_FRAMES.saturating_mul(usize::from(channels));
+        assert_eq!(block_lens.len(), blocks + 1);
+        assert!(block_lens[..blocks].iter().all(|&len| len == ready));
+        assert_eq!(block_lens[blocks], 13);
+        assert_eq!(decoded.len(), frames);
+        assert_eq!(decoded[0], -1.0_f32);
+        assert_eq!(decoded[1], 32_767.0_f32 / 32_768.0_f32);
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
         Ok(())
     }
 }

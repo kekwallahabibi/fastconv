@@ -114,6 +114,8 @@ pub enum VideoCodec {
     Opus,
     Mp3,
     Vorbis,
+    Flac,
+    Pcm,
     TimedText,
     Gif,
     Webp,
@@ -132,6 +134,8 @@ impl VideoCodec {
             Self::Opus => "Opus",
             Self::Mp3 => "MP3",
             Self::Vorbis => "Vorbis",
+            Self::Flac => "FLAC",
+            Self::Pcm => "PCM",
             Self::TimedText => "Timed text",
             Self::Gif => "GIF",
             Self::Webp => "WebP",
@@ -143,7 +147,7 @@ impl VideoCodec {
     #[must_use]
     pub const fn supported_in(self, container: VideoContainerFormat) -> bool {
         match container {
-            VideoContainerFormat::Mp4 | VideoContainerFormat::Mov => matches!(
+            VideoContainerFormat::Mp4 => matches!(
                 self,
                 Self::H264
                     | Self::Hevc
@@ -152,6 +156,21 @@ impl VideoCodec {
                     | Self::Aac
                     | Self::Opus
                     | Self::Mp3
+                    | Self::Flac
+                    | Self::TimedText
+            ),
+            // QuickTime MOV has a v2 `lpcm` sample entry; ISO MP4 does not.
+            VideoContainerFormat::Mov => matches!(
+                self,
+                Self::H264
+                    | Self::Hevc
+                    | Self::Av1
+                    | Self::Vp9
+                    | Self::Aac
+                    | Self::Opus
+                    | Self::Mp3
+                    | Self::Flac
+                    | Self::Pcm
                     | Self::TimedText
             ),
             VideoContainerFormat::Mkv => matches!(
@@ -164,6 +183,8 @@ impl VideoCodec {
                     | Self::Opus
                     | Self::Mp3
                     | Self::Vorbis
+                    | Self::Flac
+                    | Self::Pcm
                     | Self::TimedText
             ),
             VideoContainerFormat::Webm => {
@@ -178,6 +199,7 @@ impl VideoCodec {
                     | Self::Aac
                     | Self::Opus
                     | Self::Mp3
+                    | Self::Pcm
             ),
             // Standard MPEG-TS carries no VP9 bitstream mapping.
             VideoContainerFormat::Ts => matches!(
@@ -199,7 +221,10 @@ impl VideoCodec {
 
     #[must_use]
     pub const fn is_audio(self) -> bool {
-        matches!(self, Self::Aac | Self::Opus | Self::Mp3 | Self::Vorbis)
+        matches!(
+            self,
+            Self::Aac | Self::Opus | Self::Mp3 | Self::Vorbis | Self::Flac | Self::Pcm
+        )
     }
 
     /// Whether NVDEC can decode this bitstream on a Turing-or-newer GPU.
@@ -286,6 +311,8 @@ pub enum TargetAudioCodec {
     Opus,
     Mp3,
     Vorbis,
+    Flac,
+    Pcm,
 }
 
 impl TargetAudioCodec {
@@ -296,6 +323,8 @@ impl TargetAudioCodec {
             Self::Opus => "Opus",
             Self::Mp3 => "MP3",
             Self::Vorbis => "Vorbis",
+            Self::Flac => "FLAC",
+            Self::Pcm => "PCM",
         }
     }
 
@@ -306,6 +335,8 @@ impl TargetAudioCodec {
             Self::Opus => VideoCodec::Opus,
             Self::Mp3 => VideoCodec::Mp3,
             Self::Vorbis => VideoCodec::Vorbis,
+            Self::Flac => VideoCodec::Flac,
+            Self::Pcm => VideoCodec::Pcm,
         }
     }
 
@@ -321,6 +352,8 @@ impl TargetAudioCodec {
             "opus" => Some(Self::Opus),
             "mp3" => Some(Self::Mp3),
             "vorbis" => Some(Self::Vorbis),
+            "flac" => Some(Self::Flac),
+            "pcm" => Some(Self::Pcm),
             _ => None,
         }
     }
@@ -672,12 +705,21 @@ impl AudioEncodeConfig {
         let unsupported =
             |reason: String| DomainError::UnsupportedAudioEncodeOption { codec, reason };
         if let Some(rate) = options.bitrate() {
+            // FLAC and PCM are lossless: a target bitrate has no meaning and
+            // could only be silently ignored, so reject it at the boundary.
+            if matches!(codec, TargetAudioCodec::Flac | TargetAudioCodec::Pcm) {
+                return Err(unsupported(format!(
+                    "{codec} is lossless and does not accept --abitrate"
+                )));
+            }
             let bps = rate.bps();
             let (min, max) = match codec {
                 TargetAudioCodec::Aac => (16_000, 512_000),
                 TargetAudioCodec::Opus => (6_000, 510_000),
                 TargetAudioCodec::Mp3 => (8_000, 320_000),
                 TargetAudioCodec::Vorbis => (32_000, 512_000),
+                // Rejected above; zero-width range keeps the match total.
+                TargetAudioCodec::Flac | TargetAudioCodec::Pcm => (1, 0),
             };
             if !(min..=max).contains(&bps) {
                 return Err(unsupported(format!(
@@ -703,6 +745,8 @@ impl AudioEncodeConfig {
                 TargetAudioCodec::Opus => hz == 48_000,
                 TargetAudioCodec::Mp3 => Self::MP3_RATES.contains(&hz),
                 TargetAudioCodec::Vorbis => (8_000..=192_000).contains(&hz),
+                TargetAudioCodec::Flac => (1..=655_350).contains(&hz),
+                TargetAudioCodec::Pcm => (1..=384_000).contains(&hz),
             };
             if !allowed {
                 return Err(unsupported(format!(
@@ -717,6 +761,7 @@ impl AudioEncodeConfig {
                     (1..=6).contains(&count) && count != 4
                 }
                 TargetAudioCodec::Opus | TargetAudioCodec::Mp3 => (1..=2).contains(&count),
+                TargetAudioCodec::Flac | TargetAudioCodec::Pcm => (1..=8).contains(&count),
             };
             if !allowed {
                 return Err(unsupported(format!(
@@ -2168,6 +2213,8 @@ mod tests {
             VideoCodec::Opus,
             VideoCodec::Mp3,
             VideoCodec::Vorbis,
+            VideoCodec::Flac,
+            VideoCodec::Pcm,
             VideoCodec::TimedText,
         ];
         let webm = [
@@ -2192,6 +2239,7 @@ mod tests {
             VideoCodec::Aac,
             VideoCodec::Opus,
             VideoCodec::Mp3,
+            VideoCodec::Pcm,
         ];
         let mp4 = [
             VideoCodec::H264,
@@ -2201,6 +2249,7 @@ mod tests {
             VideoCodec::Aac,
             VideoCodec::Opus,
             VideoCodec::Mp3,
+            VideoCodec::Flac,
             VideoCodec::TimedText,
         ];
         let mkv = [
@@ -2212,9 +2261,16 @@ mod tests {
             VideoCodec::Opus,
             VideoCodec::Mp3,
             VideoCodec::Vorbis,
+            VideoCodec::Flac,
+            VideoCodec::Pcm,
             VideoCodec::TimedText,
         ];
 
+        // PCM is a QuickTime sample-entry codec: MOV carries it, ISO MP4 does not.
+        assert!(VideoCodec::Pcm.supported_in(VideoContainerFormat::Mov));
+        assert!(!VideoCodec::Pcm.supported_in(VideoContainerFormat::Mp4));
+        assert!(!VideoCodec::Flac.supported_in(VideoContainerFormat::Avi));
+        assert!(!VideoCodec::Flac.supported_in(VideoContainerFormat::Webm));
         for codec in all {
             assert_eq!(
                 codec.supported_in(VideoContainerFormat::Webm),
@@ -2234,7 +2290,7 @@ mod tests {
             );
             assert_eq!(
                 codec.supported_in(VideoContainerFormat::Mov),
-                mp4.contains(&codec)
+                mp4.contains(&codec) || codec == VideoCodec::Pcm
             );
             assert_eq!(
                 codec.supported_in(VideoContainerFormat::Mkv),
@@ -2287,6 +2343,12 @@ mod tests {
         assert!(VideoCodec::Opus.is_audio());
         assert!(VideoCodec::Mp3.is_audio());
         assert!(VideoCodec::Vorbis.is_audio());
+        assert!(VideoCodec::Flac.is_audio());
+        assert!(VideoCodec::Pcm.is_audio());
+        assert!(!VideoCodec::Flac.is_video());
+        assert!(!VideoCodec::Pcm.is_video());
+        assert!(!VideoCodec::Flac.nvdec_decodable());
+        assert!(!VideoCodec::Pcm.nvdec_decodable());
         assert!(!VideoCodec::H264.is_audio());
         assert!(!VideoCodec::Mp3.is_video());
     }
@@ -2470,7 +2532,14 @@ mod tests {
             TargetAudioCodec::from_name("Vorbis"),
             Some(TargetAudioCodec::Vorbis)
         );
-        assert_eq!(TargetAudioCodec::from_name("flac"), None);
+        assert_eq!(
+            TargetAudioCodec::from_name("flac"),
+            Some(TargetAudioCodec::Flac)
+        );
+        assert_eq!(
+            TargetAudioCodec::from_name("PCM"),
+            Some(TargetAudioCodec::Pcm)
+        );
         assert!(TargetVideoCodec::Vp9.supported_in(VideoContainerFormat::Webm));
         assert!(!TargetVideoCodec::H264.supported_in(VideoContainerFormat::Webm));
         assert!(!TargetAudioCodec::Mp3.supported_in(VideoContainerFormat::Webm));
@@ -3457,6 +3526,129 @@ mod tests {
                 accepted,
                 "{codec} at {bps} bps"
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lossless_audio_codecs_reject_bitrate_and_validate_rate_channels() -> Result<(), DomainError>
+    {
+        let bitrate = AudioBitrate::new(128_000)?;
+        for codec in [TargetAudioCodec::Flac, TargetAudioCodec::Pcm] {
+            let options = AudioEncodeOptions::new(Some(bitrate), None, None);
+            let result = AudioEncodeConfig::new(codec, options);
+            let Err(err) = result else {
+                return Err(DomainError::UnsupportedAudioEncodeOption {
+                    codec,
+                    reason: "lossless codecs must reject --abitrate".to_owned(),
+                });
+            };
+            assert!(matches!(
+                err,
+                DomainError::UnsupportedAudioEncodeOption { .. }
+            ));
+            assert!(
+                err.to_string().contains("lossless"),
+                "error must explain lossless rejection: {err}"
+            );
+            // Empty options keep the codec's defaults legal.
+            assert!(AudioEncodeConfig::new(codec, AudioEncodeOptions::default()).is_ok());
+        }
+        for (codec, rate, accepted) in [
+            (TargetAudioCodec::Flac, 1, true),
+            (TargetAudioCodec::Flac, 44_100, true),
+            (TargetAudioCodec::Flac, 655_350, true),
+            (TargetAudioCodec::Flac, 655_351, false),
+            (TargetAudioCodec::Pcm, 1, true),
+            (TargetAudioCodec::Pcm, 384_000, true),
+            (TargetAudioCodec::Pcm, 384_001, false),
+        ] {
+            let options = AudioEncodeOptions::new(None, Some(AudioSampleRate::new(rate)?), None);
+            assert_eq!(
+                AudioEncodeConfig::new(codec, options).is_ok(),
+                accepted,
+                "{codec} at {rate} Hz"
+            );
+        }
+        for codec in [TargetAudioCodec::Flac, TargetAudioCodec::Pcm] {
+            for count in [1, 2, 8] {
+                let options = AudioEncodeOptions::new(None, None, Some(AudioChannels::new(count)?));
+                assert!(AudioEncodeConfig::new(codec, options).is_ok());
+            }
+            for count in [0, 9, 16] {
+                if count == 0 {
+                    continue; // AudioChannels::new(0) is already invalid.
+                }
+                let options = AudioEncodeOptions::new(None, None, Some(AudioChannels::new(count)?));
+                assert!(AudioEncodeConfig::new(codec, options).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn flac_and_pcm_are_confined_to_their_containers() -> Result<(), DomainError> {
+        assert_eq!(TargetAudioCodec::Flac.label(), "FLAC");
+        assert_eq!(TargetAudioCodec::Pcm.label(), "PCM");
+        assert_eq!(TargetAudioCodec::Flac.as_video_codec(), VideoCodec::Flac);
+        assert_eq!(TargetAudioCodec::Pcm.as_video_codec(), VideoCodec::Pcm);
+        for container in [
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mov,
+        ] {
+            assert!(TargetAudioCodec::Flac.supported_in(container));
+            let item = VideoTranscodeItem::new(
+                PathBuf::from("in.mp4"),
+                PathBuf::from("out.mkv"),
+                VideoContainerFormat::Mp4,
+                container,
+                vec![VideoStreamInfo::new(
+                    VideoCodec::H264,
+                    VideoStreamKind::Video,
+                    Some(64),
+                    Some(48),
+                    None,
+                    None,
+                    1,
+                    1_000,
+                    None,
+                    None,
+                )],
+                VideoTrackAction::Encode(VideoEncodeMode::resolve(
+                    TargetVideoCodec::H264,
+                    VideoRateControl::DEFAULT,
+                    HardwareBackend::Cpu,
+                )?),
+                AudioTrackAction::Encode(AudioEncodeConfig::default_for(TargetAudioCodec::Flac)),
+                VideoDecodeMode::Cpu,
+            )?;
+            assert_eq!(item.output_format(), container);
+        }
+        for container in [
+            VideoContainerFormat::Webm,
+            VideoContainerFormat::Avi,
+            VideoContainerFormat::Ts,
+            VideoContainerFormat::Gif,
+            VideoContainerFormat::Webp,
+        ] {
+            assert!(!TargetAudioCodec::Flac.supported_in(container));
+        }
+        for container in [
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Avi,
+            VideoContainerFormat::Mov,
+        ] {
+            assert!(TargetAudioCodec::Pcm.supported_in(container));
+        }
+        for container in [
+            VideoContainerFormat::Webm,
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Ts,
+            VideoContainerFormat::Gif,
+            VideoContainerFormat::Webp,
+        ] {
+            assert!(!TargetAudioCodec::Pcm.supported_in(container));
         }
         Ok(())
     }
