@@ -25,6 +25,87 @@ pub(crate) fn encode_ieee80_u32(value: u32) -> [u8; 10] {
     out
 }
 
+/// Builds the shared `FORM`/`COMM`/`SSND` header and returns the odd-byte pad
+/// that must follow the samples. Both the in-memory writer and the streaming
+/// little-endian WAV fast path use this so the two layouts cannot diverge.
+pub(crate) fn aiff_header(
+    path: &Path,
+    rate: u32,
+    channels: usize,
+    depth: AudioBitDepth,
+    sample_count: usize,
+) -> Result<(Vec<u8>, usize), PipelineError> {
+    let encode_err = |reason: String| PipelineError::EncodeFailed {
+        path: path.to_path_buf(),
+        reason,
+    };
+    if !(1..=usize::from(u16::MAX)).contains(&channels) {
+        return Err(encode_err(format!(
+            "AIFF supports at most 65535 channels, got {channels}"
+        )));
+    }
+    let bits = usize::from(depth.bits());
+    let bytes_per_sample = bits / 8;
+    let pcm_bytes_u64 = u64::try_from(sample_count)
+        .ok()
+        .and_then(|count| count.checked_mul(u64::try_from(bytes_per_sample).unwrap_or(u64::MAX)))
+        .ok_or_else(|| encode_err("AIFF PCM byte size overflows".to_owned()))?;
+    let pad = usize::from((pcm_bytes_u64 & 1) != 0);
+    let ssnd_size_u64 = pcm_bytes_u64
+        .checked_add(8)
+        .ok_or_else(|| encode_err("AIFF SSND size overflows".to_owned()))?;
+    // FORM payload = form type (4) + chunks. AIFF-C carries FVER (12) and a
+    // 38-byte COMM instead of the plain 18-byte COMM, hence 78 vs 46.
+    let header_bytes = if depth.is_float() { 78_u64 } else { 46_u64 };
+    let form_size_u64 = pcm_bytes_u64
+        .checked_add(header_bytes)
+        .and_then(|size| size.checked_add(u64::try_from(pad).unwrap_or(u64::MAX)))
+        .ok_or_else(|| encode_err("AIFF FORM size overflows".to_owned()))?;
+    let num_frames = u32::try_from(sample_count / channels)
+        .map_err(|_| encode_err("AIFF frame count exceeds the 32-bit IFF field".to_owned()))?;
+    let ssnd_size = u32::try_from(ssnd_size_u64)
+        .map_err(|_| encode_err("AIFF SSND size exceeds the 32-bit IFF field".to_owned()))?;
+    let form_size = u32::try_from(form_size_u64)
+        .map_err(|_| encode_err("AIFF FORM size exceeds the 32-bit IFF field".to_owned()))?;
+    let channel_count = u16::try_from(channels)
+        .map_err(|_| encode_err("AIFF channel count exceeds the 16-bit IFF field".to_owned()))?;
+    let bits_u16 = u16::try_from(bits)
+        .map_err(|_| encode_err("AIFF sample depth exceeds the 16-bit IFF field".to_owned()))?;
+
+    let mut header = Vec::with_capacity(if depth.is_float() { 78 } else { 46 });
+    header.extend_from_slice(b"FORM");
+    header.extend_from_slice(&form_size.to_be_bytes());
+    if depth.is_float() {
+        header.extend_from_slice(b"AIFC");
+        // AIFF-C version 2, as required for `fl32` compressed-format chunks.
+        header.extend_from_slice(b"FVER");
+        header.extend_from_slice(&4_u32.to_be_bytes());
+        header.extend_from_slice(&0xA280_5140_u32.to_be_bytes());
+        header.extend_from_slice(b"COMM");
+        header.extend_from_slice(&38_u32.to_be_bytes());
+        header.extend_from_slice(&channel_count.to_be_bytes());
+        header.extend_from_slice(&num_frames.to_be_bytes());
+        header.extend_from_slice(&bits_u16.to_be_bytes());
+        header.extend_from_slice(&encode_ieee80_u32(rate));
+        header.extend_from_slice(b"fl32");
+        // Pascal string: 15-byte name padded to an even 16-byte payload.
+        header.extend_from_slice(b"\x0f32-bit floating");
+    } else {
+        header.extend_from_slice(b"AIFF");
+        header.extend_from_slice(b"COMM");
+        header.extend_from_slice(&18_u32.to_be_bytes());
+        header.extend_from_slice(&channel_count.to_be_bytes());
+        header.extend_from_slice(&num_frames.to_be_bytes());
+        header.extend_from_slice(&bits_u16.to_be_bytes());
+        header.extend_from_slice(&encode_ieee80_u32(rate));
+    }
+    header.extend_from_slice(b"SSND");
+    header.extend_from_slice(&ssnd_size.to_be_bytes());
+    header.extend_from_slice(&0_u32.to_be_bytes());
+    header.extend_from_slice(&0_u32.to_be_bytes());
+    Ok((header, pad))
+}
+
 /// Writes a PCM or IEEE-float AIFF file from the provided interleaved samples.
 ///
 /// Integer targets use the classic `FORM`/`AIFF` layout. `Float32` writes the
@@ -39,98 +120,20 @@ pub(crate) fn encode_aiff(
     samples_i32: &[i32],
     float_samples: &[f32],
 ) -> Result<(), PipelineError> {
-    if !(1..=usize::from(u16::MAX)).contains(&channels) {
-        return Err(PipelineError::EncodeFailed {
-            path: path.to_path_buf(),
-            reason: format!("AIFF supports at most 65535 channels, got {channels}"),
-        });
-    }
     let io_err = |source| PipelineError::Io {
         path: path.to_path_buf(),
         source,
     };
-    let encode_err = |reason: String| PipelineError::EncodeFailed {
-        path: path.to_path_buf(),
-        reason,
-    };
-
-    let bits = usize::from(depth.bits());
     let sample_count = match depth {
         AudioBitDepth::Int8 | AudioBitDepth::Int16 => samples_i16.len(),
         AudioBitDepth::Int24 | AudioBitDepth::Int32 => samples_i32.len(),
         AudioBitDepth::Float32 => float_samples.len(),
     };
-    let bytes_per_sample = bits / 8;
-    let pcm_bytes_u64 = u64::try_from(sample_count)
-        .ok()
-        .and_then(|count| count.checked_mul(u64::try_from(bytes_per_sample).unwrap_or(u64::MAX)))
-        .ok_or_else(|| encode_err("AIFF PCM byte size overflows".to_owned()))?;
-    let pad = usize::from((pcm_bytes_u64 & 1) != 0);
-    let num_frames = sample_count / channels;
-    let ssnd_size_u64 = pcm_bytes_u64
-        .checked_add(8)
-        .ok_or_else(|| encode_err("AIFF SSND size overflows".to_owned()))?;
-    // FORM payload = form type (4) + chunks. AIFF-C carries FVER (12) and a
-    // 38-byte COMM instead of the plain 18-byte COMM, hence 78 vs 46.
-    let header_bytes = if depth.is_float() { 78_u64 } else { 46_u64 };
-    let form_size_u64 = pcm_bytes_u64
-        .checked_add(header_bytes)
-        .and_then(|size| size.checked_add(u64::try_from(pad).unwrap_or(u64::MAX)))
-        .ok_or_else(|| encode_err("AIFF FORM size overflows".to_owned()))?;
-    let num_frames = u32::try_from(num_frames)
-        .map_err(|_| encode_err("AIFF frame count exceeds the 32-bit IFF field".to_owned()))?;
-    let ssnd_size = u32::try_from(ssnd_size_u64)
-        .map_err(|_| encode_err("AIFF SSND size exceeds the 32-bit IFF field".to_owned()))?;
-    let form_size = u32::try_from(form_size_u64)
-        .map_err(|_| encode_err("AIFF FORM size exceeds the 32-bit IFF field".to_owned()))?;
-    let channel_count = u16::try_from(channels)
-        .map_err(|_| encode_err("AIFF channel count exceeds the 16-bit IFF field".to_owned()))?;
-    let bits_u16 = u16::try_from(bits)
-        .map_err(|_| encode_err("AIFF sample depth exceeds the 16-bit IFF field".to_owned()))?;
+    let (header, pad) = aiff_header(path, rate, channels, depth, sample_count)?;
 
     let file = File::create(path).map_err(io_err)?;
     let mut writer = BufWriter::with_capacity(PCM_CHUNK_BYTES, file);
-    writer.write_all(b"FORM").map_err(io_err)?;
-    writer.write_all(&form_size.to_be_bytes()).map_err(io_err)?;
-    if depth.is_float() {
-        writer.write_all(b"AIFC").map_err(io_err)?;
-        // AIFF-C version 2, as required for `fl32` compressed-format chunks.
-        writer.write_all(b"FVER").map_err(io_err)?;
-        writer.write_all(&4_u32.to_be_bytes()).map_err(io_err)?;
-        writer
-            .write_all(&0xA280_5140_u32.to_be_bytes())
-            .map_err(io_err)?;
-        writer.write_all(b"COMM").map_err(io_err)?;
-        writer.write_all(&38_u32.to_be_bytes()).map_err(io_err)?;
-        writer
-            .write_all(&channel_count.to_be_bytes())
-            .map_err(io_err)?;
-        writer
-            .write_all(&num_frames.to_be_bytes())
-            .map_err(io_err)?;
-        writer.write_all(&bits_u16.to_be_bytes()).map_err(io_err)?;
-        writer.write_all(&encode_ieee80_u32(rate)).map_err(io_err)?;
-        writer.write_all(b"fl32").map_err(io_err)?;
-        // Pascal string: 15-byte name padded to an even 16-byte payload.
-        writer.write_all(b"\x0f32-bit floating").map_err(io_err)?;
-    } else {
-        writer.write_all(b"AIFF").map_err(io_err)?;
-        writer.write_all(b"COMM").map_err(io_err)?;
-        writer.write_all(&18_u32.to_be_bytes()).map_err(io_err)?;
-        writer
-            .write_all(&channel_count.to_be_bytes())
-            .map_err(io_err)?;
-        writer
-            .write_all(&num_frames.to_be_bytes())
-            .map_err(io_err)?;
-        writer.write_all(&bits_u16.to_be_bytes()).map_err(io_err)?;
-        writer.write_all(&encode_ieee80_u32(rate)).map_err(io_err)?;
-    }
-    writer.write_all(b"SSND").map_err(io_err)?;
-    writer.write_all(&ssnd_size.to_be_bytes()).map_err(io_err)?;
-    writer.write_all(&0_u32.to_be_bytes()).map_err(io_err)?;
-    writer.write_all(&0_u32.to_be_bytes()).map_err(io_err)?;
-
+    writer.write_all(&header).map_err(io_err)?;
     write_aiff_pcm(
         &mut writer,
         path,

@@ -8,7 +8,7 @@ use fastconv_domain::{
     AudioBatchItem, AudioBatchPlan, AudioBitDepth, AudioEncodingOptions, AudioExecutionMode,
     AudioInputFormat, AudioOptionBitrate, AudioOptionChannels, AudioOptionSampleRate,
     AudioOutputFormat, AudioQuality, AudioRateControl, AudioSampleFormat, AudioStreamInfo,
-    AudioTargetCodec, DomainError, HardwareBackend, PathRole,
+    AudioTargetCodec, DomainError, HardwareBackend, PathRole, PcmWavLayout, fnv1a64,
 };
 use symphonia::core::audio::sample::SampleFormat as SymphoniaSampleFormat;
 use symphonia::core::codecs::audio::{
@@ -386,15 +386,312 @@ fn read_magic_prefix(file: &mut File, path: &Path) -> Result<[u8; MAGIC_PREFIX_B
     Ok(prefix)
 }
 
+/// At most this many trailing bytes are inspected when recovering an Ogg
+/// granule position. A longer tail only adds work and never improves certainty.
+const OGG_TAIL_SCAN_BYTES: u64 = 65_536;
+const OGG_PAGE_HEADER_FIXED: usize = 27;
+/// Bounded prefix scanned for the OpusHead/OpusTags pages and the first audio page.
+const OGG_HEADER_SCAN_BYTES: u64 = 256 * 1024;
+const MAX_OGG_HEADER_PAGES: usize = 8;
+/// Ogg's non-reflected CRC-32 (RFC 3533 §6, polynomial `0x04c11db7`, zero seed,
+/// no final inversion). A page is checksummed with its own CRC field zeroed.
+const OGG_CRC_POLY: u32 = 0x04c1_1db7;
+// `i` is bounded to 0..=255 by the loop below, so narrowing the table index to
+// `u32` is lossless; `TryFrom` is not usable in a const context on this toolchain.
+#[allow(clippy::cast_possible_truncation)]
+const OGG_CRC_TABLE: [u32; 256] = {
+    let mut table = [0_u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut value = (i as u32) << 24;
+        let mut bit = 0;
+        while bit < 8 {
+            value = if value & 0x8000_0000 != 0 {
+                (value << 1) ^ OGG_CRC_POLY
+            } else {
+                value << 1
+            };
+            bit += 1;
+        }
+        table[i] = value;
+        i += 1;
+    }
+    table
+};
+
+fn ogg_crc32(data: &[u8]) -> u32 {
+    let mut crc = 0_u32;
+    for &byte in data {
+        let index = ((crc >> 24) as u8 ^ byte) as usize;
+        crc = (crc << 8) ^ OGG_CRC_TABLE[index];
+    }
+    crc
+}
+
+/// Recovers the decoded sample count of an Ogg Opus stream from its final page.
+///
+/// The granule position of the last page includes the pre-skip samples and any
+/// positive initial granule offset allowed by RFC 7845 §4.5, so the decoded
+/// length is `granule - initial_offset - pre_skip`. A candidate is accepted only
+/// when it is a version-0 page whose lacing table and body end exactly at EOF,
+/// whose serial matches the one locked by `OggOpusReader`, and whose Ogg CRC-32
+/// verifies, and whose granule equals the one reached by `OggOpusReader`.
+/// Anything else yields `None` so a crafted suffix page cannot inject a granule
+/// into the batch memory reservation.
+fn opus_total_samples(
+    file: &mut File,
+    pre_skip: u64,
+    initial_offset: u64,
+    expected_serial: u32,
+    expected_granule: u64,
+) -> Option<u64> {
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(OGG_TAIL_SCAN_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::new();
+    file.take(OGG_TAIL_SCAN_BYTES).read_to_end(&mut tail).ok()?;
+    if tail.len() < OGG_PAGE_HEADER_FIXED + 1 {
+        return None;
+    }
+    for at in (0..=tail.len() - OGG_PAGE_HEADER_FIXED).rev() {
+        if &tail[at..at + 4] != b"OggS" || tail.get(at + 4) != Some(&0) {
+            continue;
+        }
+        let Some(&seg_byte) = tail.get(at + 26) else {
+            continue;
+        };
+        let segments = usize::from(seg_byte);
+        if segments == 0 {
+            continue;
+        }
+        let Some(table_end) = at
+            .checked_add(OGG_PAGE_HEADER_FIXED)
+            .and_then(|end| end.checked_add(segments))
+        else {
+            continue;
+        };
+        let Some(table) = tail.get(at + OGG_PAGE_HEADER_FIXED..table_end) else {
+            continue;
+        };
+        let Some(body_len) = table.iter().try_fold(0_usize, |total, &lacing| {
+            total.checked_add(usize::from(lacing))
+        }) else {
+            continue;
+        };
+        if table_end.checked_add(body_len) != Some(tail.len()) {
+            continue;
+        }
+        let Some(granule_bytes) = tail
+            .get(at + 6..at + 14)
+            .and_then(|slice| <[u8; 8]>::try_from(slice).ok())
+        else {
+            continue;
+        };
+        let granule = i64::from_le_bytes(granule_bytes);
+        if granule < 0 {
+            continue;
+        }
+        let Ok(granule) = u64::try_from(granule) else {
+            continue;
+        };
+        let serial_bytes = <[u8; 4]>::try_from(tail.get(at + 14..at + 18)?).ok()?;
+        if u32::from_le_bytes(serial_bytes) != expected_serial {
+            continue;
+        }
+        // The CRC covers the whole page with the CRC field itself zeroed. The
+        // final candidate extends to EOF, so it is contiguous in `tail`.
+        let crc_bytes = <[u8; 4]>::try_from(tail.get(at + 22..at + 26)?).ok()?;
+        let mut checksummed = Vec::with_capacity(tail.len() - at);
+        checksummed.extend_from_slice(&tail[at..at + 22]);
+        checksummed.extend_from_slice(&[0_u8; 4]);
+        checksummed.extend_from_slice(&tail[at + 26..]);
+        if ogg_crc32(&checksummed) != u32::from_le_bytes(crc_bytes) {
+            continue;
+        }
+        // A CRC-valid page with the right serial can still be appended after
+        // the logical EOS. The reader stops at that EOS, so only its terminal
+        // granule is trustworthy; a different candidate is rejected.
+        if granule != expected_granule {
+            continue;
+        }
+        return granule.checked_sub(initial_offset)?.checked_sub(pre_skip);
+    }
+    None
+}
+
+/// One CRC-validated Ogg page, with the packets that COMPLETE on it (a lacing
+/// value below 255 terminates a packet).
+struct OggPageInfo<'a> {
+    granule: i64,
+    serial: u32,
+    header_type: u8,
+    end: usize,
+    completed: Vec<&'a [u8]>,
+}
+
+fn parse_ogg_page(bytes: &[u8], at: usize) -> Option<OggPageInfo<'_>> {
+    if bytes.get(at..at + 4)? != b"OggS" || bytes.get(at + 4) != Some(&0) {
+        return None;
+    }
+    let granule = i64::from_le_bytes(<[u8; 8]>::try_from(bytes.get(at + 6..at + 14)?).ok()?);
+    let serial = u32::from_le_bytes(<[u8; 4]>::try_from(bytes.get(at + 14..at + 18)?).ok()?);
+    let header_type = *bytes.get(at + 5)?;
+    let segments = usize::from(*bytes.get(at + 26)?);
+    if segments == 0 {
+        return None;
+    }
+    let table_end = at
+        .checked_add(OGG_PAGE_HEADER_FIXED)?
+        .checked_add(segments)?;
+    let table = bytes.get(at + OGG_PAGE_HEADER_FIXED..table_end)?;
+    let body_len = table
+        .iter()
+        .try_fold(0_usize, |total, &lace| total.checked_add(usize::from(lace)))?;
+    let end = table_end.checked_add(body_len)?;
+    let body = bytes.get(table_end..end)?;
+    let stored_crc = u32::from_le_bytes(<[u8; 4]>::try_from(bytes.get(at + 22..at + 26)?).ok()?);
+    let mut checksummed = Vec::with_capacity(end - at);
+    checksummed.extend_from_slice(&bytes[at..at + 22]);
+    checksummed.extend_from_slice(&[0_u8; 4]);
+    checksummed.extend_from_slice(&bytes[at + 26..end]);
+    if ogg_crc32(&checksummed) != stored_crc {
+        return None;
+    }
+    let mut completed = Vec::new();
+    let mut packet_start = 0_usize;
+    let mut cursor = 0_usize;
+    for &lace in table {
+        // A lace of 255 continues the current packet; only a shorter lace
+        // terminates it. The cursor therefore advances for every segment while
+        // the packet start stays put until the packet actually ends.
+        cursor = cursor.checked_add(usize::from(lace))?;
+        if cursor > body.len() {
+            return None;
+        }
+        if lace < 255 {
+            completed.push(&body[packet_start..cursor]);
+            packet_start = cursor;
+        }
+    }
+    if packet_start != body.len() {
+        // A packet still spanning into the next page is allowed in general,
+        // but not on a header page where this parser is used.
+        return None;
+    }
+    Some(OggPageInfo {
+        granule,
+        serial,
+        header_type,
+        end,
+        completed,
+    })
+}
+
+/// Derives the timeline offset from the FIRST audio data page by walking Ogg
+/// pages from the start of the file. RFC 7845 §4.5 permits a positive initial
+/// granule position; RFC 7845 §4.4 permits a later page to carry the same
+/// granule, so page membership must come from the page layout, not from the
+/// granule value reported on a packet.
+fn opus_initial_offset(path: &Path) -> Option<u64> {
+    let file = File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(OGG_HEADER_SCAN_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let mut at = 0_usize;
+    let mut pages = 0_usize;
+    let mut serial = None;
+    while at < bytes.len() {
+        if pages >= MAX_OGG_HEADER_PAGES {
+            return None;
+        }
+        let page = parse_ogg_page(&bytes, at)?;
+        if serial.is_some_and(|expected| expected != page.serial) {
+            return None;
+        }
+        serial = Some(page.serial);
+        match pages {
+            0 => {
+                // Identification header: begins the stream with granule zero.
+                if page.header_type & 0x02 == 0
+                    || page.granule != 0
+                    || page.completed.len() != 1
+                    || !page.completed[0].starts_with(b"OpusHead")
+                {
+                    return None;
+                }
+            }
+            1 => {
+                // Comment header must finish its own page.
+                if page.header_type & 0x02 != 0
+                    || page.granule != 0
+                    || page.completed.len() != 1
+                    || !page.completed[0].starts_with(b"OpusTags")
+                {
+                    return None;
+                }
+            }
+            _ => {
+                // First audio page: sum only the packets completing here.
+                if page.header_type & 0x01 != 0 || page.granule < 0 {
+                    return None;
+                }
+                let decoded = |data: &[u8]| -> Option<u64> {
+                    u64::try_from(opus_pure::packet::samples(data, 48_000).ok()?).ok()
+                };
+                let sum = page
+                    .completed
+                    .iter()
+                    .try_fold(0_u64, |total, packet| total.checked_add(decoded(packet)?))?;
+                return u64::try_from(page.granule).ok()?.checked_sub(sum);
+            }
+        }
+        at = page.end;
+        pages += 1;
+    }
+    None
+}
+
+/// Granule of the terminal packet actually reached by `OggOpusReader`. It stops
+/// at the logical EOS and ignores any CRC-valid page appended after it.
+fn opus_terminal_granule(reader: &mut opus_pure::OggOpusReader<File>) -> Option<u64> {
+    let mut last = None;
+    for packet in reader.packets() {
+        last = Some(packet.ok()?.page_granule);
+    }
+    let granule = last?;
+    if granule < 0 {
+        return None;
+    }
+    u64::try_from(granule).ok()
+}
+
 fn probe_opus(path: &Path, file: File) -> Result<AudioStreamInfo, ProbeError> {
-    let reader = opus_pure::OggOpusReader::new(file)
+    let mut probe_file = file.try_clone().map_err(|source| ProbeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut reader = opus_pure::OggOpusReader::new(file)
         .map_err(|err| invalid_audio(path, format!("invalid Ogg Opus stream: {err}")))?;
     let head = reader.head();
     let channels = NonZeroU16::new(u16::from(head.channel_count))
         .ok_or_else(|| invalid_audio(path, "Opus channel count must not be zero"))?;
+    let pre_skip = u64::from(head.pre_skip);
+    let serial = reader.serial();
+    let terminal_granule = opus_terminal_granule(&mut reader);
+    // A nonzero initial granule shifts the converter's Trim timeline, so the
+    // probed decoded length cannot be trusted; withhold it and keep the
+    // conservative unknown-length reservation.
+    let initial_offset = opus_initial_offset(path);
+    let total_samples = match (terminal_granule, initial_offset) {
+        (Some(final_granule), Some(offset)) if offset == 0 => {
+            opus_total_samples(&mut probe_file, pre_skip, offset, serial, final_granule)
+        }
+        _ => None,
+    };
     // Ogg Opus always decodes at 48 kHz, regardless of the rate recorded at capture time.
     let sample_rate = NonZeroU32::new(48_000).unwrap_or(NonZeroU32::MIN);
-    AudioStreamInfo::new(channels, sample_rate, NonZeroU16::new(16), None)
+    AudioStreamInfo::new(channels, sample_rate, NonZeroU16::new(16), total_samples)
         .map_err(|err| invalid_audio(path, err.to_string()))
 }
 
@@ -436,8 +733,142 @@ fn probe_adts_aac(path: &Path, mut file: File) -> Result<AudioStreamInfo, ProbeE
         .ok_or_else(|| invalid_audio(path, "AAC channel count must not be zero"))?;
     let sample_rate = NonZeroU32::new(header.sample_rate)
         .ok_or_else(|| invalid_audio(path, "AAC sample rate must not be zero"))?;
-    AudioStreamInfo::new(channels, sample_rate, None, None)
+    // An ADTS header cannot signal SBR. HE-AAC dual-rate decoding produces twice
+    // the PCM of the core-rate frame count this header describes, and the raw
+    // blocks do not reveal whether the stream is SBR-capable. Do not report a
+    // count we cannot prove: the batch keeps its conservative unknown-length
+    // reservation instead.
+    let total_samples = None;
+    AudioStreamInfo::new(channels, sample_rate, None, total_samples)
         .map_err(|err| invalid_audio(path, err.to_string()))
+}
+
+/// Upper bound on the WAV header bytes hashed into the layout fingerprint.
+/// A larger header (many junk chunks) withholds the fast path rather than
+/// allocating an unbounded buffer.
+const MAX_WAV_HEADER_FINGERPRINT_BYTES: u64 = 1024 * 1024;
+
+/// PCM `WAVEFORMATEXTENSIBLE` sub-format GUID for signed integer samples.
+const WAVE_FORMAT_PCM_GUID: [u8; 16] = [
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+];
+
+fn le_u16(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+}
+
+fn le_u32(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+/// Parses and validates a canonical signed-integer PCM RIFF/WAVE header exactly
+/// once, at the system boundary. `None` means the file needs the generic decoder
+/// (unsigned 8-bit, float, RF64, non-canonical extensible PCM, or a malformed
+/// chunk). Every size is checked against the RIFF-declared end and the actual
+/// file length, so no partial header can reach a downstream fast path.
+fn probe_pcm_wav_layout(file: &mut File) -> Option<PcmWavLayout> {
+    let file_len = file.metadata().ok()?.len();
+    let mut head = [0_u8; 12];
+    file.read_exact(&mut head).ok()?;
+    if &head[..4] != b"RIFF" || &head[8..12] != b"WAVE" {
+        return None;
+    }
+    if le_u32(&head, 4) == u32::MAX {
+        return None;
+    }
+    let riff_end = u64::from(le_u32(&head, 4)).saturating_add(8).min(file_len);
+
+    let mut pos = 12_u64;
+    let mut fmt: Option<(usize, u32, usize, usize, u32)> = None;
+    let mut data: Option<(u64, u64)> = None;
+    let mut header = [0_u8; 8];
+    let mut payload = vec![0_u8; 4096];
+
+    while pos.saturating_add(8) <= riff_end {
+        file.seek(SeekFrom::Start(pos)).ok()?;
+        file.read_exact(&mut header).ok()?;
+        let size = u64::from(le_u32(&header, 4));
+        if size == u64::from(u32::MAX) || pos.saturating_add(8).saturating_add(size) > riff_end {
+            return None;
+        }
+        let padded = size.saturating_add(size & 1);
+        match &header[..4] {
+            b"fmt " => {
+                if !(16..=4096).contains(&size) {
+                    return None;
+                }
+                let len = usize::try_from(size).ok()?;
+                payload.resize(len, 0);
+                file.read_exact(&mut payload[..len]).ok()?;
+                let audio_format = le_u16(&payload, 0);
+                let channels = usize::from(le_u16(&payload, 2));
+                let rate = le_u32(&payload, 4);
+                let block_align = usize::from(le_u16(&payload, 12));
+                let bits = usize::from(le_u16(&payload, 14));
+                let canonical = bits == 16 || bits == 24 || bits == 32;
+                let extensible = audio_format == 0xFFFE
+                    && size >= 40
+                    && le_u16(&payload, 18) == u16::try_from(bits).unwrap_or(0)
+                    && payload
+                        .get(24..40)
+                        .is_some_and(|guid| guid == WAVE_FORMAT_PCM_GUID.as_slice());
+                if !(canonical && (audio_format == 1 || extensible))
+                    || !(1..=8).contains(&channels)
+                    || rate == 0
+                    || block_align != channels.saturating_mul(bits / 8)
+                {
+                    return None;
+                }
+                let channel_mask = if audio_format == 0xFFFE {
+                    <[u8; 4]>::try_from(payload.get(20..24)?).ok()?
+                } else {
+                    [0; 4]
+                };
+                fmt = Some((
+                    channels,
+                    rate,
+                    bits,
+                    block_align,
+                    u32::from_le_bytes(channel_mask),
+                ));
+            }
+            b"data" => {
+                data = Some((pos.saturating_add(8), size));
+                if fmt.is_some() {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        pos = pos.saturating_add(8).saturating_add(padded);
+    }
+
+    let (Some((channels, rate, bits, block_align, channel_mask)), Some((data_offset, data_bytes))) =
+        (fmt, data)
+    else {
+        return None;
+    };
+    // Hash the exact prefix the pipeline will re-read before seeking to the
+    // payload. This binds the saved offset to the header that produced it.
+    if data_offset > MAX_WAV_HEADER_FINGERPRINT_BYTES {
+        return None;
+    }
+    let header_len = usize::try_from(data_offset).ok()?;
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut header_bytes = vec![0_u8; header_len];
+    file.read_exact(&mut header_bytes).ok()?;
+    let fingerprint = fnv1a64(&header_bytes);
+    PcmWavLayout::new(
+        NonZeroU16::new(u16::try_from(channels).ok()?)?,
+        NonZeroU16::new(u16::try_from(bits).ok()?)?,
+        NonZeroU32::new(rate)?,
+        NonZeroU16::new(u16::try_from(block_align).ok()?)?,
+        channel_mask,
+        data_offset,
+        data_bytes,
+        fingerprint,
+    )
+    .ok()
 }
 
 fn probe_symphonia(
@@ -598,6 +1029,31 @@ pub fn probe_audio(path: &Path) -> Result<ProbedAudio, ProbeError> {
     let (format, stream) = match format {
         AudioInputFormat::Opus => (format, probe_opus(path, file)?),
         AudioInputFormat::Aac => (format, probe_adts_aac(path, file)?),
+        AudioInputFormat::Wav => {
+            // WAV headers are parsed exactly once. A canonical signed PCM file
+            // yields both the validated layout and its stream metadata from the
+            // same parse; anything else falls back to symphonia on the same
+            // handle, which stays open and is rewound first.
+            let mut wav_file = file;
+            if let Some(layout) = probe_pcm_wav_layout(&mut wav_file) {
+                let stream = AudioStreamInfo::new(
+                    layout.channels(),
+                    layout.sample_rate(),
+                    Some(layout.bits_per_sample()),
+                    Some(layout.total_samples()),
+                )
+                .map_err(|err| invalid_audio(path, err.to_string()))?;
+                (format, stream.with_pcm_wav_layout(layout))
+            } else {
+                wav_file
+                    .seek(SeekFrom::Start(0))
+                    .map_err(|source| ProbeError::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+                probe_symphonia(path, format, wav_file)?
+            }
+        }
         _ => probe_symphonia(path, format, file)?,
     };
 
@@ -1426,6 +1882,80 @@ mod tests {
         bytes
     }
 
+    #[test]
+    fn probes_canonical_pcm_wav_layout_and_rejects_noncanonical_headers() -> Result<(), String> {
+        let dir = probe_temp_dir("wav-layout");
+        let data: Vec<u8> = (0..2_000_u32)
+            .map(|index| u8::try_from(index % 251).unwrap_or(0))
+            .collect();
+
+        let valid = dir.join("valid.wav");
+        fs::write(&valid, probe_pcm_bytes(1, 1, 16, &data, false))
+            .map_err(|err| err.to_string())?;
+        let probed = probe_audio(&valid).map_err(|err| err.to_string())?;
+        let layout = probed
+            .stream
+            .pcm_wav_layout()
+            .ok_or_else(|| "plain PCM must expose a validated layout".to_owned())?;
+        assert_eq!(layout.channels().get(), 1);
+        assert_eq!(layout.bits_per_sample().get(), 16);
+        assert_eq!(layout.sample_rate().get(), 48_000);
+        assert_eq!(layout.data_offset(), 44);
+        assert_eq!(layout.data_bytes(), 2_000);
+        assert_eq!(layout.total_samples(), 1_000);
+        assert_eq!(layout.channel_mask(), 0);
+
+        // WAVEFORMATEXTENSIBLE carries a speaker mask; the probe must keep it so
+        // a consumer can reject layouts it cannot map correctly.
+        let mut extensible = probe_pcm_bytes(0xFFFE, 2, 16, &data, true);
+        extensible[40..44].copy_from_slice(&0xB_u32.to_le_bytes());
+        extensible[44] = 0x01; // signed-integer PCM sub-format GUID
+        let ext_path = dir.join("extensible.wav");
+        fs::write(&ext_path, &extensible).map_err(|err| err.to_string())?;
+        let probed = probe_audio(&ext_path).map_err(|err| err.to_string())?;
+        let layout = probed
+            .stream
+            .pcm_wav_layout()
+            .ok_or_else(|| "canonical extensible PCM must expose a layout".to_owned())?;
+        assert_eq!(layout.channel_mask(), 0xB);
+        assert_eq!(layout.channels().get(), 2);
+
+        // Unsigned 8-bit, IEEE-float and a non-PCM extensible GUID have no
+        // canonical signed-PCM layout, so the generic decoder must handle them.
+        for bytes in [
+            probe_pcm_bytes(1, 1, 8, &data, false),
+            probe_pcm_bytes(3, 1, 32, &data, false),
+            probe_pcm_bytes(0xFFFE, 1, 32, &data, true),
+        ] {
+            let path = dir.join("noncanonical.wav");
+            fs::write(&path, &bytes).map_err(|err| err.to_string())?;
+            assert_eq!(
+                probe_audio(&path)
+                    .map_err(|err| err.to_string())?
+                    .stream
+                    .pcm_wav_layout(),
+                None
+            );
+        }
+
+        // Truncating the payload while leaving the declared sizes intact must
+        // not hand the pipeline a layout pointing past EOF.
+        let mut truncated = probe_pcm_bytes(1, 1, 16, &data, false);
+        truncated.truncate(truncated.len() - 2);
+        let path = dir.join("truncated.wav");
+        fs::write(&path, &truncated).map_err(|err| err.to_string())?;
+        assert_eq!(
+            probe_audio(&path)
+                .map_err(|err| err.to_string())?
+                .stream
+                .pcm_wav_layout(),
+            None
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     fn add_chunk(bytes: &mut Vec<u8>, id: [u8; 4], body: &[u8]) {
         bytes.extend_from_slice(&id);
         bytes.extend_from_slice(&u32::try_from(body.len()).unwrap_or(0).to_be_bytes());
@@ -1643,6 +2173,129 @@ mod tests {
         page
     }
 
+    /// Builds one Ogg page with correct lacing and CRC, used to forge suffixes.
+    fn ogg_page_with(granule: u64, serial: u32, header_type: u8, packet: &[u8]) -> Vec<u8> {
+        let mut lacing = Vec::new();
+        let mut remaining = packet.len();
+        while remaining >= 255 {
+            lacing.push(255);
+            remaining -= 255;
+        }
+        lacing.push(u8::try_from(remaining).unwrap_or(0));
+        let mut page = b"OggS".to_vec();
+        page.push(0);
+        page.push(header_type);
+        page.extend_from_slice(&granule.to_le_bytes());
+        page.extend_from_slice(&serial.to_le_bytes());
+        page.extend_from_slice(&0_u32.to_le_bytes()); // sequence
+        page.extend_from_slice(&[0_u8; 4]); // CRC placeholder
+        page.push(u8::try_from(lacing.len()).unwrap_or(u8::MAX));
+        page.extend_from_slice(&lacing);
+        page.extend_from_slice(packet);
+        let crc = ogg_crc32(&page);
+        page[22..26].copy_from_slice(&crc.to_le_bytes());
+        page
+    }
+
+    /// Encodes three 20 ms packets into a valid Opus stream. A one-byte page
+    /// target puts each packet on its own page, which lets a test shift the
+    /// granule timeline without changing how many samples complete per page.
+    fn opus_stream(serial: u32, page_target: usize) -> Result<Vec<u8>, String> {
+        let mut encoder = opus_pure::OpusEncoder::new(48_000, 2, opus_pure::Application::Audio)
+            .map_err(|err| err.to_string())?;
+        let head = opus_pure::OpusHead::for_encoder(&encoder, 48_000);
+        let mut writer = opus_pure::OggOpusWriter::with_serial(
+            Vec::new(),
+            head,
+            opus_pure::OpusTags::new(),
+            serial,
+        )
+        .map_err(|err| err.to_string())?;
+        writer.set_page_target(page_target);
+        let mut packet = vec![0_u8; opus_pure::MAX_PACKET_BYTES];
+        let silence = vec![0.0_f32; 960 * 2];
+        for _ in 0..3 {
+            let written = encoder
+                .encode(&silence, 960, &mut packet)
+                .map_err(|err| err.to_string())?;
+            writer
+                .write_packet(&packet[..written])
+                .map_err(|err| err.to_string())?;
+        }
+        writer.finish().map_err(|err| err.to_string())
+    }
+
+    /// Adds `delta` to every audio page's granule, recomputing each CRC. The
+    /// two leading header pages keep granule zero as RFC 7845 requires.
+    fn shift_audio_granules(bytes: &[u8], delta: u64) -> Option<Vec<u8>> {
+        let mut out = bytes.to_vec();
+        let mut at = 0_usize;
+        let mut page_index = 0_usize;
+        while at < out.len() {
+            let rel = out[at..].windows(4).position(|window| window == b"OggS")?;
+            let start = at + rel;
+            let segments = usize::from(*out.get(start + 26)?);
+            let table_end = start.checked_add(27)?.checked_add(segments)?;
+            let body_len = out
+                .get(start + 27..table_end)?
+                .iter()
+                .try_fold(0_usize, |total, &lace| total.checked_add(usize::from(lace)))?;
+            let end = table_end.checked_add(body_len)?;
+            if page_index >= 2 {
+                let granule_bytes = <[u8; 8]>::try_from(out.get(start + 6..start + 14)?).ok()?;
+                let granule = u64::from_le_bytes(granule_bytes).checked_add(delta)?;
+                out[start + 6..start + 14].copy_from_slice(&granule.to_le_bytes());
+                let mut crc_buf = out.get(start..end)?.to_vec();
+                crc_buf[22..26].copy_from_slice(&[0_u8; 4]);
+                let crc = ogg_crc32(&crc_buf);
+                out[start + 22..start + 26].copy_from_slice(&crc.to_le_bytes());
+            }
+            page_index += 1;
+            at = end;
+        }
+        Some(out)
+    }
+
+    /// Splits a valid Ogg stream into complete page byte ranges.
+    fn split_ogg_pages(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut pages = Vec::new();
+        let mut at = 0_usize;
+        while at < bytes.len() {
+            let Some(rel) = bytes[at..].windows(4).position(|window| window == b"OggS") else {
+                break;
+            };
+            let start = at + rel;
+            let Some(&segments) = bytes.get(start + 26) else {
+                break;
+            };
+            let segments = usize::from(segments);
+            let Some(table_end) = start
+                .checked_add(27)
+                .and_then(|end| end.checked_add(segments))
+            else {
+                break;
+            };
+            let Some(table) = bytes.get(start + 27..table_end) else {
+                break;
+            };
+            let body_len = table
+                .iter()
+                .try_fold(0_usize, |total, &lace| total.checked_add(usize::from(lace)));
+            let Some(body_len) = body_len else {
+                break;
+            };
+            let Some(end) = table_end.checked_add(body_len) else {
+                break;
+            };
+            let Some(page) = bytes.get(start..end) else {
+                break;
+            };
+            pages.push(page.to_vec());
+            at = end;
+        }
+        pages
+    }
+
     #[test]
     fn detects_ogg_audio_after_skeleton_pages() {
         let mut fishead = vec![0_u8; 44];
@@ -1835,6 +2488,284 @@ mod tests {
         assert_eq!(plan.mode(), AudioExecutionMode::CpuOggFlac);
 
         let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    fn probe_temp_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("fastconv-probe-{label}-{nanos}"));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn probes_adts_sample_counts_and_withholds_them_for_malformed_files() -> Result<(), String> {
+        let dir = probe_temp_dir("adts-count");
+        let path = dir.join("frames.aac");
+        let frame = |blocks: u8| -> Vec<u8> {
+            let mut header = rusty_aac::write_adts_header(&rusty_aac::AdtsHeader {
+                object_type: 2,
+                sample_rate: 48_000,
+                channels: 2,
+                frame_length: 9,
+                header_len: 7,
+            });
+            header[6] |= blocks;
+            let mut bytes = header;
+            bytes.extend_from_slice(&[0_u8; 2]);
+            bytes
+        };
+        let mut bytes = frame(0);
+        bytes.extend_from_slice(&frame(1));
+        bytes.extend_from_slice(&frame(0));
+        fs::write(&path, &bytes).map_err(|err| err.to_string())?;
+        // The ADTS core rate cannot establish the decoded length of an
+        // SBR-capable stream, so no count is published even for clean frames.
+        assert_eq!(
+            probe_audio(&path)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            None
+        );
+
+        // A truncated final frame leaves the walk unable to prove the stream end.
+        let truncated = dir.join("truncated.aac");
+        fs::write(&truncated, &bytes[..bytes.len() - 1]).map_err(|err| err.to_string())?;
+        assert_eq!(
+            probe_audio(&truncated)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            None
+        );
+
+        // A broken second syncword is malformed, so no count is reported.
+        let corrupt = dir.join("corrupt.aac");
+        let mut corrupt_bytes = bytes.clone();
+        corrupt_bytes[9] = 0;
+        fs::write(&corrupt, &corrupt_bytes).map_err(|err| err.to_string())?;
+        assert_eq!(
+            probe_audio(&corrupt)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            None
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn probes_opus_sample_count_and_withholds_it_for_trailing_garbage() -> Result<(), String> {
+        let dir = probe_temp_dir("opus-count");
+        let path = dir.join("tone.opus");
+        let mut encoder = opus_pure::OpusEncoder::new(48_000, 2, opus_pure::Application::Audio)
+            .map_err(|err| err.to_string())?;
+        let head = opus_pure::OpusHead::for_encoder(&encoder, 48_000);
+        let mut writer =
+            opus_pure::OggOpusWriter::new(Vec::new(), head).map_err(|err| err.to_string())?;
+        let mut packet = vec![0_u8; opus_pure::MAX_PACKET_BYTES];
+        let silence = vec![0.0_f32; 960 * 2];
+        for _ in 0..3 {
+            let written = encoder
+                .encode(&silence, 960, &mut packet)
+                .map_err(|err| err.to_string())?;
+            writer
+                .write_packet(&packet[..written])
+                .map_err(|err| err.to_string())?;
+        }
+        let bytes = writer.finish().map_err(|err| err.to_string())?;
+        fs::write(&path, &bytes).map_err(|err| err.to_string())?;
+        // Three 20 ms packets decode to 2880 samples, of which the first
+        // `pre_skip` (312) are discarded by the Ogg Opus pre-roll.
+        assert_eq!(
+            probe_audio(&path)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            Some(2_568)
+        );
+
+        // Bytes after the final page make that page's end ambiguous.
+        let mut junk = bytes;
+        junk.extend_from_slice(b"trailing-garbage");
+        fs::write(&path, &junk).map_err(|err| err.to_string())?;
+        assert_eq!(
+            probe_audio(&path)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            None
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn opus_withholds_count_for_forged_suffix_pages() -> Result<(), String> {
+        let dir = probe_temp_dir("opus-forged-suffix");
+        let path = dir.join("tone.opus");
+        let serial = 0x1122_3344_u32;
+        let base = opus_stream(serial, 1)?;
+        fs::write(&path, &base).map_err(|err| err.to_string())?;
+        assert_eq!(
+            probe_audio(&path)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            Some(2_568)
+        );
+
+        // A page with an arbitrary granule but the wrong logical stream serial
+        // must not be mistaken for the final page of this stream.
+        let mut wrong_serial = base.clone();
+        wrong_serial.extend_from_slice(&ogg_page_with(100_000, serial ^ 1, 0x04, &[0_u8; 1]));
+        fs::write(&path, &wrong_serial).map_err(|err| err.to_string())?;
+        assert_eq!(
+            probe_audio(&path)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            None
+        );
+
+        // The right serial does not help a page whose body was changed without
+        // updating its CRC.
+        let mut bad_crc_page = ogg_page_with(100_000, serial, 0x04, &[0_u8; 1]);
+        let last = bad_crc_page.len().saturating_sub(1);
+        bad_crc_page[last] ^= 0x01;
+        let mut bad_crc = base.clone();
+        bad_crc.extend_from_slice(&bad_crc_page);
+        fs::write(&path, &bad_crc).map_err(|err| err.to_string())?;
+        assert_eq!(
+            probe_audio(&path)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            None
+        );
+
+        // Corrupting the genuine final page also withholds the count.
+        let mut corrupt = base.clone();
+        let last = corrupt.len().saturating_sub(1);
+        corrupt[last] ^= 0x01;
+        fs::write(&path, &corrupt).map_err(|err| err.to_string())?;
+        assert_eq!(
+            probe_audio(&path)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            None
+        );
+
+        // A CRC-valid page with the right serial appended after the logical EOS
+        // is not the page the reader reached; its small granule must be ignored.
+        let mut after_eos = base;
+        after_eos.extend_from_slice(&ogg_page_with(1_000, serial, 0x04, &[0_u8; 1]));
+        fs::write(&path, &after_eos).map_err(|err| err.to_string())?;
+        assert_eq!(
+            probe_audio(&path)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            None
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn opus_withholds_count_for_nonzero_initial_granule() -> Result<(), String> {
+        let dir = probe_temp_dir("opus-initial-granule");
+        let path = dir.join("tone.opus");
+        let base = opus_stream(0x1122_3344, 1)?;
+        // A positive initial granule shifts the converter's Trim timeline, so
+        // no decoded length can be proven from the granule position.
+        let shifted = shift_audio_granules(&base, 1_000)
+            .ok_or_else(|| "failed to shift Opus granules".to_owned())?;
+        fs::write(&path, &shifted).map_err(|err| err.to_string())?;
+        assert_eq!(
+            probe_audio(&path)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            None
+        );
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn opus_initial_offset_counts_only_the_first_audio_page() -> Result<(), String> {
+        let dir = probe_temp_dir("opus-first-page-boundary");
+        let path = dir.join("tone.opus");
+        let serial = 0x1122_3344_u32;
+        let pages = split_ogg_pages(&opus_stream(serial, 1)?);
+        assert!(
+            pages.len() >= 5,
+            "expected two header and three audio pages"
+        );
+        // Keep the real first audio page (granule 960) but insert a later page
+        // that repeats that granule. It must not be counted into the offset.
+        let mut stream = Vec::new();
+        stream.extend(pages[0].iter().copied());
+        stream.extend(pages[1].iter().copied());
+        stream.extend(pages[2].iter().copied());
+        stream.extend_from_slice(&ogg_page_with(960, serial, 0, &[0_u8; 1]));
+        for page in pages.iter().skip(3) {
+            stream.extend(page.iter().copied());
+        }
+        fs::write(&path, &stream).map_err(|err| err.to_string())?;
+        assert_eq!(
+            probe_audio(&path)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            Some(2_568)
+        );
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn opus_initial_offset_accepts_a_packet_spanning_lacing_values() -> Result<(), String> {
+        let dir = probe_temp_dir("opus-multilace-header");
+        let path = dir.join("tone.opus");
+        let serial = 0x5566_7788_u32;
+        let pages = split_ogg_pages(&opus_stream(serial, 1)?);
+        assert!(
+            pages.len() >= 3,
+            "expected two header and three audio pages"
+        );
+
+        // A 300-byte OpusTags packet needs lacing [255, 45]. Its second lace is
+        // 45 bytes into the packet, not 45 bytes into the page; the page parser
+        // must still sum it as one completed packet.
+        let mut tags = b"OpusTags".to_vec();
+        tags.extend_from_slice(&0_u32.to_le_bytes()); // empty vendor
+        tags.extend_from_slice(&0_u32.to_le_bytes()); // no comments
+        tags.resize(300, 0_u8);
+        let mut stream = Vec::new();
+        stream.extend(pages[0].iter().copied());
+        stream.extend_from_slice(&ogg_page_with(0, serial, 0, &tags));
+        for page in pages.iter().skip(2) {
+            stream.extend(page.iter().copied());
+        }
+        fs::write(&path, &stream).map_err(|err| err.to_string())?;
+        assert_eq!(
+            probe_audio(&path)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            Some(2_568)
+        );
+        let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 }

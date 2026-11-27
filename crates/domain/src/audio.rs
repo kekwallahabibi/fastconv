@@ -815,6 +815,142 @@ impl AudioEncodingOptions {
     }
 }
 
+/// FNV-1a 64-bit hash of a byte slice, used to bind a saved WAV layout to the
+/// exact header bytes the probe validated.
+#[must_use]
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+/// Validated canonical signed-integer PCM layout of a RIFF/WAVE `data` chunk.
+///
+/// The boundary probe parses the WAV header once and records the exact payload
+/// range here. Downstream crates consume these values without re-parsing the
+/// header; they only open the file and read the validated byte range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PcmWavLayout {
+    channels: NonZeroU16,
+    bits_per_sample: NonZeroU16,
+    sample_rate: NonZeroU32,
+    block_align: NonZeroU16,
+    /// `dwChannelMask` from WAVEFORMATEXTENSIBLE; zero for plain PCM or an
+    /// unspecified layout. Kept so consumers can reject layouts whose speaker
+    /// order differs from the one their fast path assumes.
+    channel_mask: u32,
+    data_offset: u64,
+    data_bytes: u64,
+    /// FNV-1a of the file bytes before the payload. Re-checked by the pipeline
+    /// so a same-length replacement with a moved `data` chunk cannot be read at
+    /// a stale offset.
+    header_fingerprint: u64,
+}
+
+impl PcmWavLayout {
+    /// Validates the parsed header values of a canonical signed PCM WAV.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidPcmWavLayout`] when the values cannot
+    /// describe a whole number of signed-integer PCM frames.
+    // Eight independent header facts must be validated together; introducing a
+    // wrapper struct would only move the same arity one level down.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        channels: NonZeroU16,
+        bits_per_sample: NonZeroU16,
+        sample_rate: NonZeroU32,
+        block_align: NonZeroU16,
+        channel_mask: u32,
+        data_offset: u64,
+        data_bytes: u64,
+        header_fingerprint: u64,
+    ) -> Result<Self, DomainError> {
+        let invalid = |reason| DomainError::InvalidPcmWavLayout { reason };
+        if !(1..=8).contains(&channels.get()) {
+            return Err(invalid("channel count must be 1..=8"));
+        }
+        if !matches!(bits_per_sample.get(), 16 | 24 | 32) {
+            return Err(invalid("bit depth must be 16, 24 or 32"));
+        }
+        let expected_align =
+            usize::from(channels.get()).saturating_mul(usize::from(bits_per_sample.get()) / 8);
+        let expected_align = u16::try_from(expected_align).map_err(|_| invalid("frame size"))?;
+        if block_align.get() != expected_align {
+            return Err(invalid("block alignment does not match channels and depth"));
+        }
+        if data_bytes == 0 {
+            return Err(invalid("empty data chunk"));
+        }
+        let align = u64::from(block_align.get());
+        if !data_bytes.is_multiple_of(align) {
+            return Err(invalid("data chunk is not a whole number of frames"));
+        }
+        data_offset
+            .checked_add(data_bytes)
+            .ok_or(invalid("data chunk range overflow"))?;
+        Ok(Self {
+            channels,
+            bits_per_sample,
+            sample_rate,
+            block_align,
+            channel_mask,
+            data_offset,
+            data_bytes,
+            header_fingerprint,
+        })
+    }
+
+    #[must_use]
+    pub const fn channels(self) -> NonZeroU16 {
+        self.channels
+    }
+
+    #[must_use]
+    pub const fn bits_per_sample(self) -> NonZeroU16 {
+        self.bits_per_sample
+    }
+
+    #[must_use]
+    pub const fn sample_rate(self) -> NonZeroU32 {
+        self.sample_rate
+    }
+
+    #[must_use]
+    pub const fn block_align(self) -> NonZeroU16 {
+        self.block_align
+    }
+
+    #[must_use]
+    pub const fn channel_mask(self) -> u32 {
+        self.channel_mask
+    }
+
+    #[must_use]
+    pub const fn data_offset(self) -> u64 {
+        self.data_offset
+    }
+
+    #[must_use]
+    pub const fn data_bytes(self) -> u64 {
+        self.data_bytes
+    }
+
+    #[must_use]
+    pub const fn total_samples(self) -> u64 {
+        self.data_bytes / self.block_align.get() as u64
+    }
+
+    #[must_use]
+    pub const fn header_fingerprint(self) -> u64 {
+        self.header_fingerprint
+    }
+}
+
 /// Validated decoded stream metadata produced by the boundary probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct AudioStreamInfo {
@@ -823,6 +959,9 @@ pub struct AudioStreamInfo {
     bits_per_sample: Option<NonZeroU16>,
     sample_format: AudioSampleFormat,
     total_samples: Option<u64>,
+    /// Present only when the source is a canonical signed PCM WAV that the
+    /// pipeline may stream directly from the validated `data` chunk.
+    pcm_wav_layout: Option<PcmWavLayout>,
 }
 
 impl AudioStreamInfo {
@@ -867,7 +1006,24 @@ impl AudioStreamInfo {
             bits_per_sample,
             sample_format,
             total_samples,
+            pcm_wav_layout: None,
         })
+    }
+
+    /// Attaches the validated canonical PCM WAV layout parsed at the boundary.
+    ///
+    /// The layout is authoritative: every stream field is derived from it so
+    /// admission budgets and conversion cannot disagree when symphonia reported
+    /// different outer metadata for the same file.
+    #[must_use]
+    pub const fn with_pcm_wav_layout(mut self, layout: PcmWavLayout) -> Self {
+        self.channels = layout.channels();
+        self.sample_rate = layout.sample_rate();
+        self.bits_per_sample = Some(layout.bits_per_sample());
+        self.sample_format = AudioSampleFormat::Int;
+        self.total_samples = Some(layout.total_samples());
+        self.pcm_wav_layout = Some(layout);
+        self
     }
 
     #[must_use]
@@ -893,6 +1049,12 @@ impl AudioStreamInfo {
     #[must_use]
     pub const fn total_samples(self) -> Option<u64> {
         self.total_samples
+    }
+
+    /// Returns the validated canonical PCM WAV payload layout, if the source is one.
+    #[must_use]
+    pub const fn pcm_wav_layout(self) -> Option<PcmWavLayout> {
+        self.pcm_wav_layout
     }
 }
 
@@ -1428,6 +1590,41 @@ mod tests {
         )?;
         assert_eq!(float.sample_format(), AudioSampleFormat::Float);
         assert_eq!(float.bits_per_sample(), bits);
+        Ok(())
+    }
+
+    #[test]
+    fn wav_layout_overrides_mismatched_stream_metadata() -> Result<(), DomainError> {
+        let layout = PcmWavLayout::new(
+            NonZeroU16::new(1).unwrap_or(NonZeroU16::MIN),
+            NonZeroU16::new(16).unwrap_or(NonZeroU16::MIN),
+            NonZeroU32::new(44_100).unwrap_or(NonZeroU32::MIN),
+            NonZeroU16::new(2).unwrap_or(NonZeroU16::MIN),
+            0,
+            44,
+            4_000,
+            fnv1a64(b"header"),
+        )?;
+        // Deliberately wrong outer metadata for the same file: stereo, 48 kHz,
+        // float and a different frame count.
+        let outer = AudioStreamInfo::with_sample_format(
+            NonZeroU16::new(2).unwrap_or(NonZeroU16::MIN),
+            NonZeroU32::new(48_000).unwrap_or(NonZeroU32::MIN),
+            NonZeroU16::new(32),
+            AudioSampleFormat::Float,
+            Some(999),
+        )?
+        .with_pcm_wav_layout(layout);
+        assert_eq!(outer.channels().get(), 1);
+        assert_eq!(outer.sample_rate().get(), 44_100);
+        assert_eq!(
+            outer.bits_per_sample(),
+            NonZeroU16::new(16),
+            "layout bit depth must win"
+        );
+        assert_eq!(outer.sample_format(), AudioSampleFormat::Int);
+        assert_eq!(outer.total_samples(), Some(2_000));
+        assert_eq!(outer.pcm_wav_layout(), Some(layout));
         Ok(())
     }
 

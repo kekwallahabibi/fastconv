@@ -1,6 +1,7 @@
 //! ISO BMFF (M4A) muxing for AAC-LC and ALAC.
 
 use std::fs::OpenOptions;
+use std::io::{self, Cursor, Read, Write};
 use std::path::Path;
 
 use containr::mp4::{AudioCodec, Brand, MuxOptions, Muxer, PacketIn, SampleEntrySpec, TrackSpec};
@@ -8,12 +9,48 @@ use containr::{EditEntry, EditList, TrackKind};
 
 use crate::PipelineError;
 
+/// Above this payload size the in-memory faststart rewrite would pin too much
+/// RAM; the file-backed muxer streams the same bytes instead.
+const IN_MEMORY_MUX_LIMIT: u64 = 64 * 1024 * 1024;
+/// Same per-file decoded PCM allowance the pipeline enforces, expressed here so
+/// the byte-oriented ALAC entry point can reject an oversized WAV before a copy.
+const MAX_PCM_BYTES_PER_FILE: u64 = 512 * 1024 * 1024;
+
+/// Sum of all packet payloads, saturating so an absurd input cannot wrap the budget.
+fn packet_payload_bytes(packets: &[(Vec<u8>, u32)]) -> u64 {
+    packets.iter().fold(0_u64, |total, (data, _)| {
+        total.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX))
+    })
+}
+
+fn use_in_memory_mux(total_bytes: u64) -> bool {
+    total_bytes <= IN_MEMORY_MUX_LIMIT
+}
+
+/// Writes a fully muxed in-memory buffer to the staging path in one pass.
+fn write_muxed_bytes(path: &Path, bytes: &[u8]) -> Result<(), PipelineError> {
+    let io_err = |source| PipelineError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(io_err)?;
+    file.write_all(bytes).map_err(io_err)?;
+    file.flush().map_err(io_err)
+}
+
 /// Packets, largest encoded packet and cookie from one ALAC shard.
 type AlacShard = (Vec<(Vec<u8>, u32)>, u32, Vec<u8>);
 
-/// Encodes one contiguous shard of whole ALAC packets with a private encoder.
+/// Encodes one contiguous shard of whole ALAC frames supplied as little-endian
+/// PCM bytes with a private encoder. Working on bytes avoids a per-sample i16
+/// bounds check and copy for every shard.
 fn encode_alac_shard(
-    shard: &[i16],
+    shard: &[u8],
     channels: usize,
     sample_rate: f64,
     chunk_samples: usize,
@@ -27,50 +64,35 @@ fn encode_alac_shard(
     let input_fmt = alac_encoder::FormatDescription::pcm::<i16>(sample_rate, ch_u32);
     let mut encoder = alac_encoder::AlacEncoder::new(&output_fmt);
     let mut out_buf = vec![0_u8; output_fmt.max_packet_size()];
-    let mut bytes = vec![0_u8; chunk_samples.saturating_mul(2)];
+    let chunk_bytes = chunk_samples.saturating_mul(2).max(1);
     let mut max_frame_bytes = 0_u32;
-    let mut packets = Vec::new();
-    for chunk in shard.chunks(chunk_samples) {
-        for (index, &sample) in chunk.iter().enumerate() {
-            let start = index.saturating_mul(2);
-            if let Some(dst) = bytes.get_mut(start..start.saturating_add(2)) {
-                dst.copy_from_slice(&sample.to_le_bytes());
-            }
-        }
-        let frame_bytes = &bytes[..chunk.len().saturating_mul(2)];
-        let written = encoder.encode(&input_fmt, frame_bytes, &mut out_buf);
+    let mut packets = Vec::with_capacity(shard.len().div_ceil(chunk_bytes));
+    for chunk in shard.chunks(chunk_bytes) {
+        let written = encoder.encode(&input_fmt, chunk, &mut out_buf);
         max_frame_bytes = max_frame_bytes.max(u32::try_from(written).unwrap_or(u32::MAX));
-        let frames = u32::try_from(chunk.len() / channels).unwrap_or(u32::MAX);
+        let frames = u32::try_from(chunk.len() / 2 / channels.max(1)).unwrap_or(u32::MAX);
         packets.push((out_buf[..written].to_vec(), frames));
     }
     (packets, max_frame_bytes, encoder.magic_cookie())
 }
 
-fn mux_alac_packets(
+/// Writes one audio track of packets into any seekable sink. Keeping this in one
+/// place lets the small-payload path mux into memory and the large-payload path
+/// stream to a file with bit-identical output.
+fn mux_packets<W: Read + Write + io::Seek>(
     path: &Path,
+    writer: W,
     sample_rate: u32,
-    entry: Vec<u8>,
+    track: TrackSpec,
     packets: &[(Vec<u8>, u32)],
-) -> Result<(), PipelineError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|source| PipelineError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let mut track = TrackSpec::new(TrackKind::Audio, sample_rate, SampleEntrySpec::Raw(entry));
-    track.default_duration = Some(alac_encoder::DEFAULT_FRAMES_PER_PACKET);
+) -> Result<W, PipelineError> {
     let options = MuxOptions {
         brand: Brand::Isom,
         faststart: true,
         movie_timescale: sample_rate,
         ..MuxOptions::default()
     };
-    let mut muxer = Muxer::new(file, options).map_err(|err| encode_err(path, &err))?;
+    let mut muxer = Muxer::new(writer, options).map_err(|err| encode_err(path, &err))?;
     let track_id = muxer
         .add_track(track)
         .map_err(|err| encode_err(path, &err))?;
@@ -88,10 +110,41 @@ fn mux_alac_packets(
             .map_err(|err| encode_err(path, &err))?;
         cursor = cursor.saturating_add(i64::from(*frames));
     }
-    muxer
-        .finish()
-        .map(|_| ())
-        .map_err(|err| encode_err(path, &err))
+    muxer.finish().map_err(|err| encode_err(path, &err))
+}
+
+fn mux_alac_packets(
+    path: &Path,
+    sample_rate: u32,
+    entry: Vec<u8>,
+    packets: &[(Vec<u8>, u32)],
+) -> Result<(), PipelineError> {
+    let mut track = TrackSpec::new(TrackKind::Audio, sample_rate, SampleEntrySpec::Raw(entry));
+    track.default_duration = Some(alac_encoder::DEFAULT_FRAMES_PER_PACKET);
+    if use_in_memory_mux(packet_payload_bytes(packets)) {
+        let reserve = usize::try_from(packet_payload_bytes(packets).saturating_add(256 * 1024))
+            .unwrap_or(usize::MAX);
+        let buffered = mux_packets(
+            path,
+            Cursor::new(Vec::with_capacity(reserve)),
+            sample_rate,
+            track,
+            packets,
+        )?;
+        return write_muxed_bytes(path, &buffered.into_inner());
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|source| PipelineError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    mux_packets(path, file, sample_rate, track, packets)?;
+    Ok(())
 }
 
 /// Writes an ISO/IEC 14496-1 descriptor with the four-byte expanded length form.
@@ -192,16 +245,6 @@ pub(crate) fn write_m4a_aac(
     priming_samples: u32,
     packets: &[(Vec<u8>, u32)],
 ) -> Result<(), PipelineError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|source| PipelineError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
     let asc = rusty_aac::audio_specific_config_bytes(sample_rate, channels);
     let esds = build_aac_esds(&asc, bitrate_bps);
     let mut track = TrackSpec::new(
@@ -225,31 +268,29 @@ pub(crate) fn write_m4a_aac(
             }],
         };
     }
-    let options = MuxOptions {
-        brand: Brand::Isom,
-        faststart: true,
-        movie_timescale: sample_rate,
-        ..MuxOptions::default()
-    };
-    let mut muxer = Muxer::new(file, options).map_err(|err| encode_err(path, &err))?;
-    let track_id = muxer
-        .add_track(track)
-        .map_err(|err| encode_err(path, &err))?;
-    let mut cursor = 0_i64;
-    for (data, duration) in packets {
-        let packet = PacketIn {
-            data,
-            pts: cursor,
-            dts: cursor,
-            duration: Some(u64::from(*duration)),
-            sync: true,
-        };
-        muxer
-            .write_packet(track_id, &packet)
-            .map_err(|err| encode_err(path, &err))?;
-        cursor = cursor.saturating_add(i64::from(*duration));
+    if use_in_memory_mux(packet_payload_bytes(packets)) {
+        let reserve = usize::try_from(packet_payload_bytes(packets).saturating_add(256 * 1024))
+            .unwrap_or(usize::MAX);
+        let buffered = mux_packets(
+            path,
+            Cursor::new(Vec::with_capacity(reserve)),
+            sample_rate,
+            track,
+            packets,
+        )?;
+        return write_muxed_bytes(path, &buffered.into_inner());
     }
-    muxer.finish().map_err(|err| encode_err(path, &err))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|source| PipelineError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    mux_packets(path, file, sample_rate, track, packets)?;
     Ok(())
 }
 
@@ -275,21 +316,61 @@ pub(crate) fn encode_alac_m4a(
             ),
         });
     }
-    // Frame-aligned PCM keeps every shard boundary on a packet boundary.
-    if !samples_i16.len().is_multiple_of(channels) {
+    let byte_len = u64::try_from(samples_i16.len())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(2);
+    if byte_len > MAX_PCM_BYTES_PER_FILE {
         return Err(PipelineError::EncodeFailed {
             path: path.to_path_buf(),
-            reason: format!(
-                "ALAC PCM sample count {} is not a multiple of {channels} channels",
-                samples_i16.len()
-            ),
+            reason: format!("ALAC PCM exceeds the {MAX_PCM_BYTES_PER_FILE}-byte per-file limit"),
         });
     }
-    let ch_u16 = u16::try_from(channels).map_err(|_| PipelineError::EncodeFailed {
+    let mut pcm_bytes = Vec::with_capacity(usize::try_from(byte_len).unwrap_or(usize::MAX));
+    for &sample in samples_i16 {
+        pcm_bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    encode_alac_m4a_le_bytes(path, sample_rate, channels, &pcm_bytes, inner_threads)
+}
+
+/// Encodes canonical little-endian 16-bit PCM (the layout of a WAV `data`
+/// chunk) as ALAC in an M4A file. Each worker owns a contiguous run of whole
+/// `DEFAULT_FRAME_SIZE` packets, so the ALAC predictor state stays local and
+/// only the final packet of the stream can be partial.
+pub(crate) fn encode_alac_m4a_le_bytes(
+    path: &Path,
+    sample_rate: u32,
+    channels: usize,
+    pcm_bytes: &[u8],
+    inner_threads: usize,
+) -> Result<(), PipelineError> {
+    let reject = |reason: String| PipelineError::EncodeFailed {
         path: path.to_path_buf(),
-        reason: format!("ALAC channel count {channels} exceeds the 16-bit field"),
+        reason,
+    };
+    if !(1..=8).contains(&channels) || pcm_bytes.is_empty() {
+        return Err(reject(format!(
+            "ALAC supports 1-8 channels and non-empty PCM, got {channels} channels and {} bytes",
+            pcm_bytes.len()
+        )));
+    }
+    let frame_bytes = channels.saturating_mul(2);
+    if !pcm_bytes.len().is_multiple_of(frame_bytes) {
+        return Err(reject(format!(
+            "ALAC PCM byte count {} is not a multiple of the {frame_bytes}-byte frame",
+            pcm_bytes.len()
+        )));
+    }
+    if u64::try_from(pcm_bytes.len()).unwrap_or(u64::MAX) > MAX_PCM_BYTES_PER_FILE {
+        return Err(reject(format!(
+            "ALAC PCM exceeds the {MAX_PCM_BYTES_PER_FILE}-byte per-file limit"
+        )));
+    }
+    let ch_u16 = u16::try_from(channels).map_err(|_| {
+        reject(format!(
+            "ALAC channel count {channels} exceeds the 16-bit field"
+        ))
     })?;
-    let total_frames = samples_i16.len() / channels;
+    let total_frames = pcm_bytes.len() / frame_bytes;
     let packet_count = total_frames.div_ceil(alac_encoder::DEFAULT_FRAME_SIZE);
     let requested_workers = inner_threads.max(1).min(packet_count);
     let packets_per_worker = packet_count.div_ceil(requested_workers);
@@ -311,8 +392,9 @@ pub(crate) fn encode_alac_m4a(
             let end_frame = start_frame
                 .saturating_add(packets_per_worker.saturating_mul(alac_encoder::DEFAULT_FRAME_SIZE))
                 .min(total_frames);
-            let shard = &samples_i16
-                [start_frame.saturating_mul(channels)..end_frame.saturating_mul(channels)];
+            let shard = pcm_bytes
+                .get(start_frame.saturating_mul(frame_bytes)..end_frame.saturating_mul(frame_bytes))
+                .ok_or_else(|| reject("ALAC shard outside PCM buffer".to_owned()))?;
             handles.push((
                 slot,
                 scope.spawn(move || {
@@ -340,13 +422,10 @@ pub(crate) fn encode_alac_m4a(
     }
     let mut cookie = cookie.ok_or(PipelineError::WorkerPanicked)?;
     if cookie.len() < 24 {
-        return Err(PipelineError::EncodeFailed {
-            path: path.to_path_buf(),
-            reason: format!(
-                "ALAC magic cookie is {} bytes, expected at least 24",
-                cookie.len()
-            ),
-        });
+        return Err(reject(format!(
+            "ALAC magic cookie is {} bytes, expected at least 24",
+            cookie.len()
+        )));
     }
     // ALACSpecificConfig: frame_length(4), version(1), bit_depth(1), PB/MB/KB(1 each),
     // channels(1), max_run(2), max_frame_bytes(4) at byte offset 12.
@@ -600,6 +679,44 @@ mod tests {
         let path = dir.join("out.m4a");
         let result = encode_alac_m4a(&path, 48_000, 2, &[0_i16; 4097], 4);
         assert!(matches!(result, Err(PipelineError::EncodeFailed { .. })));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn in_memory_mux_limit_boundary() {
+        assert!(use_in_memory_mux(0));
+        assert!(use_in_memory_mux(IN_MEMORY_MUX_LIMIT));
+        assert!(!use_in_memory_mux(IN_MEMORY_MUX_LIMIT.saturating_add(1)));
+        assert!(!use_in_memory_mux(u64::MAX));
+    }
+
+    #[test]
+    fn alac_le_bytes_roundtrip_is_bit_exact() -> Result<(), PipelineError> {
+        let dir = temp_dir("le-bytes-roundtrip");
+        let path = dir.join("out.m4a");
+        let samples = tone(alac_encoder::DEFAULT_FRAME_SIZE + 19, 2);
+        let mut bytes = Vec::with_capacity(samples.len().saturating_mul(2));
+        for &sample in &samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        encode_alac_m4a_le_bytes(&path, 48_000, 2, &bytes, 3)?;
+        assert_eq!(decode_alac(&path)?, samples);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn alac_le_bytes_rejects_misaligned_and_empty_input() {
+        let dir = temp_dir("le-bytes-invalid");
+        let path = dir.join("out.m4a");
+        assert!(matches!(
+            encode_alac_m4a_le_bytes(&path, 48_000, 2, &[], 1),
+            Err(PipelineError::EncodeFailed { .. })
+        ));
+        assert!(matches!(
+            encode_alac_m4a_le_bytes(&path, 48_000, 2, &[0_u8; 7], 1),
+            Err(PipelineError::EncodeFailed { .. })
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 }
