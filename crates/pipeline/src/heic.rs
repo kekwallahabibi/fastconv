@@ -254,6 +254,9 @@ pub(crate) fn decode_heic_slice_into(
     let options = heifer::Options::new()
         .with_max_threads(1)
         .with_max_pixels(MAX_HEIC_DECODE_PIXELS);
+    // Keep coded samples: `decode_srgb_rgba8` would reject PQ/HLG and non-RGB ICC
+    // inputs that decode fine today, and colour management is a repo-wide policy
+    // (JPEG/AVIF also pass samples through) rather than a HEIC-only decision.
     let image = heifer::decode_rgba8(file_bytes, &options)
         .map_err(|err| decode_error(source, format!("HEIC decode failed: {err}")))?;
     let (width, height) = (image.width, image.height);
@@ -822,16 +825,27 @@ mod tests {
         }
 
         let jpeg_target = root.join("alpha.jpg");
-        assert!(matches!(
-            convert_heic(
-                &source,
-                &jpeg_target,
-                ImageOutputFormat::Jpeg,
-                width,
-                height
+        let jpeg_result = convert_heic(
+            &source,
+            &jpeg_target,
+            ImageOutputFormat::Jpeg,
+            width,
+            height,
+        );
+        let Err(jpeg_error) = jpeg_result else {
+            return Err("JPEG conversion unexpectedly accepted an alpha image".into());
+        };
+        let Some(pipeline_error) = jpeg_error.downcast_ref::<PipelineError>() else {
+            return Err("JPEG rejection was not a PipelineError".into());
+        };
+        assert!(
+            matches!(
+                pipeline_error,
+                PipelineError::UnsupportedPixelFormat { format, .. }
+                    if format.contains("JPEG does not support transparency")
             ),
-            Err(err) if err.to_string().contains("alpha")
-        ));
+            "unexpected JPEG error: {pipeline_error}"
+        );
 
         fs::remove_dir_all(&root)?;
         Ok(())
