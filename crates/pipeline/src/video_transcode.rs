@@ -3061,7 +3061,7 @@ fn input_size(path: &Path) -> u64 {
     fs::metadata(path).map_or(0, |meta| meta.len())
 }
 
-fn enforce_decoded_budget(path: &Path, bytes: u64) -> Result<(), PipelineError> {
+pub(crate) fn enforce_decoded_budget(path: &Path, bytes: u64) -> Result<(), PipelineError> {
     if bytes > MAX_DECODED_BYTES_PER_TRACK {
         return Err(decode_error(
             path,
@@ -4035,7 +4035,7 @@ pub fn execute_video_transcode_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::video_codecs::Yuv420Frame;
+    use crate::video_codecs::{Yuv420Frame, YuvColor};
     use crate::video_container::{ContainerMedia, mux_video};
     use fastconv_domain::{
         AnimationLoop, AudioBitrate, AudioChannels, AudioEncodeOptions, AudioSampleRate,
@@ -4172,6 +4172,7 @@ mod tests {
                     v: vec![118_u8; (w / 2) * (h / 2)],
                     pts_us: i64::try_from(index).unwrap_or(i64::MAX) * 20_000,
                     duration_us: 20_000,
+                    color: YuvColor::default(),
                 }
             })
             .collect()
@@ -5921,6 +5922,7 @@ mod tests {
                     v: vec![140; chroma],
                     pts_us: i64::try_from(index).unwrap_or(0).saturating_mul(40_000),
                     duration_us: 40_000,
+                    color: YuvColor::default(),
                 }
             })
             .collect()
@@ -6446,6 +6448,7 @@ mod tests {
                 v: vec![128; 160 * 120],
                 pts_us: i64::from(index) * 40_000,
                 duration_us: 40_000,
+                color: YuvColor::default(),
             })
             .collect();
         let encoded = encode_video_cpu(
@@ -6583,6 +6586,7 @@ mod tests {
                 v: vec![128; 16 * 16],
                 pts_us: i64::from(idx) * 40_000,
                 duration_us: 40_000,
+                color: YuvColor::default(),
             })
             .collect();
         let stream = encode_video_cpu(

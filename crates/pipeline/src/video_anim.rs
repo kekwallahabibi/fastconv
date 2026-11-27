@@ -190,6 +190,7 @@ fn yuv420_simd_frame(
         v: v_plane,
         pts_us: info.pts_us,
         duration_us: info.duration_us,
+        color: YuvColor::default(),
     })
 }
 
@@ -265,6 +266,7 @@ pub(crate) fn rgb_to_yuv420(info: AnimFrameInfo, rgb: &[u8]) -> Result<Yuv420Fra
         v: v_plane,
         pts_us: info.pts_us,
         duration_us: info.duration_us,
+        color: YuvColor::default(),
     })
 }
 

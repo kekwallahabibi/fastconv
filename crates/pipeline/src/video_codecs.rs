@@ -50,6 +50,8 @@ pub(crate) struct Yuv420Frame {
     pub(crate) v: Vec<u8>,
     pub(crate) pts_us: i64,
     pub(crate) duration_us: u64,
+    /// Signalled colour of the planes; unsignalled means BT.601 limited.
+    pub(crate) color: YuvColor,
 }
 
 /// YUV→RGB matrix signalled by the source bitstream. BT.601 is the explicit
@@ -464,6 +466,7 @@ fn h264_frame(frame: H264YuvFrame, pts_us: i64, duration_us: u64) -> Yuv420Frame
         v: frame.v,
         pts_us,
         duration_us,
+        color: YuvColor::default(),
     }
 }
 
@@ -537,6 +540,7 @@ fn hevc_frame(
         v,
         pts_us,
         duration_us,
+        color: YuvColor::default(),
     })
 }
 
@@ -666,6 +670,7 @@ fn av1_frame(
         v,
         pts_us,
         duration_us,
+        color: YuvColor::default(),
     })
 }
 
@@ -736,6 +741,7 @@ fn vp9_frame(
         v: vp9_plane(plane(2)?, stride(2)?, cw, ch, frame.bit_depth, path)?,
         pts_us: frame.pts.unwrap_or(0),
         duration_us,
+        color: YuvColor::default(),
     })
 }
 
@@ -806,7 +812,8 @@ pub(crate) fn decode_video_track(
     packets: &[ContainerPacket],
 ) -> Result<Vec<Yuv420Frame>, PipelineError> {
     let ordered = decode_order(packets);
-    match track.codec {
+    let track_color = source_color(track, &ordered);
+    let decoded = match track.codec {
         VideoCodec::H264 => {
             let mut decoder = H264Decoder::new();
             let mut frames = Vec::with_capacity(ordered.len());
@@ -952,9 +959,10 @@ pub(crate) fn decode_video_track(
         VideoCodec::Mjpeg => {
             let mut frames = Vec::with_capacity(ordered.len());
             let mut rgb = Vec::new();
+            let mut retained = 0_u64;
             for packet in ordered {
                 let (width, height) = mjpeg_decode_rgb(path, &packet.data, &mut rgb)?;
-                frames.push(crate::video_anim::rgb_to_yuv420(
+                let frame = crate::video_anim::rgb_to_yuv420(
                     crate::video_anim::AnimFrameInfo {
                         width: u32::from(width),
                         height: u32::from(height),
@@ -963,7 +971,16 @@ pub(crate) fn decode_video_track(
                         channels: 3,
                     },
                     rgb.as_slice(),
-                )?);
+                )?;
+                // JPEG frames carry their own dimensions, which may be larger
+                // than the container geometry the caller used for its estimate.
+                // Count each frame as it is retained, before the next decode.
+                retained = retained
+                    .saturating_add(u64::try_from(frame.y.len()).unwrap_or(u64::MAX))
+                    .saturating_add(u64::try_from(frame.u.len()).unwrap_or(u64::MAX))
+                    .saturating_add(u64::try_from(frame.v.len()).unwrap_or(u64::MAX));
+                crate::video_transcode::enforce_decoded_budget(path, retained)?;
+                frames.push(frame);
             }
             Ok(frames)
         }
@@ -979,7 +996,18 @@ pub(crate) fn decode_video_track(
             path,
             format!("codec {other} is not a supported video decoder"),
         )),
+    };
+    let mut frames = decoded?;
+    // The streaming path applies the signalled track colour to every frame;
+    // do the same for the buffered path so RGB-producing encoders agree with
+    // it. JPEG-derived frames are already BT.601 limited and carry no signal,
+    // so they keep the explicit default.
+    for frame in &mut frames {
+        if !frame.color.signalled {
+            frame.color = track_color;
+        }
     }
+    Ok(frames)
 }
 
 /// Streaming NV12 decode path shared by the CPU animation pipeline and the
@@ -2611,6 +2639,31 @@ fn cpu_vp9(
     )
 }
 
+/// Maps the signalled source colour to the `yuv` converter inputs. An
+/// unsupported matrix is rejected where RGB is produced, mirroring the
+/// streaming path instead of silently using a different matrix.
+fn mjpeg_color(
+    path: &Path,
+    color: YuvColor,
+) -> Result<(SimdYuvRange, YuvStandardMatrix), PipelineError> {
+    let matrix = match color.matrix {
+        YuvMatrix::Bt601 => YuvStandardMatrix::Bt601,
+        YuvMatrix::Bt709 => YuvStandardMatrix::Bt709,
+        YuvMatrix::Bt2020 => YuvStandardMatrix::Bt2020,
+        YuvMatrix::Unsupported(code) => {
+            return Err(encode_error(
+                path,
+                format!("YUV→RGB conversion for matrix coefficient {code} is not supported"),
+            ));
+        }
+    };
+    let range = match color.range {
+        YuvRange::Limited => SimdYuvRange::Limited,
+        YuvRange::Full => SimdYuvRange::Full,
+    };
+    Ok((range, matrix))
+}
+
 /// Encodes one independent baseline JPEG per frame. `rgb` is a reusable
 /// scratch buffer, so a clip of equally sized frames allocates it only once.
 fn cpu_mjpeg(
@@ -2627,6 +2680,14 @@ fn cpu_mjpeg(
     let w16 = u16::try_from(width).map_err(|_| encode_error(path, "MJPEG width exceeds 65535"))?;
     let h16 =
         u16::try_from(height).map_err(|_| encode_error(path, "MJPEG height exceeds 65535"))?;
+    if width > MJPEG_MAX_DIMENSION || height > MJPEG_MAX_DIMENSION {
+        return Err(encode_error(
+            path,
+            format!(
+                "MJPEG dimensions {width}x{height} exceed the {MJPEG_MAX_DIMENSION}-pixel per-axis cap"
+            ),
+        ));
+    }
     let pixels = u64::from(width).saturating_mul(u64::from(height));
     if pixels > MJPEG_MAX_PIXELS {
         return Err(encode_error(
@@ -2667,15 +2728,17 @@ fn cpu_mjpeg(
             height,
         };
         rgb.resize(rgb_len, 0);
-        // Frames carry no per-frame colour description; BT.601 limited is the
-        // explicit default used by every other CPU animation encoder here.
+        // Use the signalled source colour instead of a fixed matrix: H.264/HEVC
+        // sources routinely signal BT.709, and decoding those planes as BT.601
+        // would shift the colours of every MJPEG frame.
+        let (range, matrix) = mjpeg_color(path, frame.color)?;
         yuv::yuv420_to_rgb(
             &image,
             &mut rgb,
             u32::try_from(w.saturating_mul(3))
                 .map_err(|_| encode_error(path, "MJPEG RGB stride exceeds u32"))?,
-            SimdYuvRange::Limited,
-            YuvStandardMatrix::Bt601,
+            range,
+            matrix,
         )
         .map_err(|err| encode_error(path, format!("MJPEG YUV→RGB conversion failed: {err}")))?;
         let mut jpeg = Vec::new();
@@ -2781,6 +2844,7 @@ mod tests {
                     v: vec![120_u8; chroma],
                     pts_us: i64::try_from(index).unwrap_or(0) * 40_000,
                     duration_us: 40_000,
+                    color: YuvColor::default(),
                 }
             })
             .collect()
@@ -3024,6 +3088,47 @@ mod tests {
         // Oversized packets are rejected before any header parsing.
         let oversized = vec![0_u8; MJPEG_PACKET_CAP.saturating_add(1)];
         assert!(mjpeg_decode_rgb(path, &oversized, &mut rgb).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn mjpeg_encode_rejects_oversized_axis() {
+        let path = Path::new("mjpeg-oversized-axis");
+        // Well under the pixel cap, but the decoder would refuse this width.
+        let frames = vec![Yuv420Frame {
+            width: 10_000,
+            height: 2,
+            y: vec![0; 20_000],
+            u: vec![128; 5_000],
+            v: vec![128; 5_000],
+            pts_us: 0,
+            duration_us: 40_000,
+            color: YuvColor::default(),
+        }];
+        assert!(matches!(
+            cpu_mjpeg(path, &frames, VideoQuality::DEFAULT, 0, 25, 1),
+            Err(PipelineError::EncodeFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn mjpeg_encode_uses_signalled_source_colour() -> Result<(), PipelineError> {
+        let path = Path::new("mjpeg-colour");
+        let frames = synthetic_frames(64, 48, 1);
+        let default = cpu_mjpeg(path, &frames, VideoQuality::DEFAULT, 0, 25, 1)?;
+        let mut bt709 = frames.clone();
+        bt709[0].color = YuvColor::specified(YuvMatrix::Bt709, YuvRange::Limited);
+        let signalled = cpu_mjpeg(path, &bt709, VideoQuality::DEFAULT, 0, 25, 1)?;
+        assert_ne!(
+            default.packets[0].data, signalled.packets[0].data,
+            "BT.709 planes must not be encoded as BT.601"
+        );
+        let mut unsupported = frames.clone();
+        unsupported[0].color = YuvColor::specified(YuvMatrix::Unsupported(10), YuvRange::Limited);
+        assert!(matches!(
+            cpu_mjpeg(path, &unsupported, VideoQuality::DEFAULT, 0, 25, 1),
+            Err(PipelineError::EncodeFailed { .. })
+        ));
         Ok(())
     }
 
@@ -3436,6 +3541,7 @@ mod tests {
                 v: vec![128; 1],
                 pts_us: packet.pts,
                 duration_us: packet.duration,
+                color: YuvColor::default(),
             });
             let future_min = future_mins.get(index + 1).copied();
             drain_ready_h264_reorder_vec(
@@ -3465,6 +3571,7 @@ mod tests {
                 v: vec![128; 1],
                 pts_us: index * 10,
                 duration_us: 10,
+                color: YuvColor::default(),
             })
             .collect();
         let mut emitted = Vec::new();
@@ -3535,6 +3642,7 @@ mod tests {
             v: v_plane,
             pts_us: info.pts_us,
             duration_us: info.duration_us,
+            color: info.color,
         })
     }
 
@@ -3565,7 +3673,20 @@ mod tests {
                 streamed.push(unpack_streamed_frame(path, info, &dst, pitch)?);
                 Ok(())
             })?;
-            assert_eq!(streamed, buffered);
+            // This test compares decoded pixels, not colour metadata: AV1
+            // signals colour per frame on the streaming path while the buffered
+            // frame carries the track default.
+            let without_color = |frames: &[Yuv420Frame]| -> Vec<Yuv420Frame> {
+                frames
+                    .iter()
+                    .cloned()
+                    .map(|mut frame| {
+                        frame.color = YuvColor::default();
+                        frame
+                    })
+                    .collect()
+            };
+            assert_eq!(without_color(&streamed), without_color(&buffered));
         }
         Ok(())
     }
