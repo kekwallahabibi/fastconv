@@ -3,12 +3,14 @@ use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(feature = "serde")]
 use serde::Serialize;
 
-use crate::{DomainError, HardwareBackend, PathRole};
+use crate::{DomainError, HardwareBackend, PathRole, u64_to_f64};
 
 /// Audio container/codec formats accepted at the system boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum AudioInputFormat {
     Wav,
     Flac,
@@ -61,7 +63,8 @@ impl fmt::Display for AudioInputFormat {
 }
 
 /// Native Rust audio encoders available to the pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum AudioOutputFormat {
     Wav,
     Flac,
@@ -240,7 +243,8 @@ impl fmt::Display for AudioOutputFormat {
 /// Pairing a codec with an incompatible container is rejected by
 /// [`AudioOutputFormat::resolve_codec`] before a plan can be built, so an
 /// `(AudioOutputFormat, AudioTargetCodec)` pair inside a plan is always valid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum AudioTargetCodec {
     Pcm,
     Flac,
@@ -281,7 +285,8 @@ impl fmt::Display for AudioTargetCodec {
 ///
 /// This is a lossless-encoder knob only: lossy codecs consume normalized `f32`
 /// samples and reject every explicit depth at the domain boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum AudioBitDepth {
     Int8,
     Int16,
@@ -325,7 +330,8 @@ impl fmt::Display for AudioBitDepth {
 }
 
 /// Whether a decoded stream carries integer or IEEE float samples.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum AudioSampleFormat {
     #[default]
     Int,
@@ -333,7 +339,8 @@ pub enum AudioSampleFormat {
 }
 
 /// Validated lossy-audio target bitrate in bits per second.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct AudioOptionBitrate(NonZeroU32);
 
 impl AudioOptionBitrate {
@@ -377,7 +384,8 @@ pub const fn aac_frame_capacity_bps(hz: u32, channels: u16) -> u32 {
 }
 
 /// Validated lossy-audio quality on a 0..=100 scale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct AudioQuality(u8);
 
 impl AudioQuality {
@@ -404,7 +412,8 @@ impl AudioQuality {
 }
 
 /// Mutually exclusive rate-control choice for lossy audio encoders.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum AudioRateControl {
     #[default]
     Default,
@@ -413,7 +422,8 @@ pub enum AudioRateControl {
 }
 
 /// Validated audio sample rate in Hz plus the rate tables of the native encoders.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct AudioOptionSampleRate(NonZeroU32);
 
 impl AudioOptionSampleRate {
@@ -459,7 +469,8 @@ impl AudioOptionSampleRate {
 }
 
 /// Validated channel count for audio conversion (1..=8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct AudioOptionChannels(NonZeroU16);
 
 impl AudioOptionChannels {
@@ -494,7 +505,8 @@ impl AudioOptionChannels {
 ///
 /// A default instance selects the exact encoder settings used before these
 /// options existed, so the type carries no behaviour change on its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct AudioEncodingOptions {
     rate_control: AudioRateControl,
     sample_rate: Option<AudioOptionSampleRate>,
@@ -832,7 +844,8 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
 /// The boundary probe parses the WAV header once and records the exact payload
 /// range here. Downstream crates consume these values without re-parsing the
 /// header; they only open the file and read the validated byte range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct PcmWavLayout {
     channels: NonZeroU16,
     bits_per_sample: NonZeroU16,
@@ -952,7 +965,8 @@ impl PcmWavLayout {
 }
 
 /// Validated decoded stream metadata produced by the boundary probe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct AudioStreamInfo {
     channels: NonZeroU16,
     sample_rate: NonZeroU32,
@@ -1062,7 +1076,8 @@ impl AudioStreamInfo {
 ///
 /// There is no GPU variant: audio conversion on a GPU backend is rejected before a plan is
 /// created, so a GPU audio plan cannot be represented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum AudioExecutionMode {
     CpuWav,
     CpuFlac,
@@ -1196,7 +1211,8 @@ impl fmt::Display for AudioExecutionMode {
 }
 
 /// Single validated audio conversion item.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct AudioBatchItem {
     source: PathBuf,
     target: PathBuf,
@@ -1256,7 +1272,8 @@ impl AudioBatchItem {
 }
 
 /// Validated non-empty audio batch with conflict-free targets and one explicit CPU encoder.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct AudioBatchPlan {
     items: Vec<AudioBatchItem>,
     mode: AudioExecutionMode,
@@ -1356,7 +1373,8 @@ impl AudioBatchPlan {
 }
 
 /// Execution summary returned after an [`AudioBatchPlan`] completes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct AudioConversionReport {
     files_converted: NonZeroUsize,
     total_input_bytes: NonZeroU64,
@@ -1432,12 +1450,6 @@ impl AudioConversionReport {
         }
         (u64_to_f64(self.total_input_bytes.get()) / 1_000_000.0) / secs
     }
-}
-
-fn u64_to_f64(value: u64) -> f64 {
-    let hi = u32::try_from(value >> 32).unwrap_or(u32::MAX);
-    let lo = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
-    f64::from(hi) * 4_294_967_296.0 + f64::from(lo)
 }
 
 #[cfg(test)]

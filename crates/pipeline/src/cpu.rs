@@ -1,10 +1,7 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::{self, BufWriter, Seek, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
@@ -41,6 +38,7 @@ use crate::heic::encode_heic_into;
 use crate::ico::encode_ico_into;
 use crate::pnm::encode_pnm_to_writer;
 use crate::qoi::encode_qoi_into;
+use crate::staging::StagingTarget;
 
 const STREAM_IO_BUF_BYTES: usize = 512 * 1024;
 const PNG_IDAT_CHUNK_BYTES: usize = 256 * 1024;
@@ -95,8 +93,6 @@ pub(crate) enum CpuImageEncoder {
         quality: ImageQuality,
     },
 }
-
-static STAGING_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct CountingWriter<W> {
     inner: W,
@@ -160,93 +156,6 @@ impl<W: Write> Write for CountingWriter<W> {
                 self.record_error(&err);
                 Err(err)
             }
-        }
-    }
-}
-
-struct StagingFile {
-    path: PathBuf,
-    committed: bool,
-}
-
-impl StagingFile {
-    fn create_for(target: &Path) -> Result<(Self, File), PipelineError> {
-        let parent = target
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let pid = process::id();
-        for _ in 0..64 {
-            let seq = STAGING_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let tmp_path = parent.join(format!(".fastconv-{pid}-{seq}.tmp"));
-            let mut open_opts = OpenOptions::new();
-            open_opts.write(true).create_new(true);
-            // Create staging files owner-only regardless of process umask so image data is never
-            // exposed during staging or after replacing a restrictive destination file.
-            #[cfg(unix)]
-            open_opts.mode(0o600);
-            match open_opts.open(&tmp_path) {
-                Ok(file) => {
-                    return Ok((
-                        Self {
-                            path: tmp_path,
-                            committed: false,
-                        },
-                        file,
-                    ));
-                }
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(source) => {
-                    return Err(PipelineError::Io {
-                        path: tmp_path,
-                        source,
-                    });
-                }
-            }
-        }
-        Err(PipelineError::Io {
-            path: target.to_path_buf(),
-            source: io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "failed to create unique temporary staging file",
-            ),
-        })
-    }
-
-    fn commit(mut self, target: &Path, file: File) -> Result<(), PipelineError> {
-        preserve_existing_permissions(&file, target)?;
-        drop(file);
-        fs::rename(&self.path, target).map_err(|source| PipelineError::Io {
-            path: target.to_path_buf(),
-            source,
-        })?;
-        self.committed = true;
-        Ok(())
-    }
-}
-
-fn preserve_existing_permissions(file: &File, target: &Path) -> Result<(), PipelineError> {
-    match fs::symlink_metadata(target) {
-        Ok(meta) if meta.file_type().is_file() => {
-            file.set_permissions(meta.permissions())
-                .map_err(|source| PipelineError::Io {
-                    path: target.to_path_buf(),
-                    source,
-                })
-        }
-        Ok(_) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(PipelineError::Io {
-            path: target.to_path_buf(),
-            source,
-        }),
-    }
-}
-
-impl Drop for StagingFile {
-    fn drop(&mut self) {
-        if !self.committed && fs::remove_file(&self.path).is_err() {
-            // Best-effort cleanup of the staging file when encoding or rename failed.
         }
     }
 }
@@ -693,14 +602,14 @@ fn encode_png_streaming(
     decoded: DecodedFrameMeta,
     level: CompressionLevel,
 ) -> Result<u64, PipelineError> {
-    let (staging, file) = StagingFile::create_for(target)?;
+    let (staging, file) = StagingTarget::create_for_image(target)?;
     let mut buf_writer = BufWriter::with_capacity(STREAM_IO_BUF_BYTES, file);
     let bytes = encode_png_to_writer(target, pixels, decoded, level, &mut buf_writer)?;
     let file = buf_writer.into_inner().map_err(|err| PipelineError::Io {
         path: target.to_path_buf(),
         source: err.into_error(),
     })?;
-    staging.commit(target, file)?;
+    staging.commit_with_permissions(file)?;
     Ok(bytes)
 }
 
@@ -710,7 +619,7 @@ fn encode_pnm_streaming(
     decoded: DecodedFrameMeta,
     aux_buf: &mut Vec<u8>,
 ) -> Result<u64, PipelineError> {
-    let (staging, file) = StagingFile::create_for(target)?;
+    let (staging, file) = StagingTarget::create_for_image(target)?;
     let mut buf_writer = BufWriter::with_capacity(STREAM_IO_BUF_BYTES, file);
     let bytes = encode_pnm_to_writer(target, pixels, decoded, aux_buf, &mut buf_writer)?;
     let file = buf_writer.into_inner().map_err(|err| PipelineError::Io {
@@ -720,7 +629,7 @@ fn encode_pnm_streaming(
     if bytes == 0 {
         return Err(PipelineError::EmptyOutput(target.to_path_buf()));
     }
-    staging.commit(target, file)?;
+    staging.commit_with_permissions(file)?;
     Ok(bytes)
 }
 
@@ -739,7 +648,7 @@ fn encode_heic_streaming(
 
     // `encode_heic_into` already produces one contiguous buffer; a BufWriter
     // would only add a 512 KiB allocation and a second copy of the same bytes.
-    let (staging, file) = StagingFile::create_for(target)?;
+    let (staging, file) = StagingTarget::create_for_image(target)?;
     let mut file = file;
     file.write_all(&encoded)
         .map_err(|source| PipelineError::Io {
@@ -750,7 +659,7 @@ fn encode_heic_streaming(
         path: target.to_path_buf(),
         source,
     })?;
-    staging.commit(target, file)?;
+    staging.commit_with_permissions(file)?;
     Ok(u64::try_from(encoded.len()).unwrap_or(u64::MAX))
 }
 
@@ -778,7 +687,7 @@ fn encode_bmp_streaming(
     let guard = write_lock
         .lock()
         .map_err(|_| PipelineError::WorkerPanicked)?;
-    let (staging, file) = StagingFile::create_for(target)?;
+    let (staging, file) = StagingTarget::create_for_image(target)?;
     file.set_len(bytes).map_err(|source| PipelineError::Io {
         path: target.to_path_buf(),
         source,
@@ -807,7 +716,7 @@ fn encode_bmp_streaming(
         path: target.to_path_buf(),
         source,
     })?;
-    staging.commit(target, file)?;
+    staging.commit_with_permissions(file)?;
     drop(guard);
     Ok(bytes)
 }
@@ -1208,7 +1117,7 @@ fn encode_tiff_streaming(
         if encoded_buf.is_empty() {
             return Err(PipelineError::EmptyOutput(target.to_path_buf()));
         }
-        let (staging, mut file) = StagingFile::create_for(target)?;
+        let (staging, mut file) = StagingTarget::create_for_image(target)?;
         file.write_all(encoded_buf)
             .map_err(|source| PipelineError::Io {
                 path: target.to_path_buf(),
@@ -1218,11 +1127,11 @@ fn encode_tiff_streaming(
             path: target.to_path_buf(),
             source,
         })?;
-        staging.commit(target, file)?;
+        staging.commit_with_permissions(file)?;
         return Ok(u64::try_from(encoded_buf.len()).unwrap_or(u64::MAX));
     }
 
-    let (staging, file) = StagingFile::create_for(target)?;
+    let (staging, file) = StagingTarget::create_for_image(target)?;
     let mut writer = BufWriter::with_capacity(STREAM_IO_BUF_BYTES, file);
     write_tiff_image(target, compression, pixels, decoded, aux_buf, &mut writer)?;
     let mut file = writer
@@ -1245,7 +1154,7 @@ fn encode_tiff_streaming(
     if bytes == 0 {
         return Err(PipelineError::EmptyOutput(target.to_path_buf()));
     }
-    staging.commit(target, file)?;
+    staging.commit_with_permissions(file)?;
     Ok(bytes)
 }
 

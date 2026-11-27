@@ -15,7 +15,7 @@ use jxl::api::JxlBitstreamInput;
 use zune_jpeg::JpegDecoder;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 
-use crate::{ProbeError, available_cpu_threads, detect_host_hardware};
+use crate::{ProbeError, available_cpu_threads, canonical_or_parent, detect_host_hardware};
 
 const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 const JPEG_MAGIC: [u8; 3] = [0xFF, 0xD8, 0xFF];
@@ -3264,21 +3264,7 @@ fn has_any_extension(path: &Path, candidates: &[&str]) -> bool {
 }
 
 fn reject_canonical_same_path(source: &Path, target: &Path) -> Result<(), ProbeError> {
-    let canon_target = match fs::canonicalize(target) {
-        Ok(path) => path,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(ProbeError::Io {
-                path: target.to_path_buf(),
-                source: err,
-            });
-        }
-    };
-    let canon_source = fs::canonicalize(source).map_err(|err| ProbeError::Io {
-        path: source.to_path_buf(),
-        source: err,
-    })?;
-    if canon_source == canon_target {
+    if canonical_or_parent(source)? == canonical_or_parent(target)? {
         return Err(ProbeError::InvalidDomain(
             DomainError::IdenticalSourceAndTarget(source.to_path_buf()),
         ));

@@ -1,12 +1,14 @@
 use std::fmt;
 use std::num::{NonZeroU64, NonZeroUsize};
 
+#[cfg(feature = "serde")]
 use serde::Serialize;
 
 use crate::{DomainError, GpuBackend, require_non_empty};
 
 /// Highest SIMD instruction set detected on the host CPU.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum SimdLevel {
     Scalar,
     X86Sse2,
@@ -35,7 +37,8 @@ impl fmt::Display for SimdLevel {
 }
 
 /// Validated CPU topology, SIMD level, and host system memory.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct CpuInfo {
     model_name: String,
     architecture: String,
@@ -111,7 +114,8 @@ impl CpuInfo {
 }
 
 /// GPU hardware vendor derived from PCI vendor IDs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum GpuVendor {
     Nvidia,
     Amd,
@@ -147,7 +151,8 @@ impl fmt::Display for GpuVendor {
 }
 
 /// Validated description of a GPU adapter discovered from host sysfs/DRM data.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct GpuAdapterInfo {
     name: String,
     vendor: GpuVendor,
@@ -206,7 +211,8 @@ impl GpuAdapterInfo {
 }
 
 /// Verified video/compute capability level of a detected GPU backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum GpuCapability {
     ComputeOnly,
     VideoDecodeOnly,
@@ -239,7 +245,8 @@ impl fmt::Display for GpuCapability {
 }
 
 /// Validated GPU acceleration backend detected on the host.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct DetectedGpuBackend {
     backend: GpuBackend,
     capability: GpuCapability,
@@ -291,7 +298,8 @@ impl DetectedGpuBackend {
 }
 
 /// Complete, validated snapshot of the host CPU, GPU adapters, and native GPU backends.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct HostHardware {
     cpu: CpuInfo,
     gpu_adapters: Vec<GpuAdapterInfo>,

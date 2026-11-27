@@ -5,8 +5,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,6 +40,7 @@ use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 
 use crate::PipelineError;
+use crate::staging::StagingTarget;
 
 const FLAC_BLOCK_SIZE: usize = 4096;
 const OPUS_RATE: u32 = 48_000;
@@ -2286,71 +2285,22 @@ fn encode_aiff(
     )
 }
 
-static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-/// Reserves a unique, exclusively created staging file in the target directory so concurrent
-/// processes and source/target aliases cannot collide with an existing file.
-fn create_staging_file(target: &Path) -> Result<PathBuf, PipelineError> {
-    let parent = target
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    for _ in 0..64 {
-        let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let staging = parent.join(format!(
-            ".fastconv-audio-{}-{sequence}.tmp",
-            std::process::id()
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        match options.open(&staging) {
-            Ok(_) => return Ok(staging),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(source) => {
-                return Err(PipelineError::Io {
-                    path: staging,
-                    source,
-                });
-            }
-        }
-    }
-    Err(PipelineError::Io {
-        path: target.to_path_buf(),
-        source: io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "failed to reserve a unique staging file",
-        ),
-    })
-}
-
 fn encode_staged(
     item: &AudioBatchItem,
     encode: impl FnOnce(&Path) -> Result<(), PipelineError>,
 ) -> Result<u64, PipelineError> {
     let target = item.target();
-    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).map_err(|source| PipelineError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    let temp = create_staging_file(target)?;
+    let staging = StagingTarget::create_path_only(target)?;
     let result = (|| -> Result<u64, PipelineError> {
-        encode(&temp)?;
-        let output_bytes = fs::metadata(&temp).map_or(0, |meta| meta.len());
+        encode(staging.path())?;
+        let output_bytes = fs::metadata(staging.path()).map_or(0, |meta| meta.len());
         if output_bytes == 0 {
             return Err(PipelineError::EmptyOutput(target.to_path_buf()));
         }
-        fs::rename(&temp, target).map_err(|source| PipelineError::Io {
-            path: target.to_path_buf(),
-            source,
-        })?;
         Ok(output_bytes)
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
+    if result.is_ok() {
+        staging.commit()?;
     }
     result
 }

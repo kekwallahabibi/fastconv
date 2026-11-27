@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use fastconv_domain::{
     ChromaSubsampling, CompressionLevel, GpuBackend, HardwareBackend, ImageCompression,
-    ImageEncodeOptions, ImageOutputFormat, ImageQuality, TiffCompressionKind,
+    ImageEncodeOptions, ImageOutputFormat, ImageQuality, TiffCompressionKind, u64_to_f64,
 };
 
 const GLOBAL_HELP: &str = r"Usage:
@@ -274,16 +274,45 @@ enum FlagStep {
     Next(usize),
 }
 
-fn flag_value<'a>(
-    args: &'a [&'a str],
+/// Shared next-argument lookup: every command reports a missing value identically.
+pub(crate) fn flag_value<'a>(
+    args: &'a [&str],
+    index: usize,
+    flag: &str,
+) -> Result<&'a str, String> {
+    args.get(index + 1)
+        .copied()
+        .ok_or_else(|| format!("missing value for {flag}"))
+}
+
+/// The same lookup plus the next index, for parsers that advance by two.
+pub(crate) fn flag_value_with_next<'a>(
+    args: &'a [&str],
     index: usize,
     flag: &str,
 ) -> Result<(&'a str, usize), String> {
-    let raw = args
-        .get(index + 1)
-        .copied()
-        .ok_or_else(|| format!("missing value for {flag}"))?;
-    Ok((raw, index + 2))
+    Ok((flag_value(args, index, flag)?, index + 2))
+}
+
+/// Rejects a repeated flag with the diagnostic used by every command.
+pub(crate) fn duplicate_flag(flag: &str) -> String {
+    format!("duplicate flag '{flag}'")
+}
+
+/// Parses `--threads <N>` with identical duplicate/missing/invalid diagnostics.
+pub(crate) fn parse_threads(
+    args: &[&str],
+    index: usize,
+    already_seen: bool,
+) -> Result<(NonZeroUsize, usize), String> {
+    if already_seen {
+        return Err(duplicate_flag("--threads"));
+    }
+    let raw = flag_value(args, index, "--threads")?;
+    let threads = raw
+        .parse::<NonZeroUsize>()
+        .map_err(|err| format!("invalid --threads '{raw}': {err}"))?;
+    Ok((threads, index + 2))
 }
 
 fn apply_core_flag<'a>(
@@ -309,7 +338,7 @@ fn apply_core_flag<'a>(
             if state.lossless {
                 return Err("cannot combine --quality with --lossless".to_owned());
             }
-            let (raw, next) = flag_value(args, i, "--quality")?;
+            let (raw, next) = flag_value_with_next(args, i, "--quality")?;
             let parsed = raw
                 .parse::<u8>()
                 .map_err(|err| format!("invalid --quality '{raw}': {err}"))?;
@@ -320,26 +349,20 @@ fn apply_core_flag<'a>(
             if state.to.is_some() {
                 return Err("duplicate flag '--to'".to_owned());
             }
-            let (raw, next) = flag_value(args, i, "--to")?;
+            let (raw, next) = flag_value_with_next(args, i, "--to")?;
             state.to = Some(parse_target_format(raw)?);
             next
         }
         "--threads" => {
-            if state.threads.is_some() {
-                return Err("duplicate flag '--threads'".to_owned());
-            }
-            let (raw, next) = flag_value(args, i, "--threads")?;
-            let parsed = raw
-                .parse::<NonZeroUsize>()
-                .map_err(|err| format!("invalid --threads '{raw}': {err}"))?;
-            state.threads = Some(parsed);
+            let (threads, next) = parse_threads(args, i, state.threads.is_some())?;
+            state.threads = Some(threads);
             next
         }
         _ => {
             if state.backend.is_some() {
                 return Err("duplicate flag '--backend'".to_owned());
             }
-            let (raw, next) = flag_value(args, i, "--backend")?;
+            let (raw, next) = flag_value_with_next(args, i, "--backend")?;
             state.backend = Some(parse_backend(raw)?);
             next
         }
@@ -357,7 +380,7 @@ fn apply_encoder_flag<'a>(
             if state.options.compression_level.is_some() {
                 return Err("duplicate flag '--compression-level'".to_owned());
             }
-            let (raw, next) = flag_value(args, i, "--compression-level")?;
+            let (raw, next) = flag_value_with_next(args, i, "--compression-level")?;
             state.options.compression_level = Some(parse_compression_level(raw)?);
             next
         }
@@ -365,7 +388,7 @@ fn apply_encoder_flag<'a>(
             if state.options.tiff_compression.is_some() {
                 return Err("duplicate flag '--tiff-compression'".to_owned());
             }
-            let (raw, next) = flag_value(args, i, "--tiff-compression")?;
+            let (raw, next) = flag_value_with_next(args, i, "--tiff-compression")?;
             state.options.tiff_compression = Some(parse_tiff_compression(raw)?);
             next
         }
@@ -373,7 +396,7 @@ fn apply_encoder_flag<'a>(
             if state.options.chroma.is_some() {
                 return Err("duplicate flag '--chroma'".to_owned());
             }
-            let (raw, next) = flag_value(args, i, "--chroma")?;
+            let (raw, next) = flag_value_with_next(args, i, "--chroma")?;
             state.options.chroma = Some(parse_chroma(raw)?);
             next
         }
@@ -527,12 +550,6 @@ fn run_convert(args: &ConvertArgs) -> Result<(), String> {
         throughput_mbps
     );
     Ok(())
-}
-
-pub(crate) fn u64_to_f64(value: u64) -> f64 {
-    let hi = u32::try_from(value >> 32).unwrap_or(u32::MAX);
-    let lo = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
-    f64::from(hi) * 4_294_967_296.0 + f64::from(lo)
 }
 
 fn fail(message: &str) -> ExitCode {

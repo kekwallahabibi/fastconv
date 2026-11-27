@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use fastconv_domain::{
     BenchmarkMetrics, BenchmarkSample, GpuBackend, HostHardware, ImageInputFormat,
-    ImageOutputFormat, MediaKind, PeakMemory, WorkloadUnit,
+    ImageOutputFormat, MediaKind, PeakMemory, WorkloadUnit, u64_to_f64,
 };
 use serde::Serialize;
 use zune_jpeg::JpegDecoder;
@@ -3086,12 +3086,6 @@ fn format_mb(bytes: u64) -> String {
 fn format_mib(bytes: u64) -> String {
     let mib = u64_to_f64(bytes) / (1024.0 * 1024.0);
     format!("{mib:.1} MiB")
-}
-
-fn u64_to_f64(value: u64) -> f64 {
-    let hi = u32::try_from(value >> 32).unwrap_or(u32::MAX);
-    let lo = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
-    f64::from(hi) * 4_294_967_296.0 + f64::from(lo)
 }
 
 #[cfg(test)]

@@ -3,19 +3,18 @@
 //! Uses `containr` as a pure-Rust container library. No codec is decoded or
 //! re-encoded. No `ffmpeg`/`ffprobe` subprocess is involved.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-
-/// Process-wide serial makes staging paths unique across concurrent invocations.
-static STAGING_SERIAL: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+use std::fs::OpenOptions;
 
 use containr::Packet;
 use containr::mkv::DocType;
@@ -26,6 +25,7 @@ use fastconv_domain::{
 };
 
 use crate::PipelineError;
+use crate::staging::StagingTarget;
 use crate::video_container::{demux_video, mux_video};
 
 /// Nanoseconds per Matroska tick used when an exact timestamp plan is not possible.
@@ -416,73 +416,6 @@ fn remux_file(item: &VideoRemuxItem, target: &File) -> Result<(), PipelineError>
                 output
             ),
         )),
-    }
-}
-
-/// A crash-safe staging target: the temp file is created exclusively, written
-/// through the owned handle, then published with a rename.
-struct StagingTarget {
-    temp: PathBuf,
-    target: PathBuf,
-    file: Option<File>,
-}
-
-impl StagingTarget {
-    fn new(target: &Path, tag: usize) -> Result<Self, PipelineError> {
-        if let Some(parent) = target.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|source| PipelineError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        let name = target.file_name().map_or_else(
-            || "remux.mp4".to_owned(),
-            |n| n.to_string_lossy().into_owned(),
-        );
-        let serial = STAGING_SERIAL.fetch_add(1, Ordering::Relaxed);
-        let temp = target.with_file_name(format!(
-            ".{name}.remux-{}-{serial}-{tag}.tmp",
-            std::process::id()
-        ));
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let file = options.open(&temp).map_err(|source| PipelineError::Io {
-            path: temp.clone(),
-            source,
-        })?;
-        Ok(Self {
-            temp,
-            target: target.to_path_buf(),
-            file: Some(file),
-        })
-    }
-
-    fn file(&self) -> Result<&File, PipelineError> {
-        self.file
-            .as_ref()
-            .ok_or_else(|| remux_failed(&self.target, "staging file is already committed"))
-    }
-
-    fn commit(mut self) -> Result<(), PipelineError> {
-        // Close the owned handle before the rename so no writer holds the inode.
-        drop(self.file.take());
-        std::fs::rename(&self.temp, &self.target).map_err(|source| PipelineError::Io {
-            path: self.target.clone(),
-            source,
-        })
-    }
-}
-
-impl Drop for StagingTarget {
-    fn drop(&mut self) {
-        // Only remove the entry this invocation created exclusively.
-        if self.file.is_some() {
-            let _ = std::fs::remove_file(&self.temp);
-        }
     }
 }
 
@@ -937,7 +870,7 @@ fn mkv_to_mkv(
 }
 
 fn remux_with_staging(item: &VideoRemuxItem, tag: usize) -> Result<(), PipelineError> {
-    let staging = StagingTarget::new(item.target(), tag)?;
+    let staging = StagingTarget::create_with_handle(item.target(), tag)?;
     remux_file(item, staging.file()?)?;
     staging.commit()
 }

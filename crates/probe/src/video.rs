@@ -16,7 +16,7 @@ use fastconv_domain::{
     resolve_video_rate_control, validate_audio_options_for_container,
 };
 
-use crate::{ProbeError, available_cpu_threads};
+use crate::{ProbeError, available_cpu_threads, canonical_or_parent};
 
 /// Three 188-byte TS or 192-byte M2TS packets, plus EBML/`ftyp`/RIFF headers.
 const MAGIC_PREFIX_BYTES: usize = 576;
@@ -2038,46 +2038,16 @@ pub fn probe_video(path: &Path) -> Result<ProbedVideo, ProbeError> {
     })
 }
 
-fn canonical_source(path: &Path) -> Result<PathBuf, ProbeError> {
-    fs::canonicalize(path).map_err(|source| ProbeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-/// Resolves a target that may not exist yet through its canonical parent.
-fn canonical_target(target: &Path) -> Result<PathBuf, ProbeError> {
-    if target.exists() {
-        Ok(fs::canonicalize(target).map_err(|err| ProbeError::Io {
-            path: target.to_path_buf(),
-            source: err,
-        })?)
-    } else {
-        let parent = target
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let canonical_parent = fs::canonicalize(parent).map_err(|err| ProbeError::Io {
-            path: parent.to_path_buf(),
-            source: err,
-        })?;
-        Ok(match target.file_name() {
-            Some(name) => canonical_parent.join(name),
-            None => canonical_parent,
-        })
-    }
-}
-
 /// Rejects targets that name the same file as the source through a different path spelling.
 fn reject_alias_collision(source: &Path, target: &Path) -> Result<(), ProbeError> {
-    if canonical_source(source)? == canonical_target(target)? {
+    if canonical_or_parent(source)? == canonical_or_parent(target)? {
         return Err(DomainError::IdenticalSourceAndTarget(source.to_path_buf()).into());
     }
     Ok(())
 }
 
 fn canonical_sources(paths: &[PathBuf]) -> Result<HashSet<PathBuf>, ProbeError> {
-    paths.iter().map(|path| canonical_source(path)).collect()
+    paths.iter().map(|path| canonical_or_parent(path)).collect()
 }
 
 /// Rejects a batch target that resolves onto any source in the same batch.
@@ -2085,7 +2055,7 @@ fn reject_batch_target_collision(
     sources: &HashSet<PathBuf>,
     target: &Path,
 ) -> Result<(), ProbeError> {
-    if sources.contains(&canonical_target(target)?) {
+    if sources.contains(&canonical_or_parent(target)?) {
         return Err(ProbeError::InvalidVideo {
             path: target.to_path_buf(),
             reason: "target aliases another source in this batch".to_owned(),
