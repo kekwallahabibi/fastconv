@@ -1172,13 +1172,16 @@ fn flac_streaminfo(
     let mut info = FlacStreamInfo::new(rate, usize::from(channels), 16).map_err(|err| {
         encode_error(Path::new("flac"), format!("invalid FLAC StreamInfo: {err}"))
     })?;
-    // The final block can be shorter; FLAC requires min block size >= 32.
-    info.set_block_sizes(32, FLAC_CHUNK_FRAMES).map_err(|err| {
-        encode_error(
-            Path::new("flac"),
-            format!("invalid FLAC block sizes: {err}"),
-        )
-    })?;
+    // Tail blocks are padded to FLAC_MIN_BLOCK_FRAMES, so the declared
+    // minimum must use the same constant or strict decoders see an illegal
+    // final block that is shorter than STREAMINFO's min_block_size.
+    info.set_block_sizes(FLAC_MIN_BLOCK_FRAMES, FLAC_CHUNK_FRAMES)
+        .map_err(|err| {
+            encode_error(
+                Path::new("flac"),
+                format!("invalid FLAC block sizes: {err}"),
+            )
+        })?;
     info.set_total_samples(total_samples);
     Ok(info)
 }
@@ -6756,6 +6759,20 @@ mod tests {
                 .iter()
                 .find(|track| track.codec == VideoCodec::Flac)
                 .ok_or_else(|| decode_error(&target, "no FLAC track"))?;
+            // STREAMINFO's declared minimum must cover the padded tail frames.
+            let min_block = u16::from_be_bytes(
+                audio
+                    .config
+                    .get(..2)
+                    .ok_or_else(|| decode_error(&target, "short FLAC STREAMINFO"))?
+                    .try_into()
+                    .map_err(|_| decode_error(&target, "invalid FLAC min block size"))?,
+            );
+            assert_eq!(
+                usize::from(min_block),
+                FLAC_MIN_BLOCK_FRAMES,
+                "declared FLAC min block disagrees with tail padding in {name}"
+            );
             let packets: Vec<_> = media
                 .packets
                 .iter()

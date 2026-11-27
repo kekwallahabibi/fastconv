@@ -513,7 +513,7 @@ fn audio_facts(track: &Track) -> (Option<u16>, Option<u32>) {
 // The range check makes the narrowing lossless for canonical integral rates.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn matroska_rate(rate: f64) -> Option<u32> {
-    if rate.is_finite() && rate > 0.0 && rate <= f64::from(u32::MAX) {
+    if rate.is_finite() && rate.fract() == 0.0 && rate > 0.0 && rate <= f64::from(u32::MAX) {
         Some(rate as u32)
     } else {
         None
@@ -4769,6 +4769,18 @@ mod tests {
         }
         assert!(avi_stream_info(&strl(0x0001, 0, 48_000, 16), &AvihInfo::default()).is_err());
         assert!(avi_stream_info(&strl(0x0001, 2, 0, 16), &AvihInfo::default()).is_err());
+    }
+
+    #[test]
+    fn matroska_rate_rejects_fractional_and_out_of_range_rates() {
+        assert_eq!(matroska_rate(48_000.0), Some(48_000));
+        assert_eq!(matroska_rate(44_100.0), Some(44_100));
+        assert_eq!(matroska_rate(48_000.5), None);
+        assert_eq!(matroska_rate(0.0), None);
+        assert_eq!(matroska_rate(-1.0), None);
+        assert_eq!(matroska_rate(f64::NAN), None);
+        assert_eq!(matroska_rate(f64::INFINITY), None);
+        assert_eq!(matroska_rate(f64::from(u32::MAX) + 1.0), None);
     }
 
     #[test]

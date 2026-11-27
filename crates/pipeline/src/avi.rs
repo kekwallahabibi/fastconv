@@ -782,6 +782,14 @@ pub(crate) fn mux_avi(
                     .filter(|packet| packet.track == index)
                     .map(|packet| packet.data.len())
                     .sum();
+                // dwLength counts whole samples; a partial frame here would
+                // make the header disagree with the bytes written to `movi`.
+                if !bytes.is_multiple_of(block_align) {
+                    return Err(avi_error(
+                        target_path,
+                        "AVI PCM data is not a whole number of frames",
+                    ));
+                }
                 length = u32::try_from(bytes / block_align).unwrap_or(u32::MAX);
                 (
                     1_u32,

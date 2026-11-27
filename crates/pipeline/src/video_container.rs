@@ -1766,14 +1766,24 @@ fn mux_mkv(
             VideoCodec::Opus => "A_OPUS",
             VideoCodec::Vorbis => "A_VORBIS",
             VideoCodec::Flac => "A_FLAC",
-            VideoCodec::Pcm => match track
-                .pcm_format
-                .ok_or_else(|| container_error(target_path, "PCM track has no sample format"))?
-            {
-                PcmFormat::S16Be | PcmFormat::S24Be | PcmFormat::S32Be => "A_PCM/INT/BIG",
-                PcmFormat::F32Le | PcmFormat::F32Be | PcmFormat::F64Le => "A_PCM/FLOAT/IEEE",
-                _ => "A_PCM/INT/LIT",
-            },
+            VideoCodec::Pcm => {
+                let format = track.pcm_format.ok_or_else(|| {
+                    container_error(target_path, "PCM track has no sample format")
+                })?;
+                // A_PCM/FLOAT/IEEE is little-endian; writing big-endian floats
+                // under that ID would silently corrupt samples on demux.
+                if format == PcmFormat::F32Be {
+                    return Err(container_error(
+                        target_path,
+                        "big-endian float PCM cannot be stored in Matroska",
+                    ));
+                }
+                match format {
+                    PcmFormat::S16Be | PcmFormat::S24Be | PcmFormat::S32Be => "A_PCM/INT/BIG",
+                    PcmFormat::F32Le | PcmFormat::F64Le => "A_PCM/FLOAT/IEEE",
+                    _ => "A_PCM/INT/LIT",
+                }
+            }
             VideoCodec::Mp3 => "A_MPEG/L3",
             _ => {
                 return Err(container_error(
@@ -3125,6 +3135,44 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn mkv_rejects_big_endian_float_pcm() -> Result<(), String> {
+        let dir =
+            std::env::temp_dir().join(format!("fastconv-mkv-be-float-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let target = dir.join("out.mkv");
+        let media = ContainerMedia {
+            tracks: vec![ContainerTrack {
+                codec: VideoCodec::Pcm,
+                width: None,
+                height: None,
+                channels: Some(2),
+                sample_rate: Some(48_000),
+                config: Vec::new(),
+                timescale: US_TIMESCALE,
+                presentation_edit: None,
+                pcm_format: Some(crate::video_bitstream::PcmFormat::F32Be),
+            }],
+            packets: vec![ContainerPacket {
+                track: 0,
+                pts: 0,
+                dts: 0,
+                duration: 1_000,
+                keyframe: true,
+                data: vec![0_u8; 16],
+            }],
+        };
+        let file = File::create(&target).map_err(|err| err.to_string())?;
+        let result = mux_video(&file, &target, VideoContainerFormat::Mkv, &media);
+        drop(file);
+        assert!(
+            matches!(result, Err(PipelineError::RemuxFailed { .. })),
+            "A_PCM/FLOAT/IEEE is little-endian; a big-endian stream must not be mislabelled"
+        );
+        std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
         Ok(())
     }
 }
