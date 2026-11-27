@@ -195,14 +195,15 @@ Arguments:
 Options:
   --to <format>         Output container (required for directory batches): mp4,
                         mkv, webm, mov, avi, ts, gif, webp
-  --vcodec <codec>      Video codec: h264, hevc (h265), av1, vp9, gif, webp, copy
+  --vcodec <codec>      Video codec: h264, hevc (h265), av1, vp9, mjpeg (mjpg),
+                        gif, webp, copy
   --acodec <codec>      Audio codec: aac, opus, mp3, vorbis, flac, pcm, none
                         (drop), copy. FLAC/PCM are lossless and reject --abitrate
   --quality <0..=100>   Encoding quality (default 80; mutually exclusive with
                         --vbitrate and --vcodec copy)
   --vbitrate <rate>     Target video bitrate, e.g. 500k, 2M, 2.5M or 2000000
                         (mutually exclusive with --quality and --vcodec copy;
-                        rejected for GIF/WebP)
+                        rejected for GIF/WebP/MJPEG)
   --abitrate <rate>     Audio bitrate, e.g. 128k or 192000 (requires audio
                         re-encoding: rejected with --acodec copy/none)
   --asample-rate <Hz>   Audio sample rate (requires audio re-encoding; codec-
@@ -210,15 +211,17 @@ Options:
   --achannels <N>       Audio channel count (requires audio re-encoding;
                         codec-specific limits apply)
   --threads <N>         Number of parallel workers
-  --backend <name>      cpu (default: H.264/AV1/VP9/GIF/WebP and copy) or nvenc
-                        (H.264/HEVC only; HEVC has no CPU encoder)
+  --backend <name>      cpu (default: H.264/AV1/VP9/MJPEG/GIF/WebP and copy) or
+                        nvenc (H.264/HEVC only; HEVC has no CPU encoder)
   --hwdecode <name>     auto (default), cpu, or nvdec (NVDEC + NVENC zero-copy).
                         Aliases: software -> cpu, cuda/gpu -> nvdec. A failed
                         NVDEC setup is a hard error, never a CPU fallback.
   -h, --help            Print this help
 
-Backends: cpu encodes H.264/AV1/VP9/GIF/WebP and --vcodec copy; nvenc encodes
-          H.264/HEVC only. HEVC requires nvenc; AV1/VP9 require cpu.
+Backends: cpu encodes H.264/AV1/VP9/MJPEG/GIF/WebP and --vcodec copy; nvenc
+          encodes H.264/HEVC only. HEVC requires nvenc; AV1/VP9/MJPEG require cpu.
+MJPEG: CPU-only, quality-driven (--vbitrate is rejected), and available in
+       AVI, MOV and MKV only; every frame is an independent JPEG image.
 Decode: --hwdecode auto uses NVDEC for H.264/HEVC/VP9 with --backend nvenc;
         --hwdecode cpu forces CPU decode; --hwdecode nvdec requires --backend
         nvenc and a hardware-decodable source.
@@ -241,7 +244,7 @@ fn parse_video_codec(raw: &str) -> Result<RequestedVideoCodec, String> {
     }
     let codec = TargetVideoCodec::from_name(raw).ok_or_else(|| {
         format!(
-            "unknown video codec '{raw}' (expected h264, hevc (h265), av1, vp9, gif, webp, or copy)"
+            "unknown video codec '{raw}' (expected h264, hevc (h265), av1, vp9, mjpeg (mjpg), gif, webp, or copy)"
         )
     })?;
     Ok(RequestedVideoCodec::Encode(codec))
@@ -745,6 +748,8 @@ mod tests {
             ("h265", TargetVideoCodec::Hevc),
             ("av1", TargetVideoCodec::Av1),
             ("vp9", TargetVideoCodec::Vp9),
+            ("mjpeg", TargetVideoCodec::Mjpeg),
+            ("MJPG", TargetVideoCodec::Mjpeg),
             ("gif", TargetVideoCodec::Gif),
             ("webp", TargetVideoCodec::Webp),
         ] {

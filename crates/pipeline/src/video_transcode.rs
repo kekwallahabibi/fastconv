@@ -3061,7 +3061,7 @@ fn input_size(path: &Path) -> u64 {
     fs::metadata(path).map_or(0, |meta| meta.len())
 }
 
-fn enforce_decoded_budget(path: &Path, bytes: u64) -> Result<(), PipelineError> {
+pub(crate) fn enforce_decoded_budget(path: &Path, bytes: u64) -> Result<(), PipelineError> {
     if bytes > MAX_DECODED_BYTES_PER_TRACK {
         return Err(decode_error(
             path,
@@ -3694,7 +3694,8 @@ fn transcode_file(
                     }
                     VideoEncodeMode::CpuH264 { .. }
                     | VideoEncodeMode::CpuAv1 { .. }
-                    | VideoEncodeMode::CpuVp9 { .. } => {
+                    | VideoEncodeMode::CpuVp9 { .. }
+                    | VideoEncodeMode::CpuMjpeg { .. } => {
                         if let Err(err) = drain_audio_nonblocking(
                             audio_rx.as_ref(),
                             &audio_failed,
@@ -4034,12 +4035,12 @@ pub fn execute_video_transcode_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::video_codecs::Yuv420Frame;
+    use crate::video_codecs::{Yuv420Frame, YuvColor};
     use crate::video_container::{ContainerMedia, mux_video};
     use fastconv_domain::{
         AnimationLoop, AudioBitrate, AudioChannels, AudioEncodeOptions, AudioSampleRate,
-        DomainError, TargetVideoCodec, VideoBitrate, VideoContainerFormat, VideoRateControl,
-        VideoStreamKind,
+        DomainError, TargetVideoCodec, VideoBitrate, VideoContainerFormat, VideoQuality,
+        VideoRateControl, VideoStreamKind,
     };
     use std::num::NonZeroUsize;
     use std::process::{Command, ExitStatus, Stdio};
@@ -4171,6 +4172,7 @@ mod tests {
                     v: vec![118_u8; (w / 2) * (h / 2)],
                     pts_us: i64::try_from(index).unwrap_or(i64::MAX) * 20_000,
                     duration_us: 20_000,
+                    color: YuvColor::default(),
                 }
             })
             .collect()
@@ -4280,6 +4282,143 @@ mod tests {
             reason: err.to_string(),
         })?;
         execute_video_transcode_batch(&plan)
+    }
+
+    #[test]
+    fn mjpeg_transcodes_from_h264_with_audio() -> Result<(), PipelineError> {
+        let dir = temp_dir("mjpeg-transcode-from")?;
+        let mjpeg_mode = VideoEncodeMode::CpuMjpeg {
+            quality: VideoQuality::DEFAULT,
+        };
+
+        // H.264/AAC -> MJPEG in each supported container, with audio copied.
+        let h264_source = dir.join("h264-source.mkv");
+        make_source(
+            &h264_source,
+            VideoContainerFormat::Mkv,
+            VideoEncodeMode::CpuH264 {
+                rate_control: VideoRateControl::DEFAULT,
+            },
+            TargetAudioCodec::Aac,
+        )?;
+        for (ext, format) in [
+            ("avi", VideoContainerFormat::Avi),
+            ("mov", VideoContainerFormat::Mov),
+            ("mkv", VideoContainerFormat::Mkv),
+        ] {
+            let target = dir.join(format!("mjpeg-out.{ext}"));
+            transcode(
+                &h264_source,
+                &target,
+                VideoContainerFormat::Mkv,
+                format,
+                VideoTrackAction::Encode(mjpeg_mode),
+                AudioTrackAction::Copy,
+            )?;
+            assert_output(&target, format, VideoCodec::Mjpeg, VideoCodec::Aac)?;
+            let media = demux_video(&target, format)?;
+            let packets: Vec<ContainerPacket> = media
+                .packets
+                .iter()
+                .filter(|packet| media.tracks[packet.track].codec == VideoCodec::Mjpeg)
+                .cloned()
+                .collect();
+            assert!(
+                packets
+                    .iter()
+                    .all(|packet| packet.keyframe && packet.dts == packet.pts)
+            );
+            let decoded = decode_video_track(&target, &media.tracks[0], &packets)?;
+            assert_eq!(decoded.len(), 4, "MJPEG frames must decode in {format}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mjpeg_transcodes_to_other_codecs() -> Result<(), PipelineError> {
+        let dir = temp_dir("mjpeg-transcode-to")?;
+        let mjpeg_mode = VideoEncodeMode::CpuMjpeg {
+            quality: VideoQuality::DEFAULT,
+        };
+        // MJPEG -> H.264/VP9 (audio copied) and -> GIF/WebP (audio dropped).
+        let mjpeg_source = dir.join("mjpeg-source.avi");
+        make_source(
+            &mjpeg_source,
+            VideoContainerFormat::Avi,
+            mjpeg_mode,
+            TargetAudioCodec::Aac,
+        )?;
+        for (label, ext, format, mode, expected, copy_audio) in [
+            (
+                "h264",
+                "mkv",
+                VideoContainerFormat::Mkv,
+                VideoEncodeMode::CpuH264 {
+                    rate_control: VideoRateControl::DEFAULT,
+                },
+                VideoCodec::H264,
+                true,
+            ),
+            (
+                "vp9",
+                "webm",
+                VideoContainerFormat::Webm,
+                VideoEncodeMode::CpuVp9 {
+                    rate_control: VideoRateControl::DEFAULT,
+                },
+                VideoCodec::Vp9,
+                true,
+            ),
+            (
+                "gif",
+                "gif",
+                VideoContainerFormat::Gif,
+                VideoEncodeMode::CpuGif {
+                    quality: VideoQuality::DEFAULT,
+                },
+                VideoCodec::Gif,
+                false,
+            ),
+            (
+                "webp",
+                "webp",
+                VideoContainerFormat::Webp,
+                VideoEncodeMode::CpuWebp {
+                    quality: VideoQuality::DEFAULT,
+                },
+                VideoCodec::Webp,
+                false,
+            ),
+        ] {
+            let target = dir.join(format!("{label}-from-mjpeg.{ext}"));
+            // WebM cannot carry AAC, so that hop transcodes audio to Opus.
+            let audio = if format == VideoContainerFormat::Webm {
+                AudioTrackAction::Encode(default_config(TargetAudioCodec::Opus))
+            } else if copy_audio {
+                AudioTrackAction::Copy
+            } else {
+                AudioTrackAction::Drop
+            };
+            transcode(
+                &mjpeg_source,
+                &target,
+                VideoContainerFormat::Avi,
+                format,
+                VideoTrackAction::Encode(mode),
+                audio,
+            )?;
+            let media = demux_video(&target, format)?;
+            assert_eq!(media.tracks[0].codec, expected, "{label} output codec");
+            if copy_audio || format == VideoContainerFormat::Webm {
+                let audio_codec = if format == VideoContainerFormat::Webm {
+                    VideoCodec::Opus
+                } else {
+                    VideoCodec::Aac
+                };
+                assert_output(&target, format, expected, audio_codec)?;
+            }
+        }
+        Ok(())
     }
 
     fn assert_output(
@@ -5783,6 +5922,7 @@ mod tests {
                     v: vec![140; chroma],
                     pts_us: i64::try_from(index).unwrap_or(0).saturating_mul(40_000),
                     duration_us: 40_000,
+                    color: YuvColor::default(),
                 }
             })
             .collect()
@@ -6308,6 +6448,7 @@ mod tests {
                 v: vec![128; 160 * 120],
                 pts_us: i64::from(index) * 40_000,
                 duration_us: 40_000,
+                color: YuvColor::default(),
             })
             .collect();
         let encoded = encode_video_cpu(
@@ -6445,6 +6586,7 @@ mod tests {
                 v: vec![128; 16 * 16],
                 pts_us: i64::from(idx) * 40_000,
                 duration_us: 40_000,
+                color: YuvColor::default(),
             })
             .collect();
         let stream = encode_video_cpu(

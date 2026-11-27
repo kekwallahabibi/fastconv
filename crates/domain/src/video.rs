@@ -110,6 +110,7 @@ pub enum VideoCodec {
     Hevc,
     Av1,
     Vp9,
+    Mjpeg,
     Aac,
     Opus,
     Mp3,
@@ -130,6 +131,7 @@ impl VideoCodec {
             Self::Hevc => "HEVC",
             Self::Av1 => "AV1",
             Self::Vp9 => "VP9",
+            Self::Mjpeg => "MJPEG",
             Self::Aac => "AAC",
             Self::Opus => "Opus",
             Self::Mp3 => "MP3",
@@ -166,6 +168,7 @@ impl VideoCodec {
                     | Self::Hevc
                     | Self::Av1
                     | Self::Vp9
+                    | Self::Mjpeg
                     | Self::Aac
                     | Self::Opus
                     | Self::Mp3
@@ -179,6 +182,7 @@ impl VideoCodec {
                     | Self::Hevc
                     | Self::Av1
                     | Self::Vp9
+                    | Self::Mjpeg
                     | Self::Aac
                     | Self::Opus
                     | Self::Mp3
@@ -196,6 +200,7 @@ impl VideoCodec {
                     | Self::Hevc
                     | Self::Av1
                     | Self::Vp9
+                    | Self::Mjpeg
                     | Self::Aac
                     | Self::Opus
                     | Self::Mp3
@@ -215,7 +220,7 @@ impl VideoCodec {
     pub const fn is_video(self) -> bool {
         matches!(
             self,
-            Self::H264 | Self::Hevc | Self::Av1 | Self::Vp9 | Self::Gif | Self::Webp
+            Self::H264 | Self::Hevc | Self::Av1 | Self::Vp9 | Self::Mjpeg | Self::Gif | Self::Webp
         )
     }
 
@@ -250,6 +255,7 @@ pub enum TargetVideoCodec {
     Hevc,
     Av1,
     Vp9,
+    Mjpeg,
     Gif,
     Webp,
 }
@@ -262,6 +268,7 @@ impl TargetVideoCodec {
             Self::Hevc => "HEVC",
             Self::Av1 => "AV1",
             Self::Vp9 => "VP9",
+            Self::Mjpeg => "MJPEG",
             Self::Gif => "GIF",
             Self::Webp => "WebP",
         }
@@ -274,6 +281,7 @@ impl TargetVideoCodec {
             Self::Hevc => VideoCodec::Hevc,
             Self::Av1 => VideoCodec::Av1,
             Self::Vp9 => VideoCodec::Vp9,
+            Self::Mjpeg => VideoCodec::Mjpeg,
             Self::Gif => VideoCodec::Gif,
             Self::Webp => VideoCodec::Webp,
         }
@@ -291,6 +299,7 @@ impl TargetVideoCodec {
             "hevc" | "h265" | "x265" => Some(Self::Hevc),
             "av1" => Some(Self::Av1),
             "vp9" => Some(Self::Vp9),
+            "mjpeg" | "mjpg" => Some(Self::Mjpeg),
             "gif" => Some(Self::Gif),
             "webp" => Some(Self::Webp),
             _ => None,
@@ -1116,6 +1125,7 @@ pub enum VideoEncodeMode {
     CpuH264 { rate_control: VideoRateControl },
     CpuAv1 { rate_control: VideoRateControl },
     CpuVp9 { rate_control: VideoRateControl },
+    CpuMjpeg { quality: VideoQuality },
     CpuGif { quality: VideoQuality },
     CpuWebp { quality: VideoQuality },
     NvencH264 { rate_control: VideoRateControl },
@@ -1128,8 +1138,9 @@ impl VideoEncodeMode {
     /// # Errors
     ///
     /// Returns [`DomainError::UnsupportedVideoPipeline`] when the requested codec
-    /// has no encoder on the selected backend, or when bitrate targeting is
-    /// requested for GIF/WebP (which have no bitrate-aware encoder).
+    /// has no encoder on the selected backend, when bitrate targeting is
+    /// requested for GIF/WebP/MJPEG (which have no bitrate-aware encoder), or
+    /// when a CPU-only codec is paired with a GPU backend.
     pub fn resolve(
         codec: TargetVideoCodec,
         rate_control: VideoRateControl,
@@ -1146,10 +1157,22 @@ impl VideoEncodeMode {
                 ),
             });
         }
+        if matches!(codec, TargetVideoCodec::Mjpeg)
+            && matches!(rate_control, VideoRateControl::Bitrate(_))
+        {
+            return Err(DomainError::UnsupportedVideoPipeline {
+                codec: VideoCodec::Mjpeg,
+                backend,
+                reason: format!("{codec} encoding supports only --quality, not --vbitrate"),
+            });
+        }
         match (codec, backend) {
             (TargetVideoCodec::H264, HardwareBackend::Cpu) => Ok(Self::CpuH264 { rate_control }),
             (TargetVideoCodec::Av1, HardwareBackend::Cpu) => Ok(Self::CpuAv1 { rate_control }),
             (TargetVideoCodec::Vp9, HardwareBackend::Cpu) => Ok(Self::CpuVp9 { rate_control }),
+            (TargetVideoCodec::Mjpeg, HardwareBackend::Cpu) => Ok(Self::CpuMjpeg {
+                quality: rate_control.quality().unwrap_or(VideoQuality::DEFAULT),
+            }),
             (TargetVideoCodec::Gif, HardwareBackend::Cpu) => Ok(Self::CpuGif {
                 quality: rate_control.quality().unwrap_or(VideoQuality::DEFAULT),
             }),
@@ -1163,6 +1186,13 @@ impl VideoEncodeMode {
                     reason:
                         "animation encoding (GIF/WebP) runs on CPU only; no silent CPU fallback"
                             .to_owned(),
+                })
+            }
+            (TargetVideoCodec::Mjpeg, HardwareBackend::Gpu(_)) => {
+                Err(DomainError::UnsupportedVideoPipeline {
+                    codec: VideoCodec::Mjpeg,
+                    backend,
+                    reason: format!("{codec} runs on CPU only; no silent CPU fallback"),
                 })
             }
             (TargetVideoCodec::Hevc, HardwareBackend::Cpu) => {
@@ -1205,6 +1235,7 @@ impl VideoEncodeMode {
             Self::CpuH264 { .. } | Self::NvencH264 { .. } => TargetVideoCodec::H264,
             Self::CpuAv1 { .. } => TargetVideoCodec::Av1,
             Self::CpuVp9 { .. } => TargetVideoCodec::Vp9,
+            Self::CpuMjpeg { .. } => TargetVideoCodec::Mjpeg,
             Self::CpuGif { .. } => TargetVideoCodec::Gif,
             Self::CpuWebp { .. } => TargetVideoCodec::Webp,
             Self::NvencHevc { .. } => TargetVideoCodec::Hevc,
@@ -1221,7 +1252,7 @@ impl VideoEncodeMode {
             | Self::CpuVp9 { rate_control }
             | Self::NvencH264 { rate_control }
             | Self::NvencHevc { rate_control } => Some(rate_control),
-            Self::CpuGif { .. } | Self::CpuWebp { .. } => None,
+            Self::CpuMjpeg { .. } | Self::CpuGif { .. } | Self::CpuWebp { .. } => None,
         }
     }
 
@@ -1231,7 +1262,9 @@ impl VideoEncodeMode {
     #[must_use]
     pub const fn quality(self) -> VideoQuality {
         match self {
-            Self::CpuGif { quality } | Self::CpuWebp { quality } => quality,
+            Self::CpuMjpeg { quality } | Self::CpuGif { quality } | Self::CpuWebp { quality } => {
+                quality
+            }
             Self::CpuH264 { rate_control }
             | Self::CpuAv1 { rate_control }
             | Self::CpuVp9 { rate_control }
@@ -1249,6 +1282,7 @@ impl VideoEncodeMode {
             Self::CpuH264 { .. }
             | Self::CpuAv1 { .. }
             | Self::CpuVp9 { .. }
+            | Self::CpuMjpeg { .. }
             | Self::CpuGif { .. }
             | Self::CpuWebp { .. } => HardwareBackend::Cpu,
             Self::NvencH264 { .. } | Self::NvencHevc { .. } => {
@@ -2192,6 +2226,9 @@ mod tests {
             TargetVideoCodec::H264 => VideoEncodeMode::CpuH264 { rate_control },
             TargetVideoCodec::Av1 => VideoEncodeMode::CpuAv1 { rate_control },
             TargetVideoCodec::Vp9 => VideoEncodeMode::CpuVp9 { rate_control },
+            TargetVideoCodec::Mjpeg => VideoEncodeMode::CpuMjpeg {
+                quality: VideoQuality::DEFAULT,
+            },
             TargetVideoCodec::Hevc => VideoEncodeMode::NvencHevc { rate_control },
             TargetVideoCodec::Gif => VideoEncodeMode::CpuGif {
                 quality: VideoQuality::DEFAULT,
@@ -2297,6 +2334,98 @@ mod tests {
                 mkv.contains(&codec)
             );
         }
+    }
+
+    #[test]
+    fn mjpeg_validation_matrix() {
+        assert_eq!(VideoCodec::Mjpeg.label(), "MJPEG");
+        assert!(VideoCodec::Mjpeg.is_video());
+        assert!(!VideoCodec::Mjpeg.is_audio());
+        assert!(!VideoCodec::Mjpeg.nvdec_decodable());
+
+        for container in [
+            VideoContainerFormat::Avi,
+            VideoContainerFormat::Mov,
+            VideoContainerFormat::Mkv,
+        ] {
+            assert!(
+                VideoCodec::Mjpeg.supported_in(container),
+                "MJPEG must be allowed in {container}"
+            );
+            assert!(TargetVideoCodec::Mjpeg.supported_in(container));
+        }
+        for container in [
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Webm,
+            VideoContainerFormat::Ts,
+            VideoContainerFormat::Gif,
+            VideoContainerFormat::Webp,
+        ] {
+            assert!(
+                !VideoCodec::Mjpeg.supported_in(container),
+                "MJPEG must be rejected in {container}"
+            );
+            assert!(!TargetVideoCodec::Mjpeg.supported_in(container));
+        }
+
+        assert_eq!(TargetVideoCodec::Mjpeg.label(), "MJPEG");
+        assert_eq!(TargetVideoCodec::Mjpeg.as_video_codec(), VideoCodec::Mjpeg);
+        assert_eq!(
+            TargetVideoCodec::from_name("mjpeg"),
+            Some(TargetVideoCodec::Mjpeg)
+        );
+        assert_eq!(
+            TargetVideoCodec::from_name("MJPG"),
+            Some(TargetVideoCodec::Mjpeg)
+        );
+        assert_eq!(TargetVideoCodec::from_name("jpe"), None);
+    }
+
+    #[test]
+    fn mjpeg_encode_mode_is_cpu_quality_only() {
+        let quality = VideoQuality::new(55).unwrap_or(VideoQuality::DEFAULT);
+        let mode = VideoEncodeMode::resolve(
+            TargetVideoCodec::Mjpeg,
+            VideoRateControl::Quality(quality),
+            HardwareBackend::Cpu,
+        );
+        assert_eq!(mode, Ok(VideoEncodeMode::CpuMjpeg { quality }));
+        let mode = mode.unwrap_or(VideoEncodeMode::CpuMjpeg {
+            quality: VideoQuality::DEFAULT,
+        });
+        assert_eq!(mode.codec(), TargetVideoCodec::Mjpeg);
+        assert_eq!(mode.quality(), quality);
+        assert_eq!(mode.backend(), HardwareBackend::Cpu);
+        assert_eq!(mode.rate_control(), None);
+
+        let bitrate = vb(2_000_000);
+        let result = VideoEncodeMode::resolve(
+            TargetVideoCodec::Mjpeg,
+            VideoRateControl::Bitrate(bitrate),
+            HardwareBackend::Cpu,
+        );
+        assert!(result.is_err(), "MJPEG must reject --vbitrate");
+        let err = result
+            .err()
+            .unwrap_or(DomainError::EmptyField("expected error"));
+        assert!(err.to_string().contains("only --quality"));
+
+        let result = VideoEncodeMode::resolve(
+            TargetVideoCodec::Mjpeg,
+            VideoRateControl::DEFAULT,
+            HardwareBackend::Gpu(GpuBackend::Nvenc),
+        );
+        assert!(result.is_err(), "MJPEG must reject NVENC");
+        let err = result
+            .err()
+            .unwrap_or(DomainError::EmptyField("expected error"));
+        assert!(err.to_string().contains("CPU only"));
+
+        // Forced NVDEC is rejected for an MJPEG source at the domain boundary.
+        let err = HardwareDecodeBackend::Nvdec
+            .resolve(VideoCodec::Mjpeg, HardwareBackend::Gpu(GpuBackend::Nvenc));
+        assert!(err.is_err());
+        assert!(!VideoCodec::Mjpeg.nvdec_decodable());
     }
 
     #[test]

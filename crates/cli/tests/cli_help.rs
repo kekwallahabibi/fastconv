@@ -289,6 +289,8 @@ fn remux_and_video_help_cover_their_constraints() -> Result<(), String> {
         "hard error",
         "GIF",
         "webp",
+        "mjpeg (mjpg)",
+        "MJPEG: CPU-only",
         "HEVC has no CPU encoder",
     ] {
         assert!(video.contains(needle), "video help missing '{needle}'");

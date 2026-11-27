@@ -43,6 +43,18 @@ const WINDOW_BYTES: usize = 1024 * 1024;
 /// being staged in RAM.
 const IN_MEMORY_MP4_FASTSTART_LIMIT: u64 = 64 * 1024 * 1024;
 
+/// Upper bound on the source size of an MJPEG remux that must take the
+/// canonical `demux_video` -> `mux_video` route.
+///
+/// That route copies every packet payload into `ContainerMedia` before muxing
+/// starts, so its peak RAM grows with the source size. MJPEG frames are already
+/// compressed JPEG images and do not shrink on demux, so the route has no
+/// natural bound; a multi-gigabyte source would otherwise exhaust memory on
+/// constrained hosts. Rejecting it up front keeps the route's footprint
+/// bounded. Matroska-to-Matroska MJPEG keeps containr's streaming `StreamCopy`
+/// path and is not subject to this limit.
+const MAX_CANONICAL_MJPEG_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
+
 fn remux_failed(path: &Path, reason: impl Into<String>) -> PipelineError {
     PipelineError::RemuxFailed {
         path: path.to_path_buf(),
@@ -171,6 +183,12 @@ fn stream_copy_supports(item: &VideoRemuxItem) -> bool {
             VideoContainerFormat::Mp4 | VideoContainerFormat::Mov
         )
     };
+    let matroska = |format| {
+        matches!(
+            format,
+            VideoContainerFormat::Mkv | VideoContainerFormat::Webm
+        )
+    };
     let direct = (family(input) && family(output))
         || (matches!(
             input,
@@ -195,6 +213,12 @@ fn stream_copy_supports(item: &VideoRemuxItem) -> bool {
     // entry; containr's StreamCopy cannot express either across families.
     item.streams().iter().all(|stream| {
         stream.codec() != VideoCodec::Mp3
+            // containr maps neither a QuickTime `jpeg` sample entry to
+            // `V_MJPEG` nor `V_MJPEG` back to a sample entry, so cross-family
+            // MJPEG must use the canonical route. A Matroska-to-Matroska copy
+            // keeps the raw `CodecID`, so MJPEG stays stream-copied there.
+            && !(stream.codec() == VideoCodec::Mjpeg
+                && !(matroska(input) && matroska(output)))
             && !matches!(stream.codec(), VideoCodec::Flac | VideoCodec::Pcm)
             && !(stream.codec() == VideoCodec::Vp9 && family(output))
     })
@@ -210,6 +234,7 @@ fn canonical_remux_supports(codec: VideoCodec) -> bool {
             | VideoCodec::Hevc
             | VideoCodec::Av1
             | VideoCodec::Vp9
+            | VideoCodec::Mjpeg
             | VideoCodec::Aac
             | VideoCodec::Opus
             | VideoCodec::Vorbis
@@ -217,6 +242,23 @@ fn canonical_remux_supports(codec: VideoCodec) -> bool {
             | VideoCodec::Flac
             | VideoCodec::Pcm
     )
+}
+
+/// Rejects an MJPEG source too large for the canonical route before any
+/// demuxing happens. `demux_video` holds the whole source in `ContainerMedia`,
+/// so failing here avoids an allocator exhaustion deep in the demuxer.
+fn check_canonical_mjpeg_source_size(source: &Path, source_len: u64) -> Result<(), PipelineError> {
+    if source_len > MAX_CANONICAL_MJPEG_SOURCE_BYTES {
+        return Err(remux_failed(
+            source,
+            format!(
+                "MJPEG source is {source_len} bytes, above the \
+                 {MAX_CANONICAL_MJPEG_SOURCE_BYTES}-byte limit for the canonical remux route; \
+                 Matroska-to-Matroska copies stay streamed, otherwise split the source"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Fails before any path is taken when an MKV source carries metadata that the
@@ -324,6 +366,13 @@ fn remux_file(item: &VideoRemuxItem, target: &File) -> Result<(), PipelineError>
                     ),
                 ));
             }
+        }
+        if item
+            .streams()
+            .iter()
+            .any(|stream| stream.codec() == VideoCodec::Mjpeg)
+        {
+            check_canonical_mjpeg_source_size(source, input_size(source))?;
         }
         let media = demux_video(source, item.input_format())?;
         return mux_video(target, item.target(), output, &media);
@@ -1751,6 +1800,197 @@ mod container_tests {
             vec![stream(VideoCodec::H264)],
         );
         assert!(stream_copy_supports(&plain));
+    }
+
+    fn mjpeg_frame(width: u16, height: u16, seed: u8) -> Result<Vec<u8>, String> {
+        let pixels: Vec<u8> = (0..usize::from(width) * usize::from(height) * 3)
+            .map(|index| u8::try_from(index % 251).unwrap_or(0).wrapping_add(seed))
+            .collect();
+        let mut jpeg = Vec::new();
+        jpeg_encoder::Encoder::new(&mut jpeg, 80)
+            .encode(&pixels, width, height, jpeg_encoder::ColorType::Rgb)
+            .map_err(|err| format!("MJPEG fixture encode failed: {err}"))?;
+        Ok(jpeg)
+    }
+
+    fn mjpeg_media() -> Result<ContainerMedia, String> {
+        let track = ContainerTrack {
+            codec: VideoCodec::Mjpeg,
+            width: Some(64),
+            height: Some(48),
+            channels: None,
+            sample_rate: None,
+            config: Vec::new(),
+            timescale: US_TIMESCALE,
+            presentation_edit: None,
+            pcm_format: None,
+        };
+        let mut packets = Vec::new();
+        for index in 0_u64..3 {
+            packets.push(ContainerPacket {
+                track: 0,
+                pts: i64::try_from(index).unwrap_or(0) * 40_000,
+                dts: i64::try_from(index).unwrap_or(0) * 40_000,
+                duration: 40_000,
+                keyframe: true,
+                data: mjpeg_frame(64, 48, u8::try_from(index).unwrap_or(0))?,
+            });
+        }
+        Ok(ContainerMedia {
+            tracks: vec![track],
+            packets,
+        })
+    }
+
+    #[test]
+    fn mjpeg_remux_roundtrips_avi_mov_mkv() -> Result<(), Box<dyn std::error::Error>> {
+        let media = mjpeg_media()?;
+        let expected = payloads(&media, VideoCodec::Mjpeg);
+        let avi = temp_path("mjpeg-remux", "avi");
+        let mov = temp_path("mjpeg-remux", "mov");
+        let mkv = temp_path("mjpeg-remux", "mkv");
+        let back = temp_path("mjpeg-remux", "avi");
+        write_container(&avi, VideoContainerFormat::Avi, &media)?;
+        for (source, target, input, output) in [
+            (
+                &avi,
+                &mov,
+                VideoContainerFormat::Avi,
+                VideoContainerFormat::Mov,
+            ),
+            (
+                &mov,
+                &mkv,
+                VideoContainerFormat::Mov,
+                VideoContainerFormat::Mkv,
+            ),
+            (
+                &mkv,
+                &back,
+                VideoContainerFormat::Mkv,
+                VideoContainerFormat::Avi,
+            ),
+        ] {
+            remux(source, target, input, output)?;
+            let out = demux_video(target, output)?;
+            assert_eq!(out.tracks[0].codec, VideoCodec::Mjpeg);
+            assert_eq!(payloads(&out, VideoCodec::Mjpeg), expected);
+            assert!(
+                out.packets.iter().all(|packet| packet.keyframe),
+                "MJPEG remux must preserve every keyframe flag"
+            );
+        }
+        for path in [avi, mov, mkv, back] {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mjpeg_rejects_iso_mp4_and_stream_copy() -> Result<(), Box<dyn std::error::Error>> {
+        let media = mjpeg_media()?;
+        let mp4 = temp_path("mjpeg-mp4-reject", "mp4");
+        let err = match write_container(&mp4, VideoContainerFormat::Mp4, &media) {
+            Ok(()) => return Err("MJPEG must be rejected in ISO MP4".into()),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("MJPEG") && err.to_string().contains("MP4"),
+            "unexpected error: {err}"
+        );
+
+        let stream = VideoStreamInfo::new(
+            VideoCodec::Mjpeg,
+            fastconv_domain::VideoStreamKind::Video,
+            Some(64),
+            Some(48),
+            None,
+            None,
+            1,
+            US_TIMESCALE,
+            None,
+            None,
+        );
+        let item = VideoRemuxItem::new(
+            PathBuf::from("in.mkv"),
+            PathBuf::from("out.mov"),
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Mov,
+            vec![stream.clone()],
+        );
+        assert!(!stream_copy_supports(&item));
+
+        // containr cannot map V_MJPEG to a QuickTime `jpeg` sample entry or
+        // back, so both cross-family directions must stay on the bounded
+        // canonical route.
+        let cross_family_item = VideoRemuxItem::new(
+            PathBuf::from("in.mov"),
+            PathBuf::from("out.mkv"),
+            VideoContainerFormat::Mov,
+            VideoContainerFormat::Mkv,
+            vec![stream.clone()],
+        );
+        assert!(!stream_copy_supports(&cross_family_item));
+
+        // A Matroska copy keeps the raw CodecID, so MJPEG stays streamed and
+        // never loads the whole source into `ContainerMedia`.
+        let matroska_copy_item = VideoRemuxItem::new(
+            PathBuf::from("in.mkv"),
+            PathBuf::from("out-copy.mkv"),
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Mkv,
+            vec![stream],
+        );
+        assert!(stream_copy_supports(&matroska_copy_item));
+        assert!(canonical_remux_supports(VideoCodec::Mjpeg));
+        Ok(())
+    }
+
+    #[test]
+    fn mjpeg_mkv_to_mkv_stream_copy_preserves_payloads() -> Result<(), Box<dyn std::error::Error>> {
+        let media = mjpeg_media()?;
+        let expected = payloads(&media, VideoCodec::Mjpeg);
+        let source = temp_path("mjpeg-mkv-copy-source", "mkv");
+        let target = temp_path("mjpeg-mkv-copy-target", "mkv");
+        write_container(&source, VideoContainerFormat::Mkv, &media)?;
+        remux(
+            &source,
+            &target,
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Mkv,
+        )?;
+        let out = demux_video(&target, VideoContainerFormat::Mkv)?;
+        assert_eq!(out.tracks[0].codec, VideoCodec::Mjpeg);
+        assert_eq!(payloads(&out, VideoCodec::Mjpeg), expected);
+        assert!(
+            out.packets.iter().all(|packet| packet.keyframe),
+            "MJPEG stream copy must keep every frame a keyframe"
+        );
+        std::fs::remove_file(source)?;
+        std::fs::remove_file(target)?;
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_mjpeg_canonical_source_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let source = Path::new("oversized.mjpeg");
+        assert!(
+            check_canonical_mjpeg_source_size(source, MAX_CANONICAL_MJPEG_SOURCE_BYTES).is_ok()
+        );
+        let err = match check_canonical_mjpeg_source_size(
+            source,
+            MAX_CANONICAL_MJPEG_SOURCE_BYTES.saturating_add(1),
+        ) {
+            Ok(()) => return Err("one byte over the bound must be rejected".into()),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("MJPEG"), "unexpected error: {message}");
+        assert!(
+            message.contains("canonical remux route"),
+            "unexpected error: {message}"
+        );
+        Ok(())
     }
 
     fn write_mov_with_chapter(

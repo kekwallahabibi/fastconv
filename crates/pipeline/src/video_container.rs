@@ -20,13 +20,13 @@ use fastconv_domain::{VideoCodec, VideoContainerFormat};
 use crate::PipelineError;
 use crate::video_bitstream::{
     PcmFormat, annex_b_to_avcc, annex_b_to_hvcc, avcc_to_annex_b, build_aac_esds,
-    build_flac_mp4_sample_entry, build_mkv_flac_codec_private, build_mp3_mp4a_sample_entry,
-    build_pcm_mp4_sample_entry, build_vp09_sample_entry, dops_to_opus_head, extract_av1c_from_obu,
-    extract_avcc_from_annex_b, extract_dfla_from_sample_entry,
-    extract_flac_streaminfo_from_mkv_codec_private, extract_hvcc_from_annex_b, find_child_box,
-    hvcc_to_annex_b, is_av1_keyframe, is_h264_keyframe_annex_b, is_hevc_keyframe_annex_b,
-    opus_head_to_dops, parse_flac_streaminfo, unpack_xiph_laced_vorbis_headers, vorbis_ident_info,
-    vp9_color_from_keyframe,
+    build_flac_mp4_sample_entry, build_jpeg_sample_entry, build_mkv_flac_codec_private,
+    build_mp3_mp4a_sample_entry, build_pcm_mp4_sample_entry, build_vp09_sample_entry,
+    dops_to_opus_head, extract_av1c_from_obu, extract_avcc_from_annex_b,
+    extract_dfla_from_sample_entry, extract_flac_streaminfo_from_mkv_codec_private,
+    extract_hvcc_from_annex_b, find_child_box, hvcc_to_annex_b, is_av1_keyframe,
+    is_h264_keyframe_annex_b, is_hevc_keyframe_annex_b, opus_head_to_dops, parse_flac_streaminfo,
+    unpack_xiph_laced_vorbis_headers, vorbis_ident_info, vp9_color_from_keyframe,
 };
 
 /// Canonical timestamp unit: exact microseconds, i.e. one tick is 1 µs and
@@ -336,6 +336,7 @@ fn mp4_codec(track: &Track) -> Option<VideoCodec> {
             b"hvc1" | b"hev1" => Some(VideoCodec::Hevc),
             b"av01" => Some(VideoCodec::Av1),
             b"vp09" => Some(VideoCodec::Vp9),
+            b"jpeg" => Some(VideoCodec::Mjpeg),
             b"Opus" => Some(VideoCodec::Opus),
             b"fLaC" => Some(VideoCodec::Flac),
             b"sowt" | b"twos" | b"lpcm" | b"fl32" => Some(VideoCodec::Pcm),
@@ -388,6 +389,7 @@ fn mkv_codec(codec_id: &str) -> Option<VideoCodec> {
         "V_MPEGH/ISO/HEVC" => Some(VideoCodec::Hevc),
         "V_AV1" => Some(VideoCodec::Av1),
         "V_VP9" => Some(VideoCodec::Vp9),
+        "V_MJPEG" => Some(VideoCodec::Mjpeg),
         "A_AAC" => Some(VideoCodec::Aac),
         "A_OPUS" => Some(VideoCodec::Opus),
         "A_VORBIS" => Some(VideoCodec::Vorbis),
@@ -600,7 +602,8 @@ fn canonical_config(
             canonical_flac_config(&codec_private, path)
         }
         // The exact PCM/MP3 representation is stored in the track facts, not config.
-        VideoCodec::Pcm | VideoCodec::Mp3 => Ok(Vec::new()),
+        // MJPEG samples are complete JPEG frames, so there is no codec config.
+        VideoCodec::Pcm | VideoCodec::Mp3 | VideoCodec::Mjpeg => Ok(Vec::new()),
         _ => Err(container_error(path, format!("unsupported codec {codec}"))),
     }
 }
@@ -935,6 +938,9 @@ fn demux_mp4_with_format(
             .map_err(|err| containr_error(path, &err))?;
         let (timescale, edit_shift) = track_meta[track];
         let dts = packet.dts.unwrap_or(packet.pts);
+        // Every MJPEG sample is a complete JPEG frame: even when a container
+        // omits the sync flag, it must be presented as an independent image.
+        let sync = packet.sync || media.tracks[track].codec == VideoCodec::Mjpeg;
         let converted = ContainerPacket {
             track,
             pts: rescale_ticks(packet.pts, 1, timescale).saturating_add(edit_shift),
@@ -947,7 +953,7 @@ fn demux_mp4_with_format(
                 ))
                 .unwrap_or(1)
             }),
-            keyframe: packet.sync,
+            keyframe: sync,
             data: buf.clone(),
         };
         if let Some(coalescer) = coalescer.as_mut()
@@ -1245,12 +1251,15 @@ fn demux_mkv(path: &Path) -> Result<ContainerMedia, PipelineError> {
             ))
             .unwrap_or(1)
         });
+        // MJPEG frames are always self-contained; do not trust a missing
+        // Matroska SimpleBlock keyframe flag to signal otherwise.
+        let sync = packet.sync || media.tracks[track].codec == VideoCodec::Mjpeg;
         media.packets.push(ContainerPacket {
             track,
             pts,
             dts: pts,
             duration,
-            keyframe: packet.sync,
+            keyframe: sync,
             data: buf.clone(),
         });
     }
@@ -1553,6 +1562,26 @@ fn mux_mp4_into<W: Read + Write + Seek>(
                     US_TIMESCALE,
                 )
             }
+            VideoCodec::Mjpeg => {
+                // ISO MP4 has no registered JPEG video sample entry; QuickTime
+                // MOV does, so refuse instead of writing a broken ISO track.
+                if options.brand != Brand::QuickTime {
+                    return Err(container_error(
+                        target_path,
+                        "MJPEG requires QuickTime MOV output; ISO MP4 has no JPEG sample entry",
+                    ));
+                }
+                let width = track.width.filter(|&w| w > 0).ok_or_else(|| {
+                    container_error(target_path, "MJPEG track is missing a non-zero width")
+                })?;
+                let height = track.height.filter(|&h| h > 0).ok_or_else(|| {
+                    container_error(target_path, "MJPEG track is missing a non-zero height")
+                })?;
+                (
+                    SampleEntrySpec::Raw(build_jpeg_sample_entry(width, height)),
+                    US_TIMESCALE,
+                )
+            }
             VideoCodec::Aac => {
                 let sample_rate = track.sample_rate.unwrap_or(48_000).max(1);
                 // Audio `mdhd` timescale must match the sample rate so MP4
@@ -1752,7 +1781,7 @@ fn mux_mp4_into<W: Read + Write + Seek>(
                     pts_ticks,
                     dts_ticks,
                     final_duration_ticks,
-                    packet.keyframe,
+                    packet.keyframe || media.tracks[packet.track].codec == VideoCodec::Mjpeg,
                 )
             } else {
                 let from = frame.saturating_mul(frame_bytes);
@@ -1888,6 +1917,7 @@ fn mkv_codec_private(
     target_path: &Path,
 ) -> Result<Option<Vec<u8>>, PipelineError> {
     match track.codec {
+        VideoCodec::Mjpeg => Ok(None),
         VideoCodec::Vp9 => {
             let private = vp9_validated_codec_private(&track.config);
             Ok((!private.is_empty()).then_some(private))
@@ -1937,6 +1967,7 @@ fn mux_mkv(
             VideoCodec::Hevc => "V_MPEGH/ISO/HEVC",
             VideoCodec::Av1 => "V_AV1",
             VideoCodec::Vp9 => "V_VP9",
+            VideoCodec::Mjpeg => "V_MJPEG",
             VideoCodec::Aac => "A_AAC",
             VideoCodec::Opus => "A_OPUS",
             VideoCodec::Vorbis => "A_VORBIS",
@@ -2018,7 +2049,7 @@ fn mux_mkv(
             data: &packet.data,
             pts,
             duration: Some(packet.duration.max(1)),
-            sync: packet.keyframe,
+            sync: packet.keyframe || media.tracks[packet.track].codec == VideoCodec::Mjpeg,
             discardable: false,
             discard_padding: None,
         };

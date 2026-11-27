@@ -962,7 +962,7 @@ mod tests {
     use super::{decode_packets_to_gpu, validate_decode_caps};
     use crate::PipelineError;
     use crate::gpu::nvenc::{encode_video_nvdec_nvenc_streaming, encode_video_nvenc_streaming};
-    use crate::video_codecs::{Yuv420Frame, decode_video_track, encode_video_cpu};
+    use crate::video_codecs::{Yuv420Frame, YuvColor, decode_video_track, encode_video_cpu};
 
     fn synthetic_frames(width: u32, height: u32, count: usize) -> Vec<Yuv420Frame> {
         let w = usize::try_from(width).unwrap_or(0);
@@ -980,6 +980,7 @@ mod tests {
                 v: vec![128; w.div_ceil(2).saturating_mul(h.div_ceil(2))],
                 pts_us: i64::try_from(index).unwrap_or(0).saturating_mul(40_000),
                 duration_us: 40_000,
+                color: YuvColor::default(),
             })
             .collect()
     }

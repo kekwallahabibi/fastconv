@@ -1456,6 +1456,42 @@ pub(crate) fn build_vp09_sample_entry(width: u16, height: u16, vpcc_body: &[u8])
     entry
 }
 
+/// `QuickTime` `jpeg` visual sample entry with a 1:1 `pasp` box.
+///
+/// MJPEG samples are complete JPEG frames, so the entry has no codec-config
+/// child box: the standard 86-byte `VisualSampleEntry` plus a 16-byte `pasp`
+/// is the entire description. The 72 dpi resolution and `Photo - JPEG`
+/// compressor name are the `QuickTime` conventions for JPEG video.
+pub(crate) fn build_jpeg_sample_entry(width: u16, height: u16) -> Vec<u8> {
+    let mut entry = Vec::with_capacity(8 + 78 + 16);
+    entry.extend_from_slice(&[0; 4]);
+    entry.extend_from_slice(b"jpeg");
+    entry.extend_from_slice(&[0; 6]); // reserved
+    entry.extend_from_slice(&1_u16.to_be_bytes()); // data_reference_index
+    entry.extend_from_slice(&[0; 2]); // pre_defined
+    entry.extend_from_slice(&[0; 2]); // reserved
+    entry.extend_from_slice(&[0; 12]); // pre_defined[3]
+    entry.extend_from_slice(&width.to_be_bytes());
+    entry.extend_from_slice(&height.to_be_bytes());
+    entry.extend_from_slice(&0x0048_0000_u32.to_be_bytes()); // 72 dpi horizontal
+    entry.extend_from_slice(&0x0048_0000_u32.to_be_bytes()); // 72 dpi vertical
+    entry.extend_from_slice(&[0; 4]); // reserved
+    entry.extend_from_slice(&1_u16.to_be_bytes()); // frame_count
+    let mut compressor = [0_u8; 32];
+    compressor[0] = 12;
+    compressor[1..13].copy_from_slice(b"Photo - JPEG");
+    entry.extend_from_slice(&compressor);
+    entry.extend_from_slice(&0x0018_u16.to_be_bytes()); // depth: 24-bit
+    entry.extend_from_slice(&0xFFFF_u16.to_be_bytes()); // color table ID
+    entry.extend_from_slice(&16_u32.to_be_bytes());
+    entry.extend_from_slice(b"pasp");
+    entry.extend_from_slice(&1_u32.to_be_bytes());
+    entry.extend_from_slice(&1_u32.to_be_bytes());
+    let size = u32::try_from(entry.len()).unwrap_or(u32::MAX);
+    entry[..4].copy_from_slice(&size.to_be_bytes());
+    entry
+}
+
 /// Exact PCM sample representation carried by a container. Endianness and
 /// depth are parsed from the source sample entry, never guessed at decode time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2067,6 +2103,38 @@ mod tests {
                 .map_err(|_| "vp09 size bytes")?,
         );
         assert_eq!(usize::try_from(vp9_size).unwrap_or(0), vp9.len());
+        Ok(())
+    }
+
+    #[test]
+    fn jpeg_sample_entry_is_well_formed() -> Result<(), String> {
+        let entry = build_jpeg_sample_entry(320, 240);
+        assert_eq!(&entry[4..8], b"jpeg");
+        // Standard 86-byte VisualSampleEntry plus a 16-byte pasp box.
+        assert_eq!(entry.len(), 102);
+        assert_eq!(&entry[8..14], &[0; 6]);
+        assert_eq!(&entry[14..16], &1_u16.to_be_bytes());
+        assert_eq!(&entry[32..34], &320_u16.to_be_bytes());
+        assert_eq!(&entry[34..36], &240_u16.to_be_bytes());
+        assert_eq!(&entry[36..40], &0x0048_0000_u32.to_be_bytes());
+        assert_eq!(&entry[40..44], &0x0048_0000_u32.to_be_bytes());
+        assert_eq!(&entry[48..50], &1_u16.to_be_bytes());
+        assert_eq!(entry[50], 12);
+        assert_eq!(&entry[51..63], b"Photo - JPEG");
+        assert_eq!(&entry[82..84], &0x0018_u16.to_be_bytes());
+        assert_eq!(&entry[84..86], &0xFFFF_u16.to_be_bytes());
+        assert_eq!(&entry[86..90], &16_u32.to_be_bytes());
+        assert_eq!(&entry[90..94], b"pasp");
+        assert_eq!(&entry[94..98], &1_u32.to_be_bytes());
+        assert_eq!(&entry[98..102], &1_u32.to_be_bytes());
+        let size = u32::from_be_bytes(
+            entry
+                .get(..4)
+                .ok_or("jpeg size")?
+                .try_into()
+                .map_err(|_| "jpeg size bytes")?,
+        );
+        assert_eq!(usize::try_from(size).unwrap_or(0), entry.len());
         Ok(())
     }
 

@@ -3467,7 +3467,7 @@ mod tests {
 
     use super::encode_video_nvenc_streaming;
     use crate::PipelineError;
-    use crate::video_codecs::{Yuv420Frame, decode_video_track, encode_video_cpu};
+    use crate::video_codecs::{Yuv420Frame, YuvColor, decode_video_track, encode_video_cpu};
     use crate::video_container::{ContainerPacket, ContainerTrack, US_TIMESCALE};
 
     fn synthetic_frames(width: u32, height: u32, count: usize) -> Vec<Yuv420Frame> {
@@ -3498,6 +3498,7 @@ mod tests {
                     v: vec![v_value; chroma],
                     pts_us: i64::try_from(index).unwrap_or(0).saturating_mul(40_000),
                     duration_us: 40_000,
+                    color: YuvColor::default(),
                 }
             })
             .collect()
