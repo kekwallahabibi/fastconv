@@ -5,10 +5,10 @@ pub mod metrics;
 pub mod video;
 
 pub use audio::{
-    AudioBatchItem, AudioBatchPlan, AudioConversionReport, AudioEncodingOptions,
+    AudioBatchItem, AudioBatchPlan, AudioBitDepth, AudioConversionReport, AudioEncodingOptions,
     AudioExecutionMode, AudioInputFormat, AudioOptionBitrate, AudioOptionChannels,
-    AudioOptionSampleRate, AudioOutputFormat, AudioQuality, AudioRateControl, AudioStreamInfo,
-    aac_frame_capacity_bps,
+    AudioOptionSampleRate, AudioOutputFormat, AudioQuality, AudioRateControl, AudioSampleFormat,
+    AudioStreamInfo, aac_frame_capacity_bps,
 };
 pub use hardware::{
     CpuInfo, DetectedGpuBackend, GpuAdapterInfo, GpuCapability, GpuVendor, HostHardware, SimdLevel,
@@ -184,6 +184,15 @@ pub enum DomainError {
     UnsupportedAudioRateControl {
         format: AudioOutputFormat,
         control: &'static str,
+        reason: &'static str,
+    },
+    InvalidAudioBitDepth {
+        raw: String,
+        expected: &'static str,
+    },
+    UnsupportedAudioBitDepth {
+        format: AudioOutputFormat,
+        bit_depth: AudioBitDepth,
         reason: &'static str,
     },
 }
@@ -385,6 +394,17 @@ fn fmt_encoding_error(err: &DomainError, f: &mut fmt::Formatter<'_>) -> fmt::Res
         } => write!(
             f,
             "audio bitrate {bps} bps at {hz} Hz with {channels} channels exceeds the AAC frame capacity of {max_bps} bps"
+        ),
+        DomainError::InvalidAudioBitDepth { raw, expected } => {
+            write!(f, "invalid audio bit depth '{raw}' (expected {expected})")
+        }
+        DomainError::UnsupportedAudioBitDepth {
+            format,
+            bit_depth,
+            reason,
+        } => write!(
+            f,
+            "--bit-depth {bit_depth} is not supported for {format} audio: {reason}"
         ),
         _ => Err(fmt::Error),
     }

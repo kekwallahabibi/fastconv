@@ -84,7 +84,7 @@ impl fmt::Display for PipelineError {
             }
             Self::UnsupportedSampleDepth { path, bits } => write!(
                 f,
-                "unsupported audio sample depth {bits} in '{}'; supported depths are 8, 16 and 24 bits",
+                "unsupported audio sample depth {bits} in '{}'; supported depths are 8, 16, 24, 32-bit integer and 32-bit float",
                 path.display()
             ),
             Self::EmptyOutput(path) => {

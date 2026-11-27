@@ -154,6 +154,61 @@ impl fmt::Display for AudioOutputFormat {
     }
 }
 
+/// Validated PCM sample depth requested for a lossless audio target.
+///
+/// This is a lossless-encoder knob only: lossy codecs consume normalized `f32`
+/// samples and reject every explicit depth at the domain boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum AudioBitDepth {
+    Int8,
+    Int16,
+    Int24,
+    Int32,
+    Float32,
+}
+
+impl AudioBitDepth {
+    #[must_use]
+    pub const fn bits(self) -> u16 {
+        match self {
+            Self::Int8 => 8,
+            Self::Int16 => 16,
+            Self::Int24 => 24,
+            Self::Int32 | Self::Float32 => 32,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_float(self) -> bool {
+        matches!(self, Self::Float32)
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Int8 => "8",
+            Self::Int16 => "16",
+            Self::Int24 => "24",
+            Self::Int32 => "32",
+            Self::Float32 => "f32",
+        }
+    }
+}
+
+impl fmt::Display for AudioBitDepth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Whether a decoded stream carries integer or IEEE float samples.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
+pub enum AudioSampleFormat {
+    #[default]
+    Int,
+    Float,
+}
+
 /// Validated lossy-audio target bitrate in bits per second.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct AudioOptionBitrate(NonZeroU32);
@@ -318,6 +373,7 @@ pub struct AudioEncodingOptions {
     rate_control: AudioRateControl,
     sample_rate: Option<AudioOptionSampleRate>,
     channels: Option<AudioOptionChannels>,
+    bit_depth: Option<AudioBitDepth>,
 }
 
 impl Default for AudioEncodingOptions {
@@ -326,6 +382,7 @@ impl Default for AudioEncodingOptions {
             rate_control: AudioRateControl::Default,
             sample_rate: None,
             channels: None,
+            bit_depth: None,
         }
     }
 }
@@ -345,11 +402,13 @@ impl AudioEncodingOptions {
         rate_control: AudioRateControl,
         sample_rate: Option<AudioOptionSampleRate>,
         channels: Option<AudioOptionChannels>,
+        bit_depth: Option<AudioBitDepth>,
     ) -> Result<Self, DomainError> {
         let options = Self {
             rate_control,
             sample_rate,
             channels,
+            bit_depth,
         };
         options.validate(format)?;
         Ok(options)
@@ -370,8 +429,16 @@ impl AudioEncodingOptions {
         self.channels
     }
 
+    #[must_use]
+    pub const fn bit_depth(&self) -> Option<AudioBitDepth> {
+        self.bit_depth
+    }
+
     fn validate(&self, format: AudioOutputFormat) -> Result<(), DomainError> {
         Self::validate_rate_control(format, self.rate_control)?;
+        if let Some(depth) = self.bit_depth {
+            Self::validate_bit_depth(format, depth)?;
+        }
         if let Some(rate) = self.sample_rate {
             Self::validate_sample_rate(format, rate)?;
         }
@@ -412,6 +479,48 @@ impl AudioEncodingOptions {
             }
         }
         Ok(())
+    }
+
+    /// Checks an explicit PCM depth against what the target encoder can actually store.
+    ///
+    /// The limits come from the native encoders: `flacenc` caps samples at 24-bit
+    /// integers, ALAC in this pipeline is wired for 16-bit integer samples, and the
+    /// lossy encoders only accept normalized `f32` input.
+    fn validate_bit_depth(
+        format: AudioOutputFormat,
+        depth: AudioBitDepth,
+    ) -> Result<(), DomainError> {
+        let valid = match format {
+            AudioOutputFormat::Wav | AudioOutputFormat::Aiff => true,
+            AudioOutputFormat::Flac => matches!(
+                depth,
+                AudioBitDepth::Int8 | AudioBitDepth::Int16 | AudioBitDepth::Int24
+            ),
+            AudioOutputFormat::Alac => depth == AudioBitDepth::Int16,
+            AudioOutputFormat::Mp3
+            | AudioOutputFormat::Aac
+            | AudioOutputFormat::M4a
+            | AudioOutputFormat::Opus
+            | AudioOutputFormat::Ogg => false,
+        };
+        if valid {
+            return Ok(());
+        }
+        let reason = match format {
+            AudioOutputFormat::Flac => "FLAC stores at most 24-bit integer PCM; use 8, 16 or 24",
+            AudioOutputFormat::Alac => "ALAC stores 16-bit integer PCM only; use 16",
+            AudioOutputFormat::Mp3
+            | AudioOutputFormat::Aac
+            | AudioOutputFormat::M4a
+            | AudioOutputFormat::Opus
+            | AudioOutputFormat::Ogg => "lossy codecs consume normalized f32 samples",
+            AudioOutputFormat::Wav | AudioOutputFormat::Aiff => "",
+        };
+        Err(DomainError::UnsupportedAudioBitDepth {
+            format,
+            bit_depth: depth,
+            reason,
+        })
     }
 
     fn validate_rate_control(
@@ -553,11 +662,12 @@ pub struct AudioStreamInfo {
     channels: NonZeroU16,
     sample_rate: NonZeroU32,
     bits_per_sample: Option<NonZeroU16>,
+    sample_format: AudioSampleFormat,
     total_samples: Option<u64>,
 }
 
 impl AudioStreamInfo {
-    /// Creates validated stream metadata.
+    /// Creates validated integer-PCM stream metadata.
     ///
     /// # Errors
     ///
@@ -568,6 +678,27 @@ impl AudioStreamInfo {
         bits_per_sample: Option<NonZeroU16>,
         total_samples: Option<u64>,
     ) -> Result<Self, DomainError> {
+        Self::with_sample_format(
+            channels,
+            sample_rate,
+            bits_per_sample,
+            AudioSampleFormat::Int,
+            total_samples,
+        )
+    }
+
+    /// Creates validated stream metadata carrying an explicit sample format.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::EmptyField`] when `channels` or `sample_rate` is zero.
+    pub fn with_sample_format(
+        channels: NonZeroU16,
+        sample_rate: NonZeroU32,
+        bits_per_sample: Option<NonZeroU16>,
+        sample_format: AudioSampleFormat,
+        total_samples: Option<u64>,
+    ) -> Result<Self, DomainError> {
         if channels.get() == 0 || sample_rate.get() == 0 {
             return Err(DomainError::EmptyField("audio.stream_info"));
         }
@@ -575,6 +706,7 @@ impl AudioStreamInfo {
             channels,
             sample_rate,
             bits_per_sample,
+            sample_format,
             total_samples,
         })
     }
@@ -592,6 +724,11 @@ impl AudioStreamInfo {
     #[must_use]
     pub const fn bits_per_sample(self) -> Option<NonZeroU16> {
         self.bits_per_sample
+    }
+
+    #[must_use]
+    pub const fn sample_format(self) -> AudioSampleFormat {
+        self.sample_format
     }
 
     #[must_use]
@@ -1038,6 +1175,120 @@ mod tests {
         AudioEncodingOptions::default()
     }
 
+    fn audio_options(
+        format: AudioOutputFormat,
+        rate_control: AudioRateControl,
+        sample_rate: Option<AudioOptionSampleRate>,
+        channels: Option<AudioOptionChannels>,
+    ) -> Result<AudioEncodingOptions, DomainError> {
+        AudioEncodingOptions::new(format, rate_control, sample_rate, channels, None)
+    }
+
+    #[test]
+    fn audio_bit_depth_reports_bits_and_float_kind() {
+        for (depth, bits, float) in [
+            (AudioBitDepth::Int8, 8, false),
+            (AudioBitDepth::Int16, 16, false),
+            (AudioBitDepth::Int24, 24, false),
+            (AudioBitDepth::Int32, 32, false),
+            (AudioBitDepth::Float32, 32, true),
+        ] {
+            assert_eq!(depth.bits(), bits);
+            assert_eq!(depth.is_float(), float);
+            assert_eq!(depth.to_string(), depth.label());
+        }
+        assert_eq!(AudioSampleFormat::default(), AudioSampleFormat::Int);
+    }
+
+    #[test]
+    fn stream_info_defaults_to_integer_samples() -> Result<(), DomainError> {
+        let channels = NonZeroU16::new(2).unwrap_or(NonZeroU16::MIN);
+        let rate = NonZeroU32::new(48_000).unwrap_or(NonZeroU32::MIN);
+        let bits = NonZeroU16::new(32);
+        let plain = AudioStreamInfo::new(channels, rate, bits, None)?;
+        assert_eq!(plain.sample_format(), AudioSampleFormat::Int);
+        let float = AudioStreamInfo::with_sample_format(
+            channels,
+            rate,
+            bits,
+            AudioSampleFormat::Float,
+            None,
+        )?;
+        assert_eq!(float.sample_format(), AudioSampleFormat::Float);
+        assert_eq!(float.bits_per_sample(), bits);
+        Ok(())
+    }
+
+    #[test]
+    fn validates_explicit_bit_depth_for_every_output_format() -> Result<(), DomainError> {
+        let all = [
+            AudioBitDepth::Int8,
+            AudioBitDepth::Int16,
+            AudioBitDepth::Int24,
+            AudioBitDepth::Int32,
+            AudioBitDepth::Float32,
+        ];
+        let options = |format, depth: Option<AudioBitDepth>| {
+            AudioEncodingOptions::new(format, AudioRateControl::Default, None, None, depth)
+        };
+        for format in [AudioOutputFormat::Wav, AudioOutputFormat::Aiff] {
+            for depth in all {
+                let resolved = options(format, Some(depth))?;
+                assert_eq!(resolved.bit_depth(), Some(depth), "{format} {depth}");
+            }
+        }
+        for depth in [
+            AudioBitDepth::Int8,
+            AudioBitDepth::Int16,
+            AudioBitDepth::Int24,
+        ] {
+            assert_eq!(
+                options(AudioOutputFormat::Flac, Some(depth))?.bit_depth(),
+                Some(depth)
+            );
+        }
+        for depth in [AudioBitDepth::Int32, AudioBitDepth::Float32] {
+            assert!(matches!(
+                options(AudioOutputFormat::Flac, Some(depth)),
+                Err(DomainError::UnsupportedAudioBitDepth { .. })
+            ));
+        }
+        assert_eq!(
+            options(AudioOutputFormat::Alac, Some(AudioBitDepth::Int16))?.bit_depth(),
+            Some(AudioBitDepth::Int16)
+        );
+        for depth in [
+            AudioBitDepth::Int8,
+            AudioBitDepth::Int24,
+            AudioBitDepth::Int32,
+            AudioBitDepth::Float32,
+        ] {
+            assert!(matches!(
+                options(AudioOutputFormat::Alac, Some(depth)),
+                Err(DomainError::UnsupportedAudioBitDepth { .. })
+            ));
+        }
+        for format in [
+            AudioOutputFormat::Mp3,
+            AudioOutputFormat::Aac,
+            AudioOutputFormat::M4a,
+            AudioOutputFormat::Opus,
+            AudioOutputFormat::Ogg,
+        ] {
+            for depth in all {
+                assert!(
+                    matches!(
+                        options(format, Some(depth)),
+                        Err(DomainError::UnsupportedAudioBitDepth { .. })
+                    ),
+                    "{format} must reject {depth}"
+                );
+            }
+            assert_eq!(options(format, None)?.bit_depth(), None);
+        }
+        Ok(())
+    }
+
     #[test]
     fn bitrate_constructor_accepts_only_exact_nonzero_bps() -> Result<(), DomainError> {
         assert_eq!(AudioOptionBitrate::new(191_500)?.bps(), 191_500);
@@ -1093,17 +1344,17 @@ mod tests {
             AudioOutputFormat::Aiff,
         ] {
             assert!(matches!(
-                AudioEncodingOptions::new(format, bitrate(128_000)?, None, None),
+                audio_options(format, bitrate(128_000)?, None, None),
                 Err(DomainError::UnsupportedAudioRateControl { .. })
             ));
             assert!(matches!(
-                AudioEncodingOptions::new(format, quality(80)?, None, None),
+                audio_options(format, quality(80)?, None, None),
                 Err(DomainError::UnsupportedAudioRateControl { .. })
             ));
         }
         for format in [AudioOutputFormat::Aac, AudioOutputFormat::M4a] {
             assert!(matches!(
-                AudioEncodingOptions::new(format, quality(80)?, None, None),
+                audio_options(format, quality(80)?, None, None),
                 Err(DomainError::UnsupportedAudioRateControl { .. })
             ));
         }
@@ -1119,33 +1370,23 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    AudioEncodingOptions::new(format, bitrate(rejected)?, None, None),
+                    audio_options(format, bitrate(rejected)?, None, None),
                     Err(DomainError::InvalidAudioOptionBitrate { .. })
                 ),
                 "{format} must reject {rejected} bps"
             );
         }
-        assert!(
-            AudioEncodingOptions::new(AudioOutputFormat::Mp3, bitrate(32_000)?, None, None).is_ok()
-        );
-        assert!(
-            AudioEncodingOptions::new(AudioOutputFormat::Mp3, bitrate(320_000)?, None, None)
-                .is_ok()
-        );
-        assert!(
-            AudioEncodingOptions::new(AudioOutputFormat::Opus, bitrate(6_000)?, None, None).is_ok()
-        );
-        assert!(
-            AudioEncodingOptions::new(AudioOutputFormat::Opus, bitrate(510_000)?, None, None)
-                .is_ok()
-        );
+        assert!(audio_options(AudioOutputFormat::Mp3, bitrate(32_000)?, None, None).is_ok());
+        assert!(audio_options(AudioOutputFormat::Mp3, bitrate(320_000)?, None, None).is_ok());
+        assert!(audio_options(AudioOutputFormat::Opus, bitrate(6_000)?, None, None).is_ok());
+        assert!(audio_options(AudioOutputFormat::Opus, bitrate(510_000)?, None, None).is_ok());
         for format in [
             AudioOutputFormat::Mp3,
             AudioOutputFormat::Ogg,
             AudioOutputFormat::Opus,
         ] {
-            assert!(AudioEncodingOptions::new(format, quality(0)?, None, None).is_ok());
-            assert!(AudioEncodingOptions::new(format, quality(100)?, None, None).is_ok());
+            assert!(audio_options(format, quality(0)?, None, None).is_ok());
+            assert!(audio_options(format, quality(100)?, None, None).is_ok());
         }
         Ok(())
     }
@@ -1158,12 +1399,7 @@ mod tests {
         for hz in AudioOptionSampleRate::MP3_MPEG2_RATES {
             assert!(
                 matches!(
-                    AudioEncodingOptions::new(
-                        AudioOutputFormat::Mp3,
-                        bitrate(320_000)?,
-                        rate(hz)?,
-                        None
-                    ),
+                    audio_options(AudioOutputFormat::Mp3, bitrate(320_000)?, rate(hz)?, None),
                     Err(DomainError::IncompatibleAudioBitrateRate {
                         bps: 320_000,
                         max_bps: 160_000,
@@ -1173,32 +1409,17 @@ mod tests {
                 "MP3 at {hz} Hz must reject 320000 bps"
             );
             assert!(
-                AudioEncodingOptions::new(
-                    AudioOutputFormat::Mp3,
-                    bitrate(160_000)?,
-                    rate(hz)?,
-                    None
-                )
-                .is_ok(),
+                audio_options(AudioOutputFormat::Mp3, bitrate(160_000)?, rate(hz)?, None).is_ok(),
                 "MP3 at {hz} Hz must accept 160000 bps"
             );
         }
         for hz in [32_000, 44_100, 48_000] {
             assert!(
-                AudioEncodingOptions::new(
-                    AudioOutputFormat::Mp3,
-                    bitrate(320_000)?,
-                    rate(hz)?,
-                    None
-                )
-                .is_ok(),
+                audio_options(AudioOutputFormat::Mp3, bitrate(320_000)?, rate(hz)?, None).is_ok(),
                 "MP3 at {hz} Hz (MPEG-1) must accept 320000 bps"
             );
         }
-        assert!(
-            AudioEncodingOptions::new(AudioOutputFormat::Mp3, bitrate(320_000)?, None, None)
-                .is_ok()
-        );
+        assert!(audio_options(AudioOutputFormat::Mp3, bitrate(320_000)?, None, None).is_ok());
         Ok(())
     }
 
@@ -1209,7 +1430,7 @@ mod tests {
         let channels = |count| AudioOptionChannels::new(count).map(Some);
         for format in [AudioOutputFormat::Aac, AudioOutputFormat::M4a] {
             assert!(matches!(
-                AudioEncodingOptions::new(format, bitrate(512_000)?, rate(8_000)?, channels(1)?),
+                audio_options(format, bitrate(512_000)?, rate(8_000)?, channels(1)?),
                 Err(DomainError::IncompatibleAacBitrateRate {
                     bps: 512_000,
                     hz: 8_000,
@@ -1217,10 +1438,7 @@ mod tests {
                     max_bps: 48_000,
                 })
             ));
-            assert!(
-                AudioEncodingOptions::new(format, bitrate(256_000)?, rate(48_000)?, channels(2)?)
-                    .is_ok()
-            );
+            assert!(audio_options(format, bitrate(256_000)?, rate(48_000)?, channels(2)?).is_ok());
         }
         assert_eq!(aac_frame_capacity_bps(8_000, 1), 48_000);
         assert_eq!(aac_frame_capacity_bps(48_000, 2), 576_000);
@@ -1232,7 +1450,7 @@ mod tests {
         let rate = |hz| AudioOptionSampleRate::new(hz).map(Some);
 
         assert!(
-            AudioEncodingOptions::new(
+            audio_options(
                 AudioOutputFormat::Opus,
                 AudioRateControl::Default,
                 rate(48_000)?,
@@ -1243,7 +1461,7 @@ mod tests {
         for hz in [8_000, 44_100, 96_000] {
             assert!(
                 matches!(
-                    AudioEncodingOptions::new(
+                    audio_options(
                         AudioOutputFormat::Opus,
                         AudioRateControl::Default,
                         rate(hz)?,
@@ -1256,7 +1474,7 @@ mod tests {
         }
         for hz in [8_000, 11_025, 48_000] {
             assert!(
-                AudioEncodingOptions::new(
+                audio_options(
                     AudioOutputFormat::Mp3,
                     AudioRateControl::Default,
                     rate(hz)?,
@@ -1266,7 +1484,7 @@ mod tests {
             );
         }
         assert!(matches!(
-            AudioEncodingOptions::new(
+            audio_options(
                 AudioOutputFormat::Mp3,
                 AudioRateControl::Default,
                 rate(7_350)?,
@@ -1275,7 +1493,7 @@ mod tests {
             Err(DomainError::InvalidAudioOptionSampleRate { .. })
         ));
         assert!(
-            AudioEncodingOptions::new(
+            audio_options(
                 AudioOutputFormat::M4a,
                 AudioRateControl::Default,
                 rate(7_350)?,
@@ -1288,12 +1506,9 @@ mod tests {
             AudioOutputFormat::Flac,
             AudioOutputFormat::Ogg,
         ] {
-            assert!(
-                AudioEncodingOptions::new(format, AudioRateControl::Default, rate(44_100)?, None)
-                    .is_ok()
-            );
+            assert!(audio_options(format, AudioRateControl::Default, rate(44_100)?, None).is_ok());
             assert!(matches!(
-                AudioEncodingOptions::new(format, AudioRateControl::Default, rate(7_999)?, None),
+                audio_options(format, AudioRateControl::Default, rate(7_999)?, None),
                 Err(DomainError::InvalidAudioOptionSampleRate { .. })
             ));
         }
@@ -1304,12 +1519,9 @@ mod tests {
     fn rejects_illegal_channels_per_format() -> Result<(), DomainError> {
         let channels = |count| AudioOptionChannels::new(count).map(Some);
         for format in [AudioOutputFormat::Mp3, AudioOutputFormat::Opus] {
-            assert!(
-                AudioEncodingOptions::new(format, AudioRateControl::Default, None, channels(2)?)
-                    .is_ok()
-            );
+            assert!(audio_options(format, AudioRateControl::Default, None, channels(2)?).is_ok());
             assert!(matches!(
-                AudioEncodingOptions::new(format, AudioRateControl::Default, None, channels(3)?),
+                audio_options(format, AudioRateControl::Default, None, channels(3)?),
                 Err(DomainError::InvalidAudioOptionChannels { .. })
             ));
         }
@@ -1320,22 +1532,17 @@ mod tests {
         ] {
             for count in [1, 2, 3, 5, 6] {
                 assert!(
-                    AudioEncodingOptions::new(
-                        format,
-                        AudioRateControl::Default,
-                        None,
-                        channels(count)?
-                    )
-                    .is_ok()
+                    audio_options(format, AudioRateControl::Default, None, channels(count)?)
+                        .is_ok()
                 );
             }
             assert!(matches!(
-                AudioEncodingOptions::new(format, AudioRateControl::Default, None, channels(4)?),
+                audio_options(format, AudioRateControl::Default, None, channels(4)?),
                 Err(DomainError::InvalidAudioOptionChannels { .. })
             ));
         }
         assert!(
-            AudioEncodingOptions::new(
+            audio_options(
                 AudioOutputFormat::Wav,
                 AudioRateControl::Default,
                 None,
@@ -1357,6 +1564,7 @@ mod tests {
                 AudioOptionSampleRate::new(24_000).unwrap_or_else(|_| unreachable!()),
             ),
             channels: None,
+            bit_depth: None,
         };
         let result = AudioBatchPlan::with_options(
             vec![item("a")],
@@ -1374,7 +1582,7 @@ mod tests {
     fn plan_revalidates_options_against_its_mode() {
         let workers = NonZeroUsize::MIN;
         let bitrate = AudioOptionBitrate::new(128_000).unwrap_or_else(|_| unreachable!());
-        let invalid_for_wav = AudioEncodingOptions::new(
+        let invalid_for_wav = audio_options(
             AudioOutputFormat::Mp3,
             AudioRateControl::Bitrate(bitrate),
             None,
@@ -1391,7 +1599,7 @@ mod tests {
             result,
             Err(DomainError::UnsupportedAudioRateControl { .. })
         ));
-        let valid = AudioEncodingOptions::new(
+        let valid = audio_options(
             AudioOutputFormat::Mp3,
             AudioRateControl::Bitrate(bitrate),
             None,

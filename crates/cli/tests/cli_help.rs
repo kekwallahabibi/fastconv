@@ -59,6 +59,7 @@ fn global_help_is_available_through_all_entry_points() -> Result<(), String> {
         "--compression-level <fast|balanced|best>",
         "--tiff-compression <deflate|lzw|packbits|none>",
         "--chroma <420|444>",
+        "--bit-depth <8|16|24|32|f32>",
         "fastconv <command> --help",
         "fastconv help <command>",
     ] {
@@ -193,7 +194,8 @@ fn audio_help_documents_all_encoding_flags_and_rules() -> Result<(), String> {
     let text = stdout(&["audio", "--help"])?;
     for needle in [
         "fastconv audio <source> <target> [--to <format>] [--bitrate <rate> | --quality <0..=100>]",
-        "[--sample-rate <hz>] [--channels <1..=8>] [--threads <N>] [--backend <name>]",
+        "[--sample-rate <hz>] [--channels <1..=8>] [--bit-depth <8|16|24|32|f32>]",
+        "[--threads <N>] [--backend <name>]",
         "<source>",
         "<target>",
         "--to <format>",
@@ -201,6 +203,7 @@ fn audio_help_documents_all_encoding_flags_and_rules() -> Result<(), String> {
         "--quality <0..=100>",
         "--sample-rate <hz>",
         "--channels <1..=8>",
+        "--bit-depth <8|16|24|32|f32>",
         "--threads <N>",
         "--backend <name>",
         "-h, --help",
@@ -404,6 +407,40 @@ fn invalid_audio_encoding_flags_fail_before_io() -> Result<(), String> {
                 "2",
                 "--channels",
                 "1",
+            ],
+            "duplicate flag",
+        ),
+    ];
+    for (args, expected) in cases {
+        let stderr = failure(args)?;
+        assert!(
+            stderr.contains(expected),
+            "expected '{expected}' for {args:?}, got: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn invalid_audio_bit_depth_flags_fail_before_io() -> Result<(), String> {
+    let cases: [(&[&str], &str); 3] = [
+        (
+            &["audio", "in.wav", "out.wav", "--bit-depth"],
+            "missing value",
+        ),
+        (
+            &["audio", "in.wav", "out.wav", "--bit-depth", "64"],
+            "invalid audio bit depth",
+        ),
+        (
+            &[
+                "audio",
+                "in.wav",
+                "out.wav",
+                "--bit-depth",
+                "16",
+                "--bit-depth",
+                "32",
             ],
             "duplicate flag",
         ),
