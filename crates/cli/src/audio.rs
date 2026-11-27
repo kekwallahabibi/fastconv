@@ -1,12 +1,16 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use fastconv_domain::{AudioOutputFormat, HardwareBackend};
+use fastconv_domain::{
+    AudioBitrate, AudioChannels, AudioOutputFormat, AudioQuality, AudioRateControl,
+    AudioSampleRate, HardwareBackend,
+};
 
 pub(crate) const AUDIO_HELP: &str = r"fastconv audio - convert audio files
 
 Usage:
-  fastconv audio <source> <target> [--to <format>] [--threads <N>] [--backend <name>]
+  fastconv audio <source> <target> [--to <format>] [--bitrate <rate> | --quality <0..=100>]
+                 [--sample-rate <hz>] [--channels <1..=8>] [--threads <N>] [--backend <name>]
 
 Arguments:
   <source>              Source audio file or directory
@@ -16,6 +20,19 @@ Options:
   --to <format>         Output format; directory batches default to flac, single
                         files infer it from the target extension: flac, wav,
                         opus, ogg, mp3, aac, m4a, alac, aiff
+  --bitrate <rate>      Lossy target bitrate: 128k, 192K, 320kbps, bare kbps
+                        below 1000 (e.g. 192), or bare bps (e.g. 192000).
+                        Ranges: mp3 32-320k, aac/m4a/ogg 32-512k, opus 6-510k.
+                        Mutually exclusive with --quality; rejected by
+                        lossless outputs (wav, flac, alac, aiff).
+  --quality <0..=100>   Quality-based VBR, supported by mp3, ogg and opus.
+                        mutually exclusive with --bitrate; aac/m4a have no
+                        VBR quality mode (use --bitrate) and lossless outputs
+                        reject it.
+  --sample-rate <hz>    Resample output to this rate. Opus accepts only 48000;
+                        mp3 and aac/m4a accept only their codec rate tables.
+  --channels <1..=8>    Output channel count (mp3/opus 1-2, aac/m4a/ogg 1-6
+                        excluding 4, lossless 1-8). Remixing is deterministic.
   --threads <N>         Number of parallel workers
   --backend <name>      cpu (default). Audio runs on CPU only; GPU backends
                         nvenc, vaapi, qsv, amf, videotoolbox, and vulkan are
@@ -37,6 +54,9 @@ pub(crate) struct AudioArgs {
     source: PathBuf,
     target: PathBuf,
     to: Option<AudioOutputFormat>,
+    rate_control: AudioRateControl,
+    sample_rate: Option<AudioSampleRate>,
+    channels: Option<AudioChannels>,
     threads: Option<NonZeroUsize>,
     backend: HardwareBackend,
 }
@@ -64,20 +84,104 @@ fn parse_target_format(value: &str) -> Result<AudioOutputFormat, String> {
     }
 }
 
+/// State for the four encoding flags, grouped so mutual exclusion is checked once.
+#[derive(Default)]
+struct AudioOptionState {
+    rate_control: Option<AudioRateControl>,
+    seen_bitrate: bool,
+    seen_quality: bool,
+    sample_rate: Option<AudioSampleRate>,
+    channels: Option<AudioChannels>,
+}
+
+impl AudioOptionState {
+    /// Returns the next argument index when `flag` is an encoding flag.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic for duplicate flags, missing or invalid values, or combining
+    /// `--bitrate` with `--quality`.
+    fn parse(&mut self, flag: &str, args: &[&str], index: usize) -> Result<Option<usize>, String> {
+        let value = || {
+            args.get(index + 1)
+                .copied()
+                .ok_or_else(|| format!("missing value for {flag}"))
+        };
+        match flag {
+            "--bitrate" => {
+                if self.seen_bitrate {
+                    return Err("duplicate flag '--bitrate'".to_owned());
+                }
+                if self.seen_quality {
+                    return Err("cannot combine --bitrate with --quality".to_owned());
+                }
+                let raw = value()?;
+                let bitrate = AudioBitrate::parse(raw).map_err(|err| err.to_string())?;
+                self.rate_control = Some(AudioRateControl::Bitrate(bitrate));
+                self.seen_bitrate = true;
+            }
+            "--quality" => {
+                if self.seen_quality {
+                    return Err("duplicate flag '--quality'".to_owned());
+                }
+                if self.seen_bitrate {
+                    return Err("cannot combine --quality with --bitrate".to_owned());
+                }
+                let raw = value()?;
+                let parsed = raw
+                    .parse::<u8>()
+                    .map_err(|err| format!("invalid --quality '{raw}': {err}"))?;
+                let quality = AudioQuality::new(parsed).map_err(|err| err.to_string())?;
+                self.rate_control = Some(AudioRateControl::Quality(quality));
+                self.seen_quality = true;
+            }
+            "--sample-rate" => {
+                if self.sample_rate.is_some() {
+                    return Err("duplicate flag '--sample-rate'".to_owned());
+                }
+                let raw = value()?;
+                let hz = raw
+                    .parse::<u32>()
+                    .map_err(|err| format!("invalid --sample-rate '{raw}': {err}"))?;
+                let rate = AudioSampleRate::new(hz).map_err(|err| err.to_string())?;
+                self.sample_rate = Some(rate);
+            }
+            "--channels" => {
+                if self.channels.is_some() {
+                    return Err("duplicate flag '--channels'".to_owned());
+                }
+                let raw = value()?;
+                let parsed = raw
+                    .parse::<u16>()
+                    .map_err(|err| format!("invalid --channels '{raw}': {err}"))?;
+                let count = AudioChannels::new(parsed).map_err(|err| err.to_string())?;
+                self.channels = Some(count);
+            }
+            _ => return Ok(None),
+        }
+        Ok(Some(index + 2))
+    }
+}
+
 /// Parses `fastconv audio` arguments without touching the file system.
 ///
 /// # Errors
 ///
 /// Returns a diagnostic for missing positional arguments, duplicate flags, malformed values,
-/// or unknown flags.
+/// unknown flags, or combining `--bitrate` with `--quality`.
 pub(crate) fn parse_audio_args(args: &[&str]) -> Result<AudioCommand, String> {
     let mut positional = Vec::new();
     let mut to = None;
+    let mut options = AudioOptionState::default();
     let mut threads = None;
     let mut backend = None;
     let mut index = 0_usize;
 
     while let Some(&arg) = args.get(index) {
+        if let Some(next) = options.parse(arg, args, index)? {
+            index = next;
+            continue;
+        }
         match arg {
             "-h" | "--help" => return Ok(AudioCommand::Help),
             "--to" => {
@@ -123,7 +227,7 @@ pub(crate) fn parse_audio_args(args: &[&str]) -> Result<AudioCommand, String> {
 
     let [source, target] = positional.as_slice() else {
         return Err(
-            "expected `fastconv audio <source> <target> [--to <flac|wav|opus|ogg|mp3|aac|m4a|alac|aiff>]`".to_owned(),
+            "expected `fastconv audio <source> <target> [--to <flac|wav|opus|ogg|mp3|aac|m4a|alac|aiff>] [--options]`".to_owned(),
         );
     };
 
@@ -131,6 +235,9 @@ pub(crate) fn parse_audio_args(args: &[&str]) -> Result<AudioCommand, String> {
         source: PathBuf::from(*source),
         target: PathBuf::from(*target),
         to,
+        rate_control: options.rate_control.unwrap_or(AudioRateControl::Default),
+        sample_rate: options.sample_rate,
+        channels: options.channels,
         threads,
         backend: backend.unwrap_or(HardwareBackend::Cpu),
     }))
@@ -149,6 +256,11 @@ pub(crate) fn run_audio(args: &AudioArgs) -> Result<(), String> {
         args.to,
         args.threads,
         args.backend,
+        fastconv_probe::AudioEncodingRequest {
+            rate_control: args.rate_control,
+            sample_rate: args.sample_rate,
+            channels: args.channels,
+        },
     )
     .map_err(|err| err.to_string())?;
 
@@ -172,9 +284,18 @@ mod tests {
     use fastconv_domain::GpuBackend;
 
     #[test]
-    fn help_is_dedicated_and_documents_only_implemented_flags() {
+    fn help_documents_only_implemented_flags() {
         assert!(AUDIO_HELP.contains("Usage:\n  fastconv audio <source> <target>"));
-        for flag in ["--to", "--threads", "--backend", "-h, --help"] {
+        for flag in [
+            "--to",
+            "--bitrate <rate>",
+            "--quality <0..=100>",
+            "--sample-rate <hz>",
+            "--channels <1..=8>",
+            "--threads",
+            "--backend",
+            "-h, --help",
+        ] {
             assert!(AUDIO_HELP.contains(flag), "missing {flag} in audio help");
         }
         for format in [
@@ -187,7 +308,8 @@ mod tests {
         }
         assert!(AUDIO_HELP.contains("no silent CPU fallback"));
         assert!(AUDIO_HELP.contains("ALAC writes an M4A container"));
-        assert!(!AUDIO_HELP.contains("--quality"));
+        assert!(AUDIO_HELP.contains("mutually exclusive with --bitrate"));
+        assert!(AUDIO_HELP.contains("use --bitrate"));
         assert!(!AUDIO_HELP.contains("--lossless"));
         assert!(!AUDIO_HELP.contains("Commands:"));
     }
@@ -202,6 +324,9 @@ mod tests {
                 source: PathBuf::from("in.wav"),
                 target: PathBuf::from("out.flac"),
                 to: None,
+                rate_control: AudioRateControl::Default,
+                sample_rate: None,
+                channels: None,
                 threads: None,
                 backend: HardwareBackend::Cpu,
             })
@@ -212,6 +337,12 @@ mod tests {
             "out_dir",
             "--to",
             "opus",
+            "--bitrate",
+            "192k",
+            "--sample-rate",
+            "48000",
+            "--channels",
+            "2",
             "--threads",
             "4",
             "--backend",
@@ -221,6 +352,18 @@ mod tests {
             return Err("expected audio run args".to_owned());
         };
         assert_eq!(flagged.to, Some(AudioOutputFormat::Opus));
+        assert_eq!(
+            flagged.rate_control,
+            AudioRateControl::Bitrate(AudioBitrate::new(192_000).map_err(|err| err.to_string())?)
+        );
+        assert_eq!(
+            flagged.sample_rate,
+            Some(AudioSampleRate::new(48_000).map_err(|err| err.to_string())?)
+        );
+        assert_eq!(
+            flagged.channels,
+            Some(AudioChannels::new(2).map_err(|err| err.to_string())?)
+        );
         assert_eq!(flagged.threads, NonZeroUsize::new(4));
         assert_eq!(flagged.backend, HardwareBackend::Gpu(GpuBackend::Nvenc));
         Ok(())
@@ -253,6 +396,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_bitrate_and_quality_ladders() -> Result<(), String> {
+        for (raw, bps) in [
+            ("128k", 128_000),
+            ("320kbps", 320_000),
+            ("6", 6_000),
+            ("128000", 128_000),
+        ] {
+            let AudioCommand::Run(parsed) = parse_audio_args(&["a", "b", "--bitrate", raw])? else {
+                return Err("expected audio run args".to_owned());
+            };
+            assert_eq!(
+                parsed.rate_control,
+                AudioRateControl::Bitrate(AudioBitrate::new(bps).map_err(|err| err.to_string())?),
+                "--bitrate {raw}"
+            );
+        }
+        let AudioCommand::Run(quality) = parse_audio_args(&["a", "b", "--quality", "85"])? else {
+            return Err("expected audio run args".to_owned());
+        };
+        assert_eq!(
+            quality.rate_control,
+            AudioRateControl::Quality(AudioQuality::new(85).map_err(|err| err.to_string())?)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rejects_invalid_audio_args() {
         assert!(parse_audio_args(&["only-source"]).is_err());
         assert!(parse_audio_args(&["a", "b", "--to", "wma"]).is_err());
@@ -260,5 +430,26 @@ mod tests {
         assert!(parse_audio_args(&["a", "b", "--threads", "0"]).is_err());
         assert!(parse_audio_args(&["a", "b", "--backend", "magic"]).is_err());
         assert!(parse_audio_args(&["a", "b", "--unknown"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--bitrate", "128k", "--quality", "80"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--quality", "80", "--bitrate", "128k"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--bitrate", "128k", "--bitrate", "192k"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--quality", "80", "--quality", "90"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--quality", "101"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--quality", "-1"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--bitrate", "abc"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--bitrate"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--quality"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--sample-rate"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--sample-rate", "0"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--sample-rate", "abc"]).is_err());
+        assert!(
+            parse_audio_args(&["a", "b", "--sample-rate", "48000", "--sample-rate", "44100"])
+                .is_err()
+        );
+        assert!(parse_audio_args(&["a", "b", "--channels"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--channels", "0"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--channels", "9"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--channels", "abc"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--channels", "2", "--channels", "4"]).is_err());
     }
 }

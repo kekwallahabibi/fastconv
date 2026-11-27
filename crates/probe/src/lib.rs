@@ -3,7 +3,7 @@ pub mod hardware;
 pub mod image;
 pub mod video;
 
-pub use audio::{ProbedAudio, prepare_audio_batch, probe_audio};
+pub use audio::{AudioEncodingRequest, ProbedAudio, prepare_audio_batch, probe_audio};
 pub use hardware::detect_host_hardware;
 pub use image::{ProbedImage, prepare_image_batch, prepare_image_batch_with_options, probe_image};
 pub use video::{

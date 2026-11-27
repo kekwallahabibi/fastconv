@@ -5,8 +5,9 @@ pub mod metrics;
 pub mod video;
 
 pub use audio::{
-    AudioBatchItem, AudioBatchPlan, AudioConversionReport, AudioExecutionMode, AudioInputFormat,
-    AudioOutputFormat, AudioStreamInfo,
+    AudioBatchItem, AudioBatchPlan, AudioBitrate, AudioChannels, AudioConversionReport,
+    AudioEncodingOptions, AudioExecutionMode, AudioInputFormat, AudioOutputFormat, AudioQuality,
+    AudioRateControl, AudioSampleRate, AudioStreamInfo,
 };
 pub use hardware::{
     CpuInfo, DetectedGpuBackend, GpuAdapterInfo, GpuCapability, GpuVendor, HostHardware, SimdLevel,
@@ -152,6 +153,27 @@ pub enum DomainError {
         backend: HardwareBackend,
         reason: String,
     },
+    InvalidAudioOptionBitrate {
+        raw: String,
+        expected: &'static str,
+    },
+    InvalidAudioQuality {
+        value: u8,
+        max: u8,
+    },
+    InvalidAudioOptionSampleRate {
+        hz: u32,
+        expected: &'static str,
+    },
+    InvalidAudioOptionChannels {
+        channels: u16,
+        expected: &'static str,
+    },
+    UnsupportedAudioRateControl {
+        format: AudioOutputFormat,
+        control: &'static str,
+        reason: &'static str,
+    },
 }
 
 pub(crate) fn require_non_empty(value: &str, field: &'static str) -> Result<String, DomainError> {
@@ -287,6 +309,26 @@ impl fmt::Display for DomainError {
                 f,
                 "backend '{backend}' cannot encode {format} audio: {reason}"
             ),
+            Self::InvalidAudioOptionBitrate { raw, expected } => {
+                write!(f, "invalid audio bitrate '{raw}' (expected {expected})")
+            }
+            Self::InvalidAudioQuality { value, max } => {
+                write!(f, "audio quality must be in 0..={max}, got {value}")
+            }
+            Self::InvalidAudioOptionSampleRate { hz, expected } => {
+                write!(f, "invalid audio sample rate {hz} Hz (expected {expected})")
+            }
+            Self::InvalidAudioOptionChannels { channels, expected } => {
+                write!(
+                    f,
+                    "invalid audio channel count {channels} (expected {expected})"
+                )
+            }
+            Self::UnsupportedAudioRateControl {
+                format,
+                control,
+                reason,
+            } => write!(f, "{control} is not supported for {format} audio: {reason}"),
             _ => fmt_encoding_error(self, f),
         }
     }

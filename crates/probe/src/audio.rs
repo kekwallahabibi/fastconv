@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use fastconv_domain::{
-    AudioBatchItem, AudioBatchPlan, AudioExecutionMode, AudioInputFormat, AudioOutputFormat,
-    AudioStreamInfo, DomainError, HardwareBackend, PathRole,
+    AudioBatchItem, AudioBatchPlan, AudioChannels, AudioEncodingOptions, AudioExecutionMode,
+    AudioInputFormat, AudioOutputFormat, AudioRateControl, AudioSampleRate, AudioStreamInfo,
+    DomainError, HardwareBackend, PathRole,
 };
 use symphonia::core::codecs::audio::{AudioDecoderOptions, well_known::CODEC_ID_ALAC};
 use symphonia::core::formats::FormatOptions;
@@ -19,6 +20,17 @@ use crate::ProbeError;
 
 const MAGIC_PREFIX_BYTES: usize = 4096;
 const SUPPORTED_AUDIO_TARGETS: &str = "flac, wav, opus, ogg, mp3, aac, m4a, alac, or aiff";
+
+/// Raw encoder knobs collected at the CLI boundary before the output format is known.
+///
+/// Field-level validity is established by the domain constructors; compatibility with the
+/// resolved output format is checked once in [`prepare_audio_batch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AudioEncodingRequest {
+    pub rate_control: AudioRateControl,
+    pub sample_rate: Option<AudioSampleRate>,
+    pub channels: Option<AudioChannels>,
+}
 
 /// Validated input metadata produced at the file-system boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -403,6 +415,7 @@ fn prepare_directory_batch(
     target_dir: &Path,
     format: AudioOutputFormat,
     threads: NonZeroUsize,
+    options: AudioEncodingOptions,
 ) -> Result<AudioBatchPlan, ProbeError> {
     match fs::metadata(target_dir) {
         Ok(meta) if meta.is_dir() => {}
@@ -480,7 +493,7 @@ fn prepare_directory_batch(
     }
 
     let mode = AudioExecutionMode::resolve(format, HardwareBackend::Cpu)?;
-    Ok(AudioBatchPlan::new(items, mode, threads)?)
+    Ok(AudioBatchPlan::with_options(items, mode, threads, options)?)
 }
 
 /// Resolves a path to an absolute location, using the parent directory for outputs that do not
@@ -540,6 +553,7 @@ pub fn prepare_audio_batch(
     to: Option<AudioOutputFormat>,
     worker_threads: Option<NonZeroUsize>,
     backend: HardwareBackend,
+    request: AudioEncodingRequest,
 ) -> Result<AudioBatchPlan, ProbeError> {
     if source.as_os_str().is_empty() {
         return Err(DomainError::EmptyPath(PathRole::Source).into());
@@ -560,13 +574,26 @@ pub fn prepare_audio_batch(
     if source_meta.is_dir() {
         let format = to.unwrap_or(AudioOutputFormat::Flac);
         AudioExecutionMode::resolve(format, backend)?;
-        return prepare_directory_batch(source, target, format, threads);
+        // Validate encoding options before touching any input file in the batch.
+        let options = AudioEncodingOptions::new(
+            format,
+            request.rate_control,
+            request.sample_rate,
+            request.channels,
+        )?;
+        return prepare_directory_batch(source, target, format, threads, options);
     }
     if !source_meta.is_file() {
         return Err(ProbeError::NotAFileOrDirectory(source.to_path_buf()));
     }
 
     let (resolved_target, format) = resolve_single_target(source, target, to)?;
+    let options = AudioEncodingOptions::new(
+        format,
+        request.rate_control,
+        request.sample_rate,
+        request.channels,
+    )?;
     let canonical_source = canonical_or_parent(source)?;
     let canonical_target = canonical_or_parent(&resolved_target)?;
     if canonical_source == canonical_target {
@@ -580,12 +607,18 @@ pub fn prepare_audio_batch(
         probed.format,
         probed.stream,
     )?;
-    Ok(AudioBatchPlan::new(vec![item], mode, threads)?)
+    Ok(AudioBatchPlan::with_options(
+        vec![item],
+        mode,
+        threads,
+        options,
+    )?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastconv_domain::AudioBitrate;
 
     #[test]
     fn detects_magic_without_extension_help() {
@@ -678,7 +711,14 @@ mod tests {
             .strip_prefix(&cwd)
             .unwrap_or(&absolute)
             .to_path_buf();
-        let result = prepare_audio_batch(&relative, &absolute, None, None, HardwareBackend::Cpu);
+        let result = prepare_audio_batch(
+            &relative,
+            &absolute,
+            None,
+            None,
+            HardwareBackend::Cpu,
+            AudioEncodingRequest::default(),
+        );
         let _ = fs::remove_dir_all(&dir);
         assert!(matches!(
             result,
@@ -704,6 +744,7 @@ mod tests {
             Some(AudioOutputFormat::Flac),
             Some(NonZeroUsize::MIN),
             HardwareBackend::Gpu(fastconv_domain::GpuBackend::Nvenc),
+            AudioEncodingRequest::default(),
         );
         assert!(matches!(
             result,
@@ -849,6 +890,108 @@ mod tests {
             assert_eq!(probed.format, AudioInputFormat::Aac, "tag_len={tag_len}");
         }
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    fn bitrate_request(bps: u32) -> AudioEncodingRequest {
+        AudioEncodingRequest {
+            rate_control: AudioRateControl::Bitrate(
+                AudioBitrate::new(bps).unwrap_or_else(|_| unreachable!()),
+            ),
+            ..AudioEncodingRequest::default()
+        }
+    }
+
+    #[test]
+    fn rejects_illegal_options_before_probing_single_file() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let target = Path::new("target/rejected.flac");
+        let result = prepare_audio_batch(
+            &source,
+            target,
+            Some(AudioOutputFormat::Flac),
+            Some(NonZeroUsize::MIN),
+            HardwareBackend::Cpu,
+            bitrate_request(128_000),
+        );
+        assert!(matches!(
+            result,
+            Err(ProbeError::InvalidDomain(
+                DomainError::UnsupportedAudioRateControl { .. }
+            ))
+        ));
+
+        let opus_target = Path::new("target/rejected.opus");
+        let request = AudioEncodingRequest {
+            sample_rate: Some(AudioSampleRate::new(44_100).unwrap_or_else(|_| unreachable!())),
+            ..AudioEncodingRequest::default()
+        };
+        let result = prepare_audio_batch(
+            &source,
+            opus_target,
+            Some(AudioOutputFormat::Opus),
+            Some(NonZeroUsize::MIN),
+            HardwareBackend::Cpu,
+            request,
+        );
+        assert!(matches!(
+            result,
+            Err(ProbeError::InvalidDomain(
+                DomainError::InvalidAudioOptionSampleRate { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn rejects_illegal_options_before_probing_directory_batch() -> Result<(), String> {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source_dir = manifest
+            .join("target")
+            .join(format!("fastconv-audio-options-src-{}", std::process::id()));
+        let target_dir = manifest
+            .join("target")
+            .join(format!("fastconv-audio-options-dst-{}", std::process::id()));
+        fs::create_dir_all(&source_dir).map_err(|err| err.to_string())?;
+        fs::create_dir_all(&target_dir).map_err(|err| err.to_string())?;
+        fs::write(source_dir.join("dummy.wav"), b"not decoded").map_err(|err| err.to_string())?;
+
+        let result = prepare_audio_batch(
+            &source_dir,
+            &target_dir,
+            Some(AudioOutputFormat::Flac),
+            Some(NonZeroUsize::MIN),
+            HardwareBackend::Cpu,
+            bitrate_request(192_000),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ProbeError::InvalidDomain(
+                    DomainError::UnsupportedAudioRateControl { .. }
+                ))
+            ),
+            "directory batches must reject illegal options before probing files"
+        );
+
+        let result = prepare_audio_batch(
+            &source_dir,
+            &target_dir,
+            Some(AudioOutputFormat::Mp3),
+            Some(NonZeroUsize::MIN),
+            HardwareBackend::Cpu,
+            AudioEncodingRequest {
+                channels: Some(AudioChannels::new(4).unwrap_or_else(|_| unreachable!())),
+                ..AudioEncodingRequest::default()
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ProbeError::InvalidDomain(
+                DomainError::InvalidAudioOptionChannels { .. }
+            ))
+        ));
+        let _ = fs::remove_dir_all(&source_dir);
+        let _ = fs::remove_dir_all(&target_dir);
         Ok(())
     }
 }
