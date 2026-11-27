@@ -1151,8 +1151,9 @@ fn heic_has_multi_sample_track(header_buf: &[u8]) -> bool {
     false
 }
 
-/// Content length of the `meta/idat` box, used to bounds-check idat-backed extents.
-fn heic_idat_content_len(header_buf: &[u8]) -> Option<u64> {
+/// Content of the `meta/idat` box. The whole `meta` box is buffered in the probe,
+/// so idat-backed items can be read here without touching `mdat`.
+fn heif_idat_content(header_buf: &[u8]) -> Option<&[u8]> {
     for meta in BoxIter::new(header_buf).filter_map(Result::ok) {
         if meta.header.box_type.0 != *b"meta" {
             continue;
@@ -1161,11 +1162,16 @@ fn heic_idat_content_len(header_buf: &[u8]) -> Option<u64> {
         let children = meta.content.get(4..)?;
         for child in BoxIter::new(children).filter_map(Result::ok) {
             if child.header.box_type.0 == *b"idat" {
-                return u64::try_from(child.content.len()).ok();
+                return Some(child.content);
             }
         }
     }
     None
+}
+
+/// Content length of the `meta/idat` box, used to bounds-check idat-backed extents.
+fn heic_idat_content_len(header_buf: &[u8]) -> Option<u64> {
+    heif_idat_content(header_buf).and_then(|data| u64::try_from(data.len()).ok())
 }
 
 fn is_alpha_auxiliary_urn(urn: &str) -> bool {
@@ -1219,14 +1225,16 @@ fn charge_heic_visit(walk: &mut HeicWalk<'_>, path: &Path) -> Result<(), ProbeEr
     Ok(())
 }
 
-/// Reads the bounded prefix of an `iovl` descriptor from its real storage. The
-/// `HeifFile` borrows the compact header buffer (no `mdat`), so file-backed
-/// extents must be resolved against the original file; idat-backed items are
-/// already present in the header buffer and use the container accessor.
+/// Reads only the bounded prefix of an `iovl` descriptor from its real storage.
+/// The `HeifFile` borrows the compact header buffer (no `mdat`), so file-backed
+/// extents are resolved against the original file and idat-backed extents against
+/// the buffered `idat` payload. No full item data is ever materialised: a hostile
+/// file with many large extents must not amplify probe work.
 fn read_heic_overlay_descriptor(
     file: &mut File,
     path: &Path,
     container: &HeifFile<'_>,
+    header_buf: &[u8],
     id: ItemId,
     file_len: u64,
 ) -> Result<Vec<u8>, ProbeError> {
@@ -1236,45 +1244,76 @@ fn read_heic_overlay_descriptor(
     let Some(location) = &item.location else {
         return Err(invalid_image(path, "HEIC iovl item has no data location"));
     };
-    if location.construction_method != ConstructionMethod::File {
-        let data = container
-            .item_data(id)
-            .map_err(|err| invalid_image(path, format!("invalid HEIC iovl data: {err}")))?;
-        let end = data.len().min(IOVL_DESCRIPTOR_MAX_BYTES);
-        return Ok(data[..end].to_vec());
+    if location.construction_method == ConstructionMethod::Item {
+        return Err(invalid_image(
+            path,
+            "HEIC iovl descriptor in constructed item data is not supported",
+        ));
     }
+    let idat =
+        if location.construction_method == ConstructionMethod::Idat {
+            Some(heif_idat_content(header_buf).ok_or_else(|| {
+                invalid_image(path, "HEIC iovl item uses idat without an idat box")
+            })?)
+        } else {
+            None
+        };
+    let idat_len = match idat {
+        Some(data) => u64::try_from(data.len())
+            .map_err(|_| invalid_image(path, "HEIC idat length overflow"))?,
+        None => 0,
+    };
 
     let mut descriptor = Vec::with_capacity(IOVL_DESCRIPTOR_MAX_BYTES);
     for extent in &location.extents {
         if descriptor.len() >= IOVL_DESCRIPTOR_MAX_BYTES {
             break;
         }
+        let limit = if idat.is_some() { idat_len } else { file_len };
         let length = if extent.length == 0 {
-            file_len.saturating_sub(extent.offset)
+            limit.saturating_sub(extent.offset)
         } else {
             extent.length
         };
+        if extent.offset > limit || length > limit.saturating_sub(extent.offset) {
+            return Err(invalid_image(
+                path,
+                "HEIC iovl descriptor extent runs past its data source",
+            ));
+        }
         let remaining = u64::try_from(IOVL_DESCRIPTOR_MAX_BYTES - descriptor.len())
             .map_err(|_| invalid_image(path, "HEIC iovl descriptor budget overflow"))?;
         let want = length.min(remaining);
         if want == 0 {
             continue;
         }
-        file.seek(SeekFrom::Start(extent.offset))
-            .map_err(|source| ProbeError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        let want = usize::try_from(want)
+        let want_usize = usize::try_from(want)
             .map_err(|_| invalid_image(path, "HEIC iovl descriptor size overflow"))?;
-        let start = descriptor.len();
-        descriptor.resize(start + want, 0);
-        read_exact_or_invalid(
-            file,
-            path,
-            &mut descriptor[start..],
-            "truncated HEIC iovl descriptor",
-        )?;
+        if let Some(data) = idat {
+            let offset = usize::try_from(extent.offset)
+                .map_err(|_| invalid_image(path, "HEIC iovl extent offset overflow"))?;
+            let end = offset
+                .checked_add(want_usize)
+                .ok_or_else(|| invalid_image(path, "HEIC iovl extent offset overflow"))?;
+            let chunk = data
+                .get(offset..end)
+                .ok_or_else(|| invalid_image(path, "truncated HEIC iovl descriptor"))?;
+            descriptor.extend_from_slice(chunk);
+        } else {
+            file.seek(SeekFrom::Start(extent.offset))
+                .map_err(|source| ProbeError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            let start = descriptor.len();
+            descriptor.resize(start + want_usize, 0);
+            read_exact_or_invalid(
+                file,
+                path,
+                &mut descriptor[start..],
+                "truncated HEIC iovl descriptor",
+            )?;
+        }
     }
     Ok(descriptor)
 }
@@ -1319,9 +1358,21 @@ fn heic_item_dimensions(
                 matches!(property, Property::AuxiliaryType(urn) if is_alpha_auxiliary_urn(urn))
             });
         if alpha {
-            // Alpha items may be `grid`/`iovl` roots (large images). Walk their
-            // whole reference tree: `heic_item_dimensions` rejects non-HEVC
-            // leaves, validates geometry and charges the retained-pixel budget.
+            let aux_item = container.item(aux).map_err(|err| {
+                invalid_image(path, format!("invalid HEIC auxiliary item: {err}"))
+            })?;
+            // heifer attaches a coded primary's alpha via `decode_hvc1`, which
+            // feeds the aux item straight into the HEVC bitstream reader. A
+            // derived alpha item is only supported on derived owners.
+            if matches!(&item.item_type.0, b"hvc1") && !matches!(&aux_item.item_type.0, b"hvc1") {
+                return Err(invalid_image(
+                    path,
+                    "derived alpha auxiliary image is not supported for a coded HEVC image",
+                ));
+            }
+            // Walk the whole alpha reference tree: `heic_item_dimensions`
+            // rejects non-HEVC leaves, validates geometry and charges the
+            // retained-pixel budget.
             visiting.push(id);
             heic_item_dimensions(container, aux, depth + 1, visiting, retained, walk, path)?;
             visiting.pop();
@@ -1705,8 +1756,14 @@ fn probe_heic(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeErro
     let mut overlay_canvases = HashMap::new();
     for item in &container.items {
         if item.item_type.0 == *b"iovl" {
-            let descriptor =
-                read_heic_overlay_descriptor(file, path, &container, item.id, file_len)?;
+            let descriptor = read_heic_overlay_descriptor(
+                file,
+                path,
+                &container,
+                &header_buf,
+                item.id,
+                file_len,
+            )?;
             let canvas = heic_overlay_canvas(&descriptor)
                 .ok_or_else(|| invalid_image(path, "invalid or truncated HEIC iovl descriptor"))?;
             overlay_canvases.insert(item.id, canvas);
