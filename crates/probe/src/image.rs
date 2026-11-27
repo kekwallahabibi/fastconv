@@ -38,6 +38,9 @@ const MAX_STILL_IMAGE_PIXELS: u64 = 128 * 1024 * 1024;
 // workers stay under ~1 GiB. Checked here, before the source pixels are decoded.
 const MAX_HEIC_PIXELS: u64 = 128 * 1024 * 1024;
 const MAX_HEIC_EXPANSION_BYTES: u64 = 128 * 1024 * 1024;
+// `heifer` encodes images as a grid of 512x512 tiles capped at 256 columns/rows;
+// a single axis above 256*512 is rejected only after decode, so screen it here.
+const MAX_HEIC_DIMENSION: u32 = 256 * 512;
 const MAX_GIF_DECODE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PNM_HEADER_BYTES: usize = 64 * 1024;
 const KNOWN_IMAGE_EXTENSIONS: &[&str] = &[
@@ -1578,6 +1581,19 @@ fn validate_cpu_heic_admission(
         return Ok(());
     }
 
+    if dimensions.width().get() > MAX_HEIC_DIMENSION
+        || dimensions.height().get() > MAX_HEIC_DIMENSION
+    {
+        return Err(invalid_image(
+            path,
+            format!(
+                "HEIC dimensions {}x{} exceed the {MAX_HEIC_DIMENSION}-pixel per-axis limit",
+                dimensions.width(),
+                dimensions.height()
+            ),
+        ));
+    }
+
     let pixels = u64::from(dimensions.width().get())
         .checked_mul(u64::from(dimensions.height().get()))
         .ok_or_else(|| invalid_image(path, "HEIC dimensions overflow pixel count".to_owned()))?;
@@ -2417,16 +2433,24 @@ mod tests {
             ImageDimensions::new(20_000, 20_000)?,
         )?;
 
+        // A wide-but-small-area image fits both budgets, but `heifer` would reject
+        // its 257 tile columns only after decode; screen the per-axis limit here.
+        assert!(matches!(
+            validate_cpu_heic_admission(path, heic, ImageDimensions::new(131_073, 128)?),
+            Err(ProbeError::InvalidImage { ref reason, .. })
+                if reason.contains("per-axis limit")
+        ));
+
         // 16384^2 = 2^28 pixels exceeds the HEIC pixel cap.
         assert!(matches!(
             validate_cpu_heic_admission(path, heic, ImageDimensions::new(16_384, 16_384)?),
             Err(ProbeError::InvalidImage { .. })
         ));
 
-        // 100M pixels pass the pixel cap, but the worst-case 4-byte L8/La8
-        // expansion (400 MiB) exceeds the per-worker scratch budget.
+        // 40M pixels pass the pixel cap and both axes, but the worst-case 4-byte
+        // L8/La8 expansion (160 MiB) exceeds the per-worker scratch budget.
         assert!(matches!(
-            validate_cpu_heic_admission(path, heic, ImageDimensions::new(100_000_000, 1)?),
+            validate_cpu_heic_admission(path, heic, ImageDimensions::new(100_000, 400)?),
             Err(ProbeError::InvalidImage { ref reason, .. })
                 if reason.contains("expansion scratch")
         ));
