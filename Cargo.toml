@@ -37,13 +37,13 @@ rubato = "5.1.0"
 # Pure-Rust video codecs for native transcoding (no C/FFI, AGPL-compatible licenses).
 rav1d-safe = "0.5.7"
 rusty_h264 = "0.17.4"
-rusty_h265 = "0.7.2"
+rusty_h265 = "0.7.3"
 rusty_vp9 = "0.3.0"
 # Direct AVIF pipeline: avif-serialize (BSD-3-Clause) writes ISOBMFF boxes and
 # rav1e (BSD-2-Clause) encodes AV1 frames. flate2 stays zlib-rs based via png/tiff.
 avif-serialize = "0.8.9"
 rav1e = { version = "0.8.1", default-features = false, features = ["asm", "threading"] }
-rusty_aac = "2.2.0"
+rusty_aac = "2.3.0"
 rusty_mp3 = "1.2.2"
 gif = "0.14.2"
 ico = "0.6.0"

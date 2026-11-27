@@ -1563,9 +1563,9 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rusty_aac"
-version = "2.2.0"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80a5f0168670e24666816b0ab2d3e6d1a57faeb58f15db8099c170c69d644e90"
+checksum = "4acb2ed3ca485ac7d9e141756f5d9a010ab351635a99ab49980f9e411c5686ed"
 
 [[package]]
 name = "rusty_alloc"
@@ -1639,18 +1639,18 @@ dependencies = [
 
 [[package]]
 name = "rusty_h265"
-version = "0.7.2"
+version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8de949ee8df15fa006d8efa6bd0f3d9b502343d65a1ac4dd71d1160d9a0a075"
+checksum = "8315204d4d6c5ea0ee81cdfcc42986a13b620a89d372eda8bd1cd0f1a6bb2707"
 dependencies = [
  "rusty_h265-accel",
 ]
 
 [[package]]
 name = "rusty_h265-accel"
-version = "0.7.2"
+version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37b720c0ba8c4993b8ad835361827581eafb1de1eb5f57df0e3c768aeb031888"
+checksum = "9d709c3072a6cc928d7496ced19edcdc1767db2ba9b7e4635d43049c14cb0817"
 
 [[package]]
 name = "rusty_mp3"
