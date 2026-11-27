@@ -8,6 +8,7 @@ pub use audio::{
     AudioBatchItem, AudioBatchPlan, AudioConversionReport, AudioEncodingOptions,
     AudioExecutionMode, AudioInputFormat, AudioOptionBitrate, AudioOptionChannels,
     AudioOptionSampleRate, AudioOutputFormat, AudioQuality, AudioRateControl, AudioStreamInfo,
+    aac_frame_capacity_bps,
 };
 pub use hardware::{
     CpuInfo, DetectedGpuBackend, GpuAdapterInfo, GpuCapability, GpuVendor, HostHardware, SimdLevel,
@@ -172,6 +173,12 @@ pub enum DomainError {
     IncompatibleAudioBitrateRate {
         bps: u32,
         hz: u32,
+        max_bps: u32,
+    },
+    IncompatibleAacBitrateRate {
+        bps: u32,
+        hz: u32,
+        channels: u16,
         max_bps: u32,
     },
     UnsupportedAudioRateControl {
@@ -370,6 +377,15 @@ fn fmt_encoding_error(err: &DomainError, f: &mut fmt::Formatter<'_>) -> fmt::Res
         DomainError::ConflictingAudioEncodeOptions { reason } => {
             write!(f, "conflicting audio encoding options: {reason}")
         }
+        DomainError::IncompatibleAacBitrateRate {
+            bps,
+            hz,
+            channels,
+            max_bps,
+        } => write!(
+            f,
+            "audio bitrate {bps} bps at {hz} Hz with {channels} channels exceeds the AAC frame capacity of {max_bps} bps"
+        ),
         _ => Err(fmt::Error),
     }
 }

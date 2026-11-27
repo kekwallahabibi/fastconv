@@ -16,7 +16,7 @@ use std::time::Instant;
 use fastconv_domain::{
     AudioBatchItem, AudioBatchPlan, AudioConversionReport, AudioEncodingOptions, AudioInputFormat,
     AudioOptionChannels, AudioOptionSampleRate, AudioOutputFormat, AudioRateControl,
-    HardwareBackend,
+    HardwareBackend, aac_frame_capacity_bps,
 };
 use flacenc::bitsink::ByteSink;
 use flacenc::component::BitRepr;
@@ -1484,6 +1484,29 @@ fn aac_bitrate_bps(rate_control: AudioRateControl) -> u32 {
     }
 }
 
+/// Rejects a bitrate the AAC frame cannot carry, using the effective rate and
+/// channel count when the caller did not pin them explicitly.
+fn check_aac_bitrate(
+    path: &Path,
+    rate: u32,
+    channels: usize,
+    options: &AudioEncodingOptions,
+) -> Result<(), PipelineError> {
+    if let AudioRateControl::Bitrate(bitrate) = options.rate_control() {
+        let max_bps = aac_frame_capacity_bps(rate, u16::try_from(channels).unwrap_or(u16::MAX));
+        if bitrate.bps() > max_bps {
+            return Err(PipelineError::EncodeFailed {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "AAC bitrate {} bps at {rate} Hz with {channels} channels exceeds the frame capacity of {max_bps} bps",
+                    bitrate.bps()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn opus_settings(rate_control: AudioRateControl) -> (i32, RateControl) {
     match rate_control {
         AudioRateControl::Default => (OPUS_BITRATE, RateControl::ConstrainedVbr),
@@ -1610,6 +1633,7 @@ fn encode_aac(
 ) -> Result<(), PipelineError> {
     check_aac_channels(path, channels, "AAC")?;
     let target_rate = effective_sample_rate(AudioOutputFormat::Aac, rate, options);
+    check_aac_bitrate(path, target_rate, channels, options)?;
     resample_f32(rate, target_rate, channels, buf, "aac-resampler")?;
     if buf.samples_f32.is_empty() {
         return Err(PipelineError::EmptyOutput(path.to_path_buf()));
@@ -1678,6 +1702,7 @@ fn encode_m4a(
 ) -> Result<(), PipelineError> {
     check_aac_channels(path, channels, "M4A/AAC")?;
     let target_rate = effective_sample_rate(AudioOutputFormat::M4a, rate, options);
+    check_aac_bitrate(path, target_rate, channels, options)?;
     resample_f32(rate, target_rate, channels, buf, "m4a-resampler")?;
     if buf.samples_f32.is_empty() {
         return Err(PipelineError::EmptyOutput(path.to_path_buf()));
@@ -2198,7 +2223,9 @@ fn estimate_pcm_bytes(
 ) -> PcmEstimate {
     let stream = item.stream();
     let unknown = PcmEstimate {
-        peak_bytes: MAX_PCM_BYTES_PER_FILE,
+        // Without a frame count we cannot prove a rate change is absent, so reserve
+        // the decoded input and a simultaneous resample output.
+        peak_bytes: MAX_PCM_BYTES_PER_FILE.saturating_mul(2),
         largest_buffer_bytes: MAX_PCM_BYTES_PER_FILE,
     };
     let Some(frames) = stream.total_samples() else {
@@ -2243,9 +2270,15 @@ fn estimate_pcm_bytes(
             .max(resampled_bytes.saturating_add(final_bytes));
     }
     if source_channels != target_channels {
-        // A channel remix takes its input by value and builds the output before
-        // replacing it, so both sets of samples are live at the same time.
-        peak_bytes = peak_bytes.max(source_bytes.saturating_add(final_bytes));
+        // A downmix runs before resampling and sizes its output from the input
+        // frame count; an upmix runs after resampling and uses the final count.
+        // A remix holds its input and output at the same time.
+        let remix_output_bytes = if target_channels < source_channels {
+            bytes(frames, target_channels)
+        } else {
+            final_bytes
+        };
+        peak_bytes = peak_bytes.max(source_bytes.saturating_add(remix_output_bytes));
     }
     PcmEstimate {
         peak_bytes,
@@ -2713,13 +2746,15 @@ mod tests {
         let defaults = AudioEncodingOptions::default();
         let estimate = estimate_pcm_bytes(&items[0], AudioOutputFormat::Wav, &defaults);
         assert_eq!(estimate.largest_buffer_bytes, MAX_PCM_BYTES_PER_FILE);
-        assert_eq!(estimate.peak_bytes, MAX_PCM_BYTES_PER_FILE);
+        assert_eq!(
+            estimate.peak_bytes,
+            MAX_PCM_BYTES_PER_FILE.saturating_mul(2)
+        );
         let workers =
             resolve_worker_count(&items, 8, AudioOutputFormat::Wav, &defaults).unwrap_or(0);
         assert_eq!(
-            workers,
-            usize::try_from(MAX_PCM_BYTES_PER_BATCH / MAX_PCM_BYTES_PER_FILE).unwrap_or(usize::MAX),
-            "unknown decoded lengths must reserve the full per-file budget"
+            workers, 1,
+            "unknown decoded lengths must reserve two coexisting buffers"
         );
     }
 
@@ -4160,6 +4195,26 @@ mod tests {
         assert_eq!(mp3_first_frame_bitrate_kbps(&default)?, MP3_BITRATE_KBPS);
         let _ = fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    #[test]
+    fn aac_rejects_bitrate_above_frame_capacity_without_explicit_options() {
+        let dir = temp_dir("aac-frame-capacity");
+        let aac = dir.join("out.aac");
+        let mut buf = AudioWorkerBuffer::new();
+        buf.samples_f32 = vec![0.0_f32; 2_048];
+        let options = options_with(
+            AudioOutputFormat::Aac,
+            None,
+            None,
+            AudioRateControl::Bitrate(br(512_000)),
+        );
+        let result = encode_aac(&aac, 8_000, 1, &mut buf, &options);
+        assert!(
+            matches!(result, Err(PipelineError::EncodeFailed { .. })),
+            "512 kbps at 8 kHz mono must be rejected instead of silently reduced"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

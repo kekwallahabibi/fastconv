@@ -188,6 +188,16 @@ impl AudioOptionBitrate {
     }
 }
 
+/// Maximum bitrate the AAC frame model can carry at a rate/channel pair.
+///
+/// `rusty_aac` stores at most 6144 bits per channel in each 1024-sample frame,
+/// i.e. 6 bits per sample per channel. Asking for more makes the encoder silently
+/// lower the bitrate, so both the domain and the pipeline reject such pairs.
+#[must_use]
+pub const fn aac_frame_capacity_bps(hz: u32, channels: u16) -> u32 {
+    hz.saturating_mul(channels as u32).saturating_mul(6)
+}
+
 /// Validated lossy-audio quality on a 0..=100 scale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct AudioQuality(u8);
@@ -382,6 +392,24 @@ impl AudioEncodingOptions {
                 hz: rate.hz(),
                 max_bps: Self::MP3_MPEG2_MAX_BPS,
             });
+        }
+        // AAC stores at most 6144 bits per channel per 1024-sample frame. With an
+        // explicit rate and channel count the limit is knowable before any I/O;
+        // without either one the pipeline checks it against the effective values.
+        if matches!(format, AudioOutputFormat::Aac | AudioOutputFormat::M4a)
+            && let AudioRateControl::Bitrate(bitrate) = self.rate_control
+            && let Some(rate) = self.sample_rate
+            && let Some(channels) = self.channels
+        {
+            let max_bps = aac_frame_capacity_bps(rate.hz(), channels.get());
+            if bitrate.bps() > max_bps {
+                return Err(DomainError::IncompatibleAacBitrateRate {
+                    bps: bitrate.bps(),
+                    hz: rate.hz(),
+                    channels: channels.get(),
+                    max_bps,
+                });
+            }
         }
         Ok(())
     }
@@ -1171,6 +1199,31 @@ mod tests {
             AudioEncodingOptions::new(AudioOutputFormat::Mp3, bitrate(320_000)?, None, None)
                 .is_ok()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_aac_bitrate_above_the_frame_capacity() -> Result<(), DomainError> {
+        let bitrate = |bps| AudioOptionBitrate::new(bps).map(AudioRateControl::Bitrate);
+        let rate = |hz| AudioOptionSampleRate::new(hz).map(Some);
+        let channels = |count| AudioOptionChannels::new(count).map(Some);
+        for format in [AudioOutputFormat::Aac, AudioOutputFormat::M4a] {
+            assert!(matches!(
+                AudioEncodingOptions::new(format, bitrate(512_000)?, rate(8_000)?, channels(1)?),
+                Err(DomainError::IncompatibleAacBitrateRate {
+                    bps: 512_000,
+                    hz: 8_000,
+                    channels: 1,
+                    max_bps: 48_000,
+                })
+            ));
+            assert!(
+                AudioEncodingOptions::new(format, bitrate(256_000)?, rate(48_000)?, channels(2)?)
+                    .is_ok()
+            );
+        }
+        assert_eq!(aac_frame_capacity_bps(8_000, 1), 48_000);
+        assert_eq!(aac_frame_capacity_bps(48_000, 2), 576_000);
         Ok(())
     }
 
