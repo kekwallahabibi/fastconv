@@ -14,29 +14,12 @@ use heifer::EncodeOptions;
 use crate::PipelineError;
 use crate::decode::{DecodedFrameMeta, DecodedPixelFormat};
 
-/// Half of `heifer`'s own 2^28 pixel limit: bounds tile scratch memory on 4K batches.
-const MAX_HEIC_PIXELS: u64 = 128 * 1024 * 1024;
-
-/// Per-worker cap on the expanded RGB/RGBA scratch buffer. RGB8/RGBA8 are passed
-/// to `heifer` zero-copy, but L8/La8 are expanded 3x/4x here; with at most 8 image
-/// workers this keeps that scratch under 1 GiB for adversarial near-cap sources.
-const MAX_HEIC_EXPANDED_BYTES: u64 = 128 * 1024 * 1024;
-
 const fn pixel_channels(format: DecodedPixelFormat) -> u64 {
     match format {
         DecodedPixelFormat::L8 => 1,
         DecodedPixelFormat::La8 => 2,
         DecodedPixelFormat::Rgb8 => 3,
         DecodedPixelFormat::Rgba8 => 4,
-    }
-}
-
-/// Bytes of reusable `aux_buf` scratch one pixel costs for a given layout.
-const fn aux_expansion_channels(format: DecodedPixelFormat) -> u64 {
-    match format {
-        DecodedPixelFormat::L8 => 3,
-        DecodedPixelFormat::La8 => 4,
-        DecodedPixelFormat::Rgb8 | DecodedPixelFormat::Rgba8 => 1,
     }
 }
 
@@ -47,7 +30,9 @@ fn encode_error(target: &Path, reason: impl Into<String>) -> PipelineError {
     }
 }
 
-/// Checks dimensions and exact buffer length before handing pixels to `heifer`.
+/// Validates decoder output before handing pixels to `heifer`. Geometry admission
+/// (pixel and per-worker expansion budgets) is checked once in `probe` on the media
+/// header; here we only verify the decoder produced a buffer matching its metadata.
 fn validate_input(
     target: &Path,
     pixels: &[u8],
@@ -60,33 +45,9 @@ fn validate_input(
         ));
     }
 
-    let pixel_count = u64::from(decoded.width)
+    let expected = u64::from(decoded.width)
         .checked_mul(u64::from(decoded.height))
-        .filter(|&count| count <= MAX_HEIC_PIXELS)
-        .ok_or_else(|| {
-            encode_error(
-                target,
-                format!(
-                    "HEIC image has too many pixels: {}x{} (limit {MAX_HEIC_PIXELS})",
-                    decoded.width, decoded.height
-                ),
-            )
-        })?;
-
-    pixel_count
-        .checked_mul(aux_expansion_channels(decoded.format))
-        .filter(|&bytes| bytes <= MAX_HEIC_EXPANDED_BYTES)
-        .ok_or_else(|| {
-            encode_error(
-                target,
-                format!(
-                    "HEIC expansion scratch needs too many bytes (limit {MAX_HEIC_EXPANDED_BYTES})"
-                ),
-            )
-        })?;
-
-    let expected = pixel_count
-        .checked_mul(pixel_channels(decoded.format))
+        .and_then(|count| count.checked_mul(pixel_channels(decoded.format)))
         .and_then(|bytes| usize::try_from(bytes).ok())
         .ok_or_else(|| encode_error(target, "HEIC pixel buffer size overflow"))?;
     if pixels.len() != expected {
@@ -205,7 +166,7 @@ pub(crate) fn encode_heic_into(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_HEIC_PIXELS, encode_heic_into};
+    use super::encode_heic_into;
     use crate::PipelineError;
     use crate::decode::{DecodedFrameMeta, DecodedPixelFormat};
     use fastconv_domain::ImageQuality;
@@ -423,34 +384,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_oversized_and_mismatched_inputs() {
+    fn rejects_zero_dimensions_and_mismatched_buffer() {
         let mut aux = Vec::new();
         assert!(matches!(
             encode(&[], meta(0, 8, DecodedPixelFormat::Rgb8, 0), 80, &mut aux,),
             Err(PipelineError::EncodeFailed { .. })
-        ));
-        // 16384^2 = 2^28 pixels exceeds the 2^27 pixel cap.
-        assert!(matches!(
-            encode(
-                &[],
-                meta(16_384, 16_384, DecodedPixelFormat::Rgb8, 0),
-                80,
-                &mut aux,
-            ),
-            Err(PipelineError::EncodeFailed { .. })
-        ));
-        assert!(u64::from(16_384_u32) * u64::from(16_384_u32) > MAX_HEIC_PIXELS);
-        // 100M L8 pixels pass the pixel cap but need ~300 MiB of expansion scratch,
-        // above the per-worker cap that keeps an 8-worker batch under ~1 GiB.
-        assert!(matches!(
-            encode(
-                &[],
-                meta(100_000_000, 1, DecodedPixelFormat::L8, 0),
-                80,
-                &mut aux,
-            ),
-            Err(PipelineError::EncodeFailed { ref reason, .. })
-                if reason.contains("expansion scratch")
         ));
         assert!(matches!(
             encode(
