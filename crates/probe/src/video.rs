@@ -412,6 +412,9 @@ fn stream_codec(track: &Track) -> VideoCodec {
         if codec_id == "V_VP9" {
             return VideoCodec::Vp9;
         }
+        if codec_id == "V_MJPEG" {
+            return VideoCodec::Mjpeg;
+        }
         if codec_id == "A_MPEG/L3" {
             return VideoCodec::Mp3;
         }
@@ -445,6 +448,7 @@ fn stream_codec(track: &Track) -> VideoCodec {
         Some([b'h', b'v', b'c', b'1'] | [b'h', b'e', b'v', b'1']) => VideoCodec::Hevc,
         Some([b'a', b'v', b'0', b'1']) => VideoCodec::Av1,
         Some([b'v', b'p', b'0', b'9']) => VideoCodec::Vp9,
+        Some([b'j', b'p', b'e', b'g']) => VideoCodec::Mjpeg,
         Some([b'.', b'm', b'p', b'3']) => VideoCodec::Mp3,
         Some([b'm', b'p', b'4', b'a']) => {
             // `mp4a` carries either AAC or MPEG-4/MP3 in its ES descriptor.
@@ -893,6 +897,9 @@ fn fourcc_in(fourcc: [u8; 4], known: &[&[u8; 4]]) -> bool {
 }
 
 fn avi_video_codec(compression: [u8; 4], handler: Option<[u8; 4]>) -> VideoCodec {
+    // `upper_fourcc` already normalises the handler; do the same for the
+    // BITMAPINFOHEADER compression so `MJPG` and `mjpg` both match.
+    let compression = compression.map(|byte| byte.to_ascii_uppercase());
     for fourcc in handler.into_iter().chain(std::iter::once(compression)) {
         if fourcc_in(fourcc, &[b"H264", b"X264", b"AVC1", b"DAVC", b"VSSH"]) {
             return VideoCodec::H264;
@@ -905,6 +912,10 @@ fn avi_video_codec(compression: [u8; 4], handler: Option<[u8; 4]>) -> VideoCodec
         }
         if fourcc_in(fourcc, &[b"VP90", b"VP09"]) {
             return VideoCodec::Vp9;
+        }
+        // `upper_fourcc` normalises both `MJPG` and `mjpg`.
+        if fourcc_in(fourcc, &[b"MJPG"]) {
+            return VideoCodec::Mjpeg;
         }
     }
     VideoCodec::Unknown
@@ -2539,6 +2550,19 @@ pub fn prepare_video_transcode_batch_with_options(
         }
         .into());
     }
+    // MJPEG encodes one independent JPEG per frame: quality is its only rate
+    // control. Reject --vbitrate here, at the same boundary as all other
+    // option/codec conflicts, with a codec-specific reason.
+    if matches!(encode_codec, TargetVideoCodec::Mjpeg)
+        && matches!(rate_control, VideoRateControl::Bitrate(_))
+    {
+        return Err(DomainError::UnsupportedVideoPipeline {
+            codec: VideoCodec::Mjpeg,
+            backend,
+            reason: "MJPEG encoding supports only --quality, not --vbitrate".to_owned(),
+        }
+        .into());
+    }
 
     let animation_target = !output_format.supports_audio();
     validate_audio_options_for_container(options.audio_options(), output_format)?;
@@ -2648,6 +2672,7 @@ mod tests {
             TargetVideoCodec::H264 => VideoEncodeMode::CpuH264 { rate_control },
             TargetVideoCodec::Av1 => VideoEncodeMode::CpuAv1 { rate_control },
             TargetVideoCodec::Vp9 => VideoEncodeMode::CpuVp9 { rate_control },
+            TargetVideoCodec::Mjpeg => VideoEncodeMode::CpuMjpeg { quality },
             TargetVideoCodec::Hevc => VideoEncodeMode::NvencHevc { rate_control },
             TargetVideoCodec::Gif => VideoEncodeMode::CpuGif { quality },
             TargetVideoCodec::Webp => VideoEncodeMode::CpuWebp { quality },
@@ -4470,6 +4495,174 @@ mod tests {
                 "unexpected {to} error: {result:?}"
             );
         }
+        Ok(())
+    }
+
+    /// An AVI whose only video stream uses the `MJPG` fourcc.
+    fn minimal_mjpeg_avi() -> Vec<u8> {
+        let mut avih = vec![0_u8; 56];
+        avih[0..4].copy_from_slice(&33_333_u32.to_le_bytes());
+        avih[16..20].copy_from_slice(&10_u32.to_le_bytes());
+        avih[32..36].copy_from_slice(&64_u32.to_le_bytes());
+        avih[36..40].copy_from_slice(&48_u32.to_le_bytes());
+        let hdrl = vec![
+            riff_chunk(*b"avih", &avih),
+            riff_list(
+                *b"strl",
+                &[
+                    avi_strh(*b"vids", *b"MJPG", 30, 10),
+                    avi_video_strf(64, 48, *b"MJPG"),
+                ],
+            ),
+        ];
+        let mut body = b"AVI ".to_vec();
+        body.extend_from_slice(&riff_list(*b"hdrl", &hdrl));
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&u32::try_from(body.len()).unwrap_or(0).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
+    /// A Matroska file with a single `V_MJPEG` video track.
+    fn mkv_with_mjpeg_video() -> Vec<u8> {
+        let mut header = Vec::new();
+        header.extend(ebml_uint(0x4286, 1));
+        header.extend(ebml_uint(0x42F2, 4));
+        header.extend(ebml_uint(0x42F3, 8));
+        header.extend(ebml_el(0x4282, b"matroska"));
+        header.extend(ebml_uint(0x4287, 4));
+        header.extend(ebml_uint(0x4285, 2));
+        let mut segment = Vec::new();
+        segment.extend(ebml_el_vint(
+            0x1549_A966,
+            &ebml_uint(0x002A_D7B1, 1_000_000),
+        ));
+        let mut entry = Vec::new();
+        entry.extend(ebml_uint(0xD7, 1));
+        entry.extend(ebml_uint(0x73C5, 1));
+        entry.extend(ebml_uint(0x83, 1)); // video track
+        entry.extend(ebml_el(0x86, b"V_MJPEG"));
+        let mut video = Vec::new();
+        video.extend(ebml_uint(0xB0, 64));
+        video.extend(ebml_uint(0xBA, 48));
+        entry.extend(ebml_el_vint(0xE0, &video));
+        segment.extend(ebml_el_vint(0x1654_AE6B, &ebml_el_vint(0xAE, &entry)));
+        let mut bytes = ebml_el_vint(0x1A45_DFA3, &header);
+        bytes.extend(ebml_el_vint(0x1853_8067, &segment));
+        bytes
+    }
+
+    #[test]
+    fn mjpeg_is_detected_in_avi_mov_and_mkv() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(avi_video_codec(*b"MJPG", None), VideoCodec::Mjpeg);
+        assert_eq!(avi_video_codec(*b"mjpg", None), VideoCodec::Mjpeg);
+        assert_eq!(avi_video_codec(*b"MJPG", Some(*b"MJPG")), VideoCodec::Mjpeg);
+
+        let avi = temp_file("mjpeg-avi", &minimal_mjpeg_avi())?;
+        let probed = probe_video(&avi)?;
+        assert_eq!(probed.format, VideoContainerFormat::Avi);
+        assert_eq!(probed.streams[0].codec(), VideoCodec::Mjpeg);
+        assert_eq!(
+            probed.streams[0].width().map(std::num::NonZero::get),
+            Some(64)
+        );
+        assert_eq!(
+            probed.streams[0].height().map(std::num::NonZero::get),
+            Some(48)
+        );
+
+        let mkv = temp_file("mjpeg-mkv", &mkv_with_mjpeg_video())?;
+        let probed = probe_video(&mkv)?;
+        assert_eq!(probed.format, VideoContainerFormat::Mkv);
+        assert_eq!(probed.streams[0].codec(), VideoCodec::Mjpeg);
+
+        // QuickTime MOV carries a `jpeg` visual sample entry.
+        let track = containr::Track {
+            id: 1,
+            kind: TrackKind::Video,
+            handler: None,
+            timebase: containr::Timebase::from_timescale(1_000_000),
+            duration: Some(1_000_000),
+            language: containr::Language::Iso639(*b"und"),
+            matrix: [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000],
+            display_width: 0,
+            display_height: 0,
+            sample_entries: vec![containr::SampleEntry {
+                fourcc: containr::FourCc(*b"jpeg"),
+                raw: Vec::new(),
+                data_reference_index: 1,
+                codec_config: None,
+                video: None,
+                audio: None,
+            }],
+            edit_list: containr::EditList::default(),
+            references: Vec::new(),
+            chapter_track: false,
+            metadata: Vec::new(),
+            sample_count: 1,
+            matroska: None,
+        };
+        assert_eq!(stream_codec(&track), VideoCodec::Mjpeg);
+        Ok(())
+    }
+
+    #[test]
+    fn mjpeg_rejects_vbitrate_and_gpu_at_probe_boundary() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let source = temp_file("mjpeg-rate", &minimal_mjpeg_avi())?;
+        let target = temp_path("mjpeg-rate").with_extension("avi");
+        let options = VideoTranscodeOptions::new(
+            Some(VideoRateControl::Bitrate(VideoBitrate::parse("1M")?)),
+            AudioEncodeOptions::default(),
+        );
+        let result = prepare_video_transcode_batch_with_options(
+            &source,
+            &target,
+            Some(VideoContainerFormat::Avi),
+            Some(RequestedVideoCodec::Encode(TargetVideoCodec::Mjpeg)),
+            None,
+            options,
+            HardwareBackend::Cpu,
+            HardwareDecodeBackend::Auto,
+            Some(plan_threads()),
+        );
+        assert!(
+            err_contains(&result, "MJPEG encoding supports only --quality"),
+            "unexpected MJPEG bitrate error: {result:?}"
+        );
+
+        let gpu = prepare_video_transcode_batch_with_options(
+            &source,
+            &target,
+            Some(VideoContainerFormat::Avi),
+            Some(RequestedVideoCodec::Encode(TargetVideoCodec::Mjpeg)),
+            None,
+            VideoTranscodeOptions::with_quality(VideoQuality::DEFAULT),
+            HardwareBackend::Gpu(fastconv_domain::GpuBackend::Nvenc),
+            HardwareDecodeBackend::Auto,
+            Some(plan_threads()),
+        );
+        assert!(
+            err_contains(&gpu, "CPU only"),
+            "unexpected MJPEG GPU error: {gpu:?}"
+        );
+
+        // Quality-only MJPEG on CPU is accepted.
+        let plan = prepare_video_transcode_batch_with_options(
+            &source,
+            &target,
+            Some(VideoContainerFormat::Avi),
+            Some(RequestedVideoCodec::Encode(TargetVideoCodec::Mjpeg)),
+            None,
+            VideoTranscodeOptions::with_quality(VideoQuality::DEFAULT),
+            HardwareBackend::Cpu,
+            HardwareDecodeBackend::Auto,
+            Some(plan_threads()),
+        )?;
+        assert_eq!(
+            plan.items()[0].video_action(),
+            quality_mode(TargetVideoCodec::Mjpeg, VideoQuality::DEFAULT)
+        );
         Ok(())
     }
 

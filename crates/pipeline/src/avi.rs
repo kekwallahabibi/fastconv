@@ -106,6 +106,7 @@ fn video_codec(compression: [u8; 4], handler: Option<[u8; 4]>) -> Option<VideoCo
             b"HEVC" | b"H265" | b"HVC1" | b"HEV1" | b"X265" => return Some(VideoCodec::Hevc),
             b"AV01" => return Some(VideoCodec::Av1),
             b"VP90" | b"VP09" => return Some(VideoCodec::Vp9),
+            b"MJPG" => return Some(VideoCodec::Mjpeg),
             _ => {}
         }
     }
@@ -262,8 +263,7 @@ fn parse_header(
         }
         let format = strf.unwrap_or_default();
         if is_video {
-            let compression =
-                <[u8; 4]>::try_from(format.get(16..20).unwrap_or(&[])).unwrap_or([0; 4]);
+            let compression = upper_fourcc(format.get(16..20).unwrap_or(&[])).unwrap_or([0; 4]);
             let Some(codec) = video_codec(compression, handler) else {
                 continue;
             };
@@ -486,10 +486,13 @@ pub(crate) fn demux_avi(path: &Path) -> Result<DemuxedMedia, PipelineError> {
         else {
             continue;
         };
-        let keyframe = keyframes
-            .get(&u64::try_from(offset).unwrap_or(0))
-            .copied()
-            .unwrap_or(streams[number].packets == 0);
+        // Every MJPEG chunk is a standalone JPEG image, so no idx1 flag is
+        // needed to mark it as a random-access point.
+        let keyframe = streams[number].codec == VideoCodec::Mjpeg
+            || keyframes
+                .get(&u64::try_from(offset).unwrap_or(0))
+                .copied()
+                .unwrap_or(streams[number].packets == 0);
         match streams[number].codec {
             VideoCodec::H264 | VideoCodec::Hevc => {
                 let data = payload;
@@ -539,7 +542,11 @@ pub(crate) fn demux_avi(path: &Path) -> Result<DemuxedMedia, PipelineError> {
                     sync,
                 );
             }
-            VideoCodec::Vp9 | VideoCodec::Opus | VideoCodec::Mp3 | VideoCodec::Pcm => {
+            VideoCodec::Vp9
+            | VideoCodec::Mjpeg
+            | VideoCodec::Opus
+            | VideoCodec::Mp3
+            | VideoCodec::Pcm => {
                 push_packet(
                     &mut media,
                     &mut streams,
@@ -635,6 +642,7 @@ fn video_fourcc(codec: VideoCodec) -> [u8; 4] {
         VideoCodec::Hevc => *b"HEVC",
         VideoCodec::Av1 => *b"AV01",
         VideoCodec::Vp9 => *b"VP90",
+        VideoCodec::Mjpeg => *b"MJPG",
         _ => *b"\0\0\0\0",
     }
 }
@@ -925,7 +933,14 @@ pub(crate) fn mux_avi(
         let size = u32::try_from(payload.len()).unwrap_or(u32::MAX);
         movi.extend_from_slice(&riff_chunk(id, &payload));
         index.extend_from_slice(&id);
-        index.extend_from_slice(&if packet.keyframe { AVIIF_KEYFRAME } else { 0 }.to_le_bytes());
+        index.extend_from_slice(
+            &if packet.keyframe || track.codec == VideoCodec::Mjpeg {
+                AVIIF_KEYFRAME
+            } else {
+                0
+            }
+            .to_le_bytes(),
+        );
         index.extend_from_slice(&offset.to_le_bytes());
         index.extend_from_slice(&size.to_le_bytes());
     }

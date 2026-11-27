@@ -5,6 +5,7 @@
 //! Every illegal state is rejected explicitly; there is no silent fallback
 //! between codecs or bit depths.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -13,6 +14,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use fastconv_domain::{VideoCodec, VideoEncodeMode, VideoQuality, VideoRateControl};
+use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor};
 use rav1d_safe::src::managed::{Decoder as Av1Decoder, PixelLayout, Planes as Av1Planes};
 use rav1e::color::ChromaSampling;
 use rav1e::prelude::{Config, EncoderConfig, FrameType, Rational, SpeedSettings};
@@ -24,6 +26,11 @@ use rusty_h265::Decoder as HevcDecoder;
 use rusty_vp9::{
     DecodedFrame as Vp9DecodedFrame, Error as Vp9Error, Vp9Decoder, Vp9Encoder, Vp9EncoderConfig,
 };
+use yuv::{YuvPlanarImage, YuvRange as SimdYuvRange, YuvStandardMatrix};
+use zune_jpeg::JpegDecoder;
+use zune_jpeg::zune_core::bytestream::ZCursor;
+use zune_jpeg::zune_core::colorspace::ColorSpace;
+use zune_jpeg::zune_core::options::DecoderOptions;
 
 use crate::PipelineError;
 use crate::video_bitstream::{
@@ -217,6 +224,235 @@ fn copy_plane_u8(
         dst.copy_from_slice(src);
     }
     Ok(())
+}
+
+// MJPEG is a sequence of standalone base-line JPEG images. These caps bound
+// work done before any pixel buffer is allocated, so a hostile packet cannot
+// turn a small AVI chunk into an unbounded allocation.
+const MJPEG_PACKET_CAP: usize = 16 * 1024 * 1024;
+const MJPEG_MAX_DIMENSION: u32 = 8192;
+const MJPEG_MAX_PIXELS: u64 = 16_777_216;
+
+// ISO/IEC 10918-1 Annex K default Huffman tables. AVI MJPEG often omits DHT
+// segments entirely, relying on the decoder to supply these four tables.
+const DC_LUMA_BITS: [u8; 16] = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+const DC_LUMA_VALUES: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+const AC_LUMA_BITS: [u8; 16] = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7D];
+const AC_LUMA_VALUES: [u8; 162] = [
+    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+    0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08, 0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0,
+    0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
+    0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+    0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+    0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+    0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5,
+    0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
+    0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+    0xF9, 0xFA,
+];
+const DC_CHROMA_BITS: [u8; 16] = [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0];
+const DC_CHROMA_VALUES: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+const AC_CHROMA_BITS: [u8; 16] = [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77];
+const AC_CHROMA_VALUES: [u8; 162] = [
+    0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
+    0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xA1, 0xB1, 0xC1, 0x09, 0x23, 0x33, 0x52, 0xF0,
+    0x15, 0x62, 0x72, 0xD1, 0x0A, 0x16, 0x24, 0x34, 0xE1, 0x25, 0xF1, 0x17, 0x18, 0x19, 0x1A, 0x26,
+    0x27, 0x28, 0x29, 0x2A, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+    0x49, 0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
+    0x69, 0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+    0x88, 0x89, 0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5,
+    0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3,
+    0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA,
+    0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+    0xF9, 0xFA,
+];
+
+fn dht_segment(class: u8, id: u8, bits: &[u8; 16], values: &[u8]) -> Vec<u8> {
+    let body_len = u16::try_from(19_usize.saturating_add(values.len())).unwrap_or(u16::MAX);
+    let mut segment = Vec::with_capacity(21_usize.saturating_add(values.len()));
+    segment.extend_from_slice(&[0xFF, 0xC4]);
+    segment.extend_from_slice(&body_len.to_be_bytes());
+    segment.push((class << 4) | (id & 0x0F));
+    segment.extend_from_slice(bits);
+    segment.extend_from_slice(values);
+    segment
+}
+
+fn standard_jpeg_huffman_tables() -> Vec<u8> {
+    let mut tables = Vec::with_capacity(1024);
+    tables.extend_from_slice(&dht_segment(0, 0, &DC_LUMA_BITS, &DC_LUMA_VALUES));
+    tables.extend_from_slice(&dht_segment(1, 0, &AC_LUMA_BITS, &AC_LUMA_VALUES));
+    tables.extend_from_slice(&dht_segment(0, 1, &DC_CHROMA_BITS, &DC_CHROMA_VALUES));
+    tables.extend_from_slice(&dht_segment(1, 1, &AC_CHROMA_BITS, &AC_CHROMA_VALUES));
+    tables
+}
+
+/// Returns the packet with standard Huffman tables injected immediately before
+/// SOS when it carries no DHT segment at all. Marker lengths are validated so a
+/// truncated or malformed header is rejected rather than decoded partially.
+fn mjpeg_with_huffman_tables<'a>(
+    path: &Path,
+    packet: &'a [u8],
+) -> Result<Cow<'a, [u8]>, PipelineError> {
+    if packet.len() < 4 || packet[..2] != [0xFF, 0xD8] {
+        return Err(decode_error(
+            path,
+            "MJPEG packet does not start with a JPEG SOI marker",
+        ));
+    }
+    let mut idx = 2_usize;
+    let mut has_dht = false;
+    let mut sos_start = None;
+    while idx < packet.len() {
+        if packet[idx] != 0xFF {
+            return Err(decode_error(
+                path,
+                "malformed MJPEG marker segment: missing 0xFF marker prefix",
+            ));
+        }
+        let marker_prefix = idx;
+        while packet.get(idx) == Some(&0xFF) {
+            idx = idx.saturating_add(1);
+        }
+        let marker = *packet
+            .get(idx)
+            .ok_or_else(|| decode_error(path, "truncated MJPEG marker"))?;
+        idx = idx.saturating_add(1);
+        if marker == 0xDA {
+            // Inject before the whole marker, including any 0xFF fill bytes.
+            sos_start = Some(marker_prefix);
+            break;
+        }
+        if marker == 0xD9 {
+            return Err(decode_error(
+                path,
+                "MJPEG packet has no start-of-scan marker",
+            ));
+        }
+        if marker == 0x00 {
+            return Err(decode_error(
+                path,
+                "unexpected 0xFF 0x00 byte-stuffing before JPEG start-of-scan",
+            ));
+        }
+        // Standalone markers carry no length.
+        if marker == 0x01 || (0xD0..=0xD7).contains(&marker) || marker == 0xD8 {
+            continue;
+        }
+        let len_bytes = packet
+            .get(idx..idx.saturating_add(2))
+            .ok_or_else(|| decode_error(path, "truncated MJPEG marker length"))?;
+        let len = usize::from(u16::from_be_bytes([len_bytes[0], len_bytes[1]]));
+        if len < 2 {
+            return Err(decode_error(
+                path,
+                "MJPEG marker segment declares an invalid length",
+            ));
+        }
+        let end = idx.checked_add(len).ok_or_else(|| {
+            decode_error(path, "MJPEG marker segment length overflows the packet")
+        })?;
+        if end > packet.len() {
+            return Err(decode_error(
+                path,
+                "MJPEG marker segment extends past the end of the packet",
+            ));
+        }
+        if marker == 0xC4 {
+            has_dht = true;
+        }
+        idx = end;
+    }
+    let sos_start =
+        sos_start.ok_or_else(|| decode_error(path, "MJPEG packet has no start-of-scan marker"))?;
+    if has_dht {
+        return Ok(Cow::Borrowed(packet));
+    }
+    let tables = standard_jpeg_huffman_tables();
+    let mut complete = Vec::with_capacity(packet.len().saturating_add(tables.len()));
+    complete.extend_from_slice(&packet[..sos_start]);
+    complete.extend_from_slice(&tables);
+    complete.extend_from_slice(&packet[sos_start..]);
+    Ok(Cow::Owned(complete))
+}
+
+/// Decodes one MJPEG packet into a reusable tightly packed RGB8 scratch buffer.
+/// Returns the JPEG's natural (possibly odd) dimensions.
+fn mjpeg_decode_rgb(
+    path: &Path,
+    packet: &[u8],
+    rgb: &mut Vec<u8>,
+) -> Result<(u16, u16), PipelineError> {
+    if packet.len() > MJPEG_PACKET_CAP {
+        return Err(decode_error(
+            path,
+            format!(
+                "MJPEG packet of {} bytes exceeds the {MJPEG_PACKET_CAP}-byte cap",
+                packet.len()
+            ),
+        ));
+    }
+    // `zune-jpeg` treats premature EOF as recoverable and may still return
+    // pixels, so require a complete image with an EOI marker before decoding.
+    let mut end = packet.len();
+    while end > 0 && packet[end - 1] == 0 {
+        end -= 1;
+    }
+    if end < 2 || packet[end - 2..end] != [0xFF, 0xD9] {
+        return Err(decode_error(
+            path,
+            "MJPEG packet is missing its JPEG EOI marker",
+        ));
+    }
+    let prepared = mjpeg_with_huffman_tables(path, &packet[..end])?;
+    let max_dim = usize::try_from(MJPEG_MAX_DIMENSION).unwrap_or(usize::MAX);
+    let options = DecoderOptions::default()
+        .jpeg_set_out_colorspace(ColorSpace::RGB)
+        .set_max_width(max_dim)
+        .set_max_height(max_dim);
+    let mut decoder = JpegDecoder::new_with_options(ZCursor::new(prepared.as_ref()), options);
+    decoder
+        .decode_headers()
+        .map_err(|err| decode_error(path, format!("MJPEG header parse failed: {err}")))?;
+    let info = decoder
+        .info()
+        .ok_or_else(|| decode_error(path, "MJPEG packet has no JPEG SOF metadata"))?;
+    let width = u32::from(info.width);
+    let height = u32::from(info.height);
+    if width == 0 || height == 0 || width > MJPEG_MAX_DIMENSION || height > MJPEG_MAX_DIMENSION {
+        return Err(decode_error(
+            path,
+            format!("MJPEG dimensions {width}x{height} are out of range"),
+        ));
+    }
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if pixels > MJPEG_MAX_PIXELS {
+        return Err(decode_error(
+            path,
+            format!("MJPEG frame of {pixels} pixels exceeds the {MJPEG_MAX_PIXELS}-pixel cap"),
+        ));
+    }
+    let expected_rgb = usize::from(info.width)
+        .checked_mul(usize::from(info.height))
+        .and_then(|count| count.checked_mul(3))
+        .ok_or_else(|| decode_error(path, "MJPEG decoded buffer size overflows usize"))?;
+    let required = decoder
+        .output_buffer_size()
+        .ok_or_else(|| decode_error(path, "MJPEG decoded buffer size overflows usize"))?;
+    if required != expected_rgb {
+        return Err(decode_error(
+            path,
+            format!(
+                "MJPEG decoded RGB buffer size {required} does not match expected {expected_rgb}"
+            ),
+        ));
+    }
+    rgb.resize(required, 0);
+    decoder
+        .decode_into(rgb.as_mut_slice())
+        .map_err(|err| decode_error(path, format!("MJPEG decode failed: {err}")))?;
+    Ok((info.width, info.height))
 }
 
 fn h264_frame(frame: H264YuvFrame, pts_us: i64, duration_us: u64) -> Yuv420Frame {
@@ -713,6 +949,24 @@ pub(crate) fn decode_video_track(
             }
             Ok(frames)
         }
+        VideoCodec::Mjpeg => {
+            let mut frames = Vec::with_capacity(ordered.len());
+            let mut rgb = Vec::new();
+            for packet in ordered {
+                let (width, height) = mjpeg_decode_rgb(path, &packet.data, &mut rgb)?;
+                frames.push(crate::video_anim::rgb_to_yuv420(
+                    crate::video_anim::AnimFrameInfo {
+                        width: u32::from(width),
+                        height: u32::from(height),
+                        pts_us: packet.pts,
+                        duration_us: packet.duration,
+                        channels: 3,
+                    },
+                    rgb.as_slice(),
+                )?);
+            }
+            Ok(frames)
+        }
         VideoCodec::Gif => crate::video_anim::decode_gif_frames_yuv420(
             path,
             crate::video_anim::ANIM_DECODED_BUDGET,
@@ -736,7 +990,7 @@ mod streaming {
         H264YuvFrame, HevcDecoder, Path, PipelineError, PixelLayout, VideoCodec, Vp9DecodedFrame,
         Vp9Decoder, Vp9Error, YuvColor, YuvMatrix, YuvRange, avcc_to_annex_b, decode_error,
         decode_order, has_b_frame_reordering, hevc_picture_duration, hevc_picture_pts,
-        hevc_pts_to_packet, hvcc_to_annex_b, median_duration, source_color,
+        hevc_pts_to_packet, hvcc_to_annex_b, median_duration, mjpeg_decode_rgb, source_color,
     };
 
     type PackFn<'a> = dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError> + 'a;
@@ -1596,6 +1850,46 @@ mod streaming {
         Ok(())
     }
 
+    /// MJPEG has no reorder state: decode each JPEG into RGB, then write it
+    /// straight into the caller's NV12 buffer. Odd dimensions are padded by
+    /// edge replication inside `write_nv12`, so the reported frame geometry is
+    /// rounded up to even exactly like every other 4:2:0 decoder here.
+    fn stream_mjpeg(
+        path: &Path,
+        ordered: &[&ContainerPacket],
+        on_frame: &mut impl FnMut(
+            DecodedFrameInfo,
+            &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        ) -> Result<(), PipelineError>,
+    ) -> Result<(), PipelineError> {
+        let mut rgb = Vec::new();
+        for packet in ordered {
+            let (width, height) = mjpeg_decode_rgb(path, &packet.data, &mut rgb)?;
+            let width = u32::from(width);
+            let height = u32::from(height);
+            let even_width = width
+                .checked_add(width & 1)
+                .ok_or_else(|| decode_error(path, "MJPEG width overflows when padded"))?;
+            let even_height = height
+                .checked_add(height & 1)
+                .ok_or_else(|| decode_error(path, "MJPEG height overflows when padded"))?;
+            let info = DecodedFrameInfo {
+                width: even_width,
+                height: even_height,
+                pts_us: packet.pts,
+                duration_us: packet.duration,
+                // JPEG is decoded to RGB first; the fixed BT.601 conversion in
+                // `write_nv12` is the same one used by the animation path.
+                color: YuvColor::default(),
+            };
+            let mut pack = |dst: &mut [u8], pitch: usize| {
+                crate::video_anim::write_nv12(&rgb, width, height, dst, pitch)
+            };
+            on_frame(info, &mut pack)?;
+        }
+        Ok(())
+    }
+
     /// Decodes one canonical video track and streams each frame straight into a
     /// caller-provided NV12 buffer via `on_frame`. No `Yuv420Frame` is ever built.
     ///
@@ -1634,6 +1928,7 @@ mod streaming {
             VideoCodec::Hevc => stream_hevc(path, track, &ordered, packets, &mut deliver),
             VideoCodec::Av1 => stream_av1(path, &ordered, packets, &mut deliver),
             VideoCodec::Vp9 => stream_vp9(path, &ordered, packets, &mut deliver),
+            VideoCodec::Mjpeg => stream_mjpeg(path, &ordered, &mut deliver),
             VideoCodec::Gif => {
                 crate::video_anim::decode_gif_frames_streaming_nv12(path, |info, pack| {
                     deliver(
@@ -2316,6 +2611,97 @@ fn cpu_vp9(
     )
 }
 
+/// Encodes one independent baseline JPEG per frame. `rgb` is a reusable
+/// scratch buffer, so a clip of equally sized frames allocates it only once.
+fn cpu_mjpeg(
+    path: &Path,
+    frames: &[Yuv420Frame],
+    quality: VideoQuality,
+    track_index: usize,
+    fps_num: u32,
+    fps_den: u32,
+) -> Result<EncodedVideoStream, PipelineError> {
+    let (width, height) = (frames[0].width, frames[0].height);
+    let w = usize::try_from(width).map_err(|_| encode_error(path, "MJPEG width overflow"))?;
+    let h = usize::try_from(height).map_err(|_| encode_error(path, "MJPEG height overflow"))?;
+    let w16 = u16::try_from(width).map_err(|_| encode_error(path, "MJPEG width exceeds 65535"))?;
+    let h16 =
+        u16::try_from(height).map_err(|_| encode_error(path, "MJPEG height exceeds 65535"))?;
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if pixels > MJPEG_MAX_PIXELS {
+        return Err(encode_error(
+            path,
+            format!("MJPEG frame of {pixels} pixels exceeds the {MJPEG_MAX_PIXELS}-pixel cap"),
+        ));
+    }
+    let cw = w / 2;
+    let ch = h / 2;
+    let rgb_len = w
+        .checked_mul(h)
+        .and_then(|count| count.checked_mul(3))
+        .ok_or_else(|| encode_error(path, "MJPEG RGB buffer length overflow"))?;
+    // Validate every plane before calling the SIMD converter, which assumes
+    // correctly sized slices.
+    for frame in frames {
+        if frame.y.len() < w.saturating_mul(h)
+            || frame.u.len() < cw.saturating_mul(ch)
+            || frame.v.len() < cw.saturating_mul(ch)
+        {
+            return Err(encode_error(path, "MJPEG source plane is too small"));
+        }
+    }
+    let mut rgb = Vec::with_capacity(rgb_len);
+    let mut units = Vec::with_capacity(frames.len());
+    for frame in frames {
+        let image = YuvPlanarImage {
+            y_plane: frame.y.as_slice(),
+            y_stride: u32::try_from(w)
+                .map_err(|_| encode_error(path, "MJPEG luma stride exceeds u32"))?,
+            u_plane: frame.u.as_slice(),
+            u_stride: u32::try_from(cw)
+                .map_err(|_| encode_error(path, "MJPEG chroma stride exceeds u32"))?,
+            v_plane: frame.v.as_slice(),
+            v_stride: u32::try_from(cw)
+                .map_err(|_| encode_error(path, "MJPEG chroma stride exceeds u32"))?,
+            width,
+            height,
+        };
+        rgb.resize(rgb_len, 0);
+        // Frames carry no per-frame colour description; BT.601 limited is the
+        // explicit default used by every other CPU animation encoder here.
+        yuv::yuv420_to_rgb(
+            &image,
+            &mut rgb,
+            u32::try_from(w.saturating_mul(3))
+                .map_err(|_| encode_error(path, "MJPEG RGB stride exceeds u32"))?,
+            SimdYuvRange::Limited,
+            YuvStandardMatrix::Bt601,
+        )
+        .map_err(|err| encode_error(path, format!("MJPEG YUV→RGB conversion failed: {err}")))?;
+        let mut jpeg = Vec::new();
+        let mut encoder = JpegEncoder::new(&mut jpeg, quality.get().max(1));
+        encoder.set_sampling_factor(SamplingFactor::F_2_2);
+        encoder
+            .encode(&rgb, w16, h16, JpegColorType::Rgb)
+            .map_err(|err| encode_error(path, format!("MJPEG encode failed: {err}")))?;
+        // Every JPEG frame is independently decodable: keyframe = true, and
+        // make_stream sets dts = pts for all packets.
+        units.push((jpeg, true));
+    }
+    make_stream(
+        path,
+        track_index,
+        VideoCodec::Mjpeg,
+        width,
+        height,
+        Vec::new(),
+        units,
+        frames,
+        fps_num,
+        fps_den,
+    )
+}
+
 /// Encodes decoded frames on the CPU into canonical container packets.
 pub(crate) fn encode_video_cpu(
     path: &Path,
@@ -2359,6 +2745,9 @@ pub(crate) fn encode_video_cpu(
         }
         VideoEncodeMode::CpuVp9 { rate_control } => {
             cpu_vp9(path, frames, rate_control, track_index, fps_num, fps_den)
+        }
+        VideoEncodeMode::CpuMjpeg { quality } => {
+            cpu_mjpeg(path, frames, quality, track_index, fps_num, fps_den)
         }
         VideoEncodeMode::CpuGif { .. } | VideoEncodeMode::CpuWebp { .. } => Err(encode_error(
             path,
@@ -2499,6 +2888,143 @@ mod tests {
             64,
             48,
         )
+    }
+
+    #[test]
+    fn roundtrips_mjpeg() -> Result<(), PipelineError> {
+        let path = Path::new("mjpeg-roundtrip");
+        let frames = synthetic_frames(64, 48, 4);
+        let stream = encode_video_cpu(
+            path,
+            &frames,
+            VideoEncodeMode::CpuMjpeg {
+                quality: VideoQuality::DEFAULT,
+            },
+            0,
+        )?;
+        assert_eq!(stream.track.codec, VideoCodec::Mjpeg);
+        assert_eq!(stream.packets.len(), frames.len());
+        for packet in &stream.packets {
+            assert!(packet.keyframe, "every MJPEG frame must be a keyframe");
+            assert_eq!(packet.dts, packet.pts, "MJPEG has no reorder delay");
+            assert!(packet.data.starts_with(&[0xFF, 0xD8]));
+            assert!(packet.data.ends_with(&[0xFF, 0xD9]));
+        }
+        let decoded = decode_video_track(path, &stream.track, &stream.packets)?;
+        assert_eq!(decoded.len(), frames.len());
+        for frame in &decoded {
+            assert_eq!((frame.width, frame.height), (64, 48));
+        }
+        Ok(())
+    }
+
+    /// Removes every DHT marker segment, keeping the rest of the JPEG intact.
+    fn strip_dht_segments(jpeg: &[u8]) -> Vec<u8> {
+        let mut out = jpeg.get(..2).unwrap_or(&[]).to_vec(); // SOI
+        let mut idx = 2_usize;
+        while idx.saturating_add(4) <= jpeg.len() {
+            if jpeg[idx] != 0xFF {
+                break;
+            }
+            let marker = jpeg[idx.saturating_add(1)];
+            let len = usize::from(u16::from_be_bytes([
+                jpeg[idx.saturating_add(2)],
+                jpeg[idx.saturating_add(3)],
+            ]));
+            let end = idx.saturating_add(2).saturating_add(len).min(jpeg.len());
+            if marker == 0xC4 {
+                idx = end;
+                continue;
+            }
+            if marker == 0xDA {
+                out.extend_from_slice(&jpeg[idx..]);
+                return out;
+            }
+            out.extend_from_slice(&jpeg[idx..end]);
+            idx = end;
+        }
+        out.extend_from_slice(jpeg.get(idx..).unwrap_or(&[]));
+        out
+    }
+
+    #[test]
+    fn dht_less_mjpeg_frames_decode_cleanly() -> Result<(), PipelineError> {
+        let path = Path::new("mjpeg-dht-less");
+        let frames = synthetic_frames(64, 48, 3);
+        let stream = cpu_mjpeg(path, &frames, VideoQuality::DEFAULT, 0, 25, 1)?;
+        let stripped = strip_dht_segments(&stream.packets[0].data);
+        assert_ne!(stripped.len(), stream.packets[0].data.len());
+        assert!(!stripped.windows(2).any(|pair| pair == [0xFF, 0xC4]));
+
+        let mut rgb = Vec::new();
+        let (width, height) = mjpeg_decode_rgb(path, &stripped, &mut rgb)?;
+        assert_eq!((width, height), (64, 48));
+        assert_eq!(rgb.len(), 64 * 48 * 3);
+
+        let mut packets = stream.packets.clone();
+        for packet in &mut packets {
+            packet.data = strip_dht_segments(&packet.data);
+        }
+        let decoded = decode_video_track(path, &stream.track, &packets)?;
+        assert_eq!(decoded.len(), frames.len());
+        Ok(())
+    }
+
+    #[test]
+    fn mjpeg_streaming_decode_packs_nv12() -> Result<(), PipelineError> {
+        let path = Path::new("mjpeg-streaming");
+        let frames = synthetic_frames(64, 48, 3);
+        let stream = cpu_mjpeg(path, &frames, VideoQuality::DEFAULT, 0, 25, 1)?;
+        let mut seen = 0_usize;
+        decode_video_track_streaming(path, &stream.track, &stream.packets, |info, pack| {
+            assert_eq!((info.width, info.height), (64, 48));
+            let pitch = usize::try_from(info.width)
+                .map_err(|_| decode_error(path, "frame width overflows usize"))?;
+            let length = nv12_buffer_len(info.width, info.height, pitch)?;
+            let mut nv12 = vec![0_u8; length];
+            pack(&mut nv12, pitch)?;
+            assert!(nv12.iter().any(|&byte| byte != 0));
+            seen = seen.saturating_add(1);
+            Ok(())
+        })?;
+        assert_eq!(seen, frames.len());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_and_oversized_mjpeg_packets_are_rejected() -> Result<(), PipelineError> {
+        let path = Path::new("mjpeg-malformed");
+        let mut rgb = Vec::new();
+        // Wrong magic, truncated SOI, and truncated marker length.
+        for packet in [
+            &b"not a jpeg"[..],
+            &[0xFF, 0xD8][..],
+            &[0xFF, 0xD8, 0xFF, 0xC0, 0x00][..],
+            &[0xFF, 0xD8, 0xFF, 0xC0, 0xFF, 0xFF, 0x01][..],
+        ] {
+            assert!(
+                mjpeg_decode_rgb(path, packet, &mut rgb).is_err(),
+                "malformed packet must be rejected"
+            );
+        }
+
+        // A valid frame truncated mid-scan must not be decoded partially.
+        let stream = cpu_mjpeg(
+            path,
+            &synthetic_frames(64, 48, 1),
+            VideoQuality::DEFAULT,
+            0,
+            25,
+            1,
+        )?;
+        let jpeg = &stream.packets[0].data;
+        let half = jpeg.len() / 2;
+        assert!(mjpeg_decode_rgb(path, &jpeg[..half], &mut rgb).is_err());
+
+        // Oversized packets are rejected before any header parsing.
+        let oversized = vec![0_u8; MJPEG_PACKET_CAP.saturating_add(1)];
+        assert!(mjpeg_decode_rgb(path, &oversized, &mut rgb).is_err());
+        Ok(())
     }
 
     #[test]

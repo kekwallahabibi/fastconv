@@ -195,6 +195,7 @@ fn stream_copy_supports(item: &VideoRemuxItem) -> bool {
     // entry; containr's StreamCopy cannot express either across families.
     item.streams().iter().all(|stream| {
         stream.codec() != VideoCodec::Mp3
+            && stream.codec() != VideoCodec::Mjpeg
             && !matches!(stream.codec(), VideoCodec::Flac | VideoCodec::Pcm)
             && !(stream.codec() == VideoCodec::Vp9 && family(output))
     })
@@ -210,6 +211,7 @@ fn canonical_remux_supports(codec: VideoCodec) -> bool {
             | VideoCodec::Hevc
             | VideoCodec::Av1
             | VideoCodec::Vp9
+            | VideoCodec::Mjpeg
             | VideoCodec::Aac
             | VideoCodec::Opus
             | VideoCodec::Vorbis
@@ -1751,6 +1753,127 @@ mod container_tests {
             vec![stream(VideoCodec::H264)],
         );
         assert!(stream_copy_supports(&plain));
+    }
+
+    fn mjpeg_frame(width: u16, height: u16, seed: u8) -> Result<Vec<u8>, String> {
+        let pixels: Vec<u8> = (0..usize::from(width) * usize::from(height) * 3)
+            .map(|index| u8::try_from(index % 251).unwrap_or(0).wrapping_add(seed))
+            .collect();
+        let mut jpeg = Vec::new();
+        jpeg_encoder::Encoder::new(&mut jpeg, 80)
+            .encode(&pixels, width, height, jpeg_encoder::ColorType::Rgb)
+            .map_err(|err| format!("MJPEG fixture encode failed: {err}"))?;
+        Ok(jpeg)
+    }
+
+    fn mjpeg_media() -> Result<ContainerMedia, String> {
+        let track = ContainerTrack {
+            codec: VideoCodec::Mjpeg,
+            width: Some(64),
+            height: Some(48),
+            channels: None,
+            sample_rate: None,
+            config: Vec::new(),
+            timescale: US_TIMESCALE,
+            presentation_edit: None,
+            pcm_format: None,
+        };
+        let mut packets = Vec::new();
+        for index in 0_u64..3 {
+            packets.push(ContainerPacket {
+                track: 0,
+                pts: i64::try_from(index).unwrap_or(0) * 40_000,
+                dts: i64::try_from(index).unwrap_or(0) * 40_000,
+                duration: 40_000,
+                keyframe: true,
+                data: mjpeg_frame(64, 48, u8::try_from(index).unwrap_or(0))?,
+            });
+        }
+        Ok(ContainerMedia {
+            tracks: vec![track],
+            packets,
+        })
+    }
+
+    #[test]
+    fn mjpeg_remux_roundtrips_avi_mov_mkv() -> Result<(), Box<dyn std::error::Error>> {
+        let media = mjpeg_media()?;
+        let expected = payloads(&media, VideoCodec::Mjpeg);
+        let avi = temp_path("mjpeg-remux", "avi");
+        let mov = temp_path("mjpeg-remux", "mov");
+        let mkv = temp_path("mjpeg-remux", "mkv");
+        let back = temp_path("mjpeg-remux", "avi");
+        write_container(&avi, VideoContainerFormat::Avi, &media)?;
+        for (source, target, input, output) in [
+            (
+                &avi,
+                &mov,
+                VideoContainerFormat::Avi,
+                VideoContainerFormat::Mov,
+            ),
+            (
+                &mov,
+                &mkv,
+                VideoContainerFormat::Mov,
+                VideoContainerFormat::Mkv,
+            ),
+            (
+                &mkv,
+                &back,
+                VideoContainerFormat::Mkv,
+                VideoContainerFormat::Avi,
+            ),
+        ] {
+            remux(source, target, input, output)?;
+            let out = demux_video(target, output)?;
+            assert_eq!(out.tracks[0].codec, VideoCodec::Mjpeg);
+            assert_eq!(payloads(&out, VideoCodec::Mjpeg), expected);
+            assert!(
+                out.packets.iter().all(|packet| packet.keyframe),
+                "MJPEG remux must preserve every keyframe flag"
+            );
+        }
+        for path in [avi, mov, mkv, back] {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mjpeg_rejects_iso_mp4_and_stream_copy() -> Result<(), Box<dyn std::error::Error>> {
+        let media = mjpeg_media()?;
+        let mp4 = temp_path("mjpeg-mp4-reject", "mp4");
+        let err = match write_container(&mp4, VideoContainerFormat::Mp4, &media) {
+            Ok(()) => return Err("MJPEG must be rejected in ISO MP4".into()),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("MJPEG") && err.to_string().contains("MP4"),
+            "unexpected error: {err}"
+        );
+
+        let stream = VideoStreamInfo::new(
+            VideoCodec::Mjpeg,
+            fastconv_domain::VideoStreamKind::Video,
+            Some(64),
+            Some(48),
+            None,
+            None,
+            1,
+            US_TIMESCALE,
+            None,
+            None,
+        );
+        let item = VideoRemuxItem::new(
+            PathBuf::from("in.mkv"),
+            PathBuf::from("out.mov"),
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Mov,
+            vec![stream],
+        );
+        assert!(!stream_copy_supports(&item));
+        assert!(canonical_remux_supports(VideoCodec::Mjpeg));
+        Ok(())
     }
 
     fn write_mov_with_chapter(
