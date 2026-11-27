@@ -936,6 +936,9 @@ fn demux_mp4_with_format(
         input
             .read_packet_into(&packet, &mut buf)
             .map_err(|err| containr_error(path, &err))?;
+        // Hand the freshly read payload to the packet instead of cloning it.
+        // `read_packet_into` replaces `buf` wholesale on the next iteration.
+        let data_len = buf.len();
         let (timescale, edit_shift) = track_meta[track];
         let dts = packet.dts.unwrap_or(packet.pts);
         // Every MJPEG sample is a complete JPEG frame: even when a container
@@ -954,7 +957,7 @@ fn demux_mp4_with_format(
                 .unwrap_or(1)
             }),
             keyframe: sync,
-            data: buf.clone(),
+            data: std::mem::take(&mut buf),
         };
         if let Some(coalescer) = coalescer.as_mut()
             && coalescer.is_pcm(track)
@@ -970,7 +973,7 @@ fn demux_mp4_with_format(
             let sample_bytes = usize::from(pcm.pcm_format.map_or(2, PcmFormat::bytes_per_sample))
                 .saturating_mul(usize::from(pcm.channels.unwrap_or(2).max(1)))
                 .max(1);
-            let frames_in_sample = u64::try_from(buf.len() / sample_bytes)
+            let frames_in_sample = u64::try_from(data_len / sample_bytes)
                 .unwrap_or(u64::MAX)
                 .max(1);
             // Round once after multiplying: rounding each frame's tick count
@@ -1260,7 +1263,7 @@ fn demux_mkv(path: &Path) -> Result<ContainerMedia, PipelineError> {
             dts: pts,
             duration,
             keyframe: sync,
-            data: buf.clone(),
+            data: std::mem::take(&mut buf),
         });
     }
     synthesize_mkv_decode_timestamps(path, &mut media.packets, media.tracks.len())?;

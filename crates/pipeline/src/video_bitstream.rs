@@ -20,6 +20,12 @@ fn annex_b_nalus(data: &[u8]) -> Vec<&[u8]> {
             }
             start = Some(idx + 3);
             idx += 3;
+        } else if data[idx + 2] > 1 {
+            // A start code needs `00 00 01` at some offset j. If byte idx+2
+            // exceeds 1, no start code can begin at idx, idx+1 or idx+2, so
+            // skip all three positions at once. Exact match/slicing semantics
+            // are unchanged, only the search stride.
+            idx += 3;
         } else {
             idx += 1;
         }
@@ -181,10 +187,106 @@ pub(crate) fn avcc_to_annex_b(
     Ok(out)
 }
 
+/// A length-prefixed codec configuration record parsed once per stream.
+///
+/// `avcC`/`hvcC` parameter sets are immutable for the life of a track; parsing
+/// them inside the per-packet conversion loop would repeat the same work for
+/// every frame.
+#[cfg(feature = "nvenc")]
+pub(crate) struct LengthPrefixedConfig {
+    length_size: usize,
+    params: Vec<Vec<u8>>,
+    hevc: bool,
+}
+
+#[cfg(feature = "nvenc")]
+impl LengthPrefixedConfig {
+    pub(crate) fn avcc(config: &[u8]) -> Result<Self, String> {
+        let (length_size, params) = avcc_param_sets(config)?;
+        Ok(Self {
+            length_size,
+            params,
+            hevc: false,
+        })
+    }
+
+    pub(crate) fn hvcc(config: &[u8]) -> Result<Self, String> {
+        let (length_size, params) = hvcc_param_sets(config)?;
+        Ok(Self {
+            length_size,
+            params,
+            hevc: true,
+        })
+    }
+}
+
+/// Writes one AVCC/HVCC sample as Annex-B into reusable `out` and records the
+/// `(payload_start, payload_end)` range of every emitted NAL unit in reusable
+/// `ranges`. Callers clear both buffers between packets so the output storage
+/// is reused (`length_prefixed_nalus` and the HEVC parameter-set check still
+/// allocate small per-sample vectors); the byte ranges let access-unit detection
+/// skip a second byte-by-byte scan for `00 00 01` start codes.
+#[cfg(feature = "nvenc")]
+pub(crate) fn length_prefixed_to_annex_b_into(
+    config: &LengthPrefixedConfig,
+    sample: &[u8],
+    prepend_param_sets: bool,
+    out: &mut Vec<u8>,
+    ranges: &mut Vec<(usize, usize)>,
+) -> Result<(), String> {
+    let sample_nalus = length_prefixed_nalus(sample, config.length_size)?;
+    if prepend_param_sets {
+        if config.hevc {
+            let present: Vec<u8> = sample_nalus
+                .iter()
+                .filter_map(|n| hevc_nalu_type(n))
+                .collect();
+            for nalu in &config.params {
+                let Some(kind) = hevc_nalu_type(nalu) else {
+                    continue;
+                };
+                if matches!(kind, 32..=34) && !present.contains(&kind) {
+                    push_annex_b(out, nalu);
+                    let payload_start = out.len() - nalu.len();
+                    ranges.push((payload_start, out.len()));
+                }
+            }
+        } else {
+            let sps_in_sample = sample_nalus.iter().any(|n| nalu_type(n) == Some(7));
+            let pps_in_sample = sample_nalus.iter().any(|n| nalu_type(n) == Some(8));
+            for nalu in &config.params {
+                let kind = nalu_type(nalu);
+                if (kind == Some(7) && !sps_in_sample) || (kind == Some(8) && !pps_in_sample) {
+                    push_annex_b(out, nalu);
+                    let payload_start = out.len() - nalu.len();
+                    ranges.push((payload_start, out.len()));
+                }
+            }
+        }
+    }
+    for nalu in sample_nalus {
+        push_annex_b(out, nalu);
+        let payload_start = out.len() - nalu.len();
+        ranges.push((payload_start, out.len()));
+    }
+    Ok(())
+}
+
 pub(crate) fn annex_b_to_avcc(annex_b: &[u8]) -> Vec<u8> {
+    annex_b_to_avcc_with_keyframe(annex_b).0
+}
+
+/// Converts an Annex-B H.264 access unit to length-prefixed AVCC and reports
+/// whether it contains an IDR slice (NALU type 5) in a single start-code pass.
+pub(crate) fn annex_b_to_avcc_with_keyframe(annex_b: &[u8]) -> (Vec<u8>, bool) {
     let mut out = Vec::with_capacity(annex_b.len() + 16);
+    let mut keyframe = false;
     for nalu in annex_b_nalus(annex_b) {
-        if nalu_type(nalu) == Some(9) {
+        let kind = nalu_type(nalu);
+        if kind == Some(5) {
+            keyframe = true;
+        }
+        if kind == Some(9) {
             continue;
         }
         let Ok(len) = u32::try_from(nalu.len()) else {
@@ -193,7 +295,7 @@ pub(crate) fn annex_b_to_avcc(annex_b: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(nalu);
     }
-    out
+    (out, keyframe)
 }
 
 pub(crate) fn extract_avcc_from_annex_b(annex_b: &[u8]) -> Option<Vec<u8>> {
@@ -466,9 +568,20 @@ pub(crate) fn hvcc_to_annex_b(
 }
 
 pub(crate) fn annex_b_to_hvcc(annex_b: &[u8]) -> Vec<u8> {
+    annex_b_to_hvcc_with_keyframe(annex_b).0
+}
+
+/// Converts an Annex-B HEVC access unit to length-prefixed HVCC and reports
+/// whether it contains an IRAP slice (NALU types 16..=21) in a single pass.
+pub(crate) fn annex_b_to_hvcc_with_keyframe(annex_b: &[u8]) -> (Vec<u8>, bool) {
     let mut out = Vec::with_capacity(annex_b.len() + 16);
+    let mut keyframe = false;
     for nalu in annex_b_nalus(annex_b) {
-        if hevc_nalu_type(nalu) == Some(35) {
+        let kind = hevc_nalu_type(nalu);
+        if matches!(kind, Some(16..=21)) {
+            keyframe = true;
+        }
+        if kind == Some(35) {
             continue;
         }
         let Ok(len) = u32::try_from(nalu.len()) else {
@@ -477,7 +590,7 @@ pub(crate) fn annex_b_to_hvcc(annex_b: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(nalu);
     }
-    out
+    (out, keyframe)
 }
 
 pub(crate) fn extract_hvcc_from_annex_b(annex_b: &[u8]) -> Option<Vec<u8>> {

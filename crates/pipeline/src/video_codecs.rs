@@ -9,6 +9,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -281,13 +282,19 @@ fn dht_segment(class: u8, id: u8, bits: &[u8; 16], values: &[u8]) -> Vec<u8> {
     segment
 }
 
-fn standard_jpeg_huffman_tables() -> Vec<u8> {
-    let mut tables = Vec::with_capacity(1024);
-    tables.extend_from_slice(&dht_segment(0, 0, &DC_LUMA_BITS, &DC_LUMA_VALUES));
-    tables.extend_from_slice(&dht_segment(1, 0, &AC_LUMA_BITS, &AC_LUMA_VALUES));
-    tables.extend_from_slice(&dht_segment(0, 1, &DC_CHROMA_BITS, &DC_CHROMA_VALUES));
-    tables.extend_from_slice(&dht_segment(1, 1, &AC_CHROMA_BITS, &AC_CHROMA_VALUES));
-    tables
+/// Standard JPEG Huffman tables are immutable and identical for every MJPEG
+/// packet that lacks its own DHT; build them once instead of per packet.
+static JPEG_HUFFMAN_TABLES: OnceLock<Vec<u8>> = OnceLock::new();
+
+fn standard_jpeg_huffman_tables() -> &'static [u8] {
+    JPEG_HUFFMAN_TABLES.get_or_init(|| {
+        let mut tables = Vec::with_capacity(1024);
+        tables.extend_from_slice(&dht_segment(0, 0, &DC_LUMA_BITS, &DC_LUMA_VALUES));
+        tables.extend_from_slice(&dht_segment(1, 0, &AC_LUMA_BITS, &AC_LUMA_VALUES));
+        tables.extend_from_slice(&dht_segment(0, 1, &DC_CHROMA_BITS, &DC_CHROMA_VALUES));
+        tables.extend_from_slice(&dht_segment(1, 1, &AC_CHROMA_BITS, &AC_CHROMA_VALUES));
+        tables
+    })
 }
 
 /// Returns the packet with standard Huffman tables injected immediately before
@@ -374,7 +381,7 @@ fn mjpeg_with_huffman_tables<'a>(
     let tables = standard_jpeg_huffman_tables();
     let mut complete = Vec::with_capacity(packet.len().saturating_add(tables.len()));
     complete.extend_from_slice(&packet[..sos_start]);
-    complete.extend_from_slice(&tables);
+    complete.extend_from_slice(tables);
     complete.extend_from_slice(&packet[sos_start..]);
     Ok(Cow::Owned(complete))
 }

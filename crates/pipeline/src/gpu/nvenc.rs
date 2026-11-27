@@ -1,7 +1,7 @@
 #[cfg(feature = "nvenc")]
 mod enabled {
     use std::cell::Cell;
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::VecDeque;
     use std::ffi::{CStr, c_int, c_void};
     use std::fs;
     use std::num::{NonZeroU64, NonZeroUsize};
@@ -50,8 +50,8 @@ mod enabled {
     };
     use crate::gpu::heic::{HeicColorInfo, mux_annex_b_hevc_to_heic};
     use crate::video_bitstream::{
-        annex_b_to_avcc, annex_b_to_hvcc, extract_avcc_from_annex_b, extract_hvcc_from_annex_b,
-        is_h264_keyframe_annex_b, is_hevc_keyframe_annex_b,
+        annex_b_to_avcc_with_keyframe, annex_b_to_hvcc_with_keyframe, extract_avcc_from_annex_b,
+        extract_hvcc_from_annex_b,
     };
     use crate::video_codecs::{
         DecodedFrameInfo, EncodedVideoStream, decode_video_track_streaming,
@@ -1112,13 +1112,6 @@ mod enabled {
             }
         }
 
-        fn is_keyframe(self, data: &[u8]) -> bool {
-            match self {
-                Self::H264 => is_h264_keyframe_annex_b(data),
-                Self::Hevc => is_hevc_keyframe_annex_b(data),
-            }
-        }
-
         fn extract_config(self, data: &[u8]) -> Option<Vec<u8>> {
             match self {
                 Self::H264 => extract_avcc_from_annex_b(data),
@@ -1126,10 +1119,10 @@ mod enabled {
             }
         }
 
-        fn to_sample(self, data: &[u8]) -> Vec<u8> {
+        fn to_sample_and_keyframe(self, data: &[u8]) -> (Vec<u8>, bool) {
             match self {
-                Self::H264 => annex_b_to_avcc(data),
-                Self::Hevc => annex_b_to_hvcc(data),
+                Self::H264 => annex_b_to_avcc_with_keyframe(data),
+                Self::Hevc => annex_b_to_hvcc_with_keyframe(data),
             }
         }
     }
@@ -1587,13 +1580,18 @@ mod enabled {
             Err(video_error("NVENC encoder stayed busy while flushing"))
         }
 
-        /// Locks a ready bitstream synchronously (`doNotWait = 0`), copies its
-        /// Annex-B payload and output timestamp, and unlocks it before returning.
+        /// Locks a ready bitstream synchronously (`doNotWait = 0`), performs one
+        /// contiguous copy into the reusable cached `scratch` buffer, and
+        /// unlocks immediately. NVENC bitstream buffers sit in uncached/WC
+        /// driver memory, so one bulk `memcpy` into L1/L2-cached RAM before
+        /// scanning start codes avoids slow byte-wise reads across `PCIe` and
+        /// returns the bitstream slot to the driver right away.
         #[allow(unsafe_code)]
-        fn lock_bitstream(
+        fn lock_bitstream_into(
             &self,
             bitstream: &mut RawBitstream<'_>,
-        ) -> Result<(Vec<u8>, u64), PipelineError> {
+            scratch: &mut Vec<u8>,
+        ) -> Result<u64, PipelineError> {
             let mut lock_params = NV_ENC_LOCK_BITSTREAM {
                 version: NV_ENC_LOCK_BITSTREAM_VER,
                 outputBitstream: bitstream.ptr,
@@ -1607,15 +1605,15 @@ mod enabled {
             )?;
             bitstream.locked.set(true);
             let size = usize::try_from(lock_params.bitstreamSizeInBytes).unwrap_or(0);
-            let data = if size == 0 || lock_params.bitstreamBufferPtr.is_null() {
-                Vec::new()
-            } else {
-                // SAFETY: `lock_bitstream` succeeded and guarantees `size` valid readable bytes.
-                unsafe {
+            scratch.clear();
+            if size > 0 && !lock_params.bitstreamBufferPtr.is_null() {
+                // SAFETY: `lock_bitstream` succeeded and guarantees `size` valid
+                // readable bytes until `unlock_bitstream` is called below.
+                let raw = unsafe {
                     std::slice::from_raw_parts(lock_params.bitstreamBufferPtr.cast::<u8>(), size)
-                }
-                .to_vec()
-            };
+                };
+                scratch.extend_from_slice(raw);
+            }
             let timestamp = lock_params.outputTimeStamp;
             let unlock = nvenc_check(
                 self.encoder.ptr,
@@ -1625,8 +1623,7 @@ mod enabled {
             if unlock.is_ok() {
                 bitstream.locked.set(false);
             }
-            unlock?;
-            Ok((data, timestamp))
+            unlock.map(|()| timestamp)
         }
 
         /// Synchronously locks and immediately unlocks a ready bitstream
@@ -1655,6 +1652,35 @@ mod enabled {
                 bitstream.locked.set(false);
             }
             unlock
+        }
+
+        /// Orders NVENC input reads against `input_stream` (carrying NVDEC ->
+        /// NVENC device copies) and output writes against `output_stream` so
+        /// output post-processing does not serialize behind the next frame's
+        /// decode/copy stream.
+        #[allow(unsafe_code)]
+        fn set_io_cuda_streams(
+            &self,
+            input_stream: &CudaStream,
+            output_stream: &CudaStream,
+        ) -> Result<(), PipelineError> {
+            let mut in_cu = input_stream.cu_stream();
+            let mut out_cu = output_stream.cu_stream();
+            // SAFETY: `self.encoder.ptr` is a live NVENC session and both
+            // `CudaStream` handles stay alive for the stage. `NV_ENC_CUSTREAM_PTR`
+            // is a pointer *to* `CUstream` (nvEncodeAPI.h:112).
+            let status = unsafe {
+                (ENCODE_API.set_io_cuda_streams)(
+                    self.encoder.ptr,
+                    (&raw mut in_cu).cast::<c_void>(),
+                    (&raw mut out_cu).cast::<c_void>(),
+                )
+            };
+            nvenc_check(
+                self.encoder.ptr,
+                status,
+                "failed to bind NVENC input/output CUDA streams",
+            )
         }
     }
 
@@ -1703,42 +1729,48 @@ mod enabled {
         session: &RawNvencSession,
         codec: NvencVideoCodec,
         bitstreams: &mut [RawBitstream<'_>],
+        bitstream_scratch: &mut Vec<u8>,
         mapped: &mut [Option<RawMappedResource<'_>>],
         ready_bitstreams: &mut VecDeque<usize>,
         pending_bitstreams: &mut VecDeque<usize>,
         free_bitstreams: &mut VecDeque<usize>,
         free_inputs: &mut VecDeque<usize>,
-        frame_to_input_slot: &mut HashMap<usize, usize>,
+        frame_to_input_slot: &mut [Option<usize>],
         track: &mut ContainerTrack,
         encoded_units: &mut Vec<(Vec<u8>, bool, usize)>,
         on_frame_encoded: &mut impl FnMut() -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError> {
         while let Some(bs_slot) = ready_bitstreams.pop_front() {
-            let (data, timestamp) = match session.lock_bitstream(&mut bitstreams[bs_slot]) {
-                Ok(result) => result,
-                Err(err) => {
-                    // A failed lock does not prove NVENC is done with this
-                    // picture, so it must not stay in the confirmed-ready queue.
-                    // Keep it tracked in the deferred queue instead (the earlier
-                    // fix pushed it back into `ready_bitstreams`): the slot is
-                    // never dropped here, and `abort_pending_nvenc_work` either
-                    // blocking-discards it after a confirmed EOS or quarantines
-                    // its buffers when no successful submission is available.
-                    pending_bitstreams.push_back(bs_slot);
-                    return Err(err);
-                }
-            };
-            if data.is_empty() {
+            let timestamp =
+                match session.lock_bitstream_into(&mut bitstreams[bs_slot], bitstream_scratch) {
+                    Ok(ts) => ts,
+                    Err(err) => {
+                        // A failed lock does not prove NVENC is done with this
+                        // picture, so it must not stay in the confirmed-ready
+                        // queue. Keep it tracked in the deferred queue instead
+                        // (the earlier fix pushed it back into `ready_bitstreams`):
+                        // the slot is never dropped here, and
+                        // `abort_pending_nvenc_work` either blocking-discards it
+                        // after a confirmed EOS or quarantines its buffers when
+                        // no successful submission is available.
+                        pending_bitstreams.push_back(bs_slot);
+                        return Err(err);
+                    }
+                };
+            if bitstream_scratch.is_empty() {
                 return Err(video_error("NVENC produced an empty access unit"));
             }
             let display_idx = usize::try_from(timestamp).map_err(|_| {
                 video_error(format!("NVENC output timestamp {timestamp} exceeds usize"))
             })?;
-            let finished_in_slot = frame_to_input_slot.remove(&display_idx).ok_or_else(|| {
-                video_error(format!(
-                    "NVENC returned unexpected or duplicate output timestamp {display_idx}"
-                ))
-            })?;
+            let finished_in_slot = frame_to_input_slot
+                .get_mut(display_idx)
+                .and_then(Option::take)
+                .ok_or_else(|| {
+                    video_error(format!(
+                        "NVENC returned unexpected or duplicate output timestamp {display_idx}"
+                    ))
+                })?;
             // With B-frame reordering, the finished picture's input surface is
             // identified by `display_idx`, not by `bs_slot`. Unmap that exact
             // surface before recycling its device slot; the registration stays
@@ -1747,14 +1779,14 @@ mod enabled {
             free_inputs.push_back(finished_in_slot);
             free_bitstreams.push_back(bs_slot);
 
-            let keyframe = codec.is_keyframe(&data);
+            let (payload, keyframe) = codec.to_sample_and_keyframe(bitstream_scratch);
             if track.config.is_empty()
                 && keyframe
-                && let Some(config) = codec.extract_config(&data)
+                && let Some(config) = codec.extract_config(bitstream_scratch)
             {
                 track.config = config;
             }
-            encoded_units.push((codec.to_sample(&data), keyframe, display_idx));
+            encoded_units.push((payload, keyframe, display_idx));
             on_frame_encoded()?;
         }
         Ok(())
@@ -1938,9 +1970,12 @@ mod enabled {
         let mut free_bitstreams: VecDeque<usize> = (0..slot_count).collect();
         let mut pending_bitstreams: VecDeque<usize> = VecDeque::with_capacity(slot_count);
         let mut ready_bitstreams: VecDeque<usize> = VecDeque::with_capacity(slot_count);
-        let mut frame_to_input_slot: HashMap<usize, usize> = HashMap::with_capacity(slot_count);
-        let mut frame_timings: Vec<(i64, u64)> = Vec::new();
-        let mut encoded_units: Vec<(Vec<u8>, bool, usize)> = Vec::new();
+        // Display indices are dense and bounded by the decoded frame count, so
+        // a pre-sized Vec replaces the per-frame HashMap and its hash/probe.
+        let mut frame_to_input_slot: Vec<Option<usize>> = Vec::with_capacity(slot_count);
+        let mut frame_timings: Vec<(i64, u64)> = Vec::with_capacity(slot_count);
+        let mut encoded_units: Vec<(Vec<u8>, bool, usize)> = Vec::with_capacity(slot_count);
+        let mut bitstream_scratch: Vec<u8> = Vec::with_capacity(256 * 1024);
         let mut frames_encoded = 0_u64;
         let mut next_frame = Some(first);
         let mut eos_flushed = false;
@@ -1970,7 +2005,7 @@ mod enabled {
                 let frame_idx_u64 =
                     u64::try_from(frame_idx).map_err(|_| video_error("frame index exceeds u64"))?;
                 frame_timings.push((filled.info.pts_us, filled.info.duration_us.max(1)));
-                frame_to_input_slot.insert(frame_idx, in_slot);
+                frame_to_input_slot.push(Some(in_slot));
 
                 let outcome =
                     session.encode_picture(resource, &mut bitstreams[bs_slot], frame_idx_u64)?;
@@ -1987,6 +2022,7 @@ mod enabled {
                         &session,
                         codec,
                         &mut bitstreams,
+                        &mut bitstream_scratch,
                         &mut mapped,
                         &mut ready_bitstreams,
                         &mut pending_bitstreams,
@@ -2007,6 +2043,7 @@ mod enabled {
                 &session,
                 codec,
                 &mut bitstreams,
+                &mut bitstream_scratch,
                 &mut mapped,
                 &mut ready_bitstreams,
                 &mut pending_bitstreams,
@@ -2129,6 +2166,21 @@ mod enabled {
         let device_name = cuda_ctx
             .name()
             .map_err(|err| video_error(format!("failed to query CUDA device name: {err}")))?;
+        // Real (non-default) streams are required so NVENC's I/O streams can be
+        // bound cleanly: the default stream's null handle is not a valid
+        // `NV_ENC_CUSTREAM_PTR` value, and a distinct output stream avoids
+        // serializing output post-processing behind the next NVDEC copy.
+        // Declared before the encoder/session so Rust drops them *after* both:
+        // `RawNvencSession::drop` may still submit EOS on the bound input stream,
+        // and NVENC must not see its bound streams destroyed before it does.
+        let cuda_stream = cuda_ctx.new_stream().map_err(|err| {
+            video_error(format!(
+                "failed to create NVDEC -> NVENC input CUDA stream: {err}"
+            ))
+        })?;
+        let output_cuda_stream = cuda_ctx.new_stream().map_err(|err| {
+            video_error(format!("failed to create NVENC output CUDA stream: {err}"))
+        })?;
         let encoder = RawNvencEncoder::open(Arc::clone(&cuda_ctx))?;
         if !encoder.get_encode_guids()?.contains(&guid) {
             return Err(video_error(
@@ -2199,9 +2251,8 @@ mod enabled {
         let total_slab_bytes = slot_bytes
             .checked_mul(slot_count)
             .ok_or_else(|| video_error("NVENC VRAM slab size overflow"))?;
-        let cuda_stream = cuda_ctx.default_stream();
-        // Reverse declaration order gives the required teardown order. One
-        // contiguous VRAM slab avoids 29 synchronous cuMemAlloc/cuMemFree stalls.
+        session.set_io_cuda_streams(&cuda_stream, &output_cuda_stream)?;
+        // One contiguous VRAM slab avoids 29 synchronous cuMemAlloc/cuMemFree stalls.
         let vram_slab = DeviceBuffer::zeroed(&cuda_ctx, &cuda_stream, total_slab_bytes)?;
         let slot_ptrs: Vec<sys::CUdeviceptr> = (0..slot_count)
             .map(|slot| {
@@ -2238,9 +2289,13 @@ mod enabled {
         let mut free_bitstreams: VecDeque<usize> = (0..slot_count).collect();
         let mut pending_bitstreams: VecDeque<usize> = VecDeque::with_capacity(slot_count);
         let mut ready_bitstreams: VecDeque<usize> = VecDeque::with_capacity(slot_count);
-        let mut frame_to_input_slot: HashMap<usize, usize> = HashMap::with_capacity(slot_count);
-        let mut frame_timings: Vec<(i64, u64)> = Vec::new();
-        let mut encoded_units: Vec<(Vec<u8>, bool, usize)> = Vec::new();
+        // Display indices are dense and bounded by the source packet count, so
+        // a pre-sized Vec replaces the per-frame HashMap and its hash/probe.
+        let mut frame_to_input_slot: Vec<Option<usize>> = Vec::with_capacity(track_packets.len());
+        let mut frame_timings: Vec<(i64, u64)> = Vec::with_capacity(track_packets.len());
+        let mut encoded_units: Vec<(Vec<u8>, bool, usize)> =
+            Vec::with_capacity(track_packets.len());
+        let mut bitstream_scratch: Vec<u8> = Vec::with_capacity(256 * 1024);
         let mut frames_encoded = 0_u64;
         let mut eos_flushed = false;
 
@@ -2263,6 +2318,7 @@ mod enabled {
                         &session,
                         codec,
                         &mut bitstreams,
+                        &mut bitstream_scratch,
                         &mut mapped,
                         &mut ready_bitstreams,
                         &mut pending_bitstreams,
@@ -2295,7 +2351,7 @@ mod enabled {
                 let frame_idx_u64 =
                     u64::try_from(frame_idx).map_err(|_| video_error("frame index exceeds u64"))?;
                 frame_timings.push((pts_us, duration_us.max(1)));
-                frame_to_input_slot.insert(frame_idx, in_slot);
+                frame_to_input_slot.push(Some(in_slot));
                 let outcome =
                     session.encode_picture(resource, &mut bitstreams[bs_slot], frame_idx_u64)?;
                 pending_bitstreams.push_back(bs_slot);
@@ -2310,6 +2366,7 @@ mod enabled {
                         &session,
                         codec,
                         &mut bitstreams,
+                        &mut bitstream_scratch,
                         &mut mapped,
                         &mut ready_bitstreams,
                         &mut pending_bitstreams,
@@ -2333,6 +2390,7 @@ mod enabled {
                 &session,
                 codec,
                 &mut bitstreams,
+                &mut bitstream_scratch,
                 &mut mapped,
                 &mut ready_bitstreams,
                 &mut pending_bitstreams,
@@ -2365,6 +2423,10 @@ mod enabled {
             std::mem::forget(reg_resources);
             std::mem::forget(vram_slab);
             std::mem::forget(session);
+            // The quarantined session still holds the bound I/O stream handles;
+            // keep their owners alive too, or NVENC may use destroyed streams.
+            std::mem::forget(cuda_stream);
+            std::mem::forget(output_cuda_stream);
         }
         stage_result?;
 
