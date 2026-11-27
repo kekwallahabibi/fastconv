@@ -17,6 +17,9 @@ use crate::video_container::{
 
 const AVIIF_KEYFRAME: u32 = 0x10;
 const AVI_HEADER_CAP: u64 = 512 * 1024 * 1024;
+/// Matroska block timestamps are rounded to the track tick (1 ms by default),
+/// so PCM boundaries can be off by less than this while still being contiguous.
+const PCM_PTS_TOLERANCE_US: i64 = 1_000;
 
 fn avi_error(path: &Path, reason: impl Into<String>) -> PipelineError {
     PipelineError::RemuxFailed {
@@ -803,11 +806,19 @@ pub(crate) fn mux_avi(
                 length = u32::try_from(bytes / block_align).unwrap_or(u32::MAX);
                 // AVI readers derive PCM timestamps from the cumulative sample
                 // count, so a source gap would silently disappear. Reject it
-                // before writing the header or any payload instead.
+                // before writing the header or any payload instead. Matroska
+                // block timestamps are rounded to the track's tick (1 ms by
+                // default), so allow that rounding window before calling a
+                // boundary a real gap.
+                let within_tolerance = |value: i64, expected: i64| {
+                    value.saturating_sub(expected).abs() <= PCM_PTS_TOLERANCE_US
+                        && expected.saturating_sub(value).abs() <= PCM_PTS_TOLERANCE_US
+                };
                 let mut samples = 0_u64;
                 for pcm in media.packets.iter().filter(|packet| packet.track == index) {
                     let expected = avi_pcm_pts(samples, sr);
-                    if pcm.pts != expected || pcm.dts != expected {
+                    if !within_tolerance(pcm.pts, expected) || !within_tolerance(pcm.dts, expected)
+                    {
                         return Err(avi_error(
                             target_path,
                             "AVI PCM packet timestamps are not contiguous sample positions",
@@ -1134,6 +1145,47 @@ mod tests {
         assert_eq!(pcm.len(), 2);
         assert_eq!(pcm[0].pts, 0);
         assert_eq!(pcm[1].pts, 10_000, "contiguous PCM must be unchanged");
+        Ok(())
+    }
+
+    #[test]
+    fn avi_accepts_pcm_timestamps_rounded_to_source_tick() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Matroska stores block timestamps in 1 ms ticks; a 1024-frame packet
+        // at 48 kHz lands on 21,000 µs rather than the exact 21,333 µs.
+        let media = ContainerMedia {
+            tracks: vec![ContainerTrack {
+                codec: VideoCodec::Pcm,
+                width: None,
+                height: None,
+                channels: Some(2),
+                sample_rate: Some(48_000),
+                config: Vec::new(),
+                timescale: US_TIMESCALE,
+                presentation_edit: None,
+                pcm_format: Some(PcmFormat::S16Le),
+            }],
+            packets: [0_i64, 21_000, 43_000, 64_000]
+                .into_iter()
+                .map(|pts| ContainerPacket {
+                    track: 0,
+                    pts,
+                    dts: pts,
+                    duration: 21_333,
+                    keyframe: true,
+                    data: vec![0_u8; 4 * 1_024],
+                })
+                .collect(),
+        };
+        let path = temp_path("pcm-rounded-pts");
+        let file = File::create(&path)?;
+        let result = mux_avi(&file, &path, &media);
+        drop(file);
+        std::fs::remove_file(&path)?;
+        assert!(
+            result.is_ok(),
+            "source-tick rounding is not a timing gap: {result:?}"
+        );
         Ok(())
     }
 

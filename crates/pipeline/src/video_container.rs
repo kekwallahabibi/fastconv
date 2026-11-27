@@ -956,8 +956,9 @@ fn demux_mp4_with_format(
             let raw_duration = i64::try_from(packet.duration.unwrap_or(1))
                 .unwrap_or(i64::MAX)
                 .max(1);
-            // One MOV PCM sample holds one frame. A longer declared duration
-            // encodes a timeline gap that coalescing would silently erase, so
+            // An MP4 sample may carry several whole PCM frames; its `stts`
+            // duration must match the frames in the payload. A mismatch is a
+            // real timeline gap or overlap that coalescing would erase, so
             // reject it here instead of overlapping the next frame.
             let frame_ticks = i64::from(
                 timescale
@@ -965,10 +966,20 @@ fn demux_mp4_with_format(
                     .div_ceil(media.tracks[track].sample_rate.unwrap_or(48_000).max(1)),
             )
             .max(1);
-            if raw_duration > frame_ticks {
+            let pcm = &media.tracks[track];
+            let sample_bytes = usize::from(pcm.pcm_format.map_or(2, PcmFormat::bytes_per_sample))
+                .saturating_mul(usize::from(pcm.channels.unwrap_or(2).max(1)))
+                .max(1);
+            let frames_in_sample = u64::try_from(buf.len() / sample_bytes)
+                .unwrap_or(u64::MAX)
+                .max(1);
+            let expected_ticks =
+                frames_in_sample.saturating_mul(u64::try_from(frame_ticks).unwrap_or(u64::MAX));
+            let declared_ticks = u64::try_from(raw_duration).unwrap_or(u64::MAX);
+            if declared_ticks != expected_ticks {
                 return Err(container_error(
                     path,
-                    "MOV PCM sample duration exceeds one frame of source ticks",
+                    "MOV PCM sample duration does not match its frame count",
                 ));
             }
             let source_end = packet.pts.saturating_add(raw_duration);
@@ -3356,10 +3367,17 @@ mod tests {
         let id = output.add_track(spec).map_err(|err| err.to_string())?;
         for (index, (pts, data)) in frames.iter().enumerate() {
             // MP4 requires each packet's duration to equal the next DTS delta;
-            // the gapped case deliberately has a larger delta.
-            let duration = frames.get(index.saturating_add(1)).map_or(1, |(next, _)| {
-                u64::try_from(next.saturating_sub(*pts)).unwrap_or(1).max(1)
-            });
+            // the gapped case deliberately has a larger delta. The final
+            // sample reuses the previous delta so multi-frame samples keep a
+            // duration consistent with their payload.
+            let duration = frames.get(index.saturating_add(1)).map_or_else(
+                || {
+                    frames.get(index.saturating_sub(1)).map_or(1, |(prev, _)| {
+                        u64::try_from(pts.saturating_sub(*prev)).unwrap_or(1).max(1)
+                    })
+                },
+                |(next, _)| u64::try_from(next.saturating_sub(*pts)).unwrap_or(1).max(1),
+            );
             output
                 .write_packet(
                     id,
@@ -3510,6 +3528,35 @@ mod tests {
         ))
         .ok()?;
         bytes.get(start - 4..start - 4 + size).map(<[u8]>::to_vec)
+    }
+
+    #[test]
+    fn mov_pcm_accepts_multi_frame_samples_with_matching_duration() -> Result<(), String> {
+        let dir =
+            std::env::temp_dir().join(format!("fastconv-mov-multiframe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let path = dir.join("multiframe.mov");
+        // Each sample carries four stereo S16 frames (16 bytes) and declares
+        // a four-tick duration; that is consistent, not a timeline gap.
+        let first = [0_u8; 16];
+        let second = [1_u8; 16];
+        write_raw_mov(
+            &path,
+            build_pcm_mp4_sample_entry(PcmFormat::S16Le, 2, 48_000),
+            48_000,
+            &[(0, &first), (4, &second)],
+        )?;
+        let media = demux_video(&path, VideoContainerFormat::Mov)
+            .map_err(|err| format!("valid multi-frame PCM sample rejected: {err:?}"))?;
+        let data: Vec<&ContainerPacket> = media
+            .packets
+            .iter()
+            .filter(|packet| media.tracks[packet.track].codec == VideoCodec::Pcm)
+            .collect();
+        assert_eq!(data.len(), 1, "contiguous samples must coalesce");
+        assert_eq!(data[0].data.len(), 32);
+        std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
+        Ok(())
     }
 
     #[test]
