@@ -960,12 +960,6 @@ fn demux_mp4_with_format(
             // duration must match the frames in the payload. A mismatch is a
             // real timeline gap or overlap that coalescing would erase, so
             // reject it here instead of overlapping the next frame.
-            let frame_ticks = i64::from(
-                timescale
-                    .max(1)
-                    .div_ceil(media.tracks[track].sample_rate.unwrap_or(48_000).max(1)),
-            )
-            .max(1);
             let pcm = &media.tracks[track];
             let sample_bytes = usize::from(pcm.pcm_format.map_or(2, PcmFormat::bytes_per_sample))
                 .saturating_mul(usize::from(pcm.channels.unwrap_or(2).max(1)))
@@ -973,8 +967,15 @@ fn demux_mp4_with_format(
             let frames_in_sample = u64::try_from(buf.len() / sample_bytes)
                 .unwrap_or(u64::MAX)
                 .max(1);
-            let expected_ticks =
-                frames_in_sample.saturating_mul(u64::try_from(frame_ticks).unwrap_or(u64::MAX));
+            // Round once after multiplying: rounding each frame's tick count
+            // first rejects valid samples when the timescale is not a multiple
+            // of the sample rate (e.g. 48 kHz audio on a 1 kHz media timescale).
+            let expected_ticks = u64::try_from(
+                u128::from(frames_in_sample)
+                    .saturating_mul(u128::from(timescale.max(1)))
+                    .div_ceil(u128::from(pcm.sample_rate.unwrap_or(48_000).max(1))),
+            )
+            .unwrap_or(u64::MAX);
             let declared_ticks = u64::try_from(raw_duration).unwrap_or(u64::MAX);
             if declared_ticks != expected_ticks {
                 return Err(container_error(
@@ -3555,6 +3556,25 @@ mod tests {
             .collect();
         assert_eq!(data.len(), 1, "contiguous samples must coalesce");
         assert_eq!(data[0].data.len(), 32);
+        std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn mov_pcm_accepts_frames_when_timescale_is_not_a_multiple_of_rate() -> Result<(), String> {
+        let dir = std::env::temp_dir().join(format!("fastconv-mov-coarse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let path = dir.join("coarse.mov");
+        // 48 frames at 48 kHz are exactly 1 ms = 1 tick on a 1 kHz timescale.
+        let payload = [7_u8; 48 * 4];
+        write_raw_mov(
+            &path,
+            build_pcm_mp4_sample_entry(PcmFormat::S16Le, 2, 48_000),
+            1_000,
+            &[(0, &payload)],
+        )?;
+        demux_video(&path, VideoContainerFormat::Mov)
+            .map_err(|err| format!("valid coarse-timescale PCM sample rejected: {err:?}"))?;
         std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
         Ok(())
     }
