@@ -430,6 +430,9 @@ impl AudioOptionSampleRate {
         88_200, 96_000,
     ];
     pub const OPUS_RATE_HZ: u32 = 48_000;
+    /// The M4A sample entry stores the rate in a 16.16 fixed-point field, so an
+    /// integer rate above 65535 would be written as zero and break reopening.
+    pub const ALAC_MAX_HZ: u32 = 0xFFFF;
     pub const MIN_HZ: u32 = 8_000;
     pub const MAX_HZ: u32 = 192_000;
 
@@ -750,6 +753,12 @@ impl AudioEncodingOptions {
             return Err(DomainError::InvalidAudioOptionSampleRate {
                 hz,
                 expected: "exactly 48000 Hz (Ogg Opus always encodes at 48 kHz)",
+            });
+        }
+        if codec == AudioTargetCodec::Alac && hz > AudioOptionSampleRate::ALAC_MAX_HZ {
+            return Err(DomainError::InvalidAudioOptionSampleRate {
+                hz,
+                expected: "8000..=65535 Hz for ALAC (M4A stores a 16.16 fixed-point rate)",
             });
         }
         let valid = match codec {
@@ -2269,6 +2278,30 @@ mod tests {
                 None
             ))
             .contains("M4A (ALAC)")
+        );
+        // 96 kHz is a valid AAC rate, but the M4A ALAC sample entry stores the
+        // rate in a 16.16 fixed-point field: it would write zero and break reopening.
+        assert!(matches!(
+            plain(
+                AudioOutputFormat::M4a,
+                AudioTargetCodec::Alac,
+                AudioRateControl::Default,
+                Some(96_000),
+                None,
+                Some(AudioBitDepth::Int16)
+            ),
+            Err(DomainError::InvalidAudioOptionSampleRate { .. })
+        ));
+        assert!(
+            plain(
+                AudioOutputFormat::M4a,
+                AudioTargetCodec::Alac,
+                AudioRateControl::Default,
+                Some(AudioOptionSampleRate::ALAC_MAX_HZ),
+                None,
+                Some(AudioBitDepth::Int16)
+            )
+            .is_ok()
         );
 
         Ok(())

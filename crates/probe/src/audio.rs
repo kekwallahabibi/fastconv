@@ -318,24 +318,44 @@ pub fn detect_audio_magic(bytes: &[u8]) -> Option<AudioInputFormat> {
     None
 }
 
-/// Extracts the first packet from the leading Ogg page. Codec must be read from this framed
-/// identification packet; scanning arbitrary bytes can mistake Vorbis comments for Opus.
+/// Extracts the first packet of the first non-Skeleton Ogg page within the leading prefix.
+///
+/// Ogg Skeleton streams prefix the audio stream with `fishead`/`fisbone` pages, so reading
+/// only the first page would miss the codec identification packet. The codec must come from
+/// a framed identification packet; scanning arbitrary bytes can mistake Vorbis comments for
+/// Opus. The BOS flag is deliberately ignored so a lone identification page still works.
 fn ogg_identification_packet(bytes: &[u8]) -> Option<&[u8]> {
-    if !bytes.starts_with(b"OggS") || bytes.len() < 28 {
-        return None;
-    }
-    let segments = usize::from(*bytes.get(26)?);
-    let table_start = 27;
-    let table = bytes.get(table_start..table_start + segments)?;
-    let mut packet_len = 0_usize;
-    for &lacing in table {
-        packet_len += usize::from(lacing);
-        if lacing < 255 {
-            break;
+    const TABLE_START: usize = 27;
+    let limit = bytes.len().min(MAGIC_PREFIX_BYTES);
+    let mut offset = 0_usize;
+    while offset < limit {
+        let mut page = bytes.get(offset..limit)?;
+        if !page.starts_with(b"OggS") || page.len() < TABLE_START {
+            return None;
         }
+        let segments = usize::from(page[26]);
+        let table_end = TABLE_START.checked_add(segments)?;
+        let table = page.get(TABLE_START..table_end)?;
+        let mut body_len = 0_usize;
+        let mut first_packet_len = None;
+        for &lacing in table {
+            body_len = body_len.checked_add(usize::from(lacing))?;
+            if first_packet_len.is_none() && lacing < 255 {
+                first_packet_len = Some(body_len);
+            }
+        }
+        // The page body is the sum of *all* lacing values, not just the first packet's.
+        let page_len = table_end.checked_add(body_len)?;
+        page = page.get(..page_len)?;
+        if let Some(packet_len) = first_packet_len {
+            let packet = page.get(table_end..table_end.checked_add(packet_len)?)?;
+            if !packet.starts_with(b"fishead") && !packet.starts_with(b"fisbone") {
+                return Some(packet);
+            }
+        }
+        offset = offset.checked_add(page_len)?;
     }
-    let payload_start = table_start + segments;
-    bytes.get(payload_start..payload_start + packet_len)
+    None
 }
 
 fn read_magic_prefix(file: &mut File, path: &Path) -> Result<[u8; MAGIC_PREFIX_BYTES], ProbeError> {
@@ -1599,6 +1619,39 @@ mod tests {
         vorbis.extend_from_slice(&[1, 7]);
         vorbis.extend_from_slice(b"\x01vorbis");
         assert_eq!(detect_audio_magic(&vorbis), Some(AudioInputFormat::Vorbis));
+    }
+
+    // Builds a single-packet Ogg page with correct lacing (packets <= 255 bytes here).
+    fn ogg_page(header_type: u8, packet: &[u8]) -> Vec<u8> {
+        let mut page = b"OggS".to_vec();
+        page.push(0); // stream version
+        page.push(header_type);
+        page.extend_from_slice(&[0_u8; 16]); // granule position, serial number, sequence
+        page.extend_from_slice(&[0_u8; 4]); // CRC (the detector does not verify it)
+        page.push(1);
+        page.push(u8::try_from(packet.len()).unwrap_or(u8::MAX));
+        page.extend_from_slice(packet);
+        page
+    }
+
+    #[test]
+    fn detects_ogg_audio_after_skeleton_pages() {
+        let mut fishead = vec![0_u8; 44];
+        fishead[..8].copy_from_slice(b"fishead\0");
+        let mut fisbone = vec![0_u8; 30];
+        fisbone[..8].copy_from_slice(b"fisbone\0");
+
+        // Skeleton alone is not an audio identification packet.
+        assert_eq!(detect_audio_magic(&ogg_page(0x02, &fishead)), None);
+
+        let mut bytes = ogg_page(0x02, &fishead);
+        bytes.extend_from_slice(&ogg_page(0x00, &fisbone));
+        bytes.extend_from_slice(&ogg_page(0x02, b"\x7fFLAC\x01\x00\x00\x01fLaC"));
+        assert_eq!(detect_audio_magic(&bytes), Some(AudioInputFormat::OggFlac));
+
+        let mut bytes = ogg_page(0x02, &fishead);
+        bytes.extend_from_slice(&ogg_page(0x02, b"\x01vorbis"));
+        assert_eq!(detect_audio_magic(&bytes), Some(AudioInputFormat::Vorbis));
     }
 
     #[test]

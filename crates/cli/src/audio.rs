@@ -31,20 +31,20 @@ Options:
                         extension; incompatible pairs are rejected.
   --bitrate <rate>      Lossy target bitrate: 128k, 192K, 320kbps, bare kbps
                         below 1000 (e.g. 192), or bare bps (e.g. 192000).
-                        Ranges: mp3 32-320k, aac/m4a/ogg 32-512k, opus 6-510k.
+                        Ranges: mp3 32-320k, vorbis/aac 32-512k, opus 6-510k.
                         Mutually exclusive with --quality; rejected by
-                        lossless outputs (wav, flac, alac, aiff).
-  --quality <0..=100>   Quality-based VBR, supported by mp3, ogg and opus.
-                        mutually exclusive with --bitrate; aac/m4a have no
-                        VBR quality mode (use --bitrate) and lossless outputs
-                        reject it.
+                        lossless codecs (pcm, flac, alac).
+  --quality <0..=100>   Quality-based VBR, supported by mp3, vorbis and opus.
+                        mutually exclusive with --bitrate; aac has no VBR quality
+                        mode (use --bitrate) and lossless codecs reject it.
   --sample-rate <hz>    Resample output to this rate. Opus accepts only 48000;
-                        mp3 and aac/m4a accept only their codec rate tables.
-  --channels <1..=8>    Output channel count (mp3/opus 1-2, aac/m4a/ogg 1-6
-                        excluding 4, lossless 1-8). Remixing is deterministic.
+                        mp3 and aac accept only their codec rate tables; alac
+                        accepts 8000..=65535 (M4A stores a 16.16 fixed-point rate).
+  --channels <1..=8>    Output channel count (mp3/opus 1-2, aac/vorbis 1-6
+                        excluding 4, pcm/flac/alac 1-8). Remixing is deterministic.
   --bit-depth <...>     Lossless PCM depth: 8, 16, 24, 32 or f32. Accepted by
-                        wav/aiff; flac accepts 8/16/24 and alac accepts 16.
-                        Rejected by all lossy targets. Default follows the source
+                        pcm; flac accepts 8/16/24 and alac accepts 16.
+                        Rejected by all lossy codecs. Default follows the source
                         where the target stores it; otherwise float to flac gives
                         24-bit integer, and float or 8-bit input to alac gives
                         16-bit.
@@ -307,6 +307,9 @@ mod tests {
         assert!(AUDIO_HELP.contains("ogg -> vorbis"));
         assert!(AUDIO_HELP.contains("m4a -> aac"));
         assert!(AUDIO_HELP.contains("Ogg FLAC"));
+        assert!(AUDIO_HELP.contains("vorbis/aac 32-512k"));
+        assert!(AUDIO_HELP.contains("opus 6-510k"));
+        assert!(AUDIO_HELP.contains("pcm/flac/alac 1-8"));
         assert!(AUDIO_HELP.contains("no silent CPU fallback"));
         assert!(AUDIO_HELP.contains("ALAC writes an M4A container"));
         assert!(AUDIO_HELP.contains("mutually exclusive with --bitrate"));

@@ -2471,6 +2471,36 @@ fn quantizes_to_second_array(
     !direct_i16 && !direct_i32
 }
 
+/// Whether direct `i16` samples are widened into a coexisting `i32` array. This
+/// mirrors the FLAC branch in `encode_audio`; unlike `quantizes_to_second_array`
+/// it applies to integer input that needs no quantization, so both arrays stay
+/// live and the batch budget must charge for both.
+fn widens_direct_i16(
+    item: &AudioBatchItem,
+    codec: AudioTargetCodec,
+    options: &AudioEncodingOptions,
+) -> bool {
+    if codec != AudioTargetCodec::Flac || options.bit_depth().is_some_and(AudioBitDepth::is_float) {
+        return false;
+    }
+    let stream = item.stream();
+    if stream.sample_format() != AudioSampleFormat::Int {
+        return false;
+    }
+    let bits = usize::from(stream.bits_per_sample().map_or(0, NonZeroU16::get));
+    let no_transform = options
+        .sample_rate()
+        .is_none_or(|rate| rate.hz() == stream.sample_rate().get())
+        && options.channels().is_none_or(|channels| {
+            usize::from(channels.get()) == usize::from(stream.channels().get())
+        });
+    no_transform
+        && bits == 16
+        && options
+            .bit_depth()
+            .is_none_or(|depth| depth == AudioBitDepth::Int16)
+}
+
 fn estimate_pcm_bytes(
     item: &AudioBatchItem,
     codec: AudioTargetCodec,
@@ -2540,6 +2570,12 @@ fn estimate_pcm_bytes(
         // across the extend loop, and the integer array keeps its capacity for
         // later items. Charge a second full-file array at the wider 4-byte size.
         peak_bytes = peak_bytes.max(final_bytes.saturating_add(final_bytes));
+    }
+    if widens_direct_i16(item, codec, options) {
+        // Direct FLAC decoding keeps samples_i16 while the bit-exact widening
+        // fills samples_i32; both arrays are live until the encoder finishes.
+        let decoded_i16_bytes = bytes(frames, source_channels).saturating_div(2);
+        peak_bytes = peak_bytes.max(decoded_i16_bytes.saturating_add(final_bytes));
     }
     PcmEstimate {
         peak_bytes,
@@ -5132,6 +5168,27 @@ mod tests {
         );
         assert_eq!(direct.peak_bytes, 8_000);
         assert_eq!(quantized.peak_bytes, 16_000);
+    }
+
+    #[test]
+    fn direct_i16_flac_widening_reserves_both_arrays() {
+        let item = item_frames(
+            PathBuf::from("in.flac"),
+            PathBuf::from("out.ogg"),
+            AudioInputFormat::Flac,
+            2,
+            48_000,
+            1_000,
+        );
+        let defaults = AudioEncodingOptions::default();
+        // A non-WAV source has no streaming fast path. Direct decoding keeps the
+        // i16 samples while the FLAC widening fills i32, so both arrays are live.
+        let flac = estimate_pcm_bytes(&item, AudioTargetCodec::Flac, &defaults);
+        assert_eq!(flac.peak_bytes, 12_000);
+        assert_eq!(flac.largest_buffer_bytes, 8_000);
+        // PCM targets consume the i16 copy directly and do not widen it.
+        let pcm = estimate_pcm_bytes(&item, AudioTargetCodec::Pcm, &defaults);
+        assert_eq!(pcm.peak_bytes, 8_000);
     }
 
     #[test]
