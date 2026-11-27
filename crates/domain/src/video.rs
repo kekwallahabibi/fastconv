@@ -285,6 +285,7 @@ pub enum TargetAudioCodec {
     Aac,
     Opus,
     Mp3,
+    Vorbis,
 }
 
 impl TargetAudioCodec {
@@ -294,6 +295,7 @@ impl TargetAudioCodec {
             Self::Aac => "AAC",
             Self::Opus => "Opus",
             Self::Mp3 => "MP3",
+            Self::Vorbis => "Vorbis",
         }
     }
 
@@ -303,6 +305,7 @@ impl TargetAudioCodec {
             Self::Aac => VideoCodec::Aac,
             Self::Opus => VideoCodec::Opus,
             Self::Mp3 => VideoCodec::Mp3,
+            Self::Vorbis => VideoCodec::Vorbis,
         }
     }
 
@@ -317,6 +320,7 @@ impl TargetAudioCodec {
             "aac" => Some(Self::Aac),
             "opus" => Some(Self::Opus),
             "mp3" => Some(Self::Mp3),
+            "vorbis" => Some(Self::Vorbis),
             _ => None,
         }
     }
@@ -673,6 +677,7 @@ impl AudioEncodeConfig {
                 TargetAudioCodec::Aac => (16_000, 512_000),
                 TargetAudioCodec::Opus => (6_000, 510_000),
                 TargetAudioCodec::Mp3 => (8_000, 320_000),
+                TargetAudioCodec::Vorbis => (32_000, 512_000),
             };
             if !(min..=max).contains(&bps) {
                 return Err(unsupported(format!(
@@ -697,6 +702,7 @@ impl AudioEncodeConfig {
                 TargetAudioCodec::Aac => Self::AAC_RATES.contains(&hz),
                 TargetAudioCodec::Opus => hz == 48_000,
                 TargetAudioCodec::Mp3 => Self::MP3_RATES.contains(&hz),
+                TargetAudioCodec::Vorbis => (8_000..=192_000).contains(&hz),
             };
             if !allowed {
                 return Err(unsupported(format!(
@@ -707,7 +713,9 @@ impl AudioEncodeConfig {
         if let Some(channels) = options.channels() {
             let count = channels.count();
             let allowed = match codec {
-                TargetAudioCodec::Aac => (1..=6).contains(&count) && count != 4,
+                TargetAudioCodec::Aac | TargetAudioCodec::Vorbis => {
+                    (1..=6).contains(&count) && count != 4
+                }
                 TargetAudioCodec::Opus | TargetAudioCodec::Mp3 => (1..=2).contains(&count),
             };
             if !allowed {
@@ -2458,10 +2466,48 @@ mod tests {
             TargetAudioCodec::from_name("mp3"),
             Some(TargetAudioCodec::Mp3)
         );
+        assert_eq!(
+            TargetAudioCodec::from_name("Vorbis"),
+            Some(TargetAudioCodec::Vorbis)
+        );
         assert_eq!(TargetAudioCodec::from_name("flac"), None);
         assert!(TargetVideoCodec::Vp9.supported_in(VideoContainerFormat::Webm));
         assert!(!TargetVideoCodec::H264.supported_in(VideoContainerFormat::Webm));
         assert!(!TargetAudioCodec::Mp3.supported_in(VideoContainerFormat::Webm));
+    }
+
+    #[test]
+    fn vorbis_is_supported_only_in_matroska_containers() {
+        assert_eq!(TargetAudioCodec::Vorbis.label(), "Vorbis");
+        assert_eq!(
+            TargetAudioCodec::Vorbis.as_video_codec(),
+            VideoCodec::Vorbis
+        );
+        assert_eq!(TargetAudioCodec::Vorbis.to_string(), "Vorbis");
+        assert!(TargetAudioCodec::Vorbis.supported_in(VideoContainerFormat::Mkv));
+        assert!(TargetAudioCodec::Vorbis.supported_in(VideoContainerFormat::Webm));
+        for container in [
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mov,
+            VideoContainerFormat::Avi,
+            VideoContainerFormat::Ts,
+            VideoContainerFormat::Gif,
+            VideoContainerFormat::Webp,
+        ] {
+            assert!(
+                !TargetAudioCodec::Vorbis.supported_in(container),
+                "Vorbis must be rejected in {container}"
+            );
+        }
+        // Defaults must remain unchanged.
+        assert_eq!(
+            VideoContainerFormat::Mkv.default_audio_codec(),
+            Some(TargetAudioCodec::Aac)
+        );
+        assert_eq!(
+            VideoContainerFormat::Webm.default_audio_codec(),
+            Some(TargetAudioCodec::Opus)
+        );
     }
 
     #[test]
@@ -2696,6 +2742,51 @@ mod tests {
             AudioTrackAction::Copy,
         )?;
         assert_eq!(copied.streams().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn transcode_item_rejects_vorbis_outside_matroska() -> Result<(), DomainError> {
+        for (container, video_codec) in [
+            (VideoContainerFormat::Mp4, TargetVideoCodec::H264),
+            (VideoContainerFormat::Mov, TargetVideoCodec::H264),
+            (VideoContainerFormat::Avi, TargetVideoCodec::H264),
+            (VideoContainerFormat::Ts, TargetVideoCodec::H264),
+            (VideoContainerFormat::Gif, TargetVideoCodec::Gif),
+            (VideoContainerFormat::Webp, TargetVideoCodec::Webp),
+        ] {
+            assert_eq!(
+                item(
+                    "in.mkv",
+                    "out.media",
+                    VideoContainerFormat::Mkv,
+                    container,
+                    Vec::new(),
+                    cpu_encode(video_codec),
+                    audio_encode(TargetAudioCodec::Vorbis),
+                ),
+                Err(DomainError::UnsupportedVideoCodec {
+                    codec: VideoCodec::Vorbis,
+                    container,
+                }),
+                "Vorbis must be rejected in {container}"
+            );
+        }
+        for (container, video_codec) in [
+            (VideoContainerFormat::Mkv, TargetVideoCodec::H264),
+            (VideoContainerFormat::Webm, TargetVideoCodec::Vp9),
+        ] {
+            let accepted = item(
+                "in.mkv",
+                "out.media",
+                VideoContainerFormat::Mkv,
+                container,
+                Vec::new(),
+                cpu_encode(video_codec),
+                audio_encode(TargetAudioCodec::Vorbis),
+            )?;
+            assert_eq!(accepted.output_format(), container);
+        }
         Ok(())
     }
 
@@ -3355,6 +3446,10 @@ mod tests {
             (TargetAudioCodec::Mp3, 7_999, false),
             (TargetAudioCodec::Mp3, 320_000, true),
             (TargetAudioCodec::Mp3, 320_001, false),
+            (TargetAudioCodec::Vorbis, 32_000, true),
+            (TargetAudioCodec::Vorbis, 31_999, false),
+            (TargetAudioCodec::Vorbis, 512_000, true),
+            (TargetAudioCodec::Vorbis, 512_001, false),
         ] {
             let options = AudioEncodeOptions::new(Some(AudioBitrate::new(bps)?), None, None);
             assert_eq!(
@@ -3426,6 +3521,11 @@ mod tests {
             (TargetAudioCodec::Mp3, 8_000, true),
             (TargetAudioCodec::Mp3, 48_000, true),
             (TargetAudioCodec::Mp3, 96_000, false),
+            (TargetAudioCodec::Vorbis, 8_000, true),
+            (TargetAudioCodec::Vorbis, 44_100, true),
+            (TargetAudioCodec::Vorbis, 192_000, true),
+            (TargetAudioCodec::Vorbis, 7_999, false),
+            (TargetAudioCodec::Vorbis, 192_001, false),
         ] {
             let options = AudioEncodeOptions::new(None, Some(AudioSampleRate::new(rate)?), None);
             assert_eq!(
@@ -3447,6 +3547,13 @@ mod tests {
             (TargetAudioCodec::Mp3, 1, true),
             (TargetAudioCodec::Mp3, 2, true),
             (TargetAudioCodec::Mp3, 3, false),
+            (TargetAudioCodec::Vorbis, 1, true),
+            (TargetAudioCodec::Vorbis, 2, true),
+            (TargetAudioCodec::Vorbis, 3, true),
+            (TargetAudioCodec::Vorbis, 4, false),
+            (TargetAudioCodec::Vorbis, 5, true),
+            (TargetAudioCodec::Vorbis, 6, true),
+            (TargetAudioCodec::Vorbis, 7, false),
         ] {
             let options = AudioEncodeOptions::new(None, None, Some(AudioChannels::new(channels)?));
             assert_eq!(

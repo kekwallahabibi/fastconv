@@ -1183,6 +1183,174 @@ pub(crate) fn opus_packet_samples_48k(packet: &[u8]) -> Option<u32> {
     }
 }
 
+// ---- Vorbis (Matroska Xiph lacing) ----------------------------------------
+
+/// Cap on a Vorbis header set stored in Matroska `CodecPrivate`. A hostile
+/// track must never make us allocate an unbounded buffer while unpacking.
+const MAX_XIPH_VORBIS_HEADERS: usize = 1_048_576;
+
+/// The three Xiph-laced Vorbis packets borrowed from a `CodecPrivate` blob.
+type VorbisHeaders<'a> = (&'a [u8], &'a [u8], &'a [u8]);
+
+fn is_vorbis_header(packet: &[u8], kind: u8) -> bool {
+    packet.len() >= 7 && packet[0] == kind && &packet[1..7] == b"vorbis"
+}
+
+/// Validates a Vorbis identification header and returns
+/// `(channels, sample_rate, bs0, bs1)`.
+///
+/// All fields are read with checked offsets; every Vorbis I constraint that
+/// affects decoding is enforced so a malformed header is rejected before the
+/// codec is instantiated.
+pub(crate) fn vorbis_ident_info(ident: &[u8]) -> Result<(u16, u32, u64, u64), String> {
+    if !is_vorbis_header(ident, 0x01) || ident.len() < 30 {
+        return Err("invalid Vorbis identification header".to_owned());
+    }
+    let version = le_u32(ident.get(7..11).ok_or("truncated Vorbis version")?)
+        .ok_or("truncated Vorbis version")?;
+    if version != 0 {
+        return Err(format!("unsupported Vorbis version {version}"));
+    }
+    let channels = u16::from(ident[11]);
+    if channels == 0 {
+        return Err("Vorbis identification header declares zero channels".to_owned());
+    }
+    let sample_rate =
+        le_u32(ident.get(12..16).ok_or("truncated Vorbis rate")?).ok_or("truncated Vorbis rate")?;
+    if sample_rate == 0 {
+        return Err("Vorbis identification header declares zero sample rate".to_owned());
+    }
+    let blocksize = ident[28];
+    let bs0 = u64::from(blocksize & 0x0F);
+    let bs1 = u64::from(blocksize >> 4);
+    if !(6..=13).contains(&bs0) || !(6..=13).contains(&bs1) || bs0 > bs1 {
+        return Err(format!(
+            "invalid Vorbis block sizes {bs0}/{bs1} (expected 6..=13 with bs0 <= bs1)"
+        ));
+    }
+    if ident[29] & 1 == 0 {
+        return Err("Vorbis identification header has no framing bit".to_owned());
+    }
+    Ok((channels, sample_rate, bs0, bs1))
+}
+
+/// Appends a Matroska Xiph-laced length: `255` bytes are emitted for each
+/// full 255-unit chunk, followed by a final byte `< 255`.
+fn push_xiph_length(out: &mut Vec<u8>, len: usize) -> Result<(), String> {
+    let mut remaining = len;
+    while remaining >= 255 {
+        out.push(0xFF);
+        remaining = remaining.checked_sub(255).ok_or("Xiph length underflow")?;
+    }
+    out.push(u8::try_from(remaining).map_err(|_| "Xiph length overflow".to_owned())?);
+    Ok(())
+}
+
+/// Reads one Xiph-laced length, advancing `idx`. A stream that ends on `0xFF`
+/// is truncated and rejected instead of being silently accepted.
+fn read_xiph_length(data: &[u8], idx: &mut usize) -> Result<usize, String> {
+    let mut len = 0_usize;
+    loop {
+        let byte = *data.get(*idx).ok_or("truncated Xiph lacing")?;
+        *idx = idx.checked_add(1).ok_or("Xiph lacing overflow")?;
+        if byte == 0xFF {
+            len = len.checked_add(255).ok_or("Xiph length overflow")?;
+            continue;
+        }
+        return len
+            .checked_add(usize::from(byte))
+            .ok_or_else(|| "Xiph length overflow".to_owned());
+    }
+}
+
+/// Packs the three Vorbis headers into a Matroska `CodecPrivate` blob using
+/// RFC 3533 / Matroska Xiph lacing (one byte of packet count minus one, two
+/// laced lengths, then the three concatenated packets).
+pub(crate) fn pack_xiph_laced_vorbis_headers(
+    ident: &[u8],
+    comment: &[u8],
+    setup: &[u8],
+) -> Result<Vec<u8>, String> {
+    if !is_vorbis_header(ident, 0x01) || !is_vorbis_header(comment, 0x03) {
+        return Err("invalid Vorbis ident or comment header".to_owned());
+    }
+    if !is_vorbis_header(setup, 0x05) {
+        return Err("invalid Vorbis setup header".to_owned());
+    }
+    vorbis_ident_info(ident)?;
+    let body_len = ident
+        .len()
+        .checked_add(comment.len())
+        .and_then(|sum| sum.checked_add(setup.len()))
+        .ok_or("Vorbis header size overflow")?;
+    // One terminating byte per laced length plus the leading packet count.
+    let lacing_len = (ident.len() / 255)
+        .checked_add(1)
+        .and_then(|n| n.checked_add(comment.len() / 255))
+        .and_then(|n| n.checked_add(1))
+        .ok_or("Vorbis header size overflow")?;
+    let total = 1_usize
+        .checked_add(lacing_len)
+        .and_then(|n| n.checked_add(body_len))
+        .ok_or("Vorbis header size overflow")?;
+    if total > MAX_XIPH_VORBIS_HEADERS {
+        return Err(format!(
+            "Vorbis headers exceed {MAX_XIPH_VORBIS_HEADERS} bytes"
+        ));
+    }
+    let mut out = Vec::with_capacity(total);
+    out.push(0x02);
+    push_xiph_length(&mut out, ident.len())?;
+    push_xiph_length(&mut out, comment.len())?;
+    out.extend_from_slice(ident);
+    out.extend_from_slice(comment);
+    out.extend_from_slice(setup);
+    Ok(out)
+}
+
+/// Splits a Matroska `CodecPrivate` blob into its three Xiph-laced Vorbis
+/// packets. Every length and offset is checked against the buffer and the
+/// header signatures and identification fields are validated.
+pub(crate) fn unpack_xiph_laced_vorbis_headers(data: &[u8]) -> Result<VorbisHeaders<'_>, String> {
+    if data.len() > MAX_XIPH_VORBIS_HEADERS {
+        return Err(format!(
+            "Vorbis CodecPrivate exceeds {MAX_XIPH_VORBIS_HEADERS} bytes"
+        ));
+    }
+    if data.first() != Some(&0x02) {
+        return Err("Vorbis CodecPrivate must declare three packets".to_owned());
+    }
+    let mut idx = 1_usize;
+    let ident_len = read_xiph_length(data, &mut idx)?;
+    let comment_len = read_xiph_length(data, &mut idx)?;
+    let ident_end = idx
+        .checked_add(ident_len)
+        .ok_or("Vorbis ident length overflow")?;
+    let comment_end = ident_end
+        .checked_add(comment_len)
+        .ok_or("Vorbis comment length overflow")?;
+    if comment_end >= data.len() {
+        return Err("Vorbis setup packet is empty".to_owned());
+    }
+    let ident = data
+        .get(idx..ident_end)
+        .ok_or("truncated Vorbis identification header")?;
+    let comment = data
+        .get(ident_end..comment_end)
+        .ok_or("truncated Vorbis comment header")?;
+    let setup = data
+        .get(comment_end..)
+        .ok_or("truncated Vorbis setup header")?;
+    if !is_vorbis_header(ident, 0x01) || !is_vorbis_header(comment, 0x03) {
+        return Err("invalid Vorbis ident or comment header".to_owned());
+    }
+    if !is_vorbis_header(setup, 0x05) {
+        return Err("invalid Vorbis setup header".to_owned());
+    }
+    vorbis_ident_info(ident)?;
+    Ok((ident, comment, setup))
+}
+
 // ---- MP4 sample entry builders ------------------------------------------
 
 fn descriptor(tag: u8, body: &[u8]) -> Vec<u8> {
@@ -1992,5 +2160,160 @@ mod tests {
         );
         // Truncated color_config must not read zero-padding as metadata.
         assert_eq!(vp9_color_from_keyframe(&[0xA2, 0x49, 0x83, 0x42]), None);
+    }
+
+    fn vorbis_ident(blocksize: u8) -> Vec<u8> {
+        let mut ident = vec![0_u8; 30];
+        ident[0] = 0x01;
+        ident[1..7].copy_from_slice(b"vorbis");
+        ident[7..11].copy_from_slice(&0_u32.to_le_bytes());
+        ident[11] = 2;
+        ident[12..16].copy_from_slice(&44_100_u32.to_le_bytes());
+        ident[28] = blocksize;
+        ident[29] = 1;
+        ident
+    }
+
+    fn vorbis_comment(extra: usize) -> Vec<u8> {
+        let mut comment = vec![0_u8; 7usize.saturating_add(extra)];
+        comment[0] = 0x03;
+        comment[1..7].copy_from_slice(b"vorbis");
+        comment
+    }
+
+    fn vorbis_setup(extra: usize) -> Vec<u8> {
+        let mut setup = vec![0_u8; 7usize.saturating_add(extra)];
+        setup[0] = 0x05;
+        setup[1..7].copy_from_slice(b"vorbis");
+        setup
+    }
+
+    #[test]
+    fn vorbis_headers_pack_and_unpack_roundtrip() -> Result<(), String> {
+        let ident = vorbis_ident(0xB8);
+        let comment = vorbis_comment(255);
+        let setup = vorbis_setup(600);
+        let packed = pack_xiph_laced_vorbis_headers(&ident, &comment, &setup)?;
+        assert_eq!(packed[0], 0x02);
+        let (out_ident, out_comment, out_setup) = unpack_xiph_laced_vorbis_headers(&packed)?;
+        assert_eq!(out_ident, ident);
+        assert_eq!(out_comment, comment);
+        assert_eq!(out_setup, setup);
+        assert_eq!(vorbis_ident_info(out_ident)?, (2, 44_100, 8, 11));
+        Ok(())
+    }
+
+    #[test]
+    fn vorbis_lacing_handles_exact_255_byte_packets() -> Result<(), String> {
+        let ident = vorbis_ident(0x88);
+        let comment = vorbis_comment(248); // exactly 255 bytes total
+        let setup = vorbis_setup(503); // exactly 510 bytes, a multiple of 255
+        let packed = pack_xiph_laced_vorbis_headers(&ident, &comment, &setup)?;
+        assert_eq!(packed[1], u8::try_from(ident.len()).unwrap_or(0));
+        assert_eq!(&packed[2..4], &[0xFF, 0x00]);
+        let (out_ident, out_comment, out_setup) = unpack_xiph_laced_vorbis_headers(&packed)?;
+        assert_eq!(out_ident, ident);
+        assert_eq!(out_comment.len(), 255);
+        assert_eq!(out_setup.len(), 510);
+        Ok(())
+    }
+
+    #[test]
+    fn vorbis_pack_rejects_invalid_headers() {
+        let ident = vorbis_ident(0xB8);
+        let comment = vorbis_comment(0);
+        let setup = vorbis_setup(0);
+        assert!(pack_xiph_laced_vorbis_headers(&[], &comment, &setup).is_err());
+        assert!(pack_xiph_laced_vorbis_headers(&ident, &[], &setup).is_err());
+        assert!(pack_xiph_laced_vorbis_headers(&ident, &comment, &[]).is_err());
+        let mut bad = ident.clone();
+        bad[0] = 0x02;
+        assert!(pack_xiph_laced_vorbis_headers(&bad, &comment, &setup).is_err());
+        let mut bad = comment.clone();
+        bad[0] = 0x01;
+        assert!(pack_xiph_laced_vorbis_headers(&ident, &bad, &setup).is_err());
+        let mut bad = setup.clone();
+        bad[0] = 0x03;
+        assert!(pack_xiph_laced_vorbis_headers(&ident, &comment, &bad).is_err());
+        let huge = vec![0_u8; MAX_XIPH_VORBIS_HEADERS];
+        assert!(pack_xiph_laced_vorbis_headers(&ident, &comment, &huge).is_err());
+    }
+
+    #[test]
+    fn vorbis_unpack_rejects_malformed_codec_private() -> Result<(), String> {
+        let ident = vorbis_ident(0xB8);
+        let comment = vorbis_comment(0);
+        let setup = vorbis_setup(0);
+        let good = pack_xiph_laced_vorbis_headers(&ident, &comment, &setup)?;
+
+        assert!(unpack_xiph_laced_vorbis_headers(&[]).is_err());
+        assert!(unpack_xiph_laced_vorbis_headers(&[0x01, 30]).is_err());
+        // Truncated lacing that ends on 0xFF.
+        assert!(unpack_xiph_laced_vorbis_headers(&[0x02, 0xFF]).is_err());
+        // Declared length exceeds the buffer.
+        assert!(unpack_xiph_laced_vorbis_headers(&[0x02, 0xFF, 0x02, 0x03]).is_err());
+        // Empty setup packet: the laced lengths consume the whole buffer.
+        let mut no_setup = vec![0x02];
+        push_xiph_length(&mut no_setup, ident.len())?;
+        push_xiph_length(&mut no_setup, comment.len())?;
+        no_setup.extend_from_slice(&ident);
+        no_setup.extend_from_slice(&comment);
+        assert!(unpack_xiph_laced_vorbis_headers(&no_setup).is_err());
+
+        // Each of the three packet signatures must be intact.
+        let ident_start = 3;
+        let comment_start = ident_start + ident.len();
+        let setup_start = comment_start + comment.len();
+        for start in [ident_start, comment_start, setup_start] {
+            let mut bad = good.clone();
+            if let Some(byte) = bad.get_mut(start) {
+                *byte ^= 0x01;
+                assert!(
+                    unpack_xiph_laced_vorbis_headers(&bad).is_err(),
+                    "mutated packet at byte {start} was accepted"
+                );
+            }
+        }
+
+        // A bad ident field inside an otherwise well-formed blob is rejected.
+        let mut bad_ident = ident.clone();
+        bad_ident[11] = 0;
+        let mut blob = vec![0x02];
+        push_xiph_length(&mut blob, bad_ident.len())?;
+        push_xiph_length(&mut blob, comment.len())?;
+        blob.extend_from_slice(&bad_ident);
+        blob.extend_from_slice(&comment);
+        blob.extend_from_slice(&setup);
+        assert!(unpack_xiph_laced_vorbis_headers(&blob).is_err());
+
+        let oversized = vec![0_u8; MAX_XIPH_VORBIS_HEADERS + 1];
+        assert!(unpack_xiph_laced_vorbis_headers(&oversized).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn vorbis_ident_info_checks_version_channels_rate_blocks_and_framing() {
+        let ident = vorbis_ident(0xB8);
+        assert_eq!(vorbis_ident_info(&ident), Ok((2, 44_100, 8, 11)));
+        assert!(vorbis_ident_info(&[]).is_err());
+        assert!(vorbis_ident_info(&ident[..29]).is_err());
+        let mut bad = ident.clone();
+        bad[7] = 1;
+        assert!(vorbis_ident_info(&bad).is_err());
+        let mut bad = ident.clone();
+        bad[11] = 0;
+        assert!(vorbis_ident_info(&bad).is_err());
+        let mut bad = ident.clone();
+        bad[12..16].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(vorbis_ident_info(&bad).is_err());
+        let mut bad = ident.clone();
+        bad[28] = 0x05; // bs0=5 below the 6..=13 range
+        assert!(vorbis_ident_info(&bad).is_err());
+        let mut bad = ident.clone();
+        bad[28] = 0xBD; // bs0=13 > bs1=11
+        assert!(vorbis_ident_info(&bad).is_err());
+        let mut bad = ident.clone();
+        bad[29] = 0;
+        assert!(vorbis_ident_info(&bad).is_err());
     }
 }

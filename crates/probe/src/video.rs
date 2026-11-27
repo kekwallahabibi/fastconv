@@ -493,9 +493,21 @@ fn audio_facts(track: &Track) -> (Option<u16>, Option<u32>) {
     (None, None)
 }
 
-fn stream_info(track: &Track) -> VideoStreamInfo {
+fn stream_info(track: &Track, ident_facts: Option<(u16, u32)>) -> VideoStreamInfo {
     let (width, height) = dimensions(track);
-    let (channels, sample_rate) = audio_facts(track);
+    let (mut channels, mut sample_rate) = audio_facts(track);
+    // containr collapses missing Matroska Audio children to spec defaults
+    // (1 channel, 8000 Hz) without exposing child presence. The validated
+    // Vorbis ident header is authoritative for the encoded stream, so those
+    // defaults must not mask it; explicit non-default values still win.
+    if let Some((ident_channels, ident_rate)) = ident_facts {
+        if channels.is_none_or(|value| value == 1) {
+            channels = Some(ident_channels);
+        }
+        if sample_rate.is_none_or(|value| value == 8000) {
+            sample_rate = Some(ident_rate);
+        }
+    }
     let language = track.language.iso639_mapped().map(str::to_owned);
     VideoStreamInfo::new(
         stream_codec(track),
@@ -509,6 +521,92 @@ fn stream_info(track: &Track) -> VideoStreamInfo {
         track.duration,
         language,
     )
+}
+
+/// Reads one Matroska Xiph-laced length. A lacing sequence that ends on `0xFF`
+/// is truncated and rejected instead of being silently accepted.
+fn read_xiph_length(data: &[u8], idx: &mut usize) -> Result<usize, String> {
+    let mut len = 0_usize;
+    loop {
+        let byte = *data
+            .get(*idx)
+            .ok_or("truncated Xiph lacing in Vorbis CodecPrivate")?;
+        *idx = idx.checked_add(1).ok_or("Xiph lacing overflow")?;
+        if byte == 0xFF {
+            len = len.checked_add(255).ok_or("Xiph length overflow")?;
+            continue;
+        }
+        return len
+            .checked_add(usize::from(byte))
+            .ok_or_else(|| "Xiph length overflow".to_owned());
+    }
+}
+
+/// Validates a Matroska `CodecPrivate` blob carrying three Xiph-laced Vorbis
+/// headers (RFC 3533 / Vorbis I). Returns `(channels, sample_rate)` from the
+/// validated ident packet.
+fn validate_vorbis_codec_private(data: &[u8]) -> Result<(u16, u32), String> {
+    const MAX_LEN: usize = 1_048_576;
+    if data.len() > MAX_LEN {
+        return Err(format!("Vorbis CodecPrivate exceeds {MAX_LEN} bytes"));
+    }
+    if data.first() != Some(&0x02) {
+        return Err("Vorbis CodecPrivate must contain three Xiph-laced packets".to_owned());
+    }
+    let mut idx = 1_usize;
+    let ident_len = read_xiph_length(data, &mut idx)?;
+    let comment_len = read_xiph_length(data, &mut idx)?;
+    let ident_end = idx
+        .checked_add(ident_len)
+        .ok_or("Vorbis ident length overflow")?;
+    let comment_end = ident_end
+        .checked_add(comment_len)
+        .ok_or("Vorbis comment length overflow")?;
+    if comment_end >= data.len() {
+        return Err("Vorbis setup packet is empty".to_owned());
+    }
+    let ident = data
+        .get(idx..ident_end)
+        .ok_or("truncated Vorbis identification header")?;
+    let comment = data
+        .get(ident_end..comment_end)
+        .ok_or("truncated Vorbis comment header")?;
+    let setup = data
+        .get(comment_end..)
+        .ok_or("truncated Vorbis setup header")?;
+    if ident.len() < 30 || ident[0] != 0x01 || &ident[1..7] != b"vorbis" {
+        return Err("invalid Vorbis identification header".to_owned());
+    }
+    if comment.len() < 7 || comment[0] != 0x03 || &comment[1..7] != b"vorbis" {
+        return Err("invalid Vorbis comment header".to_owned());
+    }
+    if setup.len() < 7 || setup[0] != 0x05 || &setup[1..7] != b"vorbis" {
+        return Err("invalid Vorbis setup header".to_owned());
+    }
+    let version = le_u32(ident.get(7..11).ok_or("truncated Vorbis version")?)
+        .ok_or("truncated Vorbis version")?;
+    if version != 0 {
+        return Err(format!("unsupported Vorbis version {version}"));
+    }
+    let channels = u16::from(ident[11]);
+    if channels == 0 {
+        return Err("Vorbis identification header declares zero channels".to_owned());
+    }
+    let rate =
+        le_u32(ident.get(12..16).ok_or("truncated Vorbis rate")?).ok_or("truncated Vorbis rate")?;
+    if rate == 0 {
+        return Err("Vorbis identification header declares zero sample rate".to_owned());
+    }
+    let blocksize = ident[28];
+    let bs0 = blocksize & 0x0F;
+    let bs1 = blocksize >> 4;
+    if !(6..=13).contains(&bs0) || !(6..=13).contains(&bs1) || bs0 > bs1 {
+        return Err("invalid Vorbis block sizes in identification header".to_owned());
+    }
+    if ident[29] & 1 == 0 {
+        return Err("Vorbis identification header has no framing bit".to_owned());
+    }
+    Ok((channels, rate))
 }
 
 fn le_u16(bytes: &[u8]) -> Option<u16> {
@@ -1525,7 +1623,11 @@ fn probe_containr(
             let reader = WindowedFileReader::from_file(file, file_len);
             let demuxer = containr::mp4::Demuxer::open(reader)
                 .map_err(|err| invalid_video(path, format!("container parse failed: {err}")))?;
-            demuxer.tracks().iter().map(stream_info).collect::<Vec<_>>()
+            demuxer
+                .tracks()
+                .iter()
+                .map(|track| stream_info(track, None))
+                .collect::<Vec<_>>()
         }
         VideoContainerFormat::Mkv | VideoContainerFormat::Webm => {
             let reader = WindowedFileReader::from_file(file, file_len);
@@ -1534,7 +1636,26 @@ fn probe_containr(
             if demuxer.truncated() {
                 return Err(invalid_video(path, "truncated MKV input"));
             }
-            demuxer.tracks().iter().map(stream_info).collect::<Vec<_>>()
+            let mut streams = Vec::new();
+            for track in demuxer.tracks() {
+                let ident_facts = if track.codec_id() == Some("A_VORBIS") {
+                    let private = track
+                        .matroska
+                        .as_ref()
+                        .and_then(|mkv| mkv.codec_private.as_deref())
+                        .ok_or_else(|| {
+                            invalid_video(path, "A_VORBIS track is missing CodecPrivate")
+                        })?;
+                    Some(
+                        validate_vorbis_codec_private(private)
+                            .map_err(|reason| invalid_video(path, reason))?,
+                    )
+                } else {
+                    None
+                };
+                streams.push(stream_info(track, ident_facts));
+            }
+            streams
         }
         VideoContainerFormat::Avi => probe_avi(path, &mut file, file_len)?,
         VideoContainerFormat::Ts => probe_ts(path, &mut file, file_len)?,
@@ -2243,6 +2364,232 @@ mod tests {
         entry.extend(ebml_el(0x86, b"V_MPEG4/ISO/AVC"));
         bytes.extend(ebml_el(0x1654_AE6B, &ebml_el(0xAE, &entry)));
         bytes
+    }
+
+    /// EBML element with a variable-width size integer, for payloads above
+    /// the 126-byte limit of `ebml_el`.
+    fn ebml_el_vint(id: u32, body: &[u8]) -> Vec<u8> {
+        let raw = id.to_be_bytes();
+        let skip = raw.iter().take_while(|&&b| b == 0).count();
+        let mut out = raw[skip..].to_vec();
+        let len = body.len();
+        let mut width = 1_usize;
+        while len >= (1_usize << (7 * width)) - 1 {
+            width += 1;
+        }
+        let marker = 0x100_u16 >> width;
+        for shift in (0..width).rev() {
+            // EBML VINT_DATA is a big-endian integer of 8-bit octets, not
+            // 7-bit groups; only the first octet's marker bit is reserved.
+            let byte = u8::try_from((len >> (8 * shift)) & 0xFF).unwrap_or(0);
+            out.push(if shift == width - 1 {
+                byte | u8::try_from(marker).unwrap_or(0)
+            } else {
+                byte
+            });
+        }
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn ebml_el_vint_encodes_exact_body_boundaries() -> Result<(), Box<dyn std::error::Error>> {
+        for len in [126, 127, 128, 255] {
+            let body = vec![0x5A_u8; len];
+            let encoded = ebml_el_vint(0xAE, &body);
+            let size_bytes = encoded.get(1..).ok_or("missing size VINT")?;
+            let (size, vint_len) = ebml_vint_size(size_bytes).ok_or("size VINT did not decode")?;
+            assert_eq!(size, len, "wrong size for {len}-byte body");
+            assert_eq!(
+                encoded.get(1 + vint_len..).ok_or("truncated body")?,
+                body.as_slice(),
+                "wrong body boundary for {len}-byte body"
+            );
+        }
+        Ok(())
+    }
+
+    fn vorbis_ident_bytes() -> Vec<u8> {
+        let mut ident = vec![0_u8; 30];
+        ident[0] = 0x01;
+        ident[1..7].copy_from_slice(b"vorbis");
+        ident[7..11].copy_from_slice(&0_u32.to_le_bytes());
+        ident[11] = 2;
+        ident[12..16].copy_from_slice(&44_100_u32.to_le_bytes());
+        ident[28] = 0xB8; // bs0=8, bs1=11
+        ident[29] = 1;
+        ident
+    }
+
+    fn vorbis_codec_private() -> Vec<u8> {
+        let ident = vorbis_ident_bytes();
+        let comment = b"\x03vorbis";
+        let setup = b"\x05vorbis";
+        let mut private = vec![0x02, u8::try_from(ident.len()).unwrap_or(0)];
+        private.push(u8::try_from(comment.len()).unwrap_or(0));
+        private.extend_from_slice(&ident);
+        private.extend_from_slice(comment);
+        private.extend_from_slice(setup);
+        private
+    }
+
+    /// Selectable Matroska `Audio` children; `None` omits the child entirely.
+    #[derive(Default)]
+    struct AudioFacts {
+        channels: Option<u64>,
+        sampling_frequency: Option<f64>,
+    }
+
+    fn mkv_with_vorbis(private: &[u8], audio: Option<AudioFacts>) -> Vec<u8> {
+        let mut header = Vec::new();
+        header.extend(ebml_uint(0x4286, 1));
+        header.extend(ebml_uint(0x42F2, 4));
+        header.extend(ebml_uint(0x42F3, 8));
+        header.extend(ebml_el(0x4282, b"matroska"));
+        header.extend(ebml_uint(0x4287, 4));
+        header.extend(ebml_uint(0x4285, 2));
+        let mut segment = Vec::new();
+        segment.extend(ebml_el_vint(
+            0x1549_A966,
+            &ebml_uint(0x002A_D7B1, 1_000_000),
+        ));
+        let mut entry = Vec::new();
+        entry.extend(ebml_uint(0xD7, 1));
+        entry.extend(ebml_uint(0x73C5, 1));
+        entry.extend(ebml_uint(0x83, 2)); // audio track
+        entry.extend(ebml_el(0x86, b"A_VORBIS"));
+        entry.extend(ebml_el_vint(0x63A2, private));
+        if let Some(audio) = audio {
+            let mut audio_body = Vec::new();
+            if let Some(channels) = audio.channels {
+                audio_body.extend(ebml_uint(0x9F, channels));
+            }
+            if let Some(rate) = audio.sampling_frequency {
+                audio_body.extend(ebml_el(0xB5, &rate.to_be_bytes()));
+            }
+            entry.extend(ebml_el_vint(0xE1, &audio_body));
+        }
+        segment.extend(ebml_el_vint(0x1654_AE6B, &ebml_el_vint(0xAE, &entry)));
+        let mut bytes = ebml_el_vint(0x1A45_DFA3, &header);
+        bytes.extend(ebml_el_vint(0x1853_8067, &segment));
+        bytes
+    }
+
+    #[test]
+    fn probe_accepts_vorbis_and_falls_back_to_ident_facts() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let path = temp_file("vorbis-ok", &mkv_with_vorbis(&vorbis_codec_private(), None))?;
+        let probed = probe_video(&path)?;
+        let audio = probed
+            .streams
+            .iter()
+            .find(|stream| stream.codec() == VideoCodec::Vorbis)
+            .ok_or("no Vorbis stream was probed")?;
+        assert!(audio.channels().is_some_and(|value| value.get() == 2));
+        assert!(
+            audio
+                .sample_rate()
+                .is_some_and(|value| value.get() == 44_100)
+        );
+        fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn vorbis_ident_facts_override_matroska_audio_defaults()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            ("empty Audio", AudioFacts::default(), 2, 44_100),
+            (
+                "Channels only",
+                AudioFacts {
+                    channels: Some(2),
+                    sampling_frequency: None,
+                },
+                2,
+                44_100,
+            ),
+            (
+                "SamplingFrequency only",
+                AudioFacts {
+                    channels: None,
+                    sampling_frequency: Some(44_100.0),
+                },
+                2,
+                44_100,
+            ),
+            (
+                "explicit non-defaults",
+                AudioFacts {
+                    channels: Some(6),
+                    sampling_frequency: Some(48_000.0),
+                },
+                6,
+                48_000,
+            ),
+        ];
+        for (label, audio, expected_channels, expected_rate) in cases {
+            let path = temp_file(
+                "vorbis-audio",
+                &mkv_with_vorbis(&vorbis_codec_private(), Some(audio)),
+            )?;
+            let probed = probe_video(&path)?;
+            let stream = probed
+                .streams
+                .iter()
+                .find(|stream| stream.codec() == VideoCodec::Vorbis)
+                .ok_or("no Vorbis stream was probed")?;
+            assert_eq!(
+                stream.channels().map(std::num::NonZero::get),
+                Some(expected_channels),
+                "{label}: wrong channels"
+            );
+            assert_eq!(
+                stream.sample_rate().map(std::num::NonZero::get),
+                Some(expected_rate),
+                "{label}: wrong sample rate"
+            );
+            fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn probe_rejects_malformed_vorbis_codec_private() -> Result<(), Box<dyn std::error::Error>> {
+        let good = vorbis_codec_private();
+        let mut variants = vec![Vec::new(), vec![0x01, 30], vec![0x02, 0xFF]];
+        let mut missing_setup = good.clone();
+        missing_setup.truncate(missing_setup.len() - 8);
+        variants.push(missing_setup);
+        for index in [0, 1, 2, good.len() - 7] {
+            let mut bad = good.clone();
+            if let Some(byte) = bad.get_mut(index) {
+                *byte ^= 0x01;
+                variants.push(bad);
+            }
+        }
+        for private in variants {
+            let path = temp_file("vorbis-bad", &mkv_with_vorbis(&private, None))?;
+            let result = probe_video(&path);
+            assert!(
+                matches!(result, Err(ProbeError::InvalidVideo { .. })),
+                "malformed CodecPrivate was accepted: {result:?}"
+            );
+            fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn probe_rejects_missing_vorbis_codec_private() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_file("vorbis-missing", &mkv_with_vorbis(&[], None))?;
+        let result = probe_video(&path);
+        assert!(
+            matches!(result, Err(ProbeError::InvalidVideo { .. })),
+            "missing CodecPrivate was accepted: {result:?}"
+        );
+        fs::remove_file(&path)?;
+        Ok(())
     }
 
     #[test]

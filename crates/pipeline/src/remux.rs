@@ -208,13 +208,18 @@ fn canonical_remux_supports(codec: VideoCodec) -> bool {
             | VideoCodec::Vp9
             | VideoCodec::Aac
             | VideoCodec::Opus
+            | VideoCodec::Vorbis
             | VideoCodec::Mp3
     )
 }
 
-/// Fails before any path is taken when an MKV source carries attachments that
-/// the target container cannot represent.
-fn reject_mkv_attachments(source: &Path, target: &Path) -> Result<(), PipelineError> {
+/// Fails before any path is taken when an MKV source carries metadata that the
+/// canonical `demux_video` -> `mux_video` route cannot preserve.
+///
+/// `ContainerMedia` has no chapter, tag or attachment field, so that route
+/// would silently discard them for every codec it accepts. Stream copy keeps
+/// them, so only the canonical route needs this guard.
+fn reject_unrepresentable_mkv_metadata(source: &Path, target: &Path) -> Result<(), PipelineError> {
     let reader = WindowedFileReader::open(source).map_err(|err| PipelineError::Io {
         path: source.to_path_buf(),
         source: err,
@@ -222,6 +227,18 @@ fn reject_mkv_attachments(source: &Path, target: &Path) -> Result<(), PipelineEr
     let input = containr::mkv::Demuxer::open(reader).map_err(|err| container_err(source, &err))?;
     if input.truncated() {
         return Err(remux_failed(source, "truncated MKV input"));
+    }
+    if !input.chapters().is_empty() {
+        return Err(remux_failed(
+            target,
+            "MKV chapters cannot be preserved on the canonical remux route; refusing to drop data",
+        ));
+    }
+    if !input.metadata().is_empty() {
+        return Err(remux_failed(
+            target,
+            "MKV tags cannot be preserved on the canonical remux route; refusing to drop data",
+        ));
     }
     if !input.attachments().is_empty() {
         return Err(remux_failed(
@@ -244,7 +261,7 @@ fn remux_file(item: &VideoRemuxItem, target: &File) -> Result<(), PipelineError>
         VideoContainerFormat::Mkv | VideoContainerFormat::Webm
     ) && !direct
     {
-        reject_mkv_attachments(source, item.target())?;
+        reject_unrepresentable_mkv_metadata(source, item.target())?;
     }
     for stream in item.streams() {
         if !stream.codec().supported_in(output) {
@@ -1118,6 +1135,63 @@ mod container_tests {
         }
     }
 
+    fn vorbis_media() -> Result<ContainerMedia, Box<dyn std::error::Error>> {
+        let mut ident = vec![0_u8; 30];
+        ident[0] = 0x01;
+        ident[1..7].copy_from_slice(b"vorbis");
+        ident[11] = 2;
+        ident[12..16].copy_from_slice(&48_000_u32.to_le_bytes());
+        ident[28] = 0xB8;
+        ident[29] = 1;
+        let config = crate::video_bitstream::pack_xiph_laced_vorbis_headers(
+            &ident,
+            b"\x03vorbis",
+            b"\x05vorbis",
+        )?;
+        Ok(ContainerMedia {
+            tracks: vec![
+                ContainerTrack {
+                    codec: VideoCodec::Vp9,
+                    width: Some(640),
+                    height: Some(360),
+                    channels: None,
+                    sample_rate: None,
+                    config: Vec::new(),
+                    timescale: US_TIMESCALE,
+                    presentation_edit: None,
+                },
+                ContainerTrack {
+                    codec: VideoCodec::Vorbis,
+                    width: None,
+                    height: None,
+                    channels: Some(2),
+                    sample_rate: Some(48_000),
+                    config,
+                    timescale: US_TIMESCALE,
+                    presentation_edit: None,
+                },
+            ],
+            packets: vec![
+                ContainerPacket {
+                    track: 0,
+                    pts: 0,
+                    dts: 0,
+                    duration: 33_333,
+                    keyframe: true,
+                    data: vec![0x92, 0x49, 0x83, 0x42, 0x00],
+                },
+                ContainerPacket {
+                    track: 1,
+                    pts: 5_000,
+                    dts: 5_000,
+                    duration: 23_000,
+                    keyframe: true,
+                    data: vec![0x00, 0x11, 0x22],
+                },
+            ],
+        })
+    }
+
     fn write_container(
         path: &Path,
         format: VideoContainerFormat,
@@ -1242,6 +1316,64 @@ mod container_tests {
         );
         std::fs::remove_file(source)?;
         std::fs::remove_file(target)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mkv_webm_vorbis_stream_copy_preserves_codec_private_and_timestamps()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let media = vorbis_media()?;
+        let config = media.tracks[1].config.clone();
+        let timings: Vec<(i64, i64, u64)> = media
+            .packets
+            .iter()
+            .map(|packet| (packet.pts, packet.dts, packet.duration))
+            .collect();
+        let source = temp_path("mkv-vorbis-source", "mkv");
+        let webm = temp_path("vorbis-webm-target", "webm");
+        let back = temp_path("vorbis-mkv-target", "mkv");
+        write_container(&source, VideoContainerFormat::Mkv, &media)?;
+        remux(
+            &source,
+            &webm,
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Webm,
+        )?;
+        let out = demux_video(&webm, VideoContainerFormat::Webm)?;
+        assert_eq!(out.tracks[1].codec, VideoCodec::Vorbis);
+        assert_eq!(out.tracks[1].config, config);
+        assert_eq!(
+            payloads(&out, VideoCodec::Vorbis),
+            payloads(&media, VideoCodec::Vorbis)
+        );
+        assert_eq!(
+            out.packets
+                .iter()
+                .map(|packet| (packet.pts, packet.dts, packet.duration))
+                .collect::<Vec<_>>(),
+            timings
+        );
+
+        remux(
+            &webm,
+            &back,
+            VideoContainerFormat::Webm,
+            VideoContainerFormat::Mkv,
+        )?;
+        let back_media = demux_video(&back, VideoContainerFormat::Mkv)?;
+        assert_eq!(back_media.tracks[1].codec, VideoCodec::Vorbis);
+        assert_eq!(back_media.tracks[1].config, config);
+        assert_eq!(
+            back_media
+                .packets
+                .iter()
+                .map(|packet| (packet.pts, packet.dts, packet.duration))
+                .collect::<Vec<_>>(),
+            timings
+        );
+        std::fs::remove_file(source)?;
+        std::fs::remove_file(webm)?;
+        std::fs::remove_file(back)?;
         Ok(())
     }
 
@@ -1728,6 +1860,122 @@ mod container_tests {
         assert!(matches!(result, Err(PipelineError::RemuxFailed { .. })));
         assert!(!target.exists(), "no target was published after rejection");
         std::fs::remove_file(source)?;
+        Ok(())
+    }
+
+    fn h264_mp3_vorbis_media() -> Result<ContainerMedia, Box<dyn std::error::Error>> {
+        let mut media = h264_mp3_media();
+        let vorbis = vorbis_media()?;
+        let mut packet = vorbis.packets[1].clone();
+        packet.track = media.tracks.len();
+        media.tracks.push(vorbis.tracks[1].clone());
+        media.packets.push(packet);
+        Ok(media)
+    }
+
+    fn write_mkv_with_chapter_or_tag(
+        path: &Path,
+        media: &ContainerMedia,
+        chapter: bool,
+        tag: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base = temp_path("mkv-metadata-base", "mkv");
+        write_container(&base, VideoContainerFormat::Mkv, media)?;
+        let reader = WindowedFileReader::open(&base)?;
+        let mut input = containr::mkv::Demuxer::open(reader)?;
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(&file);
+        let options = containr::mkv::MkvOptions {
+            doc_type: DocType::Matroska,
+            timestamp_scale: crate::video_container::MKV_TICK_NS,
+            ..containr::mkv::MkvOptions::default()
+        };
+        let mut output = containr::mkv::Muxer::new(&mut writer, options)?;
+        let mut plans = Vec::new();
+        for track in input.tracks() {
+            let packets = read_packets(input.track_packets(track.id)?, &base)?;
+            let plan = containr::mkv::StreamCopy::plan(track, &packets)?;
+            let id = output.add_track(plan.spec.clone())?;
+            plans.push((track.id, plan, id));
+        }
+        if chapter {
+            output.set_chapters(vec![containr::Chapter {
+                start: 0,
+                duration: Some(1_000_000_000),
+                timescale: 1_000_000_000,
+                title: "Intro".to_owned(),
+                source: containr::ChapterSource::Matroska {
+                    edition_uid: None,
+                    chapter_uid: 1,
+                    depth: 0,
+                },
+            }])?;
+        }
+        if tag {
+            output.set_metadata(vec![containr::MetadataItem {
+                scope: containr::MetadataScope::Tag(containr::TagScope {
+                    target_type_value: 50,
+                    target: containr::TagTarget::Segment,
+                    binary: false,
+                }),
+                key: containr::MetadataKey::Named(b"TITLE".to_vec()),
+                value: b"Sample".to_vec(),
+                data: Vec::new(),
+            }])?;
+        }
+        let mut buf = Vec::new();
+        for packet in input.packets() {
+            let packet = packet?;
+            let Some((_, plan, id)) = plans
+                .iter()
+                .find(|(track_id, _, _)| *track_id == packet.track_id)
+            else {
+                continue;
+            };
+            input.read_packet_into(&packet, &mut buf)?;
+            if let Some(block) = plan.packet(&packet, &buf)? {
+                output.write_packet(*id, &block)?;
+            }
+        }
+        output.finish()?;
+        writer.flush()?;
+        drop(writer);
+        std::fs::remove_file(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mkv_canonical_route_rejects_chapters_and_tags_with_mp3_and_vorbis()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let media = h264_mp3_vorbis_media()?;
+        for (name, chapter, tag) in [("chapter", true, false), ("tag", false, true)] {
+            let source = temp_path(&format!("mkv-{name}-source"), "mkv");
+            let target = temp_path(&format!("mkv-{name}-target"), "mkv");
+            write_mkv_with_chapter_or_tag(&source, &media, chapter, tag)?;
+
+            let reader = WindowedFileReader::open(&source)?;
+            let demuxer = containr::mkv::Demuxer::open(reader)?;
+            assert_eq!(demuxer.chapters().len(), usize::from(chapter));
+            assert_eq!(demuxer.metadata().len(), usize::from(tag));
+
+            // MP3 disables stream copy, so the MP3 + Vorbis source takes the
+            // canonical route; chapters and tags must fail before demuxing.
+            let result = remux(
+                &source,
+                &target,
+                VideoContainerFormat::Mkv,
+                VideoContainerFormat::Mkv,
+            );
+            assert!(
+                matches!(result, Err(PipelineError::RemuxFailed { .. })),
+                "{name} metadata was dropped instead of rejected: {result:?}"
+            );
+            assert!(
+                !target.exists(),
+                "no target was published after {name} rejection"
+            );
+            std::fs::remove_file(source)?;
+        }
         Ok(())
     }
 

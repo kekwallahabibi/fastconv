@@ -22,7 +22,8 @@ use crate::video_bitstream::{
     annex_b_to_avcc, annex_b_to_hvcc, avcc_to_annex_b, build_aac_esds, build_mp3_mp4a_sample_entry,
     build_vp09_sample_entry, dops_to_opus_head, extract_av1c_from_obu, extract_avcc_from_annex_b,
     extract_hvcc_from_annex_b, hvcc_to_annex_b, is_av1_keyframe, is_h264_keyframe_annex_b,
-    is_hevc_keyframe_annex_b, opus_head_to_dops, vp9_color_from_keyframe,
+    is_hevc_keyframe_annex_b, opus_head_to_dops, unpack_xiph_laced_vorbis_headers,
+    vorbis_ident_info, vp9_color_from_keyframe,
 };
 
 /// Canonical timestamp unit: exact microseconds, i.e. one tick is 1 µs and
@@ -355,6 +356,7 @@ fn mp4_codec(track: &Track) -> Option<VideoCodec> {
         "V_VP9" => Some(VideoCodec::Vp9),
         "A_AAC" => Some(VideoCodec::Aac),
         "A_OPUS" => Some(VideoCodec::Opus),
+        "A_VORBIS" => Some(VideoCodec::Vorbis),
         "A_MPEG/L3" => Some(VideoCodec::Mp3),
         _ => None,
     }
@@ -379,6 +381,7 @@ fn mkv_codec(codec_id: &str) -> Option<VideoCodec> {
         "V_VP9" => Some(VideoCodec::Vp9),
         "A_AAC" => Some(VideoCodec::Aac),
         "A_OPUS" => Some(VideoCodec::Opus),
+        "A_VORBIS" => Some(VideoCodec::Vorbis),
         "A_MPEG/L3" => Some(VideoCodec::Mp3),
         _ => None,
     }
@@ -568,6 +571,9 @@ fn canonical_config(
                 dops_to_opus_head(raw).map_err(|reason| container_error(path, reason))
             }
         }
+        VideoCodec::Vorbis => unpack_xiph_laced_vorbis_headers(raw)
+            .map(|_| raw.to_vec())
+            .map_err(|reason| container_error(path, reason)),
         VideoCodec::Mp3 => Ok(Vec::new()),
         _ => Err(container_error(path, format!("unsupported codec {codec}"))),
     }
@@ -721,10 +727,15 @@ fn demux_mkv(path: &Path) -> Result<ContainerMedia, PipelineError> {
             .as_ref()
             .and_then(|mkv| mkv.codec_private.clone())
             .unwrap_or_default();
-        let config = if codec == VideoCodec::Vp9 {
-            vp9_validated_codec_private(&config)
-        } else {
-            config
+        let config = match codec {
+            VideoCodec::Vp9 => vp9_validated_codec_private(&config),
+            VideoCodec::Vorbis => {
+                unpack_xiph_laced_vorbis_headers(&config).map_err(|reason| {
+                    container_error(path, format!("invalid A_VORBIS CodecPrivate: {reason}"))
+                })?;
+                config
+            }
+            _ => config,
         };
         let (width, height) = track
             .matroska
@@ -736,7 +747,7 @@ fn demux_mkv(path: &Path) -> Result<ContainerMedia, PipelineError> {
                     u16::try_from(v.pixel_height).ok(),
                 )
             });
-        let (channels, sample_rate) = track
+        let (mut channels, mut sample_rate) = track
             .matroska
             .as_ref()
             .and_then(|mkv| mkv.audio.as_ref())
@@ -746,6 +757,14 @@ fn demux_mkv(path: &Path) -> Result<ContainerMedia, PipelineError> {
                     matroska_sample_rate(a.sampling_frequency),
                 )
             });
+        if codec == VideoCodec::Vorbis
+            && (channels.is_none() || sample_rate.is_none())
+            && let Ok((ident, _, _)) = unpack_xiph_laced_vorbis_headers(&config)
+            && let Ok((ident_channels, ident_rate, _, _)) = vorbis_ident_info(ident)
+        {
+            channels = channels.or(Some(ident_channels));
+            sample_rate = sample_rate.or(Some(ident_rate));
+        }
         id_to_index.insert(track.id, media.tracks.len());
         media.tracks.push(ContainerTrack {
             codec,
@@ -1327,6 +1346,29 @@ fn validate_mkv_presentation_edits(
     Ok(())
 }
 
+/// Chooses and validates the `CodecPrivate` payload for one Matroska track.
+fn mkv_codec_private(
+    track: &ContainerTrack,
+    target_path: &Path,
+) -> Result<Option<Vec<u8>>, PipelineError> {
+    match track.codec {
+        VideoCodec::Vp9 => {
+            let private = vp9_validated_codec_private(&track.config);
+            Ok((!private.is_empty()).then_some(private))
+        }
+        VideoCodec::Vorbis => {
+            unpack_xiph_laced_vorbis_headers(&track.config).map_err(|reason| {
+                container_error(
+                    target_path,
+                    format!("invalid A_VORBIS CodecPrivate: {reason}"),
+                )
+            })?;
+            Ok(Some(track.config.clone()))
+        }
+        _ => Ok((!track.config.is_empty()).then(|| track.config.clone())),
+    }
+}
+
 fn mux_mkv(
     target: &File,
     target_path: &Path,
@@ -1351,6 +1393,7 @@ fn mux_mkv(
             VideoCodec::Vp9 => "V_VP9",
             VideoCodec::Aac => "A_AAC",
             VideoCodec::Opus => "A_OPUS",
+            VideoCodec::Vorbis => "A_VORBIS",
             VideoCodec::Mp3 => "A_MPEG/L3",
             _ => {
                 return Err(container_error(
@@ -1365,13 +1408,7 @@ fn mux_mkv(
             TrackKind::Audio
         };
         let mut spec = MkvTrackSpec::new(kind, codec_id, timebase);
-        spec.matroska.codec_private = match track.codec {
-            VideoCodec::Vp9 => {
-                let private = vp9_validated_codec_private(&track.config);
-                (!private.is_empty()).then_some(private)
-            }
-            _ => (!track.config.is_empty()).then(|| track.config.clone()),
-        };
+        spec.matroska.codec_private = mkv_codec_private(track, target_path)?;
         if track.codec == VideoCodec::Opus {
             spec.matroska.seek_pre_roll = 80_000_000;
             if track.config.len() >= 19 && &track.config[..8] == b"OpusHead" {
@@ -1558,6 +1595,7 @@ pub(crate) fn video_packet_from_annex_b(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::video_bitstream::pack_xiph_laced_vorbis_headers;
 
     #[test]
     fn vp9_codec_private_roundtrips_through_vpcc() -> Result<(), String> {
@@ -2529,6 +2567,93 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    fn vorbis_private() -> Result<Vec<u8>, String> {
+        let mut ident = vec![0_u8; 30];
+        ident[0] = 0x01;
+        ident[1..7].copy_from_slice(b"vorbis");
+        ident[11] = 2;
+        ident[12..16].copy_from_slice(&48_000_u32.to_le_bytes());
+        ident[28] = 0xB8;
+        ident[29] = 1;
+        let comment = b"\x03vorbis";
+        let setup = b"\x05vorbis";
+        pack_xiph_laced_vorbis_headers(&ident, comment, setup)
+    }
+
+    fn vorbis_media(config: Vec<u8>) -> ContainerMedia {
+        ContainerMedia {
+            tracks: vec![ContainerTrack {
+                codec: VideoCodec::Vorbis,
+                width: None,
+                height: None,
+                channels: Some(2),
+                sample_rate: Some(48_000),
+                config,
+                timescale: US_TIMESCALE,
+                presentation_edit: None,
+            }],
+            packets: vec![ContainerPacket {
+                track: 0,
+                pts: 0,
+                dts: 0,
+                duration: 23_000,
+                keyframe: true,
+                data: vec![0x00, 0x11, 0x22],
+            }],
+        }
+    }
+
+    #[test]
+    fn vorbis_codec_private_roundtrips_through_mkv() -> Result<(), String> {
+        let private = vorbis_private()?;
+        let dir = std::env::temp_dir().join(format!("fastconv-mkv-vorbis-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let path = dir.join("vorbis.mkv");
+        let file = File::create(&path).map_err(|err| err.to_string())?;
+        mux_video(
+            &file,
+            &path,
+            VideoContainerFormat::Mkv,
+            &vorbis_media(private.clone()),
+        )
+        .map_err(|err| err.to_string())?;
+        drop(file);
+        let reopened = demux_mkv(&path).map_err(|err| err.to_string())?;
+        std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
+        assert_eq!(reopened.tracks.len(), 1);
+        assert_eq!(reopened.tracks[0].codec, VideoCodec::Vorbis);
+        assert_eq!(reopened.tracks[0].config, private);
+        assert_eq!(reopened.tracks[0].sample_rate, Some(48_000));
+        assert_eq!(reopened.tracks[0].channels, Some(2));
+        assert_eq!(reopened.packets.len(), 1);
+        assert_eq!(reopened.packets[0].pts, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn mux_mkv_rejects_invalid_vorbis_codec_private() -> Result<(), String> {
+        let dir = std::env::temp_dir().join(format!(
+            "fastconv-mkv-vorbis-invalid-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let path = dir.join("bad.mkv");
+        let file = File::create(&path).map_err(|err| err.to_string())?;
+        let result = mux_video(
+            &file,
+            &path,
+            VideoContainerFormat::Mkv,
+            &vorbis_media(vec![0x02, 0xFF]),
+        );
+        drop(file);
+        std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
+        assert!(
+            matches!(result, Err(PipelineError::RemuxFailed { .. })),
+            "malformed Vorbis CodecPrivate must be rejected at mux time"
+        );
         Ok(())
     }
 }
