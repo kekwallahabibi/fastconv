@@ -36,7 +36,10 @@ Options:
                         excluding 4, lossless 1-8). Remixing is deterministic.
   --bit-depth <...>     Lossless PCM depth: 8, 16, 24, 32 or f32. Accepted by
                         wav/aiff; flac accepts 8/16/24 and alac accepts 16.
-                        Rejected by all lossy targets; default follows the source.
+                        Rejected by all lossy targets. Default follows the source
+                        where the target stores it; otherwise float to flac gives
+                        24-bit integer, and float or 8-bit input to alac gives
+                        16-bit.
   --threads <N>         Number of parallel workers
   --backend <name>      cpu (default). Audio runs on CPU only; GPU backends
                         nvenc, vaapi, qsv, amf, videotoolbox, and vulkan are
