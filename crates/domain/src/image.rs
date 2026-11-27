@@ -280,8 +280,10 @@ pub struct ImageEncodeOptions {
 /// Compile-time-legal combination of output image format, codec mode, and hardware backend.
 ///
 /// Illegal pairings (e.g. NVENC + WebP/JPEG/PNG/BMP/QOI/TIFF/JXL/AVIF/GIF/ICO/PNM,
-/// Vulkan + images, CPU + HEIC, lossless + JPEG/HEIC/AVIF/GIF, lossy quality +
+/// Vulkan + images, lossless + JPEG/HEIC/AVIF/GIF, lossy quality +
 /// PNG/BMP/QOI/TIFF/ICO/PNM, or hardware-absent video encoder backends) cannot be constructed.
+/// HEIC is encodable either as pure-Rust CPU HEVC-Intra ([`Self::CpuHeic`]) or via
+/// NVIDIA NVENC ([`Self::NvencHeic`]); the latter never silently falls back to the CPU path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum ImageExecutionMode {
     CpuWebp {
@@ -312,6 +314,9 @@ pub enum ImageExecutionMode {
     CpuGif,
     CpuIco,
     CpuPnm,
+    CpuHeic {
+        quality: ImageQuality,
+    },
     NvencHeic {
         quality: ImageQuality,
     },
@@ -321,8 +326,9 @@ impl ImageExecutionMode {
     /// Resolves a CPU-only [`ImageExecutionMode`] for `format` without probing GPU hardware.
     ///
     /// When `compression` is `None`, selects the natural default for `format` (lossy quality 80
-    /// for WebP/JPEG/JXL/AVIF, lossless for PNG/BMP/QOI/TIFF/ICO/PNM, and indexed 256-color
+    /// for WebP/JPEG/JXL/AVIF/HEIC, lossless for PNG/BMP/QOI/TIFF/ICO/PNM, and indexed 256-color
     /// quantization for GIF). Omitted encoder options keep the pre-existing encoder defaults.
+    /// Lossless HEIC is rejected because the CPU encoder only produces lossy HEVC-Intra.
     ///
     /// # Errors
     ///
@@ -359,24 +365,18 @@ impl ImageExecutionMode {
             ImageOutputFormat::Webp => Ok(Self::webp_mode(compression, options)),
             ImageOutputFormat::Jxl => Ok(Self::jxl_mode(compression, options)),
             ImageOutputFormat::Jpeg => Self::jpeg_mode(compression, options),
-            ImageOutputFormat::Png => resolve_lossless_only_cpu(
-                format,
-                "PNG",
-                compression,
-                Self::png_mode(options),
-            ),
+            ImageOutputFormat::Png => {
+                resolve_lossless_only_cpu(format, "PNG", compression, Self::png_mode(options))
+            }
             ImageOutputFormat::Bmp => {
                 resolve_lossless_only_cpu(format, "BMP", compression, Self::CpuBmp)
             }
             ImageOutputFormat::Qoi => {
                 resolve_lossless_only_cpu(format, "QOI", compression, Self::CpuQoi)
             }
-            ImageOutputFormat::Tiff => resolve_lossless_only_cpu(
-                format,
-                "TIFF",
-                compression,
-                Self::tiff_mode(options),
-            ),
+            ImageOutputFormat::Tiff => {
+                resolve_lossless_only_cpu(format, "TIFF", compression, Self::tiff_mode(options))
+            }
             ImageOutputFormat::Avif => Self::avif_mode(compression, options),
             ImageOutputFormat::Ico => {
                 resolve_lossless_only_cpu(format, "ICO", compression, Self::CpuIco)
@@ -385,12 +385,23 @@ impl ImageExecutionMode {
                 resolve_lossless_only_cpu(format, "PNM", compression, Self::CpuPnm)
             }
             ImageOutputFormat::Gif => Self::gif_mode(compression),
-            ImageOutputFormat::Heic => Err(DomainError::UnsupportedImagePipeline {
-                format,
-                backend: HardwareBackend::Cpu,
-                reason: "no native CPU HEVC encoder is implemented for .heic; use --backend nvenc on NVIDIA hardware".to_owned(),
-            }),
+            ImageOutputFormat::Heic => Self::heic_cpu_mode(compression),
         }
+    }
+
+    fn heic_cpu_mode(compression: Option<ImageCompression>) -> Result<Self, DomainError> {
+        let quality = match compression {
+            None => ImageQuality::DEFAULT,
+            Some(ImageCompression::Lossy { quality }) => quality,
+            Some(ImageCompression::Lossless) => {
+                return Err(DomainError::UnsupportedImagePipeline {
+                    format: ImageOutputFormat::Heic,
+                    backend: HardwareBackend::Cpu,
+                    reason: "CPU HEIC currently supports lossy HEVC-Intra (--quality 0..=100), not --lossless".to_owned(),
+                });
+            }
+        };
+        Ok(Self::CpuHeic { quality })
     }
 
     fn webp_mode(compression: Option<ImageCompression>, options: ImageEncodeOptions) -> Self {
@@ -603,7 +614,7 @@ impl ImageExecutionMode {
             Self::CpuGif => ImageOutputFormat::Gif,
             Self::CpuIco => ImageOutputFormat::Ico,
             Self::CpuPnm => ImageOutputFormat::Pnm,
-            Self::NvencHeic { .. } => ImageOutputFormat::Heic,
+            Self::CpuHeic { .. } | Self::NvencHeic { .. } => ImageOutputFormat::Heic,
         }
     }
 
@@ -620,7 +631,8 @@ impl ImageExecutionMode {
             | Self::CpuAvif { .. }
             | Self::CpuGif
             | Self::CpuIco
-            | Self::CpuPnm => HardwareBackend::Cpu,
+            | Self::CpuPnm
+            | Self::CpuHeic { .. } => HardwareBackend::Cpu,
             Self::NvencHeic { .. } => HardwareBackend::Gpu(GpuBackend::Nvenc),
         }
     }
@@ -646,7 +658,7 @@ impl fmt::Display for ImageExecutionMode {
             Self::CpuGif => f.write_str("gif indexed"),
             Self::CpuIco => f.write_str("ico lossless"),
             Self::CpuPnm => f.write_str("pnm lossless"),
-            Self::NvencHeic { quality } => {
+            Self::CpuHeic { quality } | Self::NvencHeic { quality } => {
                 write!(f, "heic hevc-intra q={}", quality.get())
             }
         }
@@ -1199,6 +1211,100 @@ mod tests {
                 quality: ImageQuality::DEFAULT
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_cpu_heic_lossy_and_rejects_lossless() -> Result<(), DomainError> {
+        let cpu_only = cpu_only_hardware()?;
+        let quality = ImageQuality::new(90)?;
+
+        assert_eq!(
+            ImageExecutionMode::resolve(
+                ImageOutputFormat::Heic,
+                None,
+                HardwareBackend::Cpu,
+                &cpu_only
+            )?,
+            ImageExecutionMode::CpuHeic {
+                quality: ImageQuality::DEFAULT,
+            }
+        );
+        assert_eq!(
+            ImageExecutionMode::resolve(
+                ImageOutputFormat::Heic,
+                Some(ImageCompression::Lossy { quality }),
+                HardwareBackend::Cpu,
+                &cpu_only
+            )?,
+            ImageExecutionMode::CpuHeic { quality }
+        );
+        assert_eq!(
+            ImageExecutionMode::resolve_cpu(ImageOutputFormat::Heic, None)?,
+            ImageExecutionMode::CpuHeic {
+                quality: ImageQuality::DEFAULT,
+            }
+        );
+
+        let mode = ImageExecutionMode::CpuHeic { quality };
+        assert_eq!(mode.output_format(), ImageOutputFormat::Heic);
+        assert_eq!(mode.backend(), HardwareBackend::Cpu);
+        assert_eq!(
+            mode.to_string(),
+            format!("heic hevc-intra q={}", quality.get())
+        );
+
+        let lossless = ImageExecutionMode::resolve(
+            ImageOutputFormat::Heic,
+            Some(ImageCompression::Lossless),
+            HardwareBackend::Cpu,
+            &cpu_only,
+        );
+        assert!(matches!(
+            lossless,
+            Err(DomainError::UnsupportedImagePipeline {
+                format: ImageOutputFormat::Heic,
+                backend: HardwareBackend::Cpu,
+                ref reason,
+            }) if reason.contains("lossy HEVC-Intra") && reason.contains("--lossless")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn nvenc_heic_never_silently_falls_back_to_cpu() -> Result<(), DomainError> {
+        let rtx = rtx_2060_hardware()?;
+        let cpu_only = cpu_only_hardware()?;
+        let lossy = Some(ImageCompression::Lossy {
+            quality: ImageQuality::DEFAULT,
+        });
+
+        assert_eq!(
+            ImageExecutionMode::resolve(
+                ImageOutputFormat::Heic,
+                lossy,
+                HardwareBackend::Gpu(GpuBackend::Nvenc),
+                &rtx,
+            )?,
+            ImageExecutionMode::NvencHeic {
+                quality: ImageQuality::DEFAULT
+            }
+        );
+
+        let absent = ImageExecutionMode::resolve(
+            ImageOutputFormat::Heic,
+            lossy,
+            HardwareBackend::Gpu(GpuBackend::Nvenc),
+            &cpu_only,
+        );
+        assert!(matches!(
+            absent,
+            Err(DomainError::UnsupportedImagePipeline {
+                format: ImageOutputFormat::Heic,
+                backend: HardwareBackend::Gpu(GpuBackend::Nvenc),
+                ref reason,
+            }) if reason.contains("no NVENC hardware video encoder")
+        ));
         Ok(())
     }
 
@@ -1980,6 +2086,12 @@ mod tests {
             (ImageOutputFormat::Gif, ImageExecutionMode::CpuGif),
             (ImageOutputFormat::Ico, ImageExecutionMode::CpuIco),
             (ImageOutputFormat::Pnm, ImageExecutionMode::CpuPnm),
+            (
+                ImageOutputFormat::Heic,
+                ImageExecutionMode::CpuHeic {
+                    quality: ImageQuality::DEFAULT,
+                },
+            ),
         ] {
             assert_eq!(
                 ImageExecutionMode::resolve_cpu(format, None)?,

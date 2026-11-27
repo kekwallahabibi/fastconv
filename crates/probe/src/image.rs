@@ -2358,6 +2358,50 @@ mod tests {
     }
 
     #[test]
+    fn prepares_cpu_heic_single_targets() -> Result<(), ProbeError> {
+        let root = create_temp_dir("cpu-heic-single")?;
+        let png_path = root.join("alpha.png");
+        write_tiny_png(&png_path, 16, 12)?;
+
+        let cpu_heic = prepare_image_batch(
+            &png_path,
+            &root.join("cpu.heic"),
+            None,
+            Some(ImageOutputFormat::Heic),
+            None,
+            HardwareBackend::Cpu,
+        )?;
+        assert_eq!(
+            cpu_heic.mode(),
+            ImageExecutionMode::CpuHeic {
+                quality: ImageQuality::DEFAULT,
+            }
+        );
+        assert_eq!(cpu_heic.output_format(), ImageOutputFormat::Heic);
+        assert_eq!(cpu_heic.backend(), HardwareBackend::Cpu);
+
+        let cpu_heic_explicit = prepare_image_batch(
+            &png_path,
+            &root.join("cpu_q90.heic"),
+            Some(ImageCompression::Lossy {
+                quality: ImageQuality::new(90)?,
+            }),
+            Some(ImageOutputFormat::Heic),
+            None,
+            HardwareBackend::Cpu,
+        )?;
+        assert_eq!(
+            cpu_heic_explicit.mode(),
+            ImageExecutionMode::CpuHeic {
+                quality: ImageQuality::new(90)?,
+            }
+        );
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
     fn prepares_mixed_directory_batches() -> Result<(), ProbeError> {
         let root = create_temp_dir("batch")?;
         let src_dir = root.join("src");

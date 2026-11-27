@@ -99,9 +99,12 @@ Options:
                         jpeg and avif on the cpu backend; rejected for webp, png,
                         bmp, qoi, tiff, jxl, gif, ico, pnm and heic.
   --threads <N>         Number of parallel workers
-  --backend <name>      cpu (default) or nvenc (HEIC only; CPU has no native
-                        HEIC encoder). vaapi, qsv, amf, videotoolbox, and vulkan
-                        are rejected explicitly - no silent CPU fallback.
+  --backend <name>      cpu (default) uses the pure Rust HEVC-Intra encoder for
+                        .heic (and the native encoders for every other format);
+                        nvenc is GPU-accelerated HEIC only and requires NVIDIA
+                        NVENC hardware. vaapi, qsv, amf, videotoolbox, and vulkan
+                        are rejected explicitly - no silent CPU fallback when a
+                        GPU backend is requested.
   -h, --help            Print this help
 
 Supported input formats:

@@ -9,6 +9,7 @@ pub mod cpu;
 mod decode;
 mod gif;
 pub mod gpu;
+mod heic;
 mod ico;
 mod m4a;
 mod mpegts;
@@ -169,6 +170,9 @@ pub fn execute_image_batch(plan: &ImageBatchPlan) -> Result<ImageConversionRepor
         ImageExecutionMode::CpuGif => cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Gif),
         ImageExecutionMode::CpuIco => cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Ico),
         ImageExecutionMode::CpuPnm => cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Pnm),
+        ImageExecutionMode::CpuHeic { quality } => {
+            cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Heic { quality })
+        }
         ImageExecutionMode::NvencHeic { quality } => gpu::nvenc::execute_heic_batch(plan, quality),
     }
 }
@@ -1563,6 +1567,293 @@ mod tests {
             assert!(
                 !fs::read(&target)?.is_empty(),
                 "{ext} produced empty output"
+            );
+        }
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    fn decode_cpu_heic(
+        bytes: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<heifer::Image, Box<dyn std::error::Error>> {
+        assert_eq!(bytes.get(4..12), Some(b"ftypheic".as_slice()));
+        assert!(
+            bytes.windows(4).any(|window| window == b"mif1"),
+            "HEIC compatible brand mif1 missing"
+        );
+        let image = heifer::decode(bytes)?;
+        assert_eq!((image.width, image.height), (width, height));
+        Ok(image)
+    }
+
+    struct HeicSource {
+        name: &'static str,
+        format: ImageInputFormat,
+        expected_rgb: Vec<u8>,
+        expected_alpha: Option<Vec<u8>>,
+    }
+
+    fn heic_sources(
+        rgb: &[u8],
+        gray_rgb: Vec<u8>,
+        rgba_alpha: Vec<u8>,
+        la_alpha: Vec<u8>,
+    ) -> Vec<HeicSource> {
+        vec![
+            HeicSource {
+                name: "rgb.png",
+                format: ImageInputFormat::Png,
+                expected_rgb: rgb.to_vec(),
+                expected_alpha: None,
+            },
+            HeicSource {
+                name: "opaque_rgba.png",
+                format: ImageInputFormat::Png,
+                expected_rgb: rgb.to_vec(),
+                expected_alpha: None,
+            },
+            HeicSource {
+                name: "alpha_rgba.png",
+                format: ImageInputFormat::Png,
+                expected_rgb: rgb.to_vec(),
+                expected_alpha: Some(rgba_alpha),
+            },
+            HeicSource {
+                name: "luma.png",
+                format: ImageInputFormat::Png,
+                expected_rgb: gray_rgb.clone(),
+                expected_alpha: None,
+            },
+            HeicSource {
+                name: "la.png",
+                format: ImageInputFormat::Png,
+                expected_rgb: gray_rgb,
+                expected_alpha: Some(la_alpha),
+            },
+            HeicSource {
+                name: "photo.jpg",
+                format: ImageInputFormat::Jpeg,
+                expected_rgb: rgb.to_vec(),
+                expected_alpha: None,
+            },
+            HeicSource {
+                name: "photo.webp",
+                format: ImageInputFormat::Webp,
+                expected_rgb: rgb.to_vec(),
+                expected_alpha: None,
+            },
+        ]
+    }
+
+    fn write_cpu_heic_sources(
+        root: &Path,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<HeicSource>, Box<dyn std::error::Error>> {
+        let rgb = make_rgb_gradient(width, height);
+        let opaque_rgba: Vec<u8> = rgb
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b]| [r, g, b, 255])
+            .collect();
+        let alpha_rgba: Vec<u8> = rgb
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .enumerate()
+            .flat_map(|(index, &[r, g, b])| [r, g, b, if index % 4 == 0 { 96 } else { 255 }])
+            .collect();
+        let luma: Vec<u8> = (0..width * height)
+            .map(|index| u8::try_from((index * 7) % 256).unwrap_or(0))
+            .collect();
+        let gray_rgb: Vec<u8> = luma.iter().flat_map(|&v| [v, v, v]).collect();
+        let la: Vec<u8> = luma
+            .iter()
+            .enumerate()
+            .flat_map(|(index, &v)| [v, if index % 3 == 0 { 128 } else { 255 }])
+            .collect();
+
+        write_test_png(
+            &root.join("rgb.png"),
+            width,
+            height,
+            png::ColorType::Rgb,
+            &rgb,
+        )?;
+        write_test_png(
+            &root.join("opaque_rgba.png"),
+            width,
+            height,
+            png::ColorType::Rgba,
+            &opaque_rgba,
+        )?;
+        write_test_png(
+            &root.join("alpha_rgba.png"),
+            width,
+            height,
+            png::ColorType::Rgba,
+            &alpha_rgba,
+        )?;
+        write_test_png(
+            &root.join("luma.png"),
+            width,
+            height,
+            png::ColorType::Grayscale,
+            &luma,
+        )?;
+        write_test_png(
+            &root.join("la.png"),
+            width,
+            height,
+            png::ColorType::GrayscaleAlpha,
+            &la,
+        )?;
+        write_test_jpeg(
+            &root.join("photo.jpg"),
+            u16::try_from(width).unwrap_or(u16::MAX),
+            u16::try_from(height).unwrap_or(u16::MAX),
+            JpegColorType::Rgb,
+            &rgb,
+        )?;
+        execute_image_batch(&ImageBatchPlan::new(
+            vec![jpeg_item(
+                root.join("rgb.png"),
+                root.join("photo.webp"),
+                ImageInputFormat::Png,
+                width,
+                height,
+            )?],
+            ImageExecutionMode::CpuWebp {
+                compression: ImageCompression::Lossless,
+                level: CompressionLevel::Balanced,
+            },
+            NonZeroUsize::MIN,
+        )?)?;
+
+        let rgba_alpha: Vec<u8> = alpha_rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| pixel[3])
+            .collect();
+        let la_alpha: Vec<u8> = la.as_chunks::<2>().0.iter().map(|pixel| pixel[1]).collect();
+        Ok(heic_sources(&rgb, gray_rgb, rgba_alpha, la_alpha))
+    }
+
+    fn check_cpu_heic_output(
+        root: &Path,
+        source: &HeicSource,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let target = root
+            .join("out")
+            .join(source.name.replace('.', "_heic") + ".heic");
+        let image = decode_cpu_heic(&fs::read(&target)?, width, height)?;
+        let error = mean_abs_channel_diff(&image.to_rgb8(), &source.expected_rgb)?;
+        assert!(
+            error < 14.0,
+            "{} RGB diverged too far: {error:.2}",
+            source.name
+        );
+        match &source.expected_alpha {
+            Some(expected) => {
+                assert!(image.has_alpha, "{} must keep its alpha item", source.name);
+                let decoded_alpha: Vec<u8> = image
+                    .to_rgba8()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|pixel| pixel[3])
+                    .collect();
+                let alpha_error = mean_abs_channel_diff(&decoded_alpha, expected)?;
+                assert!(
+                    alpha_error < 8.0,
+                    "{} alpha diverged: {alpha_error:.2}",
+                    source.name
+                );
+            }
+            None => assert!(
+                !image.has_alpha,
+                "{} must not gain an alpha item",
+                source.name
+            ),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn converts_png_jpeg_webp_and_every_pixel_layout_to_cpu_heic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = create_temp_dir("cpu-heic-batch")?;
+        let (width, height) = (64_u32, 48_u32);
+        let sources = write_cpu_heic_sources(&root, width, height)?;
+        let items = sources
+            .iter()
+            .map(|source| {
+                jpeg_item(
+                    root.join(source.name),
+                    root.join("out")
+                        .join(source.name.replace('.', "_heic") + ".heic"),
+                    source.format,
+                    width,
+                    height,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let report = execute_image_batch(&ImageBatchPlan::new(
+            items,
+            ImageExecutionMode::CpuHeic {
+                quality: ImageQuality::new(90)?,
+            },
+            NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN),
+        )?)?;
+        assert_eq!(report.files_converted().get(), 7);
+        assert_eq!(report.backend(), HardwareBackend::Cpu);
+        assert_eq!(report.hardware_device(), None);
+        for source in &sources {
+            check_cpu_heic_output(&root, source, width, height)?;
+        }
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_heic_quality_is_monotonic_on_odd_and_tiled_dimensions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = create_temp_dir("cpu-heic-quality")?;
+        for (width, height) in [(77_u32, 51_u32), (600, 300)] {
+            let rgb = make_rgb_gradient(width, height);
+            let src = root.join("src.png");
+            write_test_png(&src, width, height, png::ColorType::Rgb, &rgb)?;
+            let mut errors = Vec::new();
+            for quality in [50, 90] {
+                let target = root.join(format!("{width}x{height}-q{quality}.heic"));
+                let report = execute_image_batch(&ImageBatchPlan::new(
+                    vec![jpeg_item(
+                        src.clone(),
+                        target.clone(),
+                        ImageInputFormat::Png,
+                        width,
+                        height,
+                    )?],
+                    ImageExecutionMode::CpuHeic {
+                        quality: ImageQuality::new(quality)?,
+                    },
+                    NonZeroUsize::MIN,
+                )?)?;
+                assert_eq!(report.files_converted().get(), 1);
+                let image = decode_cpu_heic(&fs::read(&target)?, width, height)?;
+                errors.push(mean_abs_channel_diff(&image.to_rgb8(), &rgb)?);
+            }
+            assert!(
+                errors[1] < errors[0],
+                "Q90 should preserve more detail than Q50 at {width}x{height}: {errors:?}"
             );
         }
 
