@@ -16,7 +16,7 @@ mod enabled {
     use cudarc::driver::{CudaContext, CudaStream, HostSlice, PinnedHostSlice, result, sys};
     use fastconv_domain::{
         GpuBackend, HardwareBackend, ImageBatchItem, ImageBatchPlan, ImageConversionReport,
-        ImageInputFormat, ImageQuality, VideoCodec, VideoEncodeMode, VideoQuality,
+        ImageInputFormat, ImageQuality, VideoCodec, VideoEncodeMode, VideoRateControl,
     };
     use nvidia_video_codec_sdk::{
         Bitstream, Buffer, ENCODE_API, EncodePictureParams, Encoder, EncoderInitParams,
@@ -1001,26 +1001,40 @@ mod enabled {
         }
     }
 
-    /// Configures VBR with all bitrate/VBV constraints at zero, which NVENC
-    /// interprets as pure Constant Quality driven by `targetQuality`.
+    /// VBR mode in both cases: with zero bitrate/VBV constraints NVENC treats
+    /// `targetQuality` as Constant Quality; with `averageBitRate` set it runs
+    /// true average-bitrate rate control and ignores `targetQuality`.
     fn configure_video_rc(
         rc: &mut NV_ENC_RC_PARAMS,
-        quality: VideoQuality,
+        rate_control: VideoRateControl,
         temporal_aq: bool,
         lookahead_depth: u16,
         disable_b_adapt: bool,
     ) {
-        let (target, lsb) = quality_to_nvenc_cq(quality);
+        match rate_control {
+            VideoRateControl::Quality(quality) => {
+                let (target, lsb) = quality_to_nvenc_cq(quality);
+                rc.averageBitRate = 0;
+                rc.maxBitRate = 0;
+                rc.vbvBufferSize = 0;
+                rc.vbvInitialDelay = 0;
+                rc.targetQuality = target;
+                rc.targetQualityLSB = lsb;
+            }
+            VideoRateControl::Bitrate(bitrate) => {
+                let bps = bitrate.bps();
+                rc.averageBitRate = bps;
+                rc.maxBitRate = bps.saturating_mul(3) / 2;
+                rc.vbvBufferSize = 0;
+                rc.vbvInitialDelay = 0;
+                rc.targetQuality = 0;
+                rc.targetQualityLSB = 0;
+            }
+        }
         rc.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR;
-        rc.averageBitRate = 0;
-        rc.maxBitRate = 0;
-        rc.vbvBufferSize = 0;
-        rc.vbvInitialDelay = 0;
         rc.set_enableMinQP(0);
         rc.set_enableMaxQP(0);
         rc.set_enableInitialRCQP(0);
-        rc.targetQuality = target;
-        rc.targetQualityLSB = lsb;
         rc.set_enableAQ(1);
         rc.set_aqStrength(NVENC_AQ_STRENGTH);
         rc.set_enableTemporalAQ(u32::from(temporal_aq));
@@ -1038,10 +1052,10 @@ mod enabled {
     }
 
     impl NvencVideoCodec {
-        fn from_mode(mode: VideoEncodeMode) -> Result<(Self, VideoQuality), PipelineError> {
+        fn from_mode(mode: VideoEncodeMode) -> Result<(Self, VideoRateControl), PipelineError> {
             match mode {
-                VideoEncodeMode::NvencH264 { quality } => Ok((Self::H264, quality)),
-                VideoEncodeMode::NvencHevc { quality } => Ok((Self::Hevc, quality)),
+                VideoEncodeMode::NvencH264 { rate_control } => Ok((Self::H264, rate_control)),
+                VideoEncodeMode::NvencHevc { rate_control } => Ok((Self::Hevc, rate_control)),
                 other => Err(video_error(format!(
                     "NVENC video encoding rejects mode {other}; only H.264 and HEVC are supported"
                 ))),
@@ -1811,7 +1825,7 @@ mod enabled {
         encoder: RawNvencEncoder,
         cuda_ctx: &Arc<CudaContext>,
         codec: NvencVideoCodec,
-        quality: VideoQuality,
+        rate_control: VideoRateControl,
         fps: u32,
         plan: NvencVideoPlan,
         disable_b_adapt: bool,
@@ -1840,7 +1854,7 @@ mod enabled {
         )?;
         configure_video_rc(
             &mut preset_cfg.presetCfg.rcParams,
-            quality,
+            rate_control,
             plan.temporal_aq,
             plan.lookahead_depth,
             disable_b_adapt,
@@ -2087,7 +2101,7 @@ mod enabled {
                 "--hwdecode nvdec cannot decode {source_codec}; no silent CPU fallback"
             )));
         }
-        let (codec, quality) = NvencVideoCodec::from_mode(mode)?;
+        let (codec, rate_control) = NvencVideoCodec::from_mode(mode)?;
         let guid = codec.guid();
         let width = u32::from(
             source_track
@@ -2135,7 +2149,7 @@ mod enabled {
         )?;
         configure_video_rc(
             &mut preset_cfg.presetCfg.rcParams,
-            quality,
+            rate_control,
             plan.temporal_aq,
             plan.lookahead_depth,
             false,
@@ -2416,7 +2430,7 @@ mod enabled {
     where
         F: FnMut() -> Result<(), PipelineError>,
     {
-        let (codec, quality) = NvencVideoCodec::from_mode(mode)?;
+        let (codec, rate_control) = NvencVideoCodec::from_mode(mode)?;
         let guid = codec.guid();
 
         // Only the CUDA context is needed before the decode thread starts.
@@ -2596,7 +2610,7 @@ mod enabled {
                             encoder,
                             &cuda_ctx,
                             codec,
-                            quality,
+                            rate_control,
                             fps,
                             plan,
                             disable_b_adapt,
@@ -3373,7 +3387,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use fastconv_domain::{VideoCodec, VideoEncodeMode, VideoQuality};
+    use fastconv_domain::{VideoCodec, VideoEncodeMode, VideoRateControl};
 
     use super::encode_video_nvenc_streaming;
     use crate::PipelineError;
@@ -3428,7 +3442,7 @@ mod tests {
             path,
             &frames,
             VideoEncodeMode::CpuAv1 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
         )?;
@@ -3436,7 +3450,7 @@ mod tests {
             path,
             &frames,
             VideoEncodeMode::CpuH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
         )?;
@@ -3450,7 +3464,7 @@ mod tests {
                 &av1,
                 &expected_av1,
                 VideoEncodeMode::NvencHevc {
-                    quality: VideoQuality::DEFAULT,
+                    rate_control: VideoRateControl::DEFAULT,
                 },
                 VideoCodec::Hevc,
             ),
@@ -3458,7 +3472,7 @@ mod tests {
                 &av1,
                 &expected_av1,
                 VideoEncodeMode::NvencH264 {
-                    quality: VideoQuality::DEFAULT,
+                    rate_control: VideoRateControl::DEFAULT,
                 },
                 VideoCodec::H264,
             ),
@@ -3466,7 +3480,7 @@ mod tests {
                 &h264,
                 &expected_h264,
                 VideoEncodeMode::NvencH264 {
-                    quality: VideoQuality::DEFAULT,
+                    rate_control: VideoRateControl::DEFAULT,
                 },
                 VideoCodec::H264,
             ),
@@ -3527,7 +3541,7 @@ mod tests {
             path,
             &frames,
             VideoEncodeMode::CpuH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
         )?;
@@ -3538,7 +3552,7 @@ mod tests {
             &source.track,
             &source.packets,
             VideoEncodeMode::NvencHevc {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
             || Ok(()),
@@ -3587,7 +3601,7 @@ mod tests {
             &track,
             &corrupt,
             VideoEncodeMode::NvencH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
             || Ok(()),
@@ -3610,7 +3624,7 @@ mod tests {
             path,
             &frames,
             VideoEncodeMode::CpuH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
         )?;
@@ -3623,7 +3637,7 @@ mod tests {
                 &source_for_thread.track,
                 &source_for_thread.packets,
                 VideoEncodeMode::NvencH264 {
-                    quality: VideoQuality::DEFAULT,
+                    rate_control: VideoRateControl::DEFAULT,
                 },
                 0,
                 || {
@@ -3665,7 +3679,7 @@ mod tests {
             path,
             &frames,
             VideoEncodeMode::CpuH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
         )?;
@@ -3678,7 +3692,7 @@ mod tests {
                 &source_for_thread.track,
                 &source_for_thread.packets,
                 VideoEncodeMode::NvencH264 {
-                    quality: VideoQuality::DEFAULT,
+                    rate_control: VideoRateControl::DEFAULT,
                 },
                 0,
                 || {

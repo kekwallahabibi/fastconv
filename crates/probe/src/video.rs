@@ -8,10 +8,12 @@ use containr::CodecConfig;
 use containr::Track;
 use containr::TrackKind;
 use fastconv_domain::{
-    AnimationLoop, AnimationMeta, AudioTrackAction, DomainError, HardwareBackend,
-    HardwareDecodeBackend, PathRole, TargetAudioCodec, TargetVideoCodec, VideoCodec,
-    VideoContainerFormat, VideoEncodeMode, VideoQuality, VideoRemuxItem, VideoRemuxPlan,
-    VideoStreamInfo, VideoStreamKind, VideoTrackAction, VideoTranscodeItem, VideoTranscodePlan,
+    AnimationLoop, AnimationMeta, AudioEncodeConfig, AudioEncodeOptions, AudioTrackAction,
+    DomainError, HardwareBackend, HardwareDecodeBackend, PathRole, TargetAudioCodec,
+    TargetVideoCodec, VideoCodec, VideoContainerFormat, VideoEncodeMode, VideoQuality,
+    VideoRateControl, VideoRemuxItem, VideoRemuxPlan, VideoStreamInfo, VideoStreamKind,
+    VideoTrackAction, VideoTranscodeItem, VideoTranscodePlan, resolve_audio_encode_options,
+    resolve_video_rate_control, validate_audio_options_for_container,
 };
 
 use crate::{ProbeError, available_cpu_threads};
@@ -1865,6 +1867,50 @@ pub enum RequestedAudioCodec {
     Drop,
 }
 
+/// Rate-control and audio overrides for a transcode batch. `None` rate control
+/// means the user did not pass `--quality` or `--vbitrate`, which keeps stream
+/// copy legal and leaves the encoder on its `VideoQuality::DEFAULT` behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VideoTranscodeOptions {
+    rate_control: Option<VideoRateControl>,
+    audio: AudioEncodeOptions,
+}
+
+impl VideoTranscodeOptions {
+    #[must_use]
+    pub const fn new(rate_control: Option<VideoRateControl>, audio: AudioEncodeOptions) -> Self {
+        Self {
+            rate_control,
+            audio,
+        }
+    }
+
+    /// Legacy quality-only callers: the default quality is not an explicit
+    /// flag, so it must not turn `--vcodec copy` into a conflict.
+    #[must_use]
+    pub const fn with_quality(quality: VideoQuality) -> Self {
+        let rate_control = if quality.get() == VideoQuality::DEFAULT.get() {
+            None
+        } else {
+            Some(VideoRateControl::Quality(quality))
+        };
+        Self {
+            rate_control,
+            audio: AudioEncodeOptions::new(None, None, None),
+        }
+    }
+
+    #[must_use]
+    pub const fn rate_control(self) -> Option<VideoRateControl> {
+        self.rate_control
+    }
+
+    #[must_use]
+    pub const fn audio_options(self) -> AudioEncodeOptions {
+        self.audio
+    }
+}
+
 /// Builds a validated [`VideoTranscodePlan`] from CLI inputs.
 ///
 /// # Errors
@@ -1913,6 +1959,38 @@ pub fn prepare_video_transcode_batch_with_decode(
     video_codec: Option<RequestedVideoCodec>,
     audio_codec: Option<RequestedAudioCodec>,
     quality: VideoQuality,
+    backend: HardwareBackend,
+    decode_backend: HardwareDecodeBackend,
+    worker_threads: Option<NonZeroUsize>,
+) -> Result<VideoTranscodePlan, ProbeError> {
+    prepare_video_transcode_batch_with_options(
+        source,
+        target,
+        to,
+        video_codec,
+        audio_codec,
+        VideoTranscodeOptions::with_quality(quality),
+        backend,
+        decode_backend,
+        worker_threads,
+    )
+}
+
+/// Full boundary planning entry point: carries explicit video rate control and
+/// audio overrides into the validated domain plan.
+///
+/// # Errors
+///
+/// Returns [`ProbeError`] for invalid paths, conflicting options, unsupported
+/// codec/container pairs, or a forced NVDEC request that cannot be honoured.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn prepare_video_transcode_batch_with_options(
+    source: &Path,
+    target: &Path,
+    to: Option<VideoContainerFormat>,
+    video_codec: Option<RequestedVideoCodec>,
+    audio_codec: Option<RequestedAudioCodec>,
+    options: VideoTranscodeOptions,
     backend: HardwareBackend,
     decode_backend: HardwareDecodeBackend,
     worker_threads: Option<NonZeroUsize>,
@@ -1979,6 +2057,36 @@ pub fn prepare_video_transcode_batch_with_decode(
         return Err(ProbeError::NotAFileOrDirectory(source.to_path_buf()));
     };
 
+    let copy_video = matches!(video_codec, Some(RequestedVideoCodec::Copy));
+    let rate_control = resolve_video_rate_control(copy_video, options.rate_control())?;
+    let encode_codec = match video_codec {
+        Some(RequestedVideoCodec::Encode(codec)) => codec,
+        _ => output_format.default_video_codec(),
+    };
+    // GIF/WebP have no bitrate-aware encoder. Check the resolved codec *and*
+    // the container so an implicit animation default is rejected as well.
+    if matches!(rate_control, VideoRateControl::Bitrate(_))
+        && (matches!(encode_codec, TargetVideoCodec::Gif | TargetVideoCodec::Webp)
+            || !output_format.supports_audio())
+    {
+        return Err(DomainError::UnsupportedVideoPipeline {
+            codec: encode_codec.as_video_codec(),
+            backend,
+            reason: format!(
+                "{encode_codec} animation encoding supports only --quality, not --vbitrate"
+            ),
+        }
+        .into());
+    }
+
+    let animation_target = !output_format.supports_audio();
+    validate_audio_options_for_container(options.audio_options(), output_format)?;
+    let audio_copy_or_drop = matches!(
+        audio_codec,
+        Some(RequestedAudioCodec::Copy | RequestedAudioCodec::Drop)
+    ) || (audio_codec.is_none() && animation_target);
+    let audio_options = resolve_audio_encode_options(audio_copy_or_drop, options.audio_options())?;
+
     let video_action = match video_codec {
         Some(RequestedVideoCodec::Copy) => {
             if backend != HardwareBackend::Cpu {
@@ -1993,21 +2101,26 @@ pub fn prepare_video_transcode_batch_with_decode(
             VideoTrackAction::Copy
         }
         Some(RequestedVideoCodec::Encode(codec)) => {
-            VideoTrackAction::Encode(VideoEncodeMode::resolve(codec, quality, backend)?)
+            VideoTrackAction::Encode(VideoEncodeMode::resolve(codec, rate_control, backend)?)
         }
         None => VideoTrackAction::Encode(VideoEncodeMode::resolve(
-            output_format.default_video_codec(),
-            quality,
+            encode_codec,
+            rate_control,
             backend,
         )?),
     };
     let audio_action = match audio_codec {
         Some(RequestedAudioCodec::Copy) => AudioTrackAction::Copy,
-        Some(RequestedAudioCodec::Encode(codec)) => AudioTrackAction::Encode(codec),
         Some(RequestedAudioCodec::Drop) => AudioTrackAction::Drop,
-        None => output_format
-            .default_audio_codec()
-            .map_or(AudioTrackAction::Drop, AudioTrackAction::Encode),
+        Some(RequestedAudioCodec::Encode(codec)) => AudioTrackAction::Encode(
+            AudioEncodeConfig::new(codec, audio_options).map_err(ProbeError::InvalidDomain)?,
+        ),
+        None => match output_format.default_audio_codec() {
+            Some(codec) => AudioTrackAction::Encode(
+                AudioEncodeConfig::new(codec, audio_options).map_err(ProbeError::InvalidDomain)?,
+            ),
+            None => AudioTrackAction::Drop,
+        },
     };
 
     let mut items = Vec::with_capacity(specs.len());
@@ -2050,11 +2163,35 @@ pub fn prepare_video_transcode_batch_with_decode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastconv_domain::{AudioBitrate, AudioChannels, AudioSampleRate, VideoBitrate};
     use std::io::{Read, Seek, SeekFrom};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn err_contains<T>(result: &Result<T, ProbeError>, needle: &str) -> bool {
+        result
+            .as_ref()
+            .err()
+            .is_some_and(|err| err.to_string().contains(needle))
+    }
+
+    fn audio_encode(codec: TargetAudioCodec) -> AudioTrackAction {
+        AudioTrackAction::Encode(AudioEncodeConfig::default_for(codec))
+    }
+
+    fn quality_mode(codec: TargetVideoCodec, quality: VideoQuality) -> VideoTrackAction {
+        let rate_control = VideoRateControl::Quality(quality);
+        VideoTrackAction::Encode(match codec {
+            TargetVideoCodec::H264 => VideoEncodeMode::CpuH264 { rate_control },
+            TargetVideoCodec::Av1 => VideoEncodeMode::CpuAv1 { rate_control },
+            TargetVideoCodec::Vp9 => VideoEncodeMode::CpuVp9 { rate_control },
+            TargetVideoCodec::Hevc => VideoEncodeMode::NvencHevc { rate_control },
+            TargetVideoCodec::Gif => VideoEncodeMode::CpuGif { quality },
+            TargetVideoCodec::Webp => VideoEncodeMode::CpuWebp { quality },
+        })
+    }
 
     fn temp_path(label: &str) -> PathBuf {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -2749,11 +2886,11 @@ mod tests {
         assert_eq!(webm.output_format(), VideoContainerFormat::Webm);
         assert_eq!(
             webm.items()[0].video_action(),
-            VideoTrackAction::Encode(VideoEncodeMode::CpuVp9 { quality })
+            quality_mode(TargetVideoCodec::Vp9, quality)
         );
         assert_eq!(
             webm.items()[0].audio_action(),
-            AudioTrackAction::Encode(TargetAudioCodec::Opus)
+            audio_encode(TargetAudioCodec::Opus)
         );
 
         let mp4_target = temp_path("transcode-defaults-mp4").with_extension("mp4");
@@ -2770,11 +2907,11 @@ mod tests {
         assert_eq!(mp4.output_format(), VideoContainerFormat::Mp4);
         assert_eq!(
             mp4.items()[0].video_action(),
-            VideoTrackAction::Encode(VideoEncodeMode::CpuH264 { quality })
+            quality_mode(TargetVideoCodec::H264, quality)
         );
         assert_eq!(
             mp4.items()[0].audio_action(),
-            AudioTrackAction::Encode(TargetAudioCodec::Aac)
+            audio_encode(TargetAudioCodec::Aac)
         );
         Ok(())
     }
@@ -3543,11 +3680,13 @@ mod tests {
         )?;
         assert_eq!(
             plan.items()[0].video_action(),
-            VideoTrackAction::Encode(VideoEncodeMode::NvencH264 { quality })
+            VideoTrackAction::Encode(VideoEncodeMode::NvencH264 {
+                rate_control: VideoRateControl::Quality(quality)
+            })
         );
         assert_eq!(
             plan.items()[0].audio_action(),
-            AudioTrackAction::Encode(TargetAudioCodec::Aac)
+            audio_encode(TargetAudioCodec::Aac)
         );
 
         let cpu_target = temp_path("transcode-webp-cpu").with_extension("mp4");
@@ -3563,7 +3702,173 @@ mod tests {
         )?;
         assert_eq!(
             plan.items()[0].video_action(),
-            VideoTrackAction::Encode(VideoEncodeMode::CpuH264 { quality })
+            quality_mode(TargetVideoCodec::H264, quality)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transcode_options_carry_video_bitrate() -> Result<(), Box<dyn std::error::Error>> {
+        let source = temp_file("rate-bitrate", &minimal_avi())?;
+        let target = temp_path("rate-bitrate").with_extension("mp4");
+        let bitrate = VideoBitrate::parse("1M")?;
+        let options = VideoTranscodeOptions::new(
+            Some(VideoRateControl::Bitrate(bitrate)),
+            AudioEncodeOptions::default(),
+        );
+        let plan = prepare_video_transcode_batch_with_options(
+            &source,
+            &target,
+            Some(VideoContainerFormat::Mp4),
+            None,
+            None,
+            options,
+            HardwareBackend::Cpu,
+            HardwareDecodeBackend::Auto,
+            Some(plan_threads()),
+        )?;
+        assert_eq!(
+            plan.items()[0].video_action(),
+            VideoTrackAction::Encode(VideoEncodeMode::CpuH264 {
+                rate_control: VideoRateControl::Bitrate(bitrate)
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transcode_options_reject_vbitrate_with_copy_and_animation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = temp_file("rate-conflict", &minimal_avi())?;
+        let target = temp_path("rate-conflict").with_extension("mp4");
+        let options = VideoTranscodeOptions::new(
+            Some(VideoRateControl::Bitrate(VideoBitrate::parse("1M")?)),
+            AudioEncodeOptions::default(),
+        );
+        let copy = prepare_video_transcode_batch_with_options(
+            &source,
+            &target,
+            Some(VideoContainerFormat::Mp4),
+            Some(RequestedVideoCodec::Copy),
+            None,
+            options,
+            HardwareBackend::Cpu,
+            HardwareDecodeBackend::Auto,
+            Some(plan_threads()),
+        );
+        assert!(
+            err_contains(&copy, "stream copy cannot re-encode"),
+            "unexpected copy error: {copy:?}"
+        );
+
+        for to in [VideoContainerFormat::Gif, VideoContainerFormat::Webp] {
+            let animation_target = temp_path("rate-animation").with_extension(to.extension());
+            let result = prepare_video_transcode_batch_with_options(
+                &source,
+                &animation_target,
+                Some(to),
+                None,
+                None,
+                options,
+                HardwareBackend::Cpu,
+                HardwareDecodeBackend::Auto,
+                Some(plan_threads()),
+            );
+            assert!(
+                err_contains(&result, "animation encoding supports only --quality"),
+                "unexpected {to} error: {result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn transcode_options_validate_audio_overrides() -> Result<(), Box<dyn std::error::Error>> {
+        let source = temp_file("audio-options", &minimal_avi())?;
+        let target = temp_path("audio-options").with_extension("mp4");
+        let options = VideoTranscodeOptions::new(
+            None,
+            AudioEncodeOptions::new(
+                Some(AudioBitrate::parse("192k")?),
+                Some(AudioSampleRate::new(48_000)?),
+                Some(AudioChannels::new(1)?),
+            ),
+        );
+        let plan = prepare_video_transcode_batch_with_options(
+            &source,
+            &target,
+            Some(VideoContainerFormat::Mp4),
+            None,
+            Some(RequestedAudioCodec::Encode(TargetAudioCodec::Aac)),
+            options,
+            HardwareBackend::Cpu,
+            HardwareDecodeBackend::Auto,
+            Some(plan_threads()),
+        )?;
+        let AudioTrackAction::Encode(config) = plan.items()[0].audio_action() else {
+            return Err("expected an audio encode action".into());
+        };
+        assert_eq!(config.bitrate(), Some(AudioBitrate::parse("192k")?));
+        assert_eq!(config.sample_rate(), Some(AudioSampleRate::new(48_000)?));
+        assert_eq!(config.channels(), Some(AudioChannels::new(1)?));
+
+        for requested in [
+            Some(RequestedAudioCodec::Copy),
+            Some(RequestedAudioCodec::Drop),
+        ] {
+            let result = prepare_video_transcode_batch_with_options(
+                &source,
+                &target,
+                Some(VideoContainerFormat::Mp4),
+                None,
+                requested,
+                options,
+                HardwareBackend::Cpu,
+                HardwareDecodeBackend::Auto,
+                Some(plan_threads()),
+            );
+            assert!(
+                err_contains(&result, "require audio re-encoding"),
+                "unexpected {requested:?} error: {result:?}"
+            );
+        }
+
+        let animation_target = temp_path("audio-animation").with_extension("gif");
+        let animation = prepare_video_transcode_batch_with_options(
+            &source,
+            &animation_target,
+            Some(VideoContainerFormat::Gif),
+            None,
+            None,
+            options,
+            HardwareBackend::Cpu,
+            HardwareDecodeBackend::Auto,
+            Some(plan_threads()),
+        );
+        assert!(
+            err_contains(&animation, "have no audio track"),
+            "unexpected animation error: {animation:?}"
+        );
+
+        let illegal = VideoTranscodeOptions::new(
+            None,
+            AudioEncodeOptions::new(None, Some(AudioSampleRate::new(44_100)?), None),
+        );
+        let opus_target = temp_path("audio-opus-limit").with_extension("webm");
+        let opus = prepare_video_transcode_batch_with_options(
+            &source,
+            &opus_target,
+            Some(VideoContainerFormat::Webm),
+            None,
+            Some(RequestedAudioCodec::Encode(TargetAudioCodec::Opus)),
+            illegal,
+            HardwareBackend::Cpu,
+            HardwareDecodeBackend::Auto,
+            Some(plan_threads()),
+        );
+        assert!(
+            err_contains(&opus, "not supported by Opus"),
+            "unexpected codec-limit error: {opus:?}"
         );
         Ok(())
     }
