@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use fastconv_domain::{VideoCodec, VideoEncodeMode, VideoQuality};
+use fastconv_domain::{VideoCodec, VideoEncodeMode, VideoQuality, VideoRateControl};
 use rav1d_safe::src::managed::{Decoder as Av1Decoder, PixelLayout, Planes as Av1Planes};
 use rav1e::color::ChromaSampling;
 use rav1e::prelude::{Config, EncoderConfig, FrameType, Rational, SpeedSettings};
@@ -2046,7 +2046,7 @@ fn cpu_h264_parallel_gops(
 fn cpu_h264(
     path: &Path,
     frames: &[Yuv420Frame],
-    quality: VideoQuality,
+    rate_control: VideoRateControl,
     track_index: usize,
     fps_num: u32,
     fps_den: u32,
@@ -2055,8 +2055,19 @@ fn cpu_h264(
     require_even(path, width, height)?;
     let w = usize::try_from(width).map_err(|_| encode_error(path, "H.264 width overflow"))?;
     let h = usize::try_from(height).map_err(|_| encode_error(path, "H.264 height overflow"))?;
+    // In bitrate mode rusty_h264 drives QP from `bitrate`/`framerate` and uses
+    // `qp` only as the controller's base/fallback. Rate-control state spans the
+    // whole clip, so parallel GOP encoders would each restart the controller.
+    let (qp, bitrate, parallel_gops) = match rate_control {
+        VideoRateControl::Quality(quality) => (quality_to_h264_qp(quality), 0, true),
+        VideoRateControl::Bitrate(bitrate) => (
+            quality_to_h264_qp(VideoQuality::DEFAULT),
+            bitrate.bps(),
+            false,
+        ),
+    };
     let mut config = H264EncoderConfig::new(w, h);
-    config.qp = quality_to_h264_qp(quality);
+    config.qp = qp;
     config.preset = H264Preset::Fast;
     // One-second keyframe interval, bounded so low/high frame rates stay sane.
     let fps_rounded = fps_num.div_ceil(fps_den.max(1));
@@ -2066,13 +2077,13 @@ fn cpu_h264(
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     let framerate = (f64::from(fps_num) / f64::from(fps_den.max(1))) as f32;
     config.framerate = framerate;
-    config.bitrate = 0;
+    config.bitrate = bitrate;
     config.lookahead = 0;
     config.scenecut = 0;
     config.mbtree = false;
 
     let gop_len = usize::try_from(gop_size).unwrap_or(usize::MAX);
-    let units = if frames.len() > gop_len {
+    let units = if parallel_gops && frames.len() > gop_len {
         cpu_h264_parallel_gops(path, frames, w, h, gop_len, &config)?
     } else {
         let mut encoder =
@@ -2104,10 +2115,18 @@ fn cpu_h264(
     )
 }
 
+fn quality_to_av1_quantizer(quality: VideoQuality) -> usize {
+    usize::from(
+        (100_u8.saturating_sub(quality.get()))
+            .saturating_mul(2)
+            .clamp(20, 200),
+    )
+}
+
 fn cpu_av1(
     path: &Path,
     frames: &[Yuv420Frame],
-    quality: VideoQuality,
+    rate_control: VideoRateControl,
     track_index: usize,
     fps_num: u32,
     fps_den: u32,
@@ -2116,11 +2135,17 @@ fn cpu_av1(
     require_even(path, width, height)?;
     let w = usize::try_from(width).map_err(|_| encode_error(path, "AV1 width overflow"))?;
     let h = usize::try_from(height).map_err(|_| encode_error(path, "AV1 height overflow"))?;
-    let quantizer = usize::from(
-        (100_u8.saturating_sub(quality.get()))
-            .saturating_mul(2)
-            .clamp(20, 200),
-    );
+    // rav1e's `select_qi` ignores `quantizer` whenever `bitrate > 0`, and
+    // `min_quantizer` defaults to 0, so rate control can reach any quantizer
+    // needed to hit the target. Keep a sane base quantizer for either path.
+    let (quantizer, bitrate) = match rate_control {
+        VideoRateControl::Quality(quality) => (quality_to_av1_quantizer(quality), 0),
+        VideoRateControl::Bitrate(bitrate) => (
+            quality_to_av1_quantizer(VideoQuality::DEFAULT),
+            i32::try_from(bitrate.bps())
+                .map_err(|_| encode_error(path, "AV1 bitrate exceeds i32"))?,
+        ),
+    };
     let mut config = EncoderConfig::with_speed_preset(8);
     config.width = w;
     config.height = h;
@@ -2128,6 +2153,7 @@ fn cpu_av1(
     config.chroma_sampling = ChromaSampling::Cs420;
     config.time_base = Rational::new(u64::from(fps_den), u64::from(fps_num));
     config.quantizer = quantizer;
+    config.bitrate = bitrate;
     config.min_key_frame_interval = 12;
     config.max_key_frame_interval = 120;
     config.speed_settings = SpeedSettings::from_preset(8);
@@ -2209,7 +2235,7 @@ fn cpu_av1(
 fn cpu_vp9(
     path: &Path,
     frames: &[Yuv420Frame],
-    quality: VideoQuality,
+    rate_control: VideoRateControl,
     track_index: usize,
     fps_num: u32,
     fps_den: u32,
@@ -2218,8 +2244,18 @@ fn cpu_vp9(
     require_even(path, width, height)?;
     let mut encoder = Vp9Encoder::default();
     let fps = f64::from(fps_num) / f64::from(fps_den.max(1));
+    // rusty_vp9 overrides `qindex` with its per-frame rate controller once
+    // `bitrate_bps` is set; the configured qindex remains its starting point.
+    let (qindex, bitrate_bps) = match rate_control {
+        VideoRateControl::Quality(quality) => (quality_to_vp9_qindex(quality), None),
+        VideoRateControl::Bitrate(bitrate) => (
+            quality_to_vp9_qindex(VideoQuality::DEFAULT),
+            Some(f64::from(bitrate.bps())),
+        ),
+    };
     let config = Vp9EncoderConfig {
-        qindex: Some(quality_to_vp9_qindex(quality)),
+        qindex: Some(qindex),
+        bitrate_bps,
         fps: Some(fps),
         speed: Some(6),
         keyframe_interval: Some(60),
@@ -2314,14 +2350,14 @@ pub(crate) fn encode_video_cpu(
     let fps_num = US_TIMESCALE;
     let fps_den = u32::try_from(duration.max(1)).unwrap_or(US_TIMESCALE / 30);
     match mode {
-        VideoEncodeMode::CpuH264 { quality } => {
-            cpu_h264(path, frames, quality, track_index, fps_num, fps_den)
+        VideoEncodeMode::CpuH264 { rate_control } => {
+            cpu_h264(path, frames, rate_control, track_index, fps_num, fps_den)
         }
-        VideoEncodeMode::CpuAv1 { quality } => {
-            cpu_av1(path, frames, quality, track_index, fps_num, fps_den)
+        VideoEncodeMode::CpuAv1 { rate_control } => {
+            cpu_av1(path, frames, rate_control, track_index, fps_num, fps_den)
         }
-        VideoEncodeMode::CpuVp9 { quality } => {
-            cpu_vp9(path, frames, quality, track_index, fps_num, fps_den)
+        VideoEncodeMode::CpuVp9 { rate_control } => {
+            cpu_vp9(path, frames, rate_control, track_index, fps_num, fps_den)
         }
         VideoEncodeMode::CpuGif { .. } | VideoEncodeMode::CpuWebp { .. } => Err(encode_error(
             path,
@@ -2387,7 +2423,7 @@ mod tests {
     fn roundtrips_h264() -> Result<(), PipelineError> {
         assert_roundtrip(
             VideoEncodeMode::CpuH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             64,
             48,
@@ -2399,7 +2435,7 @@ mod tests {
         let path = Path::new("h264-parallel-gop");
         let frames = synthetic_frames(32, 24, 70);
         // 15 fps -> a one-second, 15-frame GOP, so 70 frames span five GOPs.
-        let stream = cpu_h264(path, &frames, VideoQuality::DEFAULT, 0, 15, 1)?;
+        let stream = cpu_h264(path, &frames, VideoRateControl::DEFAULT, 0, 15, 1)?;
         assert_eq!(
             stream.packets.len(),
             frames.len(),
@@ -2430,7 +2466,7 @@ mod tests {
     fn h264_parallel_gops_with_higher_fps() -> Result<(), PipelineError> {
         let path = Path::new("h264-parallel-gop-60");
         let frames = synthetic_frames(32, 24, 130);
-        let stream = cpu_h264(path, &frames, VideoQuality::DEFAULT, 0, 60, 1)?;
+        let stream = cpu_h264(path, &frames, VideoRateControl::DEFAULT, 0, 60, 1)?;
         assert_eq!(stream.packets.len(), frames.len());
         for (index, packet) in stream.packets.iter().enumerate() {
             assert_eq!(
@@ -2446,7 +2482,7 @@ mod tests {
     fn roundtrips_vp9() -> Result<(), PipelineError> {
         assert_roundtrip(
             VideoEncodeMode::CpuVp9 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             64,
             48,
@@ -2457,7 +2493,7 @@ mod tests {
     fn roundtrips_av1() -> Result<(), PipelineError> {
         assert_roundtrip(
             VideoEncodeMode::CpuAv1 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             64,
             48,
@@ -2471,7 +2507,7 @@ mod tests {
             Path::new("odd.mp4"),
             &frames,
             VideoEncodeMode::CpuH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
         );
@@ -2536,10 +2572,10 @@ mod tests {
         };
         for mode in [
             VideoEncodeMode::NvencH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             VideoEncodeMode::NvencHevc {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
         ] {
             let result = crate::gpu::nvenc::encode_video_nvenc_streaming(
@@ -2569,8 +2605,12 @@ mod tests {
         let low = VideoQuality::new(40).unwrap_or(VideoQuality::DEFAULT);
         let high = VideoQuality::new(90).unwrap_or(VideoQuality::DEFAULT);
         let make_mode = |quality| match codec {
-            VideoCodec::H264 => Ok(VideoEncodeMode::NvencH264 { quality }),
-            VideoCodec::Hevc => Ok(VideoEncodeMode::NvencHevc { quality }),
+            VideoCodec::H264 => Ok(VideoEncodeMode::NvencH264 {
+                rate_control: VideoRateControl::Quality(quality),
+            }),
+            VideoCodec::Hevc => Ok(VideoEncodeMode::NvencHevc {
+                rate_control: VideoRateControl::Quality(quality),
+            }),
             _ => Err(PipelineError::WorkerPanicked),
         };
         let encoded_bytes = |mode| -> Result<u64, PipelineError> {
@@ -2594,6 +2634,85 @@ mod tests {
             high_bytes > low_bytes,
             "{codec}: quality 90 ({high_bytes} bytes) must exceed quality 40 ({low_bytes} bytes)"
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "nvenc")]
+    fn assert_nvenc_bitrate_roundtrip(
+        path: &Path,
+        source: &EncodedVideoStream,
+        codec: VideoCodec,
+        frame_count: usize,
+    ) -> Result<(), PipelineError> {
+        let low = fastconv_domain::VideoBitrate::new(200_000)
+            .map_err(|err| encode_error(path, err.to_string()))?;
+        let high = fastconv_domain::VideoBitrate::new(4_000_000)
+            .map_err(|err| encode_error(path, err.to_string()))?;
+        let make_mode = |bitrate| match codec {
+            VideoCodec::H264 => Ok(VideoEncodeMode::NvencH264 {
+                rate_control: VideoRateControl::Bitrate(bitrate),
+            }),
+            VideoCodec::Hevc => Ok(VideoEncodeMode::NvencHevc {
+                rate_control: VideoRateControl::Bitrate(bitrate),
+            }),
+            _ => Err(PipelineError::WorkerPanicked),
+        };
+        let encoded = |bitrate| -> Result<(u64, usize), PipelineError> {
+            let (stream, frames, _) = crate::gpu::nvenc::encode_video_nvenc_streaming(
+                path,
+                &source.track,
+                &source.packets,
+                make_mode(bitrate)?,
+                0,
+                || Ok(()),
+            )?;
+            let decoded = decode_video_track(path, &stream.track, &stream.packets)?;
+            assert_eq!(decoded.len(), frame_count, "{codec} decoded frame count");
+            assert_eq!(
+                usize::try_from(frames).unwrap_or(0),
+                frame_count,
+                "{codec} encoded frame count"
+            );
+            let bytes = stream
+                .packets
+                .iter()
+                .map(|packet| u64::try_from(packet.data.len()).unwrap_or(u64::MAX))
+                .sum();
+            Ok((bytes, stream.packets.len()))
+        };
+        let (low_bytes, low_packets) = encoded(low)?;
+        let (high_bytes, high_packets) = encoded(high)?;
+        assert!(
+            low_packets > 0 && high_packets > 0,
+            "{codec}: bitrate modes produced no packets"
+        );
+        assert!(
+            high_bytes > low_bytes,
+            "{codec}: 4M bitrate ({high_bytes} bytes) must exceed 200k ({low_bytes} bytes)"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "nvenc")]
+    #[test]
+    fn nvenc_bitrate_roundtrips_h264_and_hevc() -> Result<(), PipelineError> {
+        if cudarc::driver::CudaContext::new(0).is_err() {
+            return Ok(());
+        }
+        let path = Path::new("nvenc-bitrate.mp4");
+        let frames = synthetic_frames(256, 144, 24);
+        let frame_count = frames.len();
+        let source = encode_video_cpu(
+            path,
+            &frames,
+            VideoEncodeMode::CpuH264 {
+                rate_control: VideoRateControl::DEFAULT,
+            },
+            0,
+        )?;
+        for codec in [VideoCodec::H264, VideoCodec::Hevc] {
+            assert_nvenc_bitrate_roundtrip(path, &source, codec, frame_count)?;
+        }
         Ok(())
     }
 
@@ -2670,20 +2789,20 @@ mod tests {
             path,
             &frames,
             VideoEncodeMode::CpuH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
         )?;
         for (mode, codec) in [
             (
                 VideoEncodeMode::NvencH264 {
-                    quality: VideoQuality::DEFAULT,
+                    rate_control: VideoRateControl::DEFAULT,
                 },
                 VideoCodec::H264,
             ),
             (
                 VideoEncodeMode::NvencHevc {
-                    quality: VideoQuality::DEFAULT,
+                    rate_control: VideoRateControl::DEFAULT,
                 },
                 VideoCodec::Hevc,
             ),
@@ -2899,13 +3018,13 @@ mod tests {
         let frames = synthetic_frames(width, height, 4);
         for mode in [
             VideoEncodeMode::CpuAv1 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             VideoEncodeMode::CpuH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             VideoEncodeMode::CpuVp9 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
         ] {
             let stream = encode_video_cpu(path, &frames, mode, 0)?;
@@ -2931,7 +3050,7 @@ mod tests {
             path,
             &frames,
             VideoEncodeMode::CpuH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
         )?;
@@ -2956,7 +3075,7 @@ mod tests {
             path,
             &frames,
             VideoEncodeMode::CpuH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
         )?;

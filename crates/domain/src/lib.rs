@@ -18,11 +18,13 @@ pub use image::{
 };
 pub use metrics::{BenchmarkMetrics, BenchmarkSample, PeakMemory, Throughput, WorkloadUnit};
 pub use video::{
-    AnimationLoop, AnimationMeta, AudioTrackAction, HardwareDecodeBackend, TargetAudioCodec,
-    TargetVideoCodec, VideoCodec, VideoContainerFormat, VideoDecodeMode, VideoEncodeMode,
-    VideoQuality, VideoRemuxItem, VideoRemuxPlan, VideoRemuxReport, VideoStreamInfo,
-    VideoStreamKind, VideoTrackAction, VideoTranscodeItem, VideoTranscodePlan,
-    VideoTranscodeReport,
+    AnimationLoop, AnimationMeta, AudioBitrate, AudioChannels, AudioEncodeConfig,
+    AudioEncodeOptions, AudioSampleRate, AudioTrackAction, HardwareDecodeBackend, TargetAudioCodec,
+    TargetVideoCodec, VideoBitrate, VideoCodec, VideoContainerFormat, VideoDecodeMode,
+    VideoEncodeMode, VideoQuality, VideoRateControl, VideoRemuxItem, VideoRemuxPlan,
+    VideoRemuxReport, VideoStreamInfo, VideoStreamKind, VideoTrackAction, VideoTranscodeItem,
+    VideoTranscodePlan, VideoTranscodeReport, resolve_audio_encode_options,
+    resolve_video_rate_control, validate_audio_options_for_container,
 };
 
 use std::error::Error;
@@ -115,6 +117,35 @@ pub enum DomainError {
     InvalidVideoQuality {
         value: u8,
         max: u8,
+    },
+    InvalidVideoBitrate {
+        value: u32,
+        min: u32,
+        max: u32,
+    },
+    InvalidAudioBitrate {
+        value: u32,
+        min: u32,
+        max: u32,
+    },
+    InvalidBitrateSyntax {
+        raw: String,
+    },
+    InvalidAudioSampleRate {
+        value: u32,
+    },
+    InvalidAudioChannels {
+        value: u16,
+    },
+    UnsupportedAudioEncodeOption {
+        codec: TargetAudioCodec,
+        reason: String,
+    },
+    ConflictingVideoRateControl {
+        reason: String,
+    },
+    ConflictingAudioEncodeOptions {
+        reason: String,
     },
     UnsupportedAudioPipeline {
         format: AudioOutputFormat,
@@ -256,7 +287,45 @@ impl fmt::Display for DomainError {
                 f,
                 "backend '{backend}' cannot encode {format} audio: {reason}"
             ),
+            _ => fmt_encoding_error(self, f),
         }
+    }
+}
+
+/// Formats rate-control and audio-option validation errors. The caller's guard
+/// is the only path into this helper, so any other variant is a formatter bug
+/// and surfaces as `fmt::Error` rather than a misleading message.
+fn fmt_encoding_error(err: &DomainError, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match err {
+        DomainError::InvalidVideoBitrate { value, min, max } => {
+            write!(f, "video bitrate must be in {min}..={max} bps, got {value}")
+        }
+        DomainError::InvalidAudioBitrate { value, min, max } => {
+            write!(f, "audio bitrate must be in {min}..={max} bps, got {value}")
+        }
+        DomainError::InvalidBitrateSyntax { raw } => write!(
+            f,
+            "invalid bitrate '{raw}' (expected e.g. 500k, 2.5M or 5000000)"
+        ),
+        DomainError::InvalidAudioSampleRate { value } => {
+            write!(f, "audio sample rate must be non-zero, got {value}")
+        }
+        DomainError::InvalidAudioChannels { value } => {
+            write!(f, "audio channel count must be non-zero, got {value}")
+        }
+        DomainError::UnsupportedAudioEncodeOption { codec, reason } => {
+            write!(
+                f,
+                "{codec} encoding rejects requested audio options: {reason}"
+            )
+        }
+        DomainError::ConflictingVideoRateControl { reason } => {
+            write!(f, "conflicting video rate-control options: {reason}")
+        }
+        DomainError::ConflictingAudioEncodeOptions { reason } => {
+            write!(f, "conflicting audio encoding options: {reason}")
+        }
+        _ => Err(fmt::Error),
     }
 }
 

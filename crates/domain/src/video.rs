@@ -363,6 +363,449 @@ impl fmt::Display for VideoQuality {
     }
 }
 
+/// Parses `500k`, `2.5M` or a raw bit count into bits per second.
+///
+/// Integer-only on purpose: bitrates are counts of bits, and a float parse
+/// would silently round values that the codec configs store as integers.
+fn parse_bitrate(raw: &str) -> Result<u32, DomainError> {
+    let invalid = || DomainError::InvalidBitrateSyntax {
+        raw: raw.to_owned(),
+    };
+    let trimmed = raw.trim();
+    let (digits, divisor) = if let Some(rest) = trimmed
+        .strip_suffix('k')
+        .or_else(|| trimmed.strip_suffix('K'))
+    {
+        (rest, 1_000_u64)
+    } else if let Some(rest) = trimmed
+        .strip_suffix('m')
+        .or_else(|| trimmed.strip_suffix('M'))
+    {
+        // The fractional part is already scaled to millionths of a whole
+        // Mbps unit, so no further division is needed for `M`.
+        (rest, 1_u64)
+    } else {
+        (trimmed, 1_000_000_u64)
+    };
+    if digits.is_empty() {
+        return Err(invalid());
+    }
+    let (whole, fraction) = match digits.split_once('.') {
+        Some((whole, fraction)) if !fraction.is_empty() => (whole, Some(fraction)),
+        Some(_) => return Err(invalid()),
+        None => (digits, None),
+    };
+    if whole.is_empty() || !whole.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let whole = whole.parse::<u64>().map_err(|_| invalid())?;
+    let fraction = match fraction {
+        None => 0_u64,
+        Some(fraction) => {
+            if fraction.len() > 6 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            let digits = fraction.parse::<u32>().map_err(|_| invalid())?;
+            u64::from(digits)
+                .checked_mul(10_u64.pow(u32::try_from(6 - fraction.len()).unwrap_or(0)))
+                .ok_or_else(invalid)?
+        }
+    };
+    // `micro` holds the requested rate scaled by 1_000_000; the divisor turns
+    // that into bps for a raw number, kbps or Mbps input respectively. Reject
+    // non-integral bps rather than silently rounding.
+    let micro = whole
+        .checked_mul(1_000_000)
+        .and_then(|scaled| scaled.checked_add(fraction))
+        .ok_or_else(invalid)?;
+    if !micro.is_multiple_of(divisor) {
+        return Err(invalid());
+    }
+    let bps = micro / divisor;
+    u32::try_from(bps).map_err(|_| invalid())
+}
+
+const fn bitrate_display(bps: u32) -> (u32, &'static str) {
+    if bps.is_multiple_of(1_000) {
+        (bps / 1_000, "k")
+    } else {
+        (bps, "")
+    }
+}
+
+/// Validated video bitrate in bits per second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct VideoBitrate(u32);
+
+impl VideoBitrate {
+    pub const MIN_BPS: u32 = 50_000;
+    pub const MAX_BPS: u32 = 500_000_000;
+
+    /// Creates a validated bitrate in `50_000..=500_000_000` bps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidVideoBitrate`] outside that range.
+    pub fn new(bps: u32) -> Result<Self, DomainError> {
+        if !(Self::MIN_BPS..=Self::MAX_BPS).contains(&bps) {
+            return Err(DomainError::InvalidVideoBitrate {
+                value: bps,
+                min: Self::MIN_BPS,
+                max: Self::MAX_BPS,
+            });
+        }
+        Ok(Self(bps))
+    }
+
+    /// Parses `500k`, `2000k`, `5M`, `2.5M` or `5000000` into bps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidBitrateSyntax`] for malformed input and
+    /// [`DomainError::InvalidVideoBitrate`] for an out-of-range rate.
+    pub fn parse(raw: &str) -> Result<Self, DomainError> {
+        Self::new(parse_bitrate(raw)?)
+    }
+
+    #[must_use]
+    pub const fn bps(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for VideoBitrate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (value, suffix) = bitrate_display(self.0);
+        write!(f, "{value}{suffix}")
+    }
+}
+
+/// Validated audio bitrate in bits per second. Codec-specific limits are
+/// applied by [`AudioEncodeConfig::new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct AudioBitrate(u32);
+
+impl AudioBitrate {
+    pub const MIN_BPS: u32 = 1_000;
+    pub const MAX_BPS: u32 = 1_000_000_000;
+
+    /// Creates a validated bitrate in `1_000..=1_000_000_000` bps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidAudioBitrate`] outside that range.
+    pub fn new(bps: u32) -> Result<Self, DomainError> {
+        if !(Self::MIN_BPS..=Self::MAX_BPS).contains(&bps) {
+            return Err(DomainError::InvalidAudioBitrate {
+                value: bps,
+                min: Self::MIN_BPS,
+                max: Self::MAX_BPS,
+            });
+        }
+        Ok(Self(bps))
+    }
+
+    /// Parses `128k`, `1.5M` or a raw bit count into bps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidBitrateSyntax`] for malformed input and
+    /// [`DomainError::InvalidAudioBitrate`] for an out-of-range rate.
+    pub fn parse(raw: &str) -> Result<Self, DomainError> {
+        Self::new(parse_bitrate(raw)?)
+    }
+
+    #[must_use]
+    pub const fn bps(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for AudioBitrate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (value, suffix) = bitrate_display(self.0);
+        write!(f, "{value}{suffix}")
+    }
+}
+
+/// Validated audio sample rate in Hz.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct AudioSampleRate(NonZeroU32);
+
+impl AudioSampleRate {
+    /// Creates a validated, non-zero sample rate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidAudioSampleRate`] when `hz` is zero.
+    pub fn new(hz: u32) -> Result<Self, DomainError> {
+        NonZeroU32::new(hz)
+            .map(Self)
+            .ok_or(DomainError::InvalidAudioSampleRate { value: hz })
+    }
+
+    #[must_use]
+    pub const fn hz(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for AudioSampleRate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} Hz", self.0)
+    }
+}
+
+/// Validated audio channel count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct AudioChannels(NonZeroU16);
+
+impl AudioChannels {
+    /// Creates a validated, non-zero channel count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidAudioChannels`] when `count` is zero.
+    pub fn new(count: u16) -> Result<Self, DomainError> {
+        NonZeroU16::new(count)
+            .map(Self)
+            .ok_or(DomainError::InvalidAudioChannels { value: count })
+    }
+
+    #[must_use]
+    pub const fn count(self) -> u16 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for AudioChannels {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}ch", self.0)
+    }
+}
+
+/// Optional, user-requested audio encoding settings for tracks inside a video
+/// container. Nothing here is applied until it has been checked against a
+/// concrete codec by [`AudioEncodeConfig::new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
+pub struct AudioEncodeOptions {
+    bitrate: Option<AudioBitrate>,
+    sample_rate: Option<AudioSampleRate>,
+    channels: Option<AudioChannels>,
+}
+
+impl AudioEncodeOptions {
+    #[must_use]
+    pub const fn new(
+        bitrate: Option<AudioBitrate>,
+        sample_rate: Option<AudioSampleRate>,
+        channels: Option<AudioChannels>,
+    ) -> Self {
+        Self {
+            bitrate,
+            sample_rate,
+            channels,
+        }
+    }
+
+    #[must_use]
+    pub const fn bitrate(self) -> Option<AudioBitrate> {
+        self.bitrate
+    }
+
+    #[must_use]
+    pub const fn sample_rate(self) -> Option<AudioSampleRate> {
+        self.sample_rate
+    }
+
+    #[must_use]
+    pub const fn channels(self) -> Option<AudioChannels> {
+        self.channels
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.bitrate.is_none() && self.sample_rate.is_none() && self.channels.is_none()
+    }
+}
+
+/// Validated audio encoder settings for one target codec, with all unspecified
+/// fields left as `None` so the pipeline can keep its existing defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct AudioEncodeConfig {
+    codec: TargetAudioCodec,
+    bitrate: Option<AudioBitrate>,
+    sample_rate: Option<AudioSampleRate>,
+    channels: Option<AudioChannels>,
+}
+
+impl AudioEncodeConfig {
+    const AAC_RATES: [u32; 13] = [
+        7_350, 8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 64_000,
+        88_200, 96_000,
+    ];
+    const MP3_RATES: [u32; 9] = [
+        8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000,
+    ];
+
+    /// Validates `options` against the concrete codec's supported range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::UnsupportedAudioEncodeOption`] when a requested
+    /// value is outside the codec's bitrate/sample-rate/channel limits.
+    pub fn new(codec: TargetAudioCodec, options: AudioEncodeOptions) -> Result<Self, DomainError> {
+        let unsupported =
+            |reason: String| DomainError::UnsupportedAudioEncodeOption { codec, reason };
+        if let Some(rate) = options.bitrate() {
+            let bps = rate.bps();
+            let (min, max) = match codec {
+                TargetAudioCodec::Aac => (16_000, 512_000),
+                TargetAudioCodec::Opus => (6_000, 510_000),
+                TargetAudioCodec::Mp3 => (8_000, 320_000),
+            };
+            if !(min..=max).contains(&bps) {
+                return Err(unsupported(format!(
+                    "bitrate {rate} is outside {codec}'s {min}..={max} bps range"
+                )));
+            }
+            if codec == TargetAudioCodec::Mp3
+                && let Some(sample_rate) = options.sample_rate()
+            {
+                let hz = sample_rate.hz();
+                let (min, max) = if hz >= 32_000 {
+                    (32_000, 320_000)
+                } else {
+                    (8_000, 160_000)
+                };
+                if !(min..=max).contains(&bps) {
+                    return Err(unsupported(format!(
+                        "MP3 bitrate {rate} is outside {min}..={max} bps at {sample_rate}"
+                    )));
+                }
+            }
+        }
+        if let Some(sample_rate) = options.sample_rate() {
+            let hz = sample_rate.hz();
+            let allowed = match codec {
+                TargetAudioCodec::Aac => Self::AAC_RATES.contains(&hz),
+                TargetAudioCodec::Opus => hz == 48_000,
+                TargetAudioCodec::Mp3 => Self::MP3_RATES.contains(&hz),
+            };
+            if !allowed {
+                return Err(unsupported(format!(
+                    "sample rate {sample_rate} is not supported by {codec}"
+                )));
+            }
+        }
+        if let Some(channels) = options.channels() {
+            let count = channels.count();
+            let allowed = match codec {
+                TargetAudioCodec::Aac => (1..=6).contains(&count) && count != 4,
+                TargetAudioCodec::Opus | TargetAudioCodec::Mp3 => (1..=2).contains(&count),
+            };
+            if !allowed {
+                return Err(unsupported(format!(
+                    "channel count {channels} is not supported by {codec}"
+                )));
+            }
+        }
+        Ok(Self {
+            codec,
+            bitrate: options.bitrate(),
+            sample_rate: options.sample_rate(),
+            channels: options.channels(),
+        })
+    }
+
+    /// Applies no overrides; the pipeline keeps its per-codec defaults.
+    #[must_use]
+    pub const fn default_for(codec: TargetAudioCodec) -> Self {
+        Self {
+            codec,
+            bitrate: None,
+            sample_rate: None,
+            channels: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn codec(self) -> TargetAudioCodec {
+        self.codec
+    }
+
+    #[must_use]
+    pub const fn bitrate(self) -> Option<AudioBitrate> {
+        self.bitrate
+    }
+
+    #[must_use]
+    pub const fn sample_rate(self) -> Option<AudioSampleRate> {
+        self.sample_rate
+    }
+
+    #[must_use]
+    pub const fn channels(self) -> Option<AudioChannels> {
+        self.channels
+    }
+}
+
+/// Rejects rate control on a stream-copy request before any encoder is built.
+/// `None` means the user did not pass a rate-control flag.
+///
+/// # Errors
+///
+/// Returns [`DomainError::ConflictingVideoRateControl`] for `--quality` or
+/// `--vbitrate` combined with video stream copy.
+pub fn resolve_video_rate_control(
+    copy: bool,
+    requested: Option<VideoRateControl>,
+) -> Result<VideoRateControl, DomainError> {
+    if copy && requested.is_some() {
+        return Err(DomainError::ConflictingVideoRateControl {
+            reason: "video stream copy cannot re-encode; omit --quality and --vbitrate".to_owned(),
+        });
+    }
+    Ok(requested.unwrap_or(VideoRateControl::DEFAULT))
+}
+
+/// Rejects audio overrides on a copied or dropped track.
+///
+/// # Errors
+///
+/// Returns [`DomainError::ConflictingAudioEncodeOptions`] when options were
+/// supplied for a track that is not encoded.
+pub fn resolve_audio_encode_options(
+    copy_or_drop: bool,
+    options: AudioEncodeOptions,
+) -> Result<AudioEncodeOptions, DomainError> {
+    if copy_or_drop && !options.is_empty() {
+        return Err(DomainError::ConflictingAudioEncodeOptions {
+            reason: "--abitrate, --asample-rate and --achannels require audio re-encoding"
+                .to_owned(),
+        });
+    }
+    Ok(options)
+}
+
+/// Animation containers have no audio track, so audio overrides are illegal.
+///
+/// # Errors
+///
+/// Returns [`DomainError::ConflictingAudioEncodeOptions`] for a non-empty
+/// request against a container that cannot carry audio.
+pub fn validate_audio_options_for_container(
+    options: AudioEncodeOptions,
+    container: VideoContainerFormat,
+) -> Result<(), DomainError> {
+    if !container.supports_audio() && !options.is_empty() {
+        return Err(DomainError::ConflictingAudioEncodeOptions {
+            reason: format!("{container} containers have no audio track"),
+        });
+    }
+    Ok(())
+}
+
 /// Decode backend requested at the CLI/system boundary.
 ///
 /// `Auto` is resolved exactly once in `fastconv-probe` from the probed source
@@ -543,16 +986,52 @@ impl From<VideoDecodeMode> for VideoDecodePaths {
     }
 }
 
-/// Compile-time-legal video encoder choice: a codec/backend pair and its quality.
+/// Explicit rate-control choice for video encoders that support it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum VideoRateControl {
+    Quality(VideoQuality),
+    Bitrate(VideoBitrate),
+}
+
+impl VideoRateControl {
+    pub const DEFAULT: Self = Self::Quality(VideoQuality::DEFAULT);
+
+    #[must_use]
+    pub const fn quality(self) -> Option<VideoQuality> {
+        match self {
+            Self::Quality(quality) => Some(quality),
+            Self::Bitrate(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn bitrate(self) -> Option<VideoBitrate> {
+        match self {
+            Self::Bitrate(bitrate) => Some(bitrate),
+            Self::Quality(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for VideoRateControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Quality(quality) => write!(f, "quality {quality}"),
+            Self::Bitrate(bitrate) => write!(f, "bitrate {bitrate}"),
+        }
+    }
+}
+
+/// Compile-time-legal video encoder choice: a codec/backend pair and its rate control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum VideoEncodeMode {
-    CpuH264 { quality: VideoQuality },
-    CpuAv1 { quality: VideoQuality },
-    CpuVp9 { quality: VideoQuality },
+    CpuH264 { rate_control: VideoRateControl },
+    CpuAv1 { rate_control: VideoRateControl },
+    CpuVp9 { rate_control: VideoRateControl },
     CpuGif { quality: VideoQuality },
     CpuWebp { quality: VideoQuality },
-    NvencH264 { quality: VideoQuality },
-    NvencHevc { quality: VideoQuality },
+    NvencH264 { rate_control: VideoRateControl },
+    NvencHevc { rate_control: VideoRateControl },
 }
 
 impl VideoEncodeMode {
@@ -561,18 +1040,34 @@ impl VideoEncodeMode {
     /// # Errors
     ///
     /// Returns [`DomainError::UnsupportedVideoPipeline`] when the requested codec
-    /// has no encoder on the selected backend.
+    /// has no encoder on the selected backend, or when bitrate targeting is
+    /// requested for GIF/WebP (which have no bitrate-aware encoder).
     pub fn resolve(
         codec: TargetVideoCodec,
-        quality: VideoQuality,
+        rate_control: VideoRateControl,
         backend: HardwareBackend,
     ) -> Result<Self, DomainError> {
+        if matches!(codec, TargetVideoCodec::Gif | TargetVideoCodec::Webp)
+            && matches!(rate_control, VideoRateControl::Bitrate(_))
+        {
+            return Err(DomainError::UnsupportedVideoPipeline {
+                codec: codec.as_video_codec(),
+                backend,
+                reason: format!(
+                    "{codec} animation encoding supports only --quality, not --vbitrate"
+                ),
+            });
+        }
         match (codec, backend) {
-            (TargetVideoCodec::H264, HardwareBackend::Cpu) => Ok(Self::CpuH264 { quality }),
-            (TargetVideoCodec::Av1, HardwareBackend::Cpu) => Ok(Self::CpuAv1 { quality }),
-            (TargetVideoCodec::Vp9, HardwareBackend::Cpu) => Ok(Self::CpuVp9 { quality }),
-            (TargetVideoCodec::Gif, HardwareBackend::Cpu) => Ok(Self::CpuGif { quality }),
-            (TargetVideoCodec::Webp, HardwareBackend::Cpu) => Ok(Self::CpuWebp { quality }),
+            (TargetVideoCodec::H264, HardwareBackend::Cpu) => Ok(Self::CpuH264 { rate_control }),
+            (TargetVideoCodec::Av1, HardwareBackend::Cpu) => Ok(Self::CpuAv1 { rate_control }),
+            (TargetVideoCodec::Vp9, HardwareBackend::Cpu) => Ok(Self::CpuVp9 { rate_control }),
+            (TargetVideoCodec::Gif, HardwareBackend::Cpu) => Ok(Self::CpuGif {
+                quality: rate_control.quality().unwrap_or(VideoQuality::DEFAULT),
+            }),
+            (TargetVideoCodec::Webp, HardwareBackend::Cpu) => Ok(Self::CpuWebp {
+                quality: rate_control.quality().unwrap_or(VideoQuality::DEFAULT),
+            }),
             (TargetVideoCodec::Gif | TargetVideoCodec::Webp, HardwareBackend::Gpu(_)) => {
                 Err(DomainError::UnsupportedVideoPipeline {
                     codec: codec.as_video_codec(),
@@ -592,10 +1087,10 @@ impl VideoEncodeMode {
                 })
             }
             (TargetVideoCodec::H264, HardwareBackend::Gpu(GpuBackend::Nvenc)) => {
-                Ok(Self::NvencH264 { quality })
+                Ok(Self::NvencH264 { rate_control })
             }
             (TargetVideoCodec::Hevc, HardwareBackend::Gpu(GpuBackend::Nvenc)) => {
-                Ok(Self::NvencHevc { quality })
+                Ok(Self::NvencHevc { rate_control })
             }
             (
                 TargetVideoCodec::Av1 | TargetVideoCodec::Vp9,
@@ -628,16 +1123,35 @@ impl VideoEncodeMode {
         }
     }
 
+    /// Rate control of a bitrate-aware encoder. GIF/WebP have no bitrate
+    /// control, so they expose only [`Self::quality`].
+    #[must_use]
+    pub const fn rate_control(self) -> Option<VideoRateControl> {
+        match self {
+            Self::CpuH264 { rate_control }
+            | Self::CpuAv1 { rate_control }
+            | Self::CpuVp9 { rate_control }
+            | Self::NvencH264 { rate_control }
+            | Self::NvencHevc { rate_control } => Some(rate_control),
+            Self::CpuGif { .. } | Self::CpuWebp { .. } => None,
+        }
+    }
+
+    /// Quality of a quality-driven or animation mode. Bitrate-driven modes
+    /// report [`VideoQuality::DEFAULT`] only so animation callers keep a valid
+    /// quality; their encoder must use [`Self::rate_control`] instead.
     #[must_use]
     pub const fn quality(self) -> VideoQuality {
         match self {
-            Self::CpuH264 { quality }
-            | Self::CpuAv1 { quality }
-            | Self::CpuVp9 { quality }
-            | Self::CpuGif { quality }
-            | Self::CpuWebp { quality }
-            | Self::NvencH264 { quality }
-            | Self::NvencHevc { quality } => quality,
+            Self::CpuGif { quality } | Self::CpuWebp { quality } => quality,
+            Self::CpuH264 { rate_control }
+            | Self::CpuAv1 { rate_control }
+            | Self::CpuVp9 { rate_control }
+            | Self::NvencH264 { rate_control }
+            | Self::NvencHevc { rate_control } => match rate_control {
+                VideoRateControl::Quality(quality) => quality,
+                VideoRateControl::Bitrate(_) => VideoQuality::DEFAULT,
+            },
         }
     }
 
@@ -658,13 +1172,18 @@ impl VideoEncodeMode {
 
 impl fmt::Display for VideoEncodeMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} {} (quality {})",
-            self.backend(),
-            self.codec(),
-            self.quality()
-        )
+        match self.rate_control() {
+            Some(rate_control) => {
+                write!(f, "{} {} ({rate_control})", self.backend(), self.codec())
+            }
+            None => write!(
+                f,
+                "{} {} (quality {})",
+                self.backend(),
+                self.codec(),
+                self.quality()
+            ),
+        }
     }
 }
 
@@ -698,15 +1217,34 @@ impl fmt::Display for VideoTrackAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum AudioTrackAction {
     Copy,
-    Encode(TargetAudioCodec),
+    Encode(AudioEncodeConfig),
     Drop,
+}
+
+impl AudioTrackAction {
+    /// Target codec of an encode action; copied/dropped tracks have none.
+    #[must_use]
+    pub const fn codec(self) -> Option<TargetAudioCodec> {
+        match self {
+            Self::Encode(config) => Some(config.codec()),
+            Self::Copy | Self::Drop => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn config(self) -> Option<AudioEncodeConfig> {
+        match self {
+            Self::Encode(config) => Some(config),
+            Self::Copy | Self::Drop => None,
+        }
+    }
 }
 
 impl fmt::Display for AudioTrackAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Copy => f.write_str("copy"),
-            Self::Encode(codec) => write!(f, "encode {codec}"),
+            Self::Encode(config) => write!(f, "encode {}", config.codec()),
             Self::Drop => f.write_str("drop"),
         }
     }
@@ -1218,7 +1756,8 @@ impl VideoTranscodeItem {
                     }
                 }
             }
-            AudioTrackAction::Encode(codec) => {
+            AudioTrackAction::Encode(config) => {
+                let codec = config.codec();
                 if !codec.supported_in(output_format) {
                     return Err(DomainError::UnsupportedVideoCodec {
                         codec: codec.as_video_codec(),
@@ -1545,15 +2084,33 @@ mod tests {
         )
     }
 
+    fn audio_encode(codec: TargetAudioCodec) -> AudioTrackAction {
+        AudioTrackAction::Encode(AudioEncodeConfig::default_for(codec))
+    }
+
+    // Direct construction keeps test fixtures independent of the validation
+    // under test; the child module may access the parent's private fields.
+    fn ab(bps: u32) -> AudioBitrate {
+        AudioBitrate(bps)
+    }
+
+    fn vb(bps: u32) -> VideoBitrate {
+        VideoBitrate(bps)
+    }
+
     fn cpu_encode(codec: TargetVideoCodec) -> VideoTrackAction {
-        let quality = VideoQuality::DEFAULT;
+        let rate_control = VideoRateControl::DEFAULT;
         VideoTrackAction::Encode(match codec {
-            TargetVideoCodec::H264 => VideoEncodeMode::CpuH264 { quality },
-            TargetVideoCodec::Av1 => VideoEncodeMode::CpuAv1 { quality },
-            TargetVideoCodec::Vp9 => VideoEncodeMode::CpuVp9 { quality },
-            TargetVideoCodec::Hevc => VideoEncodeMode::NvencHevc { quality },
-            TargetVideoCodec::Gif => VideoEncodeMode::CpuGif { quality },
-            TargetVideoCodec::Webp => VideoEncodeMode::CpuWebp { quality },
+            TargetVideoCodec::H264 => VideoEncodeMode::CpuH264 { rate_control },
+            TargetVideoCodec::Av1 => VideoEncodeMode::CpuAv1 { rate_control },
+            TargetVideoCodec::Vp9 => VideoEncodeMode::CpuVp9 { rate_control },
+            TargetVideoCodec::Hevc => VideoEncodeMode::NvencHevc { rate_control },
+            TargetVideoCodec::Gif => VideoEncodeMode::CpuGif {
+                quality: VideoQuality::DEFAULT,
+            },
+            TargetVideoCodec::Webp => VideoEncodeMode::CpuWebp {
+                quality: VideoQuality::DEFAULT,
+            },
         })
     }
 
@@ -1875,44 +2432,45 @@ mod tests {
     #[test]
     fn encode_mode_resolve_accepts_supported_pairs() -> Result<(), DomainError> {
         let q = VideoQuality::DEFAULT;
+        let rc = VideoRateControl::Quality(q);
         assert_eq!(
-            VideoEncodeMode::resolve(TargetVideoCodec::H264, q, HardwareBackend::Cpu)?,
-            VideoEncodeMode::CpuH264 { quality: q }
+            VideoEncodeMode::resolve(TargetVideoCodec::H264, rc, HardwareBackend::Cpu)?,
+            VideoEncodeMode::CpuH264 { rate_control: rc }
         );
         assert_eq!(
-            VideoEncodeMode::resolve(TargetVideoCodec::Av1, q, HardwareBackend::Cpu)?,
-            VideoEncodeMode::CpuAv1 { quality: q }
+            VideoEncodeMode::resolve(TargetVideoCodec::Av1, rc, HardwareBackend::Cpu)?,
+            VideoEncodeMode::CpuAv1 { rate_control: rc }
         );
         assert_eq!(
-            VideoEncodeMode::resolve(TargetVideoCodec::Vp9, q, HardwareBackend::Cpu)?,
-            VideoEncodeMode::CpuVp9 { quality: q }
+            VideoEncodeMode::resolve(TargetVideoCodec::Vp9, rc, HardwareBackend::Cpu)?,
+            VideoEncodeMode::CpuVp9 { rate_control: rc }
         );
         assert_eq!(
-            VideoEncodeMode::resolve(TargetVideoCodec::Gif, q, HardwareBackend::Cpu)?,
+            VideoEncodeMode::resolve(TargetVideoCodec::Gif, rc, HardwareBackend::Cpu)?,
             VideoEncodeMode::CpuGif { quality: q }
         );
         assert_eq!(
-            VideoEncodeMode::resolve(TargetVideoCodec::Webp, q, HardwareBackend::Cpu)?,
+            VideoEncodeMode::resolve(TargetVideoCodec::Webp, rc, HardwareBackend::Cpu)?,
             VideoEncodeMode::CpuWebp { quality: q }
         );
         let nvenc = HardwareBackend::Gpu(GpuBackend::Nvenc);
         assert_eq!(
-            VideoEncodeMode::resolve(TargetVideoCodec::H264, q, nvenc)?,
-            VideoEncodeMode::NvencH264 { quality: q }
+            VideoEncodeMode::resolve(TargetVideoCodec::H264, rc, nvenc)?,
+            VideoEncodeMode::NvencH264 { rate_control: rc }
         );
         assert_eq!(
-            VideoEncodeMode::resolve(TargetVideoCodec::Hevc, q, nvenc)?,
-            VideoEncodeMode::NvencHevc { quality: q }
+            VideoEncodeMode::resolve(TargetVideoCodec::Hevc, rc, nvenc)?,
+            VideoEncodeMode::NvencHevc { rate_control: rc }
         );
         assert_eq!(
-            VideoEncodeMode::CpuH264 { quality: q }.codec(),
+            VideoEncodeMode::CpuH264 { rate_control: rc }.codec(),
             TargetVideoCodec::H264
         );
         assert_eq!(
-            VideoEncodeMode::NvencHevc { quality: q }.codec(),
+            VideoEncodeMode::NvencHevc { rate_control: rc }.codec(),
             TargetVideoCodec::Hevc
         );
-        assert_eq!(VideoEncodeMode::CpuAv1 { quality: q }.quality(), q);
+        assert_eq!(VideoEncodeMode::CpuAv1 { rate_control: rc }.quality(), q);
         assert_eq!(
             VideoEncodeMode::CpuGif { quality: q }.codec(),
             TargetVideoCodec::Gif
@@ -1924,14 +2482,17 @@ mod tests {
         assert_eq!(VideoEncodeMode::CpuGif { quality: q }.quality(), q);
         assert_eq!(VideoEncodeMode::CpuWebp { quality: q }.quality(), q);
         assert_eq!(
-            VideoEncodeMode::CpuVp9 { quality: q }.backend(),
+            VideoEncodeMode::CpuVp9 { rate_control: rc }.backend(),
             HardwareBackend::Cpu
         );
         assert_eq!(
             VideoEncodeMode::CpuWebp { quality: q }.backend(),
             HardwareBackend::Cpu
         );
-        assert_eq!(VideoEncodeMode::NvencH264 { quality: q }.backend(), nvenc);
+        assert_eq!(
+            VideoEncodeMode::NvencH264 { rate_control: rc }.backend(),
+            nvenc
+        );
         assert_eq!(VideoTrackAction::Copy.backend(), HardwareBackend::Cpu);
         Ok(())
     }
@@ -1939,8 +2500,9 @@ mod tests {
     #[test]
     fn encode_mode_resolve_rejects_unsupported_pairs_without_fallback() {
         let q = VideoQuality::DEFAULT;
+        let rc = VideoRateControl::Quality(q);
         assert_eq!(
-            VideoEncodeMode::resolve(TargetVideoCodec::Hevc, q, HardwareBackend::Cpu),
+            VideoEncodeMode::resolve(TargetVideoCodec::Hevc, rc, HardwareBackend::Cpu),
             Err(DomainError::UnsupportedVideoPipeline {
                 codec: VideoCodec::Hevc,
                 backend: HardwareBackend::Cpu,
@@ -1950,7 +2512,7 @@ mod tests {
         );
         for codec in [TargetVideoCodec::Av1, TargetVideoCodec::Vp9] {
             assert_eq!(
-                VideoEncodeMode::resolve(codec, q, HardwareBackend::Gpu(GpuBackend::Nvenc)),
+                VideoEncodeMode::resolve(codec, rc, HardwareBackend::Gpu(GpuBackend::Nvenc)),
                 Err(DomainError::UnsupportedVideoPipeline {
                     codec: codec.as_video_codec(),
                     backend: HardwareBackend::Gpu(GpuBackend::Nvenc),
@@ -1965,7 +2527,7 @@ mod tests {
                 HardwareBackend::Gpu(GpuBackend::Vaapi),
             ] {
                 assert_eq!(
-                    VideoEncodeMode::resolve(codec, q, backend),
+                    VideoEncodeMode::resolve(codec, rc, backend),
                     Err(DomainError::UnsupportedVideoPipeline {
                         codec: codec.as_video_codec(),
                         backend,
@@ -1985,7 +2547,7 @@ mod tests {
         ] {
             let backend = HardwareBackend::Gpu(gpu);
             assert_eq!(
-                VideoEncodeMode::resolve(TargetVideoCodec::H264, q, backend),
+                VideoEncodeMode::resolve(TargetVideoCodec::H264, rc, backend),
                 Err(DomainError::UnsupportedVideoPipeline {
                     codec: VideoCodec::H264,
                     backend,
@@ -2023,7 +2585,7 @@ mod tests {
                 webm,
                 Vec::new(),
                 cpu_encode(TargetVideoCodec::H264),
-                AudioTrackAction::Encode(TargetAudioCodec::Opus)
+                audio_encode(TargetAudioCodec::Opus)
             ),
             Err(DomainError::UnsupportedVideoCodec {
                 codec: VideoCodec::H264,
@@ -2053,7 +2615,7 @@ mod tests {
                 webm,
                 Vec::new(),
                 cpu_encode(TargetVideoCodec::Vp9),
-                AudioTrackAction::Encode(TargetAudioCodec::Aac)
+                audio_encode(TargetAudioCodec::Aac)
             ),
             Err(DomainError::UnsupportedVideoCodec {
                 codec: VideoCodec::Aac,
@@ -2083,7 +2645,7 @@ mod tests {
             webm,
             Vec::new(),
             cpu_encode(TargetVideoCodec::Vp9),
-            AudioTrackAction::Encode(TargetAudioCodec::Opus),
+            audio_encode(TargetAudioCodec::Opus),
         )?;
         assert_eq!(valid.output_format(), webm);
         let copied = item(
@@ -2113,7 +2675,7 @@ mod tests {
                 ts,
                 Vec::new(),
                 cpu_encode(TargetVideoCodec::Vp9),
-                AudioTrackAction::Encode(TargetAudioCodec::Opus)
+                audio_encode(TargetAudioCodec::Opus)
             ),
             Err(DomainError::UnsupportedVideoCodec {
                 codec: VideoCodec::Vp9,
@@ -2142,7 +2704,7 @@ mod tests {
             ts,
             Vec::new(),
             cpu_encode(TargetVideoCodec::H264),
-            AudioTrackAction::Encode(TargetAudioCodec::Mp3),
+            audio_encode(TargetAudioCodec::Mp3),
         )?;
         assert_eq!(valid.output_format(), ts);
         Ok(())
@@ -2210,7 +2772,7 @@ mod tests {
                 VideoContainerFormat::Webm,
                 Vec::new(),
                 cpu_encode(TargetVideoCodec::Vp9),
-                AudioTrackAction::Encode(TargetAudioCodec::Opus),
+                audio_encode(TargetAudioCodec::Opus),
             )
         };
         assert!(matches!(
@@ -2453,7 +3015,9 @@ mod tests {
         let quality = VideoQuality::DEFAULT;
         let h264 = stream(VideoCodec::H264, VideoStreamKind::Video);
         let av1 = stream(VideoCodec::Av1, VideoStreamKind::Video);
-        let nvenc_action = VideoTrackAction::Encode(VideoEncodeMode::NvencH264 { quality });
+        let nvenc_action = VideoTrackAction::Encode(VideoEncodeMode::NvencH264 {
+            rate_control: VideoRateControl::Quality(quality),
+        });
         assert!(
             item(
                 "in.mp4",
@@ -2608,7 +3172,9 @@ mod tests {
             VideoContainerFormat::Mp4,
             VideoContainerFormat::Mp4,
             stream.clone(),
-            VideoTrackAction::Encode(VideoEncodeMode::CpuH264 { quality }),
+            VideoTrackAction::Encode(VideoEncodeMode::CpuH264 {
+                rate_control: VideoRateControl::Quality(quality),
+            }),
             AudioTrackAction::Drop,
             VideoDecodeMode::Cpu,
         )?;
@@ -2618,7 +3184,9 @@ mod tests {
             VideoContainerFormat::Mp4,
             VideoContainerFormat::Mp4,
             stream,
-            VideoTrackAction::Encode(VideoEncodeMode::NvencH264 { quality }),
+            VideoTrackAction::Encode(VideoEncodeMode::NvencH264 {
+                rate_control: VideoRateControl::Quality(quality),
+            }),
             AudioTrackAction::Drop,
             VideoDecodeMode::Cpu,
         )?;
@@ -2640,7 +3208,9 @@ mod tests {
             VideoContainerFormat::Mp4,
             VideoContainerFormat::Mp4,
             stream.clone(),
-            VideoTrackAction::Encode(VideoEncodeMode::NvencH264 { quality }),
+            VideoTrackAction::Encode(VideoEncodeMode::NvencH264 {
+                rate_control: VideoRateControl::Quality(quality),
+            }),
             AudioTrackAction::Drop,
             VideoDecodeMode::Nvdec,
         )?;
@@ -2650,7 +3220,9 @@ mod tests {
             VideoContainerFormat::Mp4,
             VideoContainerFormat::Mp4,
             stream,
-            VideoTrackAction::Encode(VideoEncodeMode::NvencH264 { quality }),
+            VideoTrackAction::Encode(VideoEncodeMode::NvencH264 {
+                rate_control: VideoRateControl::Quality(quality),
+            }),
             AudioTrackAction::Drop,
             VideoDecodeMode::Cpu,
         )?;
@@ -2659,5 +3231,254 @@ mod tests {
         assert_eq!(plan.items()[0].decode_mode(), VideoDecodeMode::Nvdec);
         assert_eq!(plan.items()[1].decode_mode(), VideoDecodeMode::Cpu);
         Ok(())
+    }
+
+    #[test]
+    fn video_bitrate_parses_all_forms() -> Result<(), DomainError> {
+        for (raw, bps) in [
+            ("500k", 500_000),
+            ("2000K", 2_000_000),
+            ("5M", 5_000_000),
+            ("2.5m", 2_500_000),
+            ("0.5M", 500_000),
+            ("5000000", 5_000_000),
+            ("  1.25M  ", 1_250_000),
+        ] {
+            assert_eq!(VideoBitrate::parse(raw)?.bps(), bps, "parse {raw}");
+        }
+        assert_eq!(VideoBitrate::new(50_000)?.bps(), 50_000);
+        assert_eq!(VideoBitrate::new(500_000_000)?.bps(), 500_000_000);
+        assert_eq!(VideoBitrate::new(2_000_000)?.to_string(), "2000k");
+        assert_eq!(
+            VideoRateControl::Bitrate(VideoBitrate::new(2_000_000)?).to_string(),
+            "bitrate 2000k"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bitrate_parsing_rejects_illegal_input() {
+        for raw in [
+            "",
+            "   ",
+            "k",
+            "0",
+            "-1k",
+            "1.2.3M",
+            "2.M",
+            "1000.5",
+            "1.0005k",
+            "1.0000001M",
+            "8M8",
+            "999999999999M",
+            "abc",
+        ] {
+            assert!(
+                matches!(
+                    VideoBitrate::parse(raw),
+                    Err(DomainError::InvalidBitrateSyntax { .. }
+                        | DomainError::InvalidVideoBitrate { .. })
+                ),
+                "must reject {raw:?}"
+            );
+        }
+        assert_eq!(
+            VideoBitrate::new(49_999),
+            Err(DomainError::InvalidVideoBitrate {
+                value: 49_999,
+                min: 50_000,
+                max: 500_000_000,
+            })
+        );
+        assert_eq!(
+            VideoBitrate::new(500_000_001),
+            Err(DomainError::InvalidVideoBitrate {
+                value: 500_000_001,
+                min: 50_000,
+                max: 500_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn audio_bitrate_parses_and_enforces_codec_limits() -> Result<(), DomainError> {
+        assert_eq!(AudioBitrate::parse("128k")?.bps(), 128_000);
+        assert_eq!(AudioBitrate::parse("1.5M")?.bps(), 1_500_000);
+        assert_eq!(AudioBitrate::parse("96000")?.bps(), 96_000);
+        assert_eq!(AudioBitrate::new(1_000)?, AudioBitrate::parse("1k")?);
+        assert!(AudioBitrate::new(999).is_err());
+        for (codec, bps, accepted) in [
+            (TargetAudioCodec::Aac, 16_000, true),
+            (TargetAudioCodec::Aac, 15_999, false),
+            (TargetAudioCodec::Aac, 512_000, true),
+            (TargetAudioCodec::Aac, 512_001, false),
+            (TargetAudioCodec::Opus, 6_000, true),
+            (TargetAudioCodec::Opus, 5_999, false),
+            (TargetAudioCodec::Opus, 510_000, true),
+            (TargetAudioCodec::Opus, 510_001, false),
+            (TargetAudioCodec::Mp3, 8_000, true),
+            (TargetAudioCodec::Mp3, 7_999, false),
+            (TargetAudioCodec::Mp3, 320_000, true),
+            (TargetAudioCodec::Mp3, 320_001, false),
+        ] {
+            let options = AudioEncodeOptions::new(Some(AudioBitrate::new(bps)?), None, None);
+            assert_eq!(
+                AudioEncodeConfig::new(codec, options).is_ok(),
+                accepted,
+                "{codec} at {bps} bps"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mp3_bitrate_follows_sample_rate_band() -> Result<(), DomainError> {
+        let low = AudioSampleRate::new(22_050)?;
+        let high = AudioSampleRate::new(48_000)?;
+        // 200 kbps exceeds the low-rate band's 160 kbps ceiling but fits the
+        // high-rate band; 16 kbps is the mirror image.
+        let bps = AudioBitrate::new(200_000)?;
+        let low_options = AudioEncodeOptions::new(Some(bps), Some(low), None);
+        let high_options = AudioEncodeOptions::new(Some(bps), Some(high), None);
+        assert!(AudioEncodeConfig::new(TargetAudioCodec::Mp3, low_options).is_err());
+        assert!(AudioEncodeConfig::new(TargetAudioCodec::Mp3, high_options).is_ok());
+        let bps = AudioBitrate::new(16_000)?;
+        let low_options = AudioEncodeOptions::new(Some(bps), Some(low), None);
+        let high_options = AudioEncodeOptions::new(Some(bps), Some(high), None);
+        assert!(AudioEncodeConfig::new(TargetAudioCodec::Mp3, low_options).is_ok());
+        assert!(AudioEncodeConfig::new(TargetAudioCodec::Mp3, high_options).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn audio_sample_rates_and_channels_follow_codec_limits() -> Result<(), DomainError> {
+        assert_eq!(
+            AudioSampleRate::new(0),
+            Err(DomainError::InvalidAudioSampleRate { value: 0 })
+        );
+        assert_eq!(
+            AudioChannels::new(0),
+            Err(DomainError::InvalidAudioChannels { value: 0 })
+        );
+        assert_eq!(AudioSampleRate::new(48_000)?.hz(), 48_000);
+        assert_eq!(AudioChannels::new(6)?.count(), 6);
+        assert_eq!(AudioSampleRate::new(48_000)?.to_string(), "48000 Hz");
+        assert_eq!(AudioChannels::new(2)?.to_string(), "2ch");
+
+        for (codec, rate, accepted) in [
+            (TargetAudioCodec::Aac, 7_350, true),
+            (TargetAudioCodec::Aac, 96_000, true),
+            (TargetAudioCodec::Aac, 44_100, true),
+            (TargetAudioCodec::Aac, 44_200, false),
+            (TargetAudioCodec::Opus, 48_000, true),
+            (TargetAudioCodec::Opus, 44_100, false),
+            (TargetAudioCodec::Mp3, 8_000, true),
+            (TargetAudioCodec::Mp3, 48_000, true),
+            (TargetAudioCodec::Mp3, 96_000, false),
+        ] {
+            let options = AudioEncodeOptions::new(None, Some(AudioSampleRate::new(rate)?), None);
+            assert_eq!(
+                AudioEncodeConfig::new(codec, options).is_ok(),
+                accepted,
+                "{codec} at {rate} Hz"
+            );
+        }
+        for (codec, channels, accepted) in [
+            (TargetAudioCodec::Aac, 1, true),
+            (TargetAudioCodec::Aac, 2, true),
+            (TargetAudioCodec::Aac, 3, true),
+            (TargetAudioCodec::Aac, 4, false),
+            (TargetAudioCodec::Aac, 5, true),
+            (TargetAudioCodec::Aac, 6, true),
+            (TargetAudioCodec::Aac, 7, false),
+            (TargetAudioCodec::Opus, 2, true),
+            (TargetAudioCodec::Opus, 3, false),
+            (TargetAudioCodec::Mp3, 1, true),
+            (TargetAudioCodec::Mp3, 2, true),
+            (TargetAudioCodec::Mp3, 3, false),
+        ] {
+            let options = AudioEncodeOptions::new(None, None, Some(AudioChannels::new(channels)?));
+            assert_eq!(
+                AudioEncodeConfig::new(codec, options).is_ok(),
+                accepted,
+                "{codec} with {channels} channels"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn audio_encode_config_defaults_and_options() {
+        let options = AudioEncodeOptions::new(None, None, None);
+        assert!(options.is_empty());
+        let config = AudioEncodeConfig::default_for(TargetAudioCodec::Aac);
+        assert_eq!(config.codec(), TargetAudioCodec::Aac);
+        assert!(config.bitrate().is_none());
+        assert!(config.sample_rate().is_none());
+        assert!(config.channels().is_none());
+        let rate = ab(192_000);
+        let options = AudioEncodeOptions::new(Some(rate), None, None);
+        assert!(!options.is_empty());
+        assert_eq!(options.bitrate(), Some(rate));
+        let config = AudioEncodeConfig::new(TargetAudioCodec::Mp3, options);
+        assert!(config.is_ok());
+        assert_eq!(config.map_or(None, AudioEncodeConfig::bitrate), Some(rate));
+    }
+
+    #[test]
+    fn domain_resolution_rejects_conflicting_options_without_fallback() {
+        assert_eq!(
+            resolve_video_rate_control(true, Some(VideoRateControl::DEFAULT)),
+            Err(DomainError::ConflictingVideoRateControl {
+                reason: "video stream copy cannot re-encode; omit --quality and --vbitrate"
+                    .to_owned()
+            })
+        );
+        assert_eq!(
+            resolve_video_rate_control(true, None).map(|value| value.to_string()),
+            Ok("quality 80".to_owned())
+        );
+        let bitrate = vb(2_000_000);
+        assert_eq!(
+            resolve_video_rate_control(false, Some(VideoRateControl::Bitrate(bitrate)))
+                .map(|value| value.to_string()),
+            Ok("bitrate 2000k".to_owned())
+        );
+
+        let options = AudioEncodeOptions::new(Some(ab(128_000)), None, None);
+        assert!(resolve_audio_encode_options(true, options).is_err());
+        assert_eq!(resolve_audio_encode_options(false, options), Ok(options));
+        assert!(validate_audio_options_for_container(options, VideoContainerFormat::Gif).is_err());
+        assert!(validate_audio_options_for_container(options, VideoContainerFormat::Mp4).is_ok());
+    }
+
+    #[test]
+    fn animation_modes_cannot_hold_bitrate_and_display_is_stable() {
+        let bitrate = vb(2_000_000);
+        let rate_control = VideoRateControl::Bitrate(bitrate);
+        for codec in [TargetVideoCodec::Gif, TargetVideoCodec::Webp] {
+            assert_eq!(
+                VideoEncodeMode::resolve(codec, rate_control, HardwareBackend::Cpu)
+                    .err()
+                    .map(|err| matches!(err, DomainError::UnsupportedVideoPipeline { .. })),
+                Some(true)
+            );
+        }
+        let rc = VideoRateControl::Quality(VideoQuality::DEFAULT);
+        assert_eq!(
+            VideoEncodeMode::CpuH264 { rate_control: rc }.to_string(),
+            "cpu H.264 (quality 80)"
+        );
+        assert_eq!(
+            VideoEncodeMode::NvencHevc { rate_control: rc }.to_string(),
+            "gpu:nvenc HEVC (quality 80)"
+        );
+        assert_eq!(
+            VideoEncodeMode::CpuH264 {
+                rate_control: VideoRateControl::Bitrate(bitrate)
+            }
+            .to_string(),
+            "cpu H.264 (bitrate 2000k)"
+        );
     }
 }

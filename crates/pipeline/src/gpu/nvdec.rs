@@ -956,7 +956,7 @@ mod tests {
     use std::path::Path;
 
     use cudarc::driver::CudaContext;
-    use fastconv_domain::{VideoCodec, VideoEncodeMode, VideoQuality};
+    use fastconv_domain::{VideoCodec, VideoEncodeMode, VideoRateControl};
 
     use super::enabled::{annex_b_access_units, au_timing};
     use super::{decode_packets_to_gpu, validate_decode_caps};
@@ -1060,7 +1060,7 @@ mod tests {
             path,
             &frames,
             VideoEncodeMode::CpuH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
         )?;
@@ -1106,7 +1106,7 @@ mod tests {
             path,
             &frames,
             VideoEncodeMode::CpuVp9 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
         )?;
@@ -1115,7 +1115,7 @@ mod tests {
             &source.packets,
             VideoCodec::Vp9,
             VideoEncodeMode::NvencH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
             || Ok(()),
@@ -1137,7 +1137,7 @@ mod tests {
             path,
             &frames,
             VideoEncodeMode::CpuH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
         )?;
@@ -1146,7 +1146,7 @@ mod tests {
             &h264.track,
             &h264.packets,
             VideoEncodeMode::NvencHevc {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
             || Ok(()),
@@ -1156,7 +1156,7 @@ mod tests {
             &hevc.packets,
             VideoCodec::Hevc,
             VideoEncodeMode::NvencH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
             || Ok(()),
@@ -1183,7 +1183,7 @@ mod tests {
             &[],
             VideoCodec::Av1,
             VideoEncodeMode::NvencH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
             || Ok(()),
@@ -1205,7 +1205,7 @@ mod tests {
             path,
             &frames,
             VideoEncodeMode::CpuH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
         )?;
@@ -1215,7 +1215,7 @@ mod tests {
             &source.packets,
             VideoCodec::H264,
             VideoEncodeMode::NvencH264 {
-                quality: VideoQuality::DEFAULT,
+                rate_control: VideoRateControl::DEFAULT,
             },
             0,
             || {

@@ -7,8 +7,10 @@ pub use audio::{ProbedAudio, prepare_audio_batch, probe_audio};
 pub use hardware::detect_host_hardware;
 pub use image::{ProbedImage, prepare_image_batch, prepare_image_batch_with_options, probe_image};
 pub use video::{
-    ProbedVideo, RequestedAudioCodec, RequestedVideoCodec, detect_video_magic, prepare_video_batch,
-    prepare_video_transcode_batch, prepare_video_transcode_batch_with_decode, probe_video,
+    ProbedVideo, RequestedAudioCodec, RequestedVideoCodec, VideoTranscodeOptions,
+    detect_video_magic, prepare_video_batch, prepare_video_transcode_batch,
+    prepare_video_transcode_batch_with_decode, prepare_video_transcode_batch_with_options,
+    probe_video,
 };
 
 use std::error::Error;

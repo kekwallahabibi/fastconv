@@ -2,10 +2,14 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use fastconv_domain::{
-    HardwareBackend, HardwareDecodeBackend, TargetAudioCodec, TargetVideoCodec,
-    VideoContainerFormat, VideoQuality,
+    AudioBitrate, AudioChannels, AudioEncodeOptions, AudioSampleRate, HardwareBackend,
+    HardwareDecodeBackend, TargetAudioCodec, TargetVideoCodec, VideoBitrate, VideoContainerFormat,
+    VideoQuality, VideoRateControl,
 };
-use fastconv_probe::{RequestedAudioCodec, RequestedVideoCodec};
+use fastconv_probe::{
+    RequestedAudioCodec, RequestedVideoCodec, VideoTranscodeOptions,
+    prepare_video_transcode_batch_with_options,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemuxArgs {
@@ -156,6 +160,10 @@ pub(crate) struct VideoArgs {
     video_codec: Option<RequestedVideoCodec>,
     audio_codec: Option<RequestedAudioCodec>,
     quality: Option<VideoQuality>,
+    vbitrate: Option<VideoBitrate>,
+    abitrate: Option<AudioBitrate>,
+    asample_rate: Option<AudioSampleRate>,
+    achannels: Option<AudioChannels>,
     threads: Option<NonZeroUsize>,
     backend: HardwareBackend,
     decode_backend: HardwareDecodeBackend,
@@ -171,8 +179,9 @@ pub(crate) const VIDEO_HELP: &str = r"fastconv video - transcode audio/video tra
 
 Usage:
   fastconv video <source> <target> [--to <format>] [--vcodec <codec>]
-                 [--acodec <codec>] [--quality <0..=100>] [--threads <N>]
-                 [--backend <name>] [--hwdecode <auto|cpu|nvdec>]
+                 [--acodec <codec>] [--quality <0..=100> | --vbitrate <rate>]
+                 [--abitrate <rate>] [--asample-rate <Hz>] [--achannels <N>]
+                 [--threads <N>] [--backend <name>] [--hwdecode <auto|cpu|nvdec>]
 
 Transcode audio/video tracks while converting between MP4/MOV, MKV, WebM, AVI,
 TS, GIF, and WebP containers.
@@ -186,8 +195,17 @@ Options:
                         mkv, webm, mov, avi, ts, gif, webp
   --vcodec <codec>      Video codec: h264, hevc (h265), av1, vp9, gif, webp, copy
   --acodec <codec>      Audio codec: aac, opus, mp3, none (drop), copy
-  --quality <0..=100>   Encoding quality (default 80; cannot be combined with
-                        --vcodec copy)
+  --quality <0..=100>   Encoding quality (default 80; mutually exclusive with
+                        --vbitrate and --vcodec copy)
+  --vbitrate <rate>     Target video bitrate, e.g. 500k, 2M, 2.5M or 2000000
+                        (mutually exclusive with --quality and --vcodec copy;
+                        rejected for GIF/WebP)
+  --abitrate <rate>     Audio bitrate, e.g. 128k or 192000 (requires audio
+                        re-encoding: rejected with --acodec copy/none)
+  --asample-rate <Hz>   Audio sample rate (requires audio re-encoding; codec-
+                        specific limits apply)
+  --achannels <N>       Audio channel count (requires audio re-encoding;
+                        codec-specific limits apply)
   --threads <N>         Number of parallel workers
   --backend <name>      cpu (default: H.264/AV1/VP9/GIF/WebP and copy) or nvenc
                         (H.264/HEVC only; HEVC has no CPU encoder)
@@ -239,6 +257,16 @@ fn parse_audio_codec(raw: &str) -> Result<RequestedAudioCodec, String> {
     }
 }
 
+fn reject_audio_overrides(audio_codec: Option<RequestedAudioCodec>) -> Result<(), String> {
+    if matches!(
+        audio_codec,
+        Some(RequestedAudioCodec::Copy | RequestedAudioCodec::Drop)
+    ) {
+        return Err("audio bitrate, sample rate and channels require audio re-encoding".to_owned());
+    }
+    Ok(())
+}
+
 /// Parses `fastconv video` arguments without touching the file system.
 ///
 /// # Errors
@@ -254,6 +282,10 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
     let mut video_codec = None;
     let mut audio_codec = None;
     let mut quality = None;
+    let mut vbitrate = None;
+    let mut abitrate = None;
+    let mut asample_rate = None;
+    let mut achannels = None;
     let mut threads = None;
     let mut backend = None;
     let mut decode_backend = None;
@@ -274,8 +306,10 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
                     return Err("duplicate flag '--vcodec'".to_owned());
                 }
                 let raw = flag_value(args, index, "--vcodec")?;
-                if raw == "copy" && quality.is_some() {
-                    return Err("cannot combine --quality with --vcodec copy".to_owned());
+                if raw == "copy" && (quality.is_some() || vbitrate.is_some()) {
+                    return Err(
+                        "cannot combine --quality or --vbitrate with --vcodec copy".to_owned()
+                    );
                 }
                 video_codec = Some(parse_video_codec(raw)?);
                 index += 2;
@@ -284,12 +318,25 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
                 if audio_codec.is_some() {
                     return Err("duplicate flag '--acodec'".to_owned());
                 }
-                audio_codec = Some(parse_audio_codec(flag_value(args, index, "--acodec")?)?);
+                let raw = flag_value(args, index, "--acodec")?;
+                let codec = parse_audio_codec(raw)?;
+                if matches!(codec, RequestedAudioCodec::Copy | RequestedAudioCodec::Drop)
+                    && (abitrate.is_some() || asample_rate.is_some() || achannels.is_some())
+                {
+                    return Err(
+                        "audio bitrate, sample rate and channels require audio re-encoding"
+                            .to_owned(),
+                    );
+                }
+                audio_codec = Some(codec);
                 index += 2;
             }
             "--quality" => {
                 if quality.is_some() {
                     return Err("duplicate flag '--quality'".to_owned());
+                }
+                if vbitrate.is_some() {
+                    return Err("cannot combine --quality with --vbitrate".to_owned());
                 }
                 if video_codec == Some(RequestedVideoCodec::Copy) {
                     return Err("cannot combine --quality with --vcodec copy".to_owned());
@@ -299,6 +346,53 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
                     .parse::<u8>()
                     .map_err(|err| format!("invalid --quality '{raw}': {err}"))?;
                 quality = Some(VideoQuality::new(parsed).map_err(|err| err.to_string())?);
+                index += 2;
+            }
+            "--vbitrate" => {
+                if vbitrate.is_some() {
+                    return Err("duplicate flag '--vbitrate'".to_owned());
+                }
+                if quality.is_some() {
+                    return Err("cannot combine --quality with --vbitrate".to_owned());
+                }
+                if video_codec == Some(RequestedVideoCodec::Copy) {
+                    return Err("cannot combine --vbitrate with --vcodec copy".to_owned());
+                }
+                let raw = flag_value(args, index, "--vbitrate")?;
+                vbitrate = Some(VideoBitrate::parse(raw).map_err(|err| err.to_string())?);
+                index += 2;
+            }
+            "--abitrate" => {
+                if abitrate.is_some() {
+                    return Err("duplicate flag '--abitrate'".to_owned());
+                }
+                reject_audio_overrides(audio_codec)?;
+                let raw = flag_value(args, index, "--abitrate")?;
+                abitrate = Some(AudioBitrate::parse(raw).map_err(|err| err.to_string())?);
+                index += 2;
+            }
+            "--asample-rate" => {
+                if asample_rate.is_some() {
+                    return Err("duplicate flag '--asample-rate'".to_owned());
+                }
+                reject_audio_overrides(audio_codec)?;
+                let raw = flag_value(args, index, "--asample-rate")?;
+                let hz = raw
+                    .parse::<u32>()
+                    .map_err(|err| format!("invalid --asample-rate '{raw}': {err}"))?;
+                asample_rate = Some(AudioSampleRate::new(hz).map_err(|err| err.to_string())?);
+                index += 2;
+            }
+            "--achannels" => {
+                if achannels.is_some() {
+                    return Err("duplicate flag '--achannels'".to_owned());
+                }
+                reject_audio_overrides(audio_codec)?;
+                let raw = flag_value(args, index, "--achannels")?;
+                let count = raw
+                    .parse::<u16>()
+                    .map_err(|err| format!("invalid --achannels '{raw}': {err}"))?;
+                achannels = Some(AudioChannels::new(count).map_err(|err| err.to_string())?);
                 index += 2;
             }
             "--threads" => {
@@ -351,6 +445,10 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
         video_codec,
         audio_codec,
         quality,
+        vbitrate,
+        abitrate,
+        asample_rate,
+        achannels,
         threads,
         backend: backend.unwrap_or(HardwareBackend::Cpu),
         decode_backend: decode_backend.unwrap_or(HardwareDecodeBackend::Auto),
@@ -364,13 +462,19 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
 /// Returns a diagnostic if probing, planning, decoding, encoding, or muxing fails. Unsupported
 /// codec/container pairs and backend combinations are rejected before any file is written.
 pub(crate) fn run_video(args: &VideoArgs) -> Result<(), String> {
-    let plan = fastconv_probe::prepare_video_transcode_batch_with_decode(
+    let rate_control = match (args.quality, args.vbitrate) {
+        (Some(quality), _) => Some(VideoRateControl::Quality(quality)),
+        (None, Some(bitrate)) => Some(VideoRateControl::Bitrate(bitrate)),
+        (None, None) => None,
+    };
+    let audio_options = AudioEncodeOptions::new(args.abitrate, args.asample_rate, args.achannels);
+    let plan = prepare_video_transcode_batch_with_options(
         &args.source,
         &args.target,
         args.to,
         args.video_codec,
         args.audio_codec,
-        args.quality.unwrap_or(VideoQuality::DEFAULT),
+        VideoTranscodeOptions::new(rate_control, audio_options),
         args.backend,
         args.decode_backend,
         args.threads,
@@ -439,6 +543,10 @@ mod tests {
                     "--vcodec",
                     "--acodec",
                     "--quality",
+                    "--vbitrate",
+                    "--abitrate",
+                    "--asample-rate",
+                    "--achannels",
                     "--threads",
                     "--backend",
                     "--hwdecode",
@@ -549,6 +657,10 @@ mod tests {
                 video_codec: None,
                 audio_codec: None,
                 quality: None,
+                vbitrate: None,
+                abitrate: None,
+                asample_rate: None,
+                achannels: None,
                 threads: None,
                 backend: HardwareBackend::Cpu,
                 decode_backend: HardwareDecodeBackend::Auto,
@@ -832,5 +944,83 @@ mod tests {
         assert_eq!(parsed.audio_codec, Some(RequestedAudioCodec::Copy));
         assert_eq!(parsed.quality, None);
         Ok(())
+    }
+
+    #[test]
+    fn parses_rate_control_and_audio_encoding_flags() -> Result<(), String> {
+        let VideoCommand::Run(flagged) = parse_video_args(&[
+            "in.mp4",
+            "out.mp4",
+            "--vbitrate",
+            "2M",
+            "--abitrate",
+            "192k",
+            "--asample-rate",
+            "48000",
+            "--achannels",
+            "1",
+        ])?
+        else {
+            return Err("expected video run args".to_owned());
+        };
+        assert_eq!(flagged.vbitrate.map(VideoBitrate::bps), Some(2_000_000));
+        assert_eq!(flagged.abitrate.map(AudioBitrate::bps), Some(192_000));
+        assert_eq!(flagged.asample_rate.map(AudioSampleRate::hz), Some(48_000));
+        assert_eq!(flagged.achannels.map(AudioChannels::count), Some(1));
+        assert_eq!(flagged.quality, None);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_conflicting_rate_control_and_audio_flags() {
+        assert!(parse_video_args(&["a", "b", "--quality", "70", "--vbitrate", "1M"]).is_err());
+        assert!(parse_video_args(&["a", "b", "--vbitrate", "1M", "--quality", "70"]).is_err());
+        assert!(parse_video_args(&["a", "b", "--vcodec", "copy", "--vbitrate", "1M"]).is_err());
+        assert!(parse_video_args(&["a", "b", "--vbitrate", "1M", "--vcodec", "copy"]).is_err());
+
+        for flag in ["--abitrate", "--asample-rate", "--achannels"] {
+            let value = match flag {
+                "--abitrate" => "128k",
+                "--asample-rate" => "48000",
+                _ => "2",
+            };
+            for codec in ["copy", "none"] {
+                assert!(
+                    parse_video_args(&["a", "b", "--acodec", codec, flag, value]).is_err(),
+                    "{flag} with --acodec {codec}"
+                );
+                assert!(
+                    parse_video_args(&["a", "b", flag, value, "--acodec", codec]).is_err(),
+                    "{flag} before --acodec {codec}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_rate_control_and_audio_values() {
+        for args in [
+            vec!["a", "b", "--vbitrate", "0"],
+            vec!["a", "b", "--vbitrate", "abc"],
+            vec!["a", "b", "--vbitrate", "1G"],
+            vec!["a", "b", "--abitrate", "0"],
+            vec!["a", "b", "--asample-rate", "0"],
+            vec!["a", "b", "--asample-rate", "abc"],
+            vec!["a", "b", "--achannels", "0"],
+            vec!["a", "b", "--achannels", "abc"],
+            vec!["a", "b", "--vbitrate", "1M", "--vbitrate", "2M"],
+            vec!["a", "b", "--abitrate", "128k", "--abitrate", "192k"],
+            vec![
+                "a",
+                "b",
+                "--asample-rate",
+                "48000",
+                "--asample-rate",
+                "44100",
+            ],
+            vec!["a", "b", "--achannels", "1", "--achannels", "2"],
+        ] {
+            assert!(parse_video_args(&args).is_err(), "{args:?}");
+        }
     }
 }
