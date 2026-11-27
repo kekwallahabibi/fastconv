@@ -10,12 +10,14 @@
 
 #[allow(unsafe_code)]
 mod enabled {
-    use std::collections::HashMap;
+    use std::cell::{Cell, RefCell};
+    use std::collections::{HashMap, VecDeque};
     use std::ffi::{c_int, c_uint, c_ulonglong, c_void};
     use std::ptr;
+    use std::sync::Arc;
     use std::sync::OnceLock;
 
-    use cudarc::driver::{CudaContext, CudaStream, sys};
+    use cudarc::driver::{CudaContext, CudaEvent, CudaStream, sys};
     use fastconv_domain::VideoCodec;
     use libloading::Library;
     use nvidia_video_codec_sdk::sys::{cuviddec, nvcuvid};
@@ -234,20 +236,136 @@ mod enabled {
         Ok(u32::from(caps.nNumNVDECs.max(1)))
     }
 
+    /// Bounds the number of NVDEC surfaces whose device-to-device copy is still
+    /// queued on the CUDA stream. A CUDA event is recorded immediately after
+    /// each copy; the oldest surface is unmapped once the ring fills and every
+    /// remaining surface is unmapped on `Drop`, which runs before the decoder
+    /// is destroyed by the enclosing `CallbackState`.
+    ///
+    /// Events are recycled so the steady state performs no per-frame CUDA
+    /// object allocation. This replaces a blocking `cuStreamSynchronize` on
+    /// every frame while keeping unmaps race-free.
+    struct UnmapTracker {
+        api: &'static CuvidApi,
+        cuda_ctx: Arc<CudaContext>,
+        decoder: Cell<cuviddec::CUvideodecoder>,
+        pending: VecDeque<(sys::CUdeviceptr, CudaEvent)>,
+        free_events: Vec<CudaEvent>,
+        max_in_flight: usize,
+    }
+
+    impl UnmapTracker {
+        fn new(api: &'static CuvidApi, cuda_ctx: &Arc<CudaContext>) -> Self {
+            Self {
+                api,
+                cuda_ctx: Arc::clone(cuda_ctx),
+                decoder: Cell::new(ptr::null_mut()),
+                pending: VecDeque::new(),
+                free_events: Vec::new(),
+                // Well below `ulNumOutputSurfaces` (8), so NVCUVID always has
+                // an unmapped output surface available for the next frame.
+                max_in_flight: 4,
+            }
+        }
+
+        fn set_decoder(&self, decoder: cuviddec::CUvideodecoder) {
+            self.decoder.set(decoder);
+        }
+
+        /// Records `stream` into an event and queues `ptr` for deferred unmap.
+        /// The ring is drained *before* taking ownership of `ptr`, so a failure
+        /// never leaves the caller's surface in two places at once.
+        #[allow(unsafe_code)]
+        fn defer(
+            &mut self,
+            ptr: sys::CUdeviceptr,
+            stream: &CudaStream,
+        ) -> Result<(), PipelineError> {
+            while self.pending.len() >= self.max_in_flight {
+                self.release_oldest()?;
+            }
+            let event = match self.free_events.pop() {
+                Some(event) => event,
+                None => self
+                    .cuda_ctx
+                    .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))
+                    .map_err(|err| nvdec_error(format!("cuEventCreate failed: {err}")))?,
+            };
+            if let Err(err) = event.record(stream) {
+                // Return the event to the pool before propagating so teardown
+                // does not leak a CUDA event on this hard error path.
+                self.free_events.push(event);
+                return Err(nvdec_error(format!("cuEventRecord failed: {err}")));
+            }
+            self.pending.push_back((ptr, event));
+            Ok(())
+        }
+
+        /// Synchronises the oldest copy, releases its NVDEC surface and recycles
+        /// the event. Both failures are returned after all cleanup is done.
+        #[allow(unsafe_code)]
+        fn release_oldest(&mut self) -> Result<(), PipelineError> {
+            let Some((ptr, event)) = self.pending.pop_front() else {
+                return Ok(());
+            };
+            let sync = event
+                .synchronize()
+                .map_err(|err| nvdec_error(format!("cuEventSynchronize failed: {err}")));
+            // SAFETY: the decoder outlives this tracker, and `ptr` came from
+            // `cuvidMapVideoFrame64`. The event above proves the copy finished.
+            let unmap = cu_result(
+                unsafe { (self.api.unmap_frame)(self.decoder.get(), ptr) },
+                "cuvidUnmapVideoFrame64 failed",
+            );
+            self.free_events.push(event);
+            sync?;
+            unmap
+        }
+    }
+
+    impl Drop for UnmapTracker {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            let decoder = self.decoder.get();
+            if decoder.is_null() {
+                return;
+            }
+            // Every remaining surface must be released before the decoder is
+            // destroyed (field order in `CallbackState` guarantees this).
+            // Errors cannot be propagated from `Drop`; never panic here.
+            while let Some((ptr, event)) = self.pending.pop_front() {
+                let _sync = event.synchronize();
+                // SAFETY: see `release_oldest`; teardown has no error channel.
+                unsafe { (self.api.unmap_frame)(decoder, ptr) };
+            }
+        }
+    }
+
     /// One decode surface mapped for the duration of this guard. `Drop` always
-    /// calls `cuvidUnmapVideoFrame64`, even when the consumer returns an error.
+    /// releases it, either immediately (before a copy could be queued) or via
+    /// the [`UnmapTracker`] once the queued device-to-device copy has completed.
     pub(crate) struct MappedCuvidFrame<'a> {
         decoder: &'a CuvidDecoder,
+        tracker: &'a RefCell<UnmapTracker>,
         ptr: sys::CUdeviceptr,
         pitch: u32,
         geometry: Geometry,
+        deferred: Cell<bool>,
     }
 
     impl MappedCuvidFrame<'_> {
-        /// Device-to-device copy of the cropped NV12 surfaces into a registered
-        /// NVENC slot. Luma and chroma are copied separately so odd display
-        /// widths/heights, crop offsets and differing pitches are handled
-        /// without touching rows outside the destination allocation.
+        /// Device-to-device copy of the NV12 surface into a registered NVENC
+        /// slot. When the row pitch and geometry match and the width is even,
+        /// luma and chroma are contiguous with identical strides in both
+        /// allocations, so one `cuMemcpy2DAsync_v2` replaces two submissions.
+        /// Otherwise the planes are copied separately so crop offsets, odd
+        /// dimensions and differing pitches never touch rows outside the
+        /// destination allocation.
+        ///
+        /// The copy is asynchronous: a CUDA event is recorded after it and the
+        /// source surface is handed to the tracker. NVENC reads the destination
+        /// on the same stream (bound via `NvEncSetIOCudaStreams`), so no
+        /// per-frame host synchronize is required.
         #[allow(unsafe_code)]
         pub(crate) fn copy_to_nvenc_slot(
             &self,
@@ -269,32 +387,37 @@ mod enabled {
             }
             let src_pitch = usize::try_from(self.pitch).unwrap_or(usize::MAX);
             let chroma_bytes = usize::try_from(g.display_width.div_ceil(2) * 2).unwrap_or(0);
+            let luma_bytes = usize::try_from(g.display_width).unwrap_or(0);
+            let luma_height = usize::try_from(g.display_height).unwrap_or(0);
+            let chroma_height = usize::try_from(g.display_height.div_ceil(2)).unwrap_or(0);
             let src_chroma = self.ptr.saturating_add(
-                u64::try_from(
-                    src_pitch.saturating_mul(usize::try_from(g.display_height).unwrap_or(0)),
-                )
-                .unwrap_or(u64::MAX),
+                u64::try_from(src_pitch.saturating_mul(luma_height)).unwrap_or(u64::MAX),
             );
             let dst_chroma = dst.saturating_add(
-                u64::try_from(dst_pitch.saturating_mul(usize::try_from(dst_height).unwrap_or(0)))
-                    .unwrap_or(u64::MAX),
+                u64::try_from(dst_pitch.saturating_mul(luma_height)).unwrap_or(u64::MAX),
             );
+            // An even width makes `chroma_bytes == luma_bytes`; with equal
+            // pitches the chroma plane starts exactly after `luma_height`
+            // rows, so a single rectangle reproduces both separate copies.
+            let coalesce = src_pitch == dst_pitch
+                && luma_height == usize::try_from(dst_height).unwrap_or(0)
+                && luma_bytes == chroma_bytes
+                && luma_bytes != 0
+                && chroma_height != 0;
+            let rects: [(sys::CUdeviceptr, sys::CUdeviceptr, usize, usize); 2] = if coalesce {
+                [
+                    (self.ptr, dst, luma_bytes, luma_height + chroma_height),
+                    (0, 0, 0, 0),
+                ]
+            } else {
+                [
+                    (self.ptr, dst, luma_bytes, luma_height),
+                    (src_chroma, dst_chroma, chroma_bytes, chroma_height),
+                ]
+            };
             let api = self.decoder.api;
             let mut copy_accepted = false;
-            for (src, dst_ptr, width_bytes, height) in [
-                (
-                    self.ptr,
-                    dst,
-                    usize::try_from(g.display_width).unwrap_or(0),
-                    usize::try_from(g.display_height).unwrap_or(0),
-                ),
-                (
-                    src_chroma,
-                    dst_chroma,
-                    chroma_bytes,
-                    usize::try_from(g.display_height.div_ceil(2)).unwrap_or(0),
-                ),
-            ] {
+            for (src, dst_ptr, width_bytes, height) in rects {
                 if width_bytes == 0 || height == 0 {
                     continue;
                 }
@@ -337,14 +460,31 @@ mod enabled {
                 }
                 copy_accepted = true;
             }
-            // NVENC runs on a separate hardware engine that does not order
-            // against CUDA streams; synchronize before mapping/encoding the
-            // slot or unmapping the NVDEC surface.
-            stream.synchronize().map_err(|err| {
-                nvdec_error(format!(
-                    "CUDA stream synchronize after NVDEC -> NVENC copy failed: {err}"
-                ))
-            })?;
+            if !copy_accepted {
+                return Err(nvdec_error("NVDEC produced an empty copy rectangle"));
+            }
+            // Record after every queued copy and defer the surface release;
+            // the tracker synchronises the event before unmapping.
+            {
+                let mut tracker = self.tracker.try_borrow_mut().map_err(|_| {
+                    nvdec_error("NVDEC unmap tracker was already borrowed during frame handoff")
+                })?;
+                if let Err(err) = tracker.defer(self.ptr, stream) {
+                    drop(tracker);
+                    // The copy is still queued on this stream; drain it so the
+                    // guard's immediate unmap cannot race with the device read.
+                    let drained = stream.synchronize().map_err(|sync| {
+                        nvdec_error(format!(
+                            "CUDA stream synchronize after failed NVDEC surface handoff: {sync}"
+                        ))
+                    });
+                    return Err(match drained {
+                        Err(sync_err) => nvdec_error(format!("{err}; {sync_err}")),
+                        Ok(()) => err,
+                    });
+                }
+            }
+            self.deferred.set(true);
             Ok(())
         }
     }
@@ -352,6 +492,9 @@ mod enabled {
     impl Drop for MappedCuvidFrame<'_> {
         #[allow(unsafe_code)]
         fn drop(&mut self) {
+            if self.deferred.get() {
+                return;
+            }
             // SAFETY: the decoder outlives this guard by construction and the
             // mapped pointer came from `cuvidMapVideoFrame64`. Never panic here.
             let _status = unsafe { (self.decoder.api.unmap_frame)(self.decoder.handle, self.ptr) };
@@ -410,6 +553,9 @@ mod enabled {
 
     struct CallbackState<'a> {
         api: &'static CuvidApi,
+        // Declared before `decoder` so its `Drop` releases every deferred
+        // surface while the decoder is still alive.
+        unmap_tracker: RefCell<UnmapTracker>,
         codec: cuviddec::cudaVideoCodec,
         source: VideoCodec,
         ctx_lock: cuviddec::CUvideoctxlock,
@@ -503,7 +649,9 @@ mod enabled {
                             cuviddec::cudaVideoDeinterlaceMode::cudaVideoDeinterlaceMode_Weave,
                         ulTargetWidth: u64::from(display_width),
                         ulTargetHeight: u64::from(display_height),
-                        ulNumOutputSurfaces: 4,
+                        // Eight mapped-output slots leave headroom for the
+                        // four-in-flight deferred-unmap ring.
+                        ulNumOutputSurfaces: 8,
                         vidLock: state.ctx_lock,
                         ..Default::default()
                     };
@@ -528,6 +676,7 @@ mod enabled {
                         api: state.api,
                         handle: decoder,
                     });
+                    state.unmap_tracker.borrow().set_decoder(decoder);
                     state.geometry = Some(Geometry {
                         coded_width: width,
                         coded_height: height,
@@ -619,9 +768,11 @@ mod enabled {
                 }
                 let frame = MappedCuvidFrame {
                     decoder,
+                    tracker: &state.unmap_tracker,
                     ptr,
                     pitch,
                     geometry,
+                    deferred: Cell::new(false),
                 };
                 let pts = display.timestamp;
                 let duration = state.durations.get(&pts).copied().unwrap_or(1).max(1);
@@ -665,6 +816,11 @@ mod enabled {
         while idx.saturating_add(2) < data.len() {
             if data[idx] == 0 && data[idx + 1] == 0 && data[idx + 2] == 1 {
                 starts.push((idx, idx + 3));
+                idx = idx.saturating_add(3);
+            } else if data[idx + 2] > 1 {
+                // A start code needs `00 00 01` at some offset j. When
+                // `data[idx + 2] > 1`, no start code can begin at idx, idx+1
+                // or idx+2; skip all three without changing the matches.
                 idx = idx.saturating_add(3);
             } else {
                 idx = idx.saturating_add(1);
@@ -762,6 +918,39 @@ mod enabled {
         units
     }
 
+    /// Same access-unit grouping as [`annex_b_access_units`] but driven by the
+    /// NALU ranges produced while emitting a length-prefixed sample, so the
+    /// Annex-B buffer is never rescanned for start codes.
+    fn access_units_from_ranges<'a>(
+        data: &'a [u8],
+        ranges: &[(usize, usize)],
+        codec: VideoCodec,
+    ) -> Vec<(&'a [u8], bool, bool)> {
+        let mut units = Vec::new();
+        let mut au_start = 0_usize;
+        let mut au_end = 0_usize;
+        let mut has_picture_start = false;
+        let mut has_vcl = false;
+        for &(payload_start, end) in ranges {
+            // Every emitted NALU is preceded by a four-byte start code.
+            let start = payload_start.saturating_sub(4);
+            let (is_vcl, starts_au, starts_picture) = nal_role(&data[payload_start..end], codec);
+            if starts_au && has_vcl {
+                units.push((&data[au_start..au_end], has_picture_start, has_vcl));
+                au_start = start;
+                has_picture_start = false;
+                has_vcl = false;
+            }
+            au_end = end;
+            has_picture_start |= starts_picture;
+            has_vcl |= is_vcl;
+        }
+        if au_end > au_start {
+            units.push((&data[au_start..au_end], has_picture_start, has_vcl));
+        }
+        units
+    }
+
     /// Splits one PES presentation interval evenly across its access units.
     ///
     /// MPEG-TS reassembles a PES carrying several pictures into one packet with
@@ -776,6 +965,14 @@ mod enabled {
         (pts.saturating_add(offset), per_au)
     }
 
+    /// How packet payloads reach NVCUVID: raw Annex-B (MPEG-TS) or one of the
+    /// length-prefixed MP4/MKV formats.
+    enum PacketFormat {
+        AnnexB,
+        Avcc,
+        Hvcc,
+    }
+
     /// Decodes `packets` with NVDEC and invokes `on_frame` once per displayed
     /// frame while its GPU surface is still mapped. Copying into NVENC here
     /// keeps the frame resident in VRAM: no CUDA host staging and no CPU decode.
@@ -783,7 +980,7 @@ mod enabled {
     // no RAII guard can be dropped out of order.
     #[allow(clippy::too_many_lines)]
     pub(crate) fn decode_packets_to_gpu<F>(
-        cuda_ctx: &CudaContext,
+        cuda_ctx: &Arc<CudaContext>,
         stream: &CudaStream,
         codec: VideoCodec,
         config: &[u8],
@@ -812,6 +1009,7 @@ mod enabled {
 
         let mut state = CallbackState {
             api,
+            unmap_tracker: RefCell::new(UnmapTracker::new(api, cuda_ctx)),
             codec: kind,
             source: codec,
             ctx_lock: ctx_lock.handle,
@@ -847,40 +1045,69 @@ mod enabled {
             handle: parser,
         };
 
+        // avcC/hvcC parameter sets never change within a track. Parse them once
+        // and reuse both the Annex-B scratch buffer and the NALU range list
+        // across packets instead of reparsing and reallocating per frame.
+        let format = match state.source {
+            VideoCodec::H264 if !config.is_empty() => PacketFormat::Avcc,
+            VideoCodec::Hevc if !config.is_empty() => PacketFormat::Hvcc,
+            VideoCodec::H264 | VideoCodec::Hevc | VideoCodec::Vp9 => PacketFormat::AnnexB,
+            other => return Err(nvdec_error(format!("NVDEC cannot decode {other}"))),
+        };
+        let prepared = match format {
+            PacketFormat::Avcc => Some(
+                crate::video_bitstream::LengthPrefixedConfig::avcc(config)
+                    .map_err(|err| nvdec_error(format!("invalid avcC config: {err}")))?,
+            ),
+            PacketFormat::Hvcc => Some(
+                crate::video_bitstream::LengthPrefixedConfig::hvcc(config)
+                    .map_err(|err| nvdec_error(format!("invalid hvcC config: {err}")))?,
+            ),
+            PacketFormat::AnnexB => None,
+        };
+        let mut annex_b_scratch = Vec::with_capacity(64 * 1024);
+        let mut nalu_ranges: Vec<(usize, usize)> = Vec::with_capacity(64);
+
         for packet in packets {
-            // NVDEC consumes Annex-B H.264/HEVC; the demuxer stores AVCC/HVCC
-            // configuration. Convert each access unit before submitting it.
-            let payload = match state.source {
-                // MP4/MKV store length-prefixed AVCC/HVCC samples; MPEG-TS
-                // already carries Annex-B. An absent config means the latter.
-                VideoCodec::H264 if !config.is_empty() => {
-                    crate::video_bitstream::avcc_to_annex_b(config, &packet.data, packet.keyframe)
-                        .map_err(|err| nvdec_error(format!("AVCC to Annex-B failed: {err}")))?
-                }
-                VideoCodec::Hevc if !config.is_empty() => {
-                    crate::video_bitstream::hvcc_to_annex_b(config, &packet.data, packet.keyframe)
-                        .map_err(|err| nvdec_error(format!("HVCC to Annex-B failed: {err}")))?
-                }
-                VideoCodec::H264 | VideoCodec::Hevc | VideoCodec::Vp9 => packet.data.clone(),
-                other => return Err(nvdec_error(format!("NVDEC cannot decode {other}"))),
-            };
             // MPEG-TS reassembles a whole PES into one ContainerPacket, which
             // may hold several access units. Submit each one separately so
             // ENDOFPICTURE only marks a packet with exactly one complete
-            // frame/field, as NVCUVID requires.
-            let units: Vec<(&[u8], bool, bool)> = match state.source {
-                VideoCodec::H264 | VideoCodec::Hevc => {
-                    let split = annex_b_access_units(&payload, state.source);
-                    if split.is_empty() && !payload.is_empty() {
-                        // Unparsable Annex-B cannot be proven complete; never
-                        // claim an end-of-picture boundary for it.
-                        vec![(payload.as_slice(), false, false)]
-                    } else {
-                        split
+            // frame/field, as NVCUVID requires. Length-prefixed samples emit
+            // their NALU ranges as they are written, so no start-code rescan
+            // is necessary for MP4/MKV inputs.
+            let units: Vec<(&[u8], bool, bool)> = if let Some(config) = prepared.as_ref() {
+                annex_b_scratch.clear();
+                nalu_ranges.clear();
+                crate::video_bitstream::length_prefixed_to_annex_b_into(
+                    config,
+                    &packet.data,
+                    packet.keyframe,
+                    &mut annex_b_scratch,
+                    &mut nalu_ranges,
+                )
+                .map_err(|err| nvdec_error(format!("length-prefixed sample conversion: {err}")))?;
+                match state.source {
+                    VideoCodec::H264 | VideoCodec::Hevc => {
+                        access_units_from_ranges(&annex_b_scratch, &nalu_ranges, state.source)
                     }
+                    VideoCodec::Vp9 => vec![(annex_b_scratch.as_slice(), true, true)],
+                    other => return Err(nvdec_error(format!("NVDEC cannot decode {other}"))),
                 }
-                VideoCodec::Vp9 => vec![(payload.as_slice(), true, true)],
-                other => return Err(nvdec_error(format!("NVDEC cannot decode {other}"))),
+            } else {
+                match state.source {
+                    VideoCodec::H264 | VideoCodec::Hevc => {
+                        let split = annex_b_access_units(&packet.data, state.source);
+                        if split.is_empty() && !packet.data.is_empty() {
+                            // Unparsable Annex-B cannot be proven complete;
+                            // never claim an end-of-picture boundary for it.
+                            vec![(packet.data.as_slice(), false, false)]
+                        } else {
+                            split
+                        }
+                    }
+                    VideoCodec::Vp9 => vec![(packet.data.as_slice(), true, true)],
+                    other => return Err(nvdec_error(format!("NVDEC cannot decode {other}"))),
+                }
             };
             // Only units carrying a VCL NAL produce a picture; a trailing AUD,
             // SPS or PPS is still submitted but must not inflate the divisor.

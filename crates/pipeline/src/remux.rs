@@ -3,7 +3,6 @@
 //! Uses `containr` as a pure-Rust container library. No codec is decoded or
 //! re-encoded. No `ffmpeg`/`ffprobe` subprocess is involved.
 
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -42,6 +41,11 @@ const WINDOW_BYTES: usize = 1024 * 1024;
 /// Above this source size, MP4 faststart is left on the target file instead of
 /// being staged in RAM.
 const IN_MEMORY_MP4_FASTSTART_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// Up to this source size, MKV-to-MP4 remux reads the MKV source once into
+/// memory so `containr::mkv::Demuxer::open` (cluster scan) and packet reading
+/// do not scan the file through the kernel twice.
+const IN_MEMORY_MKV_READ_LIMIT: u64 = 32 * 1024 * 1024;
 
 /// Upper bound on the source size of an MJPEG remux that must take the
 /// canonical `demux_video` -> `mux_video` route.
@@ -533,7 +537,7 @@ fn mp4_to_mkv(
         ..containr::mkv::MkvOptions::default()
     };
 
-    let mut writer = BufWriter::with_capacity(512 * 1024, target);
+    let mut writer = BufWriter::with_capacity(1024 * 1024, target);
     let mut output = containr::mkv::Muxer::new(&mut writer, options)
         .map_err(|err| container_err(target_path, &err))?;
 
@@ -553,7 +557,7 @@ fn mp4_to_mkv(
         .set_chapters(input.chapters().to_vec())
         .map_err(|err| container_err(target_path, &err))?;
 
-    let mut packet_buf: Vec<u8> = Vec::new();
+    let mut packet_buf: Vec<u8> = Vec::with_capacity(256 * 1024);
     for packet in input.packets() {
         let packet = packet.map_err(|err| container_err(source, &err))?;
         let Some(slot) = ids.iter().position(|(id, _)| *id == packet.track_id) else {
@@ -581,16 +585,13 @@ fn mp4_to_mkv(
     Ok(())
 }
 
-fn mux_mkv_to_mp4<W: io::Read + io::Write + io::Seek>(
+fn mux_mkv_to_mp4<R: io::Read + io::Seek, W: io::Read + io::Write + io::Seek>(
     source: &Path,
+    reader: R,
     target: W,
     target_path: &Path,
     brand: Brand,
 ) -> Result<(), PipelineError> {
-    let reader = WindowedFileReader::open(source).map_err(|source_err| PipelineError::Io {
-        path: source.to_path_buf(),
-        source: source_err,
-    })?;
     let mut input =
         containr::mkv::Demuxer::open(reader).map_err(|err| container_err(source, &err))?;
     if input.truncated() {
@@ -613,8 +614,9 @@ fn mux_mkv_to_mp4<W: io::Read + io::Write + io::Seek>(
     let mut output = containr::mp4::Muxer::new(target, options)
         .map_err(|err| container_err(target_path, &err))?;
 
-    let mut plans: HashMap<u32, (containr::mp4::StreamCopy, containr::mp4::TrackId)> =
-        HashMap::new();
+    // Tracks are few; a linear Vec beats a hashed lookup per packet.
+    let mut plans: Vec<(u32, containr::mp4::StreamCopy, containr::mp4::TrackId)> =
+        Vec::with_capacity(input.tracks().len());
     for track in input.tracks() {
         let mut packets = read_packets(
             input
@@ -652,7 +654,7 @@ fn mux_mkv_to_mp4<W: io::Read + io::Write + io::Seek>(
         let id = output
             .add_track(plan.spec.clone())
             .map_err(|err| container_err(target_path, &err))?;
-        plans.insert(track.id, (plan, id));
+        plans.push((track.id, plan, id));
     }
     if plans.is_empty() {
         return Err(remux_failed(source, "no remuxable tracks in MKV source"));
@@ -664,20 +666,21 @@ fn mux_mkv_to_mp4<W: io::Read + io::Write + io::Seek>(
         .set_chapters(containr::mp4::StreamCopy::chapters(input.chapters()))
         .map_err(|err| container_err(target_path, &err))?;
 
-    let mut packet_buf: Vec<u8> = Vec::new();
+    let mut packet_buf: Vec<u8> = Vec::with_capacity(256 * 1024);
     for packet in input.packets() {
         let packet = packet.map_err(|err| container_err(source, &err))?;
-        let Some((plan, id)) = plans.get(&packet.track_id) else {
+        let Some(entry) = plans.iter().find(|(id, _, _)| *id == packet.track_id) else {
             continue;
         };
         input
             .read_packet_into(&packet, &mut packet_buf)
             .map_err(|err| container_err(source, &err))?;
-        let block = plan
+        let block = entry
+            .1
             .packet(&packet, &packet_buf)
             .map_err(|err| container_err(source, &err))?;
         output
-            .write_packet(*id, &block)
+            .write_packet(entry.2, &block)
             .map_err(|err| container_err(target_path, &err))?;
     }
     output
@@ -699,7 +702,20 @@ fn mkv_to_mp4(
                 .unwrap_or(0)
                 .saturating_add(256 * 1024),
         ));
-        mux_mkv_to_mp4(source, &mut mem, target_path, brand)?;
+        if source_len <= IN_MEMORY_MKV_READ_LIMIT {
+            let bytes = std::fs::read(source).map_err(|source_err| PipelineError::Io {
+                path: source.to_path_buf(),
+                source: source_err,
+            })?;
+            mux_mkv_to_mp4(source, io::Cursor::new(bytes), &mut mem, target_path, brand)?;
+        } else {
+            let reader =
+                WindowedFileReader::open(source).map_err(|source_err| PipelineError::Io {
+                    path: source.to_path_buf(),
+                    source: source_err,
+                })?;
+            mux_mkv_to_mp4(source, reader, &mut mem, target_path, brand)?;
+        }
         let mut writer: &File = target;
         writer
             .write_all(mem.get_ref())
@@ -713,7 +729,11 @@ fn mkv_to_mp4(
         })?;
         Ok(())
     } else {
-        mux_mkv_to_mp4(source, target, target_path, brand)
+        let reader = WindowedFileReader::open(source).map_err(|source_err| PipelineError::Io {
+            path: source.to_path_buf(),
+            source: source_err,
+        })?;
+        mux_mkv_to_mp4(source, reader, target, target_path, brand)
     }
 }
 
@@ -739,8 +759,9 @@ fn mux_mp4_to_mp4<W: io::Read + io::Write + io::Seek>(
     let mut output = containr::mp4::Muxer::new(target, options)
         .map_err(|err| container_err(target_path, &err))?;
 
-    let mut plans: HashMap<u32, (containr::mp4::StreamCopy, containr::mp4::TrackId)> =
-        HashMap::new();
+    // Tracks are few; a linear Vec beats a hashed lookup per packet.
+    let mut plans: Vec<(u32, containr::mp4::StreamCopy, containr::mp4::TrackId)> =
+        Vec::with_capacity(input.tracks().len());
     for track in input.tracks().iter().filter(|t| !t.chapter_track) {
         let packets = read_packets(
             input
@@ -753,7 +774,7 @@ fn mux_mp4_to_mp4<W: io::Read + io::Write + io::Seek>(
         let id = output
             .add_track(plan.spec.clone())
             .map_err(|err| container_err(target_path, &err))?;
-        plans.insert(track.id, (plan, id));
+        plans.push((track.id, plan, id));
     }
     output
         .set_metadata(input.metadata().to_vec())
@@ -761,20 +782,21 @@ fn mux_mp4_to_mp4<W: io::Read + io::Write + io::Seek>(
     output
         .set_chapters(containr::mp4::StreamCopy::chapters(input.chapters()))
         .map_err(|err| container_err(target_path, &err))?;
-    let mut packet_buf: Vec<u8> = Vec::new();
+    let mut packet_buf: Vec<u8> = Vec::with_capacity(256 * 1024);
     for packet in input.packets() {
         let packet = packet.map_err(|err| container_err(source, &err))?;
-        let Some((plan, id)) = plans.get(&packet.track_id) else {
+        let Some(entry) = plans.iter().find(|(id, _, _)| *id == packet.track_id) else {
             continue;
         };
         input
             .read_packet_into(&packet, &mut packet_buf)
             .map_err(|err| container_err(source, &err))?;
-        let block = plan
+        let block = entry
+            .1
             .packet(&packet, &packet_buf)
             .map_err(|err| container_err(source, &err))?;
         output
-            .write_packet(*id, &block)
+            .write_packet(entry.2, &block)
             .map_err(|err| container_err(target_path, &err))?;
     }
     output
@@ -849,7 +871,7 @@ fn mkv_to_mkv(
         ..containr::mkv::MkvOptions::default()
     };
 
-    let mut writer = BufWriter::with_capacity(512 * 1024, target);
+    let mut writer = BufWriter::with_capacity(1024 * 1024, target);
     let mut output = containr::mkv::Muxer::new(&mut writer, options)
         .map_err(|err| container_err(target_path, &err))?;
     let mut ids: Vec<(u32, containr::mkv::TrackId)> = Vec::with_capacity(plans.len());
@@ -886,7 +908,7 @@ fn mkv_to_mkv(
             .map_err(|err| container_err(target_path, &err))?;
     }
 
-    let mut packet_buf: Vec<u8> = Vec::new();
+    let mut packet_buf: Vec<u8> = Vec::with_capacity(256 * 1024);
     for packet in input.packets() {
         let packet = packet.map_err(|err| container_err(source, &err))?;
         let Some(slot) = ids.iter().position(|(id, _)| *id == packet.track_id) else {

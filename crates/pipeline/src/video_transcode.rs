@@ -3468,6 +3468,9 @@ fn transcode_file(
         .iter()
         .map(|packets| packets.iter().map(|packet| packet.pts).min().unwrap_or(0))
         .collect::<Vec<_>>();
+    // Copied tracks emit one packet per source packet; reserve that many slots
+    // so common copy-only transcodes never grow the output vector mid-loop.
+    let source_packet_count = per_track.iter().map(Vec::len).sum();
 
     // Fail before any worker starts if a target codec cannot be carried.
     for track in &media.tracks {
@@ -3493,7 +3496,7 @@ fn transcode_file(
     // Pre-sized slots preserve source track order even when the two encoder
     // workers finish in a different order.
     let mut tracks: Vec<Option<ContainerTrack>> = vec![None; media.tracks.len()];
-    let mut packets = Vec::new();
+    let mut packets = Vec::with_capacity(source_packet_count);
     let mut audio_jobs = Vec::new();
     let mut video_jobs = Vec::new();
 

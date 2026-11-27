@@ -15,7 +15,7 @@ use std::thread;
 
 use fastconv_domain::{AnimationLoop, VideoContainerFormat, VideoQuality};
 use yuv::{
-    BufferStoreMut, YuvBiPlanarImageMut, YuvConversionMode, YuvPlanarImageMut,
+    BufferStoreMut, YuvBiPlanarImage, YuvBiPlanarImageMut, YuvConversionMode, YuvPlanarImageMut,
     YuvRange as SimdYuvRange, YuvStandardMatrix,
 };
 
@@ -480,28 +480,27 @@ fn write_pixels_nv12(
     }
 }
 
-/// 8.8 fixed-point YUV→RGB coefficients: `(y_gain, y_offset, r_v, g_u, g_v, b_u)`.
-/// Limited range expands luma by 255/219 and chroma by 255/224; full range
-/// uses the raw matrix coefficients. BT.601 is only the explicit default for
-/// sources that signal no matrix.
-fn inverse_coeffs(color: YuvColor) -> Result<(i32, i32, i32, i32, i32, i32), PipelineError> {
-    let path = Path::new("animation-nv12-to-rgb8");
-    let limited = color.range == YuvRange::Limited;
-    let coeffs = match (color.matrix, limited) {
-        (YuvMatrix::Bt709, true) => (298, 16, 459, -55, -137, 541),
-        (YuvMatrix::Bt709, false) => (256, 0, 403, -48, -120, 475),
-        (YuvMatrix::Bt2020, true) => (298, 16, 430, -48, -166, 548),
-        (YuvMatrix::Bt2020, false) => (256, 0, 377, -42, -146, 482),
-        (YuvMatrix::Bt601, true) => (298, 16, 409, -100, -208, 516),
-        (YuvMatrix::Bt601, false) => (256, 0, 359, -88, -183, 454),
-        (YuvMatrix::Unsupported(code), _) => {
+/// Maps the signalled source colour description onto the SIMD converter.
+/// Unsupported matrices stay a hard error at the RGB boundary: they are legal
+/// on video-to-video paths that never invert the matrix, but cannot be
+/// converted to RGB without guessing coefficients.
+fn simd_color(color: YuvColor) -> Result<(SimdYuvRange, YuvStandardMatrix), PipelineError> {
+    let range = match color.range {
+        YuvRange::Limited => SimdYuvRange::Limited,
+        YuvRange::Full => SimdYuvRange::Full,
+    };
+    let matrix = match color.matrix {
+        YuvMatrix::Bt601 => YuvStandardMatrix::Bt601,
+        YuvMatrix::Bt709 => YuvStandardMatrix::Bt709,
+        YuvMatrix::Bt2020 => YuvStandardMatrix::Bt2020,
+        YuvMatrix::Unsupported(code) => {
             return Err(decode_error(
-                path,
+                Path::new("animation-nv12-to-rgb8"),
                 format!("YUV→RGB conversion for matrix coefficient {code} is not supported"),
             ));
         }
     };
-    Ok(coeffs)
+    Ok((range, matrix))
 }
 
 /// Inverse conversion of pitched NV12 into packed RGB8 using the source's
@@ -540,20 +539,21 @@ pub(crate) fn nv12_to_rgb8(
             format!("NV12 buffer is {} bytes, needs {needed}", nv12.len()),
         ));
     }
-    let (y_gain, y_offset, r_v, g_u, g_v, b_u) = inverse_coeffs(color)?;
+    let (range, matrix) = simd_color(color)?;
+    let stride = u32::try_from(pitch).map_err(|_| decode_error(path, "NV12 pitch exceeds u32"))?;
+    let rgb_stride = u32::try_from(frame_w.saturating_mul(3))
+        .map_err(|_| decode_error(path, "RGB row stride exceeds u32"))?;
+    let image = YuvBiPlanarImage {
+        y_plane: &nv12[..uv_base],
+        y_stride: stride,
+        uv_plane: &nv12[uv_base..],
+        uv_stride: stride,
+        width,
+        height,
+    };
     let mut rgb = vec![0_u8; byte_len(width, height, 3)?];
-    for row_y in 0..frame_h {
-        let chroma_y = row_y / 2;
-        for sample_x in 0..frame_w {
-            let luma_delta = y_gain * (i32::from(nv12[row_y * pitch + sample_x]) - y_offset);
-            let u_delta = i32::from(nv12[uv_base + chroma_y * pitch + (sample_x & !1)]) - 128;
-            let v_delta = i32::from(nv12[uv_base + chroma_y * pitch + (sample_x & !1) + 1]) - 128;
-            let idx = (row_y * frame_w + sample_x) * 3;
-            rgb[idx] = clamp_u8((luma_delta + r_v * v_delta + 128) >> 8);
-            rgb[idx + 1] = clamp_u8((luma_delta + g_u * u_delta + g_v * v_delta + 128) >> 8);
-            rgb[idx + 2] = clamp_u8((luma_delta + b_u * u_delta + 128) >> 8);
-        }
-    }
+    yuv::yuv_nv12_to_rgb(&image, &mut rgb, rgb_stride, range, matrix, SIMD_MODE)
+        .map_err(|err| decode_error(path, format!("SIMD NV12 → RGB conversion failed: {err}")))?;
     Ok(rgb)
 }
 
