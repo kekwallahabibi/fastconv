@@ -2,7 +2,8 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use fastconv_domain::{
-    AudioChannels, AudioOutputFormat, AudioRateControl, AudioSampleRate, HardwareBackend,
+    AudioOptionChannels, AudioOptionSampleRate, AudioOutputFormat, AudioRateControl,
+    HardwareBackend,
 };
 
 pub(crate) const AUDIO_HELP: &str = r"fastconv audio - convert audio files
@@ -54,8 +55,8 @@ pub(crate) struct AudioArgs {
     target: PathBuf,
     to: Option<AudioOutputFormat>,
     rate_control: AudioRateControl,
-    sample_rate: Option<AudioSampleRate>,
-    channels: Option<AudioChannels>,
+    sample_rate: Option<AudioOptionSampleRate>,
+    channels: Option<AudioOptionChannels>,
     threads: Option<NonZeroUsize>,
     backend: HardwareBackend,
 }
@@ -249,7 +250,7 @@ pub(crate) fn run_audio(args: &AudioArgs) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastconv_domain::{AudioBitrate, AudioQuality, GpuBackend};
+    use fastconv_domain::{AudioOptionBitrate, AudioQuality, GpuBackend};
 
     #[test]
     fn help_documents_only_implemented_flags() {
@@ -322,15 +323,17 @@ mod tests {
         assert_eq!(flagged.to, Some(AudioOutputFormat::Opus));
         assert_eq!(
             flagged.rate_control,
-            AudioRateControl::Bitrate(AudioBitrate::new(192_000).map_err(|err| err.to_string())?)
+            AudioRateControl::Bitrate(
+                AudioOptionBitrate::new(192_000).map_err(|err| err.to_string())?
+            )
         );
         assert_eq!(
             flagged.sample_rate,
-            Some(AudioSampleRate::new(48_000).map_err(|err| err.to_string())?)
+            Some(AudioOptionSampleRate::new(48_000).map_err(|err| err.to_string())?)
         );
         assert_eq!(
             flagged.channels,
-            Some(AudioChannels::new(2).map_err(|err| err.to_string())?)
+            Some(AudioOptionChannels::new(2).map_err(|err| err.to_string())?)
         );
         assert_eq!(flagged.threads, NonZeroUsize::new(4));
         assert_eq!(flagged.backend, HardwareBackend::Gpu(GpuBackend::Nvenc));
@@ -376,7 +379,9 @@ mod tests {
             };
             assert_eq!(
                 parsed.rate_control,
-                AudioRateControl::Bitrate(AudioBitrate::new(bps).map_err(|err| err.to_string())?),
+                AudioRateControl::Bitrate(
+                    AudioOptionBitrate::new(bps).map_err(|err| err.to_string())?
+                ),
                 "--bitrate {raw}"
             );
         }

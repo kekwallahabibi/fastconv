@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use fastconv_domain::{
-    AudioBatchItem, AudioBatchPlan, AudioBitrate, AudioChannels, AudioEncodingOptions,
-    AudioExecutionMode, AudioInputFormat, AudioOutputFormat, AudioQuality, AudioRateControl,
-    AudioSampleRate, AudioStreamInfo, DomainError, HardwareBackend, PathRole,
+    AudioBatchItem, AudioBatchPlan, AudioEncodingOptions, AudioExecutionMode, AudioInputFormat,
+    AudioOptionBitrate, AudioOptionChannels, AudioOptionSampleRate, AudioOutputFormat,
+    AudioQuality, AudioRateControl, AudioStreamInfo, DomainError, HardwareBackend, PathRole,
 };
 use symphonia::core::codecs::audio::{AudioDecoderOptions, well_known::CODEC_ID_ALAC};
 use symphonia::core::formats::FormatOptions;
@@ -28,8 +28,8 @@ const SUPPORTED_AUDIO_TARGETS: &str = "flac, wav, opus, ogg, mp3, aac, m4a, alac
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AudioEncodingRequest {
     pub rate_control: AudioRateControl,
-    pub sample_rate: Option<AudioSampleRate>,
-    pub channels: Option<AudioChannels>,
+    pub sample_rate: Option<AudioOptionSampleRate>,
+    pub channels: Option<AudioOptionChannels>,
 }
 
 const BITRATE_PARSE_EXPECTED: &str =
@@ -42,10 +42,10 @@ const BITRATE_PARSE_EXPECTED: &str =
 ///
 /// # Errors
 ///
-/// Returns [`DomainError::InvalidAudioBitrate`] for empty, zero, non-digit, overflowing,
+/// Returns [`DomainError::InvalidAudioOptionBitrate`] for empty, zero, non-digit, overflowing,
 /// or otherwise malformed input.
-pub fn parse_audio_bitrate(raw: &str) -> Result<AudioBitrate, DomainError> {
-    let invalid = || DomainError::InvalidAudioBitrate {
+pub fn parse_audio_bitrate(raw: &str) -> Result<AudioOptionBitrate, DomainError> {
+    let invalid = || DomainError::InvalidAudioOptionBitrate {
         raw: raw.to_owned(),
         expected: BITRATE_PARSE_EXPECTED,
     };
@@ -73,7 +73,7 @@ pub fn parse_audio_bitrate(raw: &str) -> Result<AudioBitrate, DomainError> {
     } else {
         value
     };
-    AudioBitrate::new(bps)
+    AudioOptionBitrate::new(bps)
 }
 
 /// Parses and validates the four raw encoding flag values into an [`AudioEncodingRequest`].
@@ -112,7 +112,7 @@ pub fn parse_audio_encoding_request(
                 .parse::<u32>()
                 .map_err(|err| format!("invalid --sample-rate '{raw}': {err}"))?;
             Some(
-                AudioSampleRate::new(hz)
+                AudioOptionSampleRate::new(hz)
                     .map_err(|err| format!("invalid --sample-rate '{raw}': {err}"))?,
             )
         }
@@ -124,7 +124,7 @@ pub fn parse_audio_encoding_request(
                 .parse::<u16>()
                 .map_err(|err| format!("invalid --channels '{raw}': {err}"))?;
             Some(
-                AudioChannels::new(count)
+                AudioOptionChannels::new(count)
                     .map_err(|err| format!("invalid --channels '{raw}': {err}"))?,
             )
         }
@@ -723,7 +723,7 @@ pub fn prepare_audio_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastconv_domain::AudioBitrate;
+    use fastconv_domain::AudioOptionBitrate;
 
     #[test]
     fn detects_magic_without_extension_help() {
@@ -1029,7 +1029,7 @@ mod tests {
             assert!(
                 matches!(
                     parse_audio_bitrate(raw),
-                    Err(DomainError::InvalidAudioBitrate { .. })
+                    Err(DomainError::InvalidAudioOptionBitrate { .. })
                 ),
                 "'{raw}' must be rejected"
             );
@@ -1041,10 +1041,10 @@ mod tests {
     fn parses_raw_encoding_request_and_rejects_conflicts() -> Result<(), String> {
         let expected = AudioEncodingRequest {
             rate_control: AudioRateControl::Bitrate(
-                AudioBitrate::new(192_000).map_err(|err| err.to_string())?,
+                AudioOptionBitrate::new(192_000).map_err(|err| err.to_string())?,
             ),
-            sample_rate: Some(AudioSampleRate::new(48_000).map_err(|err| err.to_string())?),
-            channels: Some(AudioChannels::new(2).map_err(|err| err.to_string())?),
+            sample_rate: Some(AudioOptionSampleRate::new(48_000).map_err(|err| err.to_string())?),
+            channels: Some(AudioOptionChannels::new(2).map_err(|err| err.to_string())?),
         };
         assert_eq!(
             parse_audio_encoding_request(Some("192k"), None, Some("48000"), Some("2"))?,
@@ -1088,7 +1088,7 @@ mod tests {
     fn bitrate_request(bps: u32) -> AudioEncodingRequest {
         AudioEncodingRequest {
             rate_control: AudioRateControl::Bitrate(
-                AudioBitrate::new(bps).unwrap_or_else(|_| unreachable!()),
+                AudioOptionBitrate::new(bps).unwrap_or_else(|_| unreachable!()),
             ),
             ..AudioEncodingRequest::default()
         }
@@ -1115,7 +1115,9 @@ mod tests {
 
         let opus_target = Path::new("target/rejected.opus");
         let request = AudioEncodingRequest {
-            sample_rate: Some(AudioSampleRate::new(44_100).unwrap_or_else(|_| unreachable!())),
+            sample_rate: Some(
+                AudioOptionSampleRate::new(44_100).unwrap_or_else(|_| unreachable!()),
+            ),
             ..AudioEncodingRequest::default()
         };
         let result = prepare_audio_batch(
@@ -1172,7 +1174,7 @@ mod tests {
             Some(NonZeroUsize::MIN),
             HardwareBackend::Cpu,
             AudioEncodingRequest {
-                channels: Some(AudioChannels::new(4).unwrap_or_else(|_| unreachable!())),
+                channels: Some(AudioOptionChannels::new(4).unwrap_or_else(|_| unreachable!())),
                 ..AudioEncodingRequest::default()
             },
         );

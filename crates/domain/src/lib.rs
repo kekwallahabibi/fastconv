@@ -5,9 +5,9 @@ pub mod metrics;
 pub mod video;
 
 pub use audio::{
-    AudioBatchItem, AudioBatchPlan, AudioBitrate, AudioChannels, AudioConversionReport,
-    AudioEncodingOptions, AudioExecutionMode, AudioInputFormat, AudioOutputFormat, AudioQuality,
-    AudioRateControl, AudioSampleRate, AudioStreamInfo,
+    AudioBatchItem, AudioBatchPlan, AudioConversionReport, AudioEncodingOptions,
+    AudioExecutionMode, AudioInputFormat, AudioOptionBitrate, AudioOptionChannels,
+    AudioOptionSampleRate, AudioOutputFormat, AudioQuality, AudioRateControl, AudioStreamInfo,
 };
 pub use hardware::{
     CpuInfo, DetectedGpuBackend, GpuAdapterInfo, GpuCapability, GpuVendor, HostHardware, SimdLevel,

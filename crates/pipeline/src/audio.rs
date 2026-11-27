@@ -14,8 +14,9 @@ use std::thread;
 use std::time::Instant;
 
 use fastconv_domain::{
-    AudioBatchItem, AudioBatchPlan, AudioChannels, AudioConversionReport, AudioEncodingOptions,
-    AudioInputFormat, AudioOutputFormat, AudioRateControl, AudioSampleRate, HardwareBackend,
+    AudioBatchItem, AudioBatchPlan, AudioConversionReport, AudioEncodingOptions, AudioInputFormat,
+    AudioOptionChannels, AudioOptionSampleRate, AudioOutputFormat, AudioRateControl,
+    HardwareBackend,
 };
 use flacenc::bitsink::ByteSink;
 use flacenc::component::BitRepr;
@@ -1563,7 +1564,7 @@ fn effective_sample_rate(
     };
     options
         .sample_rate()
-        .map_or(codec_default, AudioSampleRate::hz)
+        .map_or(codec_default, AudioOptionSampleRate::hz)
 }
 
 fn check_channels(
@@ -2212,7 +2213,7 @@ fn estimate_pcm_bytes(
     let target_channels = u64::from(
         options
             .channels()
-            .map_or(stream.channels().get(), AudioChannels::get),
+            .map_or(stream.channels().get(), AudioOptionChannels::get),
     )
     .max(1);
     let bytes =
@@ -2430,7 +2431,7 @@ pub fn execute_audio_batch(plan: &AudioBatchPlan) -> Result<AudioConversionRepor
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastconv_domain::{AudioBitrate, AudioQuality};
+    use fastconv_domain::{AudioOptionBitrate, AudioQuality};
     use std::num::{NonZeroU16, NonZeroU32};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3635,8 +3636,8 @@ mod tests {
         Ok(())
     }
 
-    fn br(bps: u32) -> AudioBitrate {
-        AudioBitrate::new(bps).unwrap_or_else(|_| unreachable!())
+    fn br(bps: u32) -> AudioOptionBitrate {
+        AudioOptionBitrate::new(bps).unwrap_or_else(|_| unreachable!())
     }
 
     fn ql(value: u8) -> AudioQuality {
@@ -3856,9 +3857,9 @@ mod tests {
         channels: Option<u16>,
         control: AudioRateControl,
     ) -> AudioEncodingOptions {
-        let rate = rate.map(|hz| AudioSampleRate::new(hz).unwrap_or_else(|_| unreachable!()));
-        let channels =
-            channels.map(|count| AudioChannels::new(count).unwrap_or_else(|_| unreachable!()));
+        let rate = rate.map(|hz| AudioOptionSampleRate::new(hz).unwrap_or_else(|_| unreachable!()));
+        let channels = channels
+            .map(|count| AudioOptionChannels::new(count).unwrap_or_else(|_| unreachable!()));
         AudioEncodingOptions::new(format, control, rate, channels)
             .unwrap_or_else(|_| unreachable!())
     }
