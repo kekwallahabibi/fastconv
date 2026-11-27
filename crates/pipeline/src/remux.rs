@@ -208,6 +208,7 @@ fn canonical_remux_supports(codec: VideoCodec) -> bool {
             | VideoCodec::Vp9
             | VideoCodec::Aac
             | VideoCodec::Opus
+            | VideoCodec::Vorbis
             | VideoCodec::Mp3
     )
 }
@@ -1118,6 +1119,63 @@ mod container_tests {
         }
     }
 
+    fn vorbis_media() -> Result<ContainerMedia, Box<dyn std::error::Error>> {
+        let mut ident = vec![0_u8; 30];
+        ident[0] = 0x01;
+        ident[1..7].copy_from_slice(b"vorbis");
+        ident[11] = 2;
+        ident[12..16].copy_from_slice(&48_000_u32.to_le_bytes());
+        ident[28] = 0xB8;
+        ident[29] = 1;
+        let config = crate::video_bitstream::pack_xiph_laced_vorbis_headers(
+            &ident,
+            b"\x03vorbis",
+            b"\x05vorbis",
+        )?;
+        Ok(ContainerMedia {
+            tracks: vec![
+                ContainerTrack {
+                    codec: VideoCodec::Vp9,
+                    width: Some(640),
+                    height: Some(360),
+                    channels: None,
+                    sample_rate: None,
+                    config: Vec::new(),
+                    timescale: US_TIMESCALE,
+                    presentation_edit: None,
+                },
+                ContainerTrack {
+                    codec: VideoCodec::Vorbis,
+                    width: None,
+                    height: None,
+                    channels: Some(2),
+                    sample_rate: Some(48_000),
+                    config,
+                    timescale: US_TIMESCALE,
+                    presentation_edit: None,
+                },
+            ],
+            packets: vec![
+                ContainerPacket {
+                    track: 0,
+                    pts: 0,
+                    dts: 0,
+                    duration: 33_333,
+                    keyframe: true,
+                    data: vec![0x92, 0x49, 0x83, 0x42, 0x00],
+                },
+                ContainerPacket {
+                    track: 1,
+                    pts: 5_000,
+                    dts: 5_000,
+                    duration: 23_000,
+                    keyframe: true,
+                    data: vec![0x00, 0x11, 0x22],
+                },
+            ],
+        })
+    }
+
     fn write_container(
         path: &Path,
         format: VideoContainerFormat,
@@ -1242,6 +1300,64 @@ mod container_tests {
         );
         std::fs::remove_file(source)?;
         std::fs::remove_file(target)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mkv_webm_vorbis_stream_copy_preserves_codec_private_and_timestamps()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let media = vorbis_media()?;
+        let config = media.tracks[1].config.clone();
+        let timings: Vec<(i64, i64, u64)> = media
+            .packets
+            .iter()
+            .map(|packet| (packet.pts, packet.dts, packet.duration))
+            .collect();
+        let source = temp_path("mkv-vorbis-source", "mkv");
+        let webm = temp_path("vorbis-webm-target", "webm");
+        let back = temp_path("vorbis-mkv-target", "mkv");
+        write_container(&source, VideoContainerFormat::Mkv, &media)?;
+        remux(
+            &source,
+            &webm,
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Webm,
+        )?;
+        let out = demux_video(&webm, VideoContainerFormat::Webm)?;
+        assert_eq!(out.tracks[1].codec, VideoCodec::Vorbis);
+        assert_eq!(out.tracks[1].config, config);
+        assert_eq!(
+            payloads(&out, VideoCodec::Vorbis),
+            payloads(&media, VideoCodec::Vorbis)
+        );
+        assert_eq!(
+            out.packets
+                .iter()
+                .map(|packet| (packet.pts, packet.dts, packet.duration))
+                .collect::<Vec<_>>(),
+            timings
+        );
+
+        remux(
+            &webm,
+            &back,
+            VideoContainerFormat::Webm,
+            VideoContainerFormat::Mkv,
+        )?;
+        let back_media = demux_video(&back, VideoContainerFormat::Mkv)?;
+        assert_eq!(back_media.tracks[1].codec, VideoCodec::Vorbis);
+        assert_eq!(back_media.tracks[1].config, config);
+        assert_eq!(
+            back_media
+                .packets
+                .iter()
+                .map(|packet| (packet.pts, packet.dts, packet.duration))
+                .collect::<Vec<_>>(),
+            timings
+        );
+        std::fs::remove_file(source)?;
+        std::fs::remove_file(webm)?;
+        std::fs::remove_file(back)?;
         Ok(())
     }
 

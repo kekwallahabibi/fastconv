@@ -2007,7 +2007,7 @@ fn encode_mp3(
 /// three channels onward. Four channels are ambiguous (WAV quad FL/FR/BL/BR vs.
 /// FL/FR/FC/LFE), so they are rejected instead of being silently mislabeled.
 /// Expressed source-to-plane, the 6-channel permutation is `[0, 2, 1, 5, 3, 4]`.
-fn vorbis_plane_sources(channels: usize) -> Option<&'static [usize]> {
+pub(crate) fn vorbis_plane_sources(channels: usize) -> Option<&'static [usize]> {
     match channels {
         1 => Some(&[0]),
         2 => Some(&[0, 1]),

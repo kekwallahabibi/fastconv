@@ -194,7 +194,7 @@ Options:
   --to <format>         Output container (required for directory batches): mp4,
                         mkv, webm, mov, avi, ts, gif, webp
   --vcodec <codec>      Video codec: h264, hevc (h265), av1, vp9, gif, webp, copy
-  --acodec <codec>      Audio codec: aac, opus, mp3, none (drop), copy
+  --acodec <codec>      Audio codec: aac, opus, mp3, vorbis, none (drop), copy
   --quality <0..=100>   Encoding quality (default 80; mutually exclusive with
                         --vbitrate and --vcodec copy)
   --vbitrate <rate>     Target video bitrate, e.g. 500k, 2M, 2.5M or 2000000
@@ -250,7 +250,9 @@ fn parse_audio_codec(raw: &str) -> Result<RequestedAudioCodec, String> {
         "none" => Ok(RequestedAudioCodec::Drop),
         _ => {
             let codec = TargetAudioCodec::from_name(raw).ok_or_else(|| {
-                format!("unknown audio codec '{raw}' (expected aac, opus, mp3, none, or copy)")
+                format!(
+                    "unknown audio codec '{raw}' (expected aac, opus, mp3, vorbis, none, or copy)"
+                )
             })?;
             Ok(RequestedAudioCodec::Encode(codec))
         }
@@ -795,6 +797,7 @@ mod tests {
             ("aac", TargetAudioCodec::Aac),
             ("opus", TargetAudioCodec::Opus),
             ("mp3", TargetAudioCodec::Mp3),
+            ("vorbis", TargetAudioCodec::Vorbis),
         ] {
             let VideoCommand::Run(parsed) =
                 parse_video_args(&["in.mp4", "out.x", "--acodec", raw])?

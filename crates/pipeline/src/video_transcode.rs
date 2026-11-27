@@ -7,12 +7,12 @@
 
 use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
-use std::io::Cursor;
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::io::{self, Cursor, Write};
+use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -26,16 +26,22 @@ use fastconv_domain::{
 use opus_pure::{Application, MAX_PACKET_BYTES, OpusEncoder};
 use rubato::audioadapter_buffers::owned::InterleavedOwned;
 use rubato::{Fft, FixedSync, Indexing, Resampler};
-use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::codecs::audio::well_known::CODEC_ID_VORBIS;
+use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoderOptions};
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::formats::TrackType;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
+use symphonia::core::packet::PacketRef;
+use symphonia::core::units::{Duration, Timestamp};
 
 use crate::PipelineError;
 use crate::video_anim::{self, AnimFrameInfo};
-use crate::video_bitstream::{default_opus_head, wrap_adts};
+use crate::video_bitstream::{
+    default_opus_head, pack_xiph_laced_vorbis_headers, unpack_xiph_laced_vorbis_headers,
+    vorbis_ident_info, wrap_adts,
+};
 use crate::video_codecs::{
     DecodedFrameInfo, Yuv420Frame, decode_video_track, decode_video_track_streaming,
     encode_video_cpu, nv12_buffer_len,
@@ -67,6 +73,13 @@ const MAX_DECODED_BYTES_PER_TRACK: u64 = 1_073_741_824;
 const AUDIO_PCM_CHUNK_FRAMES: usize = 4_096;
 const AUDIO_PACKET_BATCH_SIZE: usize = 32;
 const AUDIO_QUEUE_CAPACITY: usize = 16;
+/// Cap on a single decoded Vorbis frame and on the reusable plane buffers.
+/// A hostile packet can never make us resize beyond this bound.
+const VORBIS_FRAME_SAMPLE_CAP: usize = 8_192 * 32;
+/// Number of PCM frames fed to `vorbis-enc` per `encode_audio_block` call.
+const VORBIS_CHUNK_FRAMES: usize = 4_096;
+/// Upper bound on a Vorbis `CodecPrivate` blob held in memory.
+const VORBIS_CONFIG_CAP: usize = 1_048_576;
 
 /// Absolute presentation time of one codec frame, computed from its exact
 /// rational sample position so a long stream never accumulates rounding drift.
@@ -581,6 +594,59 @@ where
                 emit_ready(&mut chunk, last_rate, last_channels, &mut on_chunk)?;
             }
         }
+        VideoCodec::Vorbis => {
+            let (ident, _, _) = unpack_xiph_laced_vorbis_headers(&track.config)
+                .map_err(|reason| decode_error(path, format!("invalid Vorbis header: {reason}")))?;
+            let (ident_channels, ident_rate, _, _) = vorbis_ident_info(ident)
+                .map_err(|reason| decode_error(path, format!("invalid Vorbis header: {reason}")))?;
+            let mut params = AudioCodecParameters::new();
+            params
+                .for_codec(CODEC_ID_VORBIS)
+                .with_sample_rate(ident_rate)
+                .with_extra_data(track.config.clone().into_boxed_slice());
+            // `gapless: true` (symphonia's default) silences the first packet,
+            // which is the Vorbis priming block.
+            let mut decoder = symphonia::default::get_codecs()
+                .make_audio_decoder(&params, &AudioDecoderOptions::default())
+                .map_err(|err| {
+                    decode_error(path, format!("failed to create Vorbis decoder: {err}"))
+                })?;
+            let mut frame: Vec<f32> = Vec::new();
+            for packet in ordered {
+                if cancelled.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let audio_buf = decoder
+                    .decode_ref(&PacketRef::new(
+                        0,
+                        Timestamp::ZERO,
+                        Duration::ZERO,
+                        &packet.data,
+                    ))
+                    .map_err(|err| decode_error(path, format!("Vorbis decode failed: {err}")))?;
+                let count = audio_buf.samples_interleaved();
+                if count == 0 {
+                    // The gapless priming packet decodes to an empty buffer.
+                    continue;
+                }
+                if count > VORBIS_FRAME_SAMPLE_CAP {
+                    return Err(decode_error(
+                        path,
+                        format!("Vorbis frame of {count} samples exceeds the allocation cap"),
+                    ));
+                }
+                if frame.len() < count {
+                    frame.resize(count, 0.0_f32);
+                }
+                if let Some(slot) = frame.get_mut(..count) {
+                    audio_buf.copy_to_slice_interleaved(&mut *slot);
+                    chunk.extend_from_slice(&slot[..count]);
+                }
+                last_rate = ident_rate;
+                last_channels = ident_channels;
+                emit_ready(&mut chunk, last_rate, last_channels, &mut on_chunk)?;
+            }
+        }
         other => {
             return Err(decode_error(
                 path,
@@ -912,6 +978,81 @@ fn encode_mp3_track(
     ))
 }
 
+/// Whole-track Vorbis encoder retained for codec round-trip tests. Production
+/// transcodes use [`StreamingAudioEncoder`] instead.
+#[cfg(test)]
+fn encode_vorbis_track(
+    path: &Path,
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+    config: AudioEncodeConfig,
+) -> Result<(ContainerTrack, Vec<ContainerPacket>), PipelineError> {
+    let target_channels = configured_audio_channels(channels, config);
+    let ch = usize::from(target_channels);
+    let channel_order = crate::audio::vorbis_plane_sources(ch).ok_or_else(|| {
+        encode_error(
+            path,
+            format!("Vorbis cannot safely map {target_channels} channels"),
+        )
+    })?;
+    let rate = configured_audio_rate(TargetAudioCodec::Vorbis, sample_rate, config);
+    let resampled = resample_interleaved(samples, usize::from(channels), sample_rate, rate)?;
+    let pcm = mix_to_channels(&resampled, usize::from(channels), ch)?;
+    if pcm.is_empty() {
+        return Err(encode_error(path, "no samples to encode as Vorbis"));
+    }
+    let ch_nz = u8::try_from(ch)
+        .ok()
+        .and_then(NonZeroU8::new)
+        .ok_or_else(|| encode_error(path, "Vorbis channel count must be in 1..=255"))?;
+    let parts = start_vorbis_encoder(rate, ch_nz.get(), config)?;
+    let mut encoder = parts.encoder;
+    let mut planes: Vec<Vec<f32>> = vec![Vec::with_capacity(VORBIS_CHUNK_FRAMES); ch];
+    let total_frames = pcm.len() / ch;
+    for start in (0..total_frames).step_by(VORBIS_CHUNK_FRAMES) {
+        let frames = VORBIS_CHUNK_FRAMES.min(total_frames.saturating_sub(start));
+        for plane in &mut planes {
+            plane.clear();
+        }
+        for frame_samples in pcm.chunks_exact(ch).skip(start).take(frames) {
+            for (plane, &source) in planes.iter_mut().zip(channel_order) {
+                if let Some(&value) = frame_samples.get(source) {
+                    plane.push(value);
+                }
+            }
+        }
+        encoder
+            .encode_audio_block(planes.iter())
+            .map_err(|err| encode_error(path, format!("Vorbis encoding failed: {err}")))?;
+    }
+    let finished = encoder
+        .finish()
+        .map_err(|err| encode_error(path, format!("failed to finalize Vorbis stream: {err}")))?;
+    drop(finished);
+    let mut timestamps = VorbisTimestamps::new(rate, parts.bs0, parts.bs1);
+    let mut packets = Vec::new();
+    for packet in drain_ogg_sink(&parts.sink)? {
+        packets.push(timestamps.next_packet(packet)?);
+    }
+    if packets.is_empty() {
+        return Err(encode_error(path, "Vorbis encoder produced no packets"));
+    }
+    Ok((
+        ContainerTrack {
+            codec: VideoCodec::Vorbis,
+            width: None,
+            height: None,
+            channels: Some(target_channels),
+            sample_rate: Some(rate),
+            config: parts.private,
+            timescale: US_TIMESCALE,
+            presentation_edit: None,
+        },
+        packets,
+    ))
+}
+
 /// Encodes decoded PCM into the requested in-container audio codec.
 #[cfg(test)]
 pub(crate) fn encode_audio_track(
@@ -926,6 +1067,9 @@ pub(crate) fn encode_audio_track(
         TargetAudioCodec::Aac => encode_aac_track(path, samples, sample_rate, channels, config),
         TargetAudioCodec::Opus => encode_opus_track(path, samples, sample_rate, channels, config),
         TargetAudioCodec::Mp3 => encode_mp3_track(path, samples, sample_rate, channels, config),
+        TargetAudioCodec::Vorbis => {
+            encode_vorbis_track(path, samples, sample_rate, channels, config)
+        }
     }
 }
 
@@ -951,6 +1095,13 @@ fn target_audio_rate(target: TargetAudioCodec, source_rate: u32) -> u32 {
         TargetAudioCodec::Opus => OPUS_RATE,
         TargetAudioCodec::Mp3 => {
             if MP3_RATES.contains(&source_rate) {
+                source_rate
+            } else {
+                OPUS_RATE
+            }
+        }
+        TargetAudioCodec::Vorbis => {
+            if (8_000..=192_000).contains(&source_rate) {
                 source_rate
             } else {
                 OPUS_RATE
@@ -1071,7 +1222,328 @@ fn mix_to_channels(pcm: &[f32], from: usize, to: usize) -> Result<Cow<'_, [f32]>
     Ok(Cow::Owned(out))
 }
 
-/// Incremental encoder for the three in-container audio codecs. It is created
+// ---- Vorbis: streaming Ogg page -> Matroska packet bridge ------------------
+
+/// One complete Vorbis packet extracted from Ogg pages.
+#[derive(Debug)]
+struct OggPacket {
+    data: Vec<u8>,
+    granulepos: i64,
+    /// Only the last completed packet on an EOS page carries the end position.
+    eos_last: bool,
+}
+
+/// Incremental RFC 3533 page parser. It keeps only the bytes of one incomplete
+/// page and the bytes of one incomplete packet, never the whole Ogg stream.
+#[derive(Default)]
+struct OggPacketCollector {
+    partial: Vec<u8>,
+    continuing: Vec<u8>,
+    packets: Vec<OggPacket>,
+}
+
+impl OggPacketCollector {
+    /// One Ogg page is at most 255 segments of 255 bytes plus its 27-byte
+    /// header and segment table (65,307 bytes); 128 KiB gives safe headroom
+    /// for a partial page plus the next incoming write.
+    const MAX_PARTIAL: usize = 128 * 1024;
+    const MAX_PACKET: usize = 1_048_576;
+
+    fn invalid(reason: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, reason)
+    }
+
+    fn drain(&mut self) -> Vec<OggPacket> {
+        std::mem::take(&mut self.packets)
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.partial.len().saturating_add(bytes.len()) > Self::MAX_PARTIAL {
+            return Err(Self::invalid("Ogg page buffer overflow"));
+        }
+        self.partial.extend_from_slice(bytes);
+        self.parse_pages()?;
+        Ok(bytes.len())
+    }
+
+    fn parse_pages(&mut self) -> io::Result<()> {
+        while self.partial.len() >= 27 {
+            if &self.partial[..4] != b"OggS" {
+                return Err(Self::invalid("invalid Ogg capture pattern"));
+            }
+            if self.partial[4] != 0 {
+                return Err(Self::invalid("unsupported Ogg stream structure version"));
+            }
+            let nseg = usize::from(self.partial[26]);
+            let table_end = 27_usize
+                .checked_add(nseg)
+                .ok_or_else(|| Self::invalid("Ogg segment table overflow"))?;
+            if self.partial.len() < table_end {
+                break;
+            }
+            let mut body_len = 0_usize;
+            for &lacing in &self.partial[27..table_end] {
+                body_len = usize::from(lacing)
+                    .checked_add(body_len)
+                    .ok_or_else(|| Self::invalid("Ogg page body overflow"))?;
+            }
+            let page_len = table_end
+                .checked_add(body_len)
+                .ok_or_else(|| Self::invalid("Ogg page length overflow"))?;
+            if self.partial.len() < page_len {
+                break;
+            }
+            let header_type = self.partial[5];
+            let continued = header_type & 0x01 != 0;
+            if continued && self.continuing.is_empty() {
+                return Err(Self::invalid("unexpected Ogg continuation page"));
+            }
+            if !continued && !self.continuing.is_empty() {
+                return Err(Self::invalid(
+                    "incomplete Ogg packet before non-continuation page",
+                ));
+            }
+            let granule_bytes: [u8; 8] = self.partial[6..14]
+                .try_into()
+                .map_err(|_| Self::invalid("truncated Ogg granule position"))?;
+            let granulepos = i64::from_le_bytes(granule_bytes);
+            let completed = self.partial[27..table_end]
+                .iter()
+                .filter(|&&lacing| lacing < 255)
+                .count();
+            let eos = header_type & 0x04 != 0;
+            let mut offset = table_end;
+            let mut seen = 0_usize;
+            for &lacing in &self.partial[27..table_end] {
+                let end = offset
+                    .checked_add(usize::from(lacing))
+                    .ok_or_else(|| Self::invalid("Ogg segment overflow"))?;
+                let segment = self
+                    .partial
+                    .get(offset..end)
+                    .ok_or_else(|| Self::invalid("truncated Ogg segment"))?;
+                if self.continuing.len().saturating_add(segment.len()) > Self::MAX_PACKET {
+                    return Err(Self::invalid("Ogg packet exceeds the allocation cap"));
+                }
+                self.continuing.extend_from_slice(segment);
+                offset = end;
+                // A lacing value below 255 terminates this packet. A value of
+                // exactly 255 continues it, possibly onto the next page.
+                if lacing < 255 {
+                    seen = seen.saturating_add(1);
+                    self.packets.push(OggPacket {
+                        data: std::mem::take(&mut self.continuing),
+                        granulepos,
+                        eos_last: eos && seen == completed,
+                    });
+                }
+            }
+            self.partial.drain(..page_len);
+        }
+        Ok(())
+    }
+}
+
+/// `io::Write` sink handed to `vorbis-enc`; parses pages as they are written.
+struct OggPacketSink(Arc<Mutex<OggPacketCollector>>);
+
+impl Write for OggPacketSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut collector = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("Ogg collector lock poisoned"))?;
+        collector.push_bytes(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn drain_ogg_sink(sink: &Arc<Mutex<OggPacketCollector>>) -> Result<Vec<OggPacket>, PipelineError> {
+    let mut collector = sink
+        .lock()
+        .map_err(|_| encode_error(Path::new("vorbis"), "Ogg collector lock poisoned"))?;
+    Ok(collector.drain())
+}
+
+/// State produced once the Vorbis headers and encoder are ready.
+struct VorbisEncoderParts {
+    encoder: vorbis_enc::Encoder<OggPacketSink>,
+    sink: Arc<Mutex<OggPacketCollector>>,
+    private: Vec<u8>,
+    bs0: u64,
+    bs1: u64,
+}
+
+/// Builds a `vorbis-enc` encoder over a bounded Ogg sink and extracts the
+/// three Xiph-laced header packets into a Matroska `CodecPrivate` blob.
+fn start_vorbis_encoder(
+    rate: u32,
+    channels: u8,
+    config: AudioEncodeConfig,
+) -> Result<VorbisEncoderParts, PipelineError> {
+    let rate_nz = NonZeroU32::new(rate)
+        .ok_or_else(|| encode_error(Path::new("vorbis"), "Vorbis rate must be non-zero"))?;
+    let ch_nz = NonZeroU8::new(channels)
+        .ok_or_else(|| encode_error(Path::new("vorbis"), "Vorbis channels must be non-zero"))?;
+    let strategy = match config.bitrate() {
+        None => vorbis_enc::BitrateManagementStrategy::QualityVbr {
+            target_quality: 0.4,
+        },
+        Some(bitrate) => {
+            let average = NonZeroU32::new(bitrate.bps()).ok_or_else(|| {
+                encode_error(
+                    Path::new("vorbis"),
+                    "Vorbis average bitrate must be non-zero",
+                )
+            })?;
+            vorbis_enc::BitrateManagementStrategy::Abr {
+                average_bitrate: average,
+            }
+        }
+    };
+    let sink = Arc::new(Mutex::new(OggPacketCollector::default()));
+    let encoder = vorbis_enc::EncoderBuilder::new(rate_nz, ch_nz, OggPacketSink(Arc::clone(&sink)))
+        .bitrate_management_strategy(strategy)
+        .build()
+        .map_err(|err| {
+            encode_error(
+                Path::new("vorbis"),
+                format!("failed to create Vorbis encoder: {err}"),
+            )
+        })?;
+    let headers = drain_ogg_sink(&sink)?;
+    if headers.len() < 3 {
+        return Err(encode_error(
+            Path::new("vorbis"),
+            format!(
+                "Vorbis encoder emitted {} header packets, expected 3",
+                headers.len()
+            ),
+        ));
+    }
+    let private =
+        pack_xiph_laced_vorbis_headers(&headers[0].data, &headers[1].data, &headers[2].data)
+            .map_err(|reason| {
+                encode_error(
+                    Path::new("vorbis"),
+                    format!("invalid Vorbis header: {reason}"),
+                )
+            })?;
+    if private.len() > VORBIS_CONFIG_CAP {
+        return Err(encode_error(
+            Path::new("vorbis"),
+            "Vorbis CodecPrivate exceeds the allocation cap",
+        ));
+    }
+    let (ident_channels, ident_rate, bs0, bs1) = vorbis_ident_info(&headers[0].data)
+        .map_err(|reason| encode_error(Path::new("vorbis"), reason))?;
+    if ident_channels != u16::from(channels) || ident_rate != rate {
+        return Err(encode_error(
+            Path::new("vorbis"),
+            format!(
+                "Vorbis ident header disagrees with the encoder: {ident_channels}ch/{ident_rate} Hz vs {channels}ch/{rate} Hz"
+            ),
+        ));
+    }
+    Ok(VorbisEncoderParts {
+        encoder,
+        sink,
+        private,
+        bs0,
+        bs1,
+    })
+}
+
+/// Converts extracted Ogg packets into microsecond-timestamped Matroska
+/// packets. `bs0`/`bs1` are Vorbis blocksize exponents (Vorbis I §4.2.2), so
+/// the sample advance of a block pair is `(2^prev + 2^cur) / 4`.
+struct VorbisTimestamps {
+    rate: u32,
+    bs0: u64,
+    bs1: u64,
+    sample_offset: u64,
+    prev_bs: Option<u64>,
+    last_pts: i64,
+}
+
+impl VorbisTimestamps {
+    fn new(rate: u32, bs0: u64, bs1: u64) -> Self {
+        Self {
+            rate,
+            bs0,
+            bs1,
+            sample_offset: 0,
+            prev_bs: None,
+            last_pts: 0,
+        }
+    }
+
+    fn next_packet(&mut self, packet: OggPacket) -> Result<ContainerPacket, PipelineError> {
+        let path = Path::new("vorbis");
+        if packet.data.is_empty() || packet.data[0] & 1 != 0 {
+            return Err(encode_error(path, "invalid Vorbis audio packet header"));
+        }
+        let cur_bs = if self.bs0 == self.bs1 || (packet.data[0] & 0x02) == 0 {
+            self.bs0
+        } else {
+            self.bs1
+        };
+        let (pts, duration) = match self.prev_bs {
+            None => {
+                // The first audio block is the priming packet; it plays no
+                // samples and sits at time zero.
+                (0_i64, 1_u64)
+            }
+            Some(prev) => {
+                let prev_size = 1_u64
+                    .checked_shl(u32::try_from(prev).unwrap_or(32))
+                    .unwrap_or(u64::MAX);
+                let cur_size = 1_u64
+                    .checked_shl(u32::try_from(cur_bs).unwrap_or(32))
+                    .unwrap_or(u64::MAX);
+                let raw_samples = prev_size.saturating_add(cur_size) / 4;
+                let effective = if packet.eos_last && packet.granulepos >= 0 {
+                    let granule = u64::try_from(packet.granulepos).unwrap_or(u64::MAX);
+                    granule.saturating_sub(self.sample_offset).min(raw_samples)
+                } else {
+                    raw_samples
+                };
+                let pts = sample_pts_us(self.sample_offset, self.rate);
+                let next_pts =
+                    sample_pts_us(self.sample_offset.saturating_add(effective), self.rate);
+                let duration = u64::try_from(next_pts.saturating_sub(pts))
+                    .unwrap_or(1)
+                    .max(1);
+                self.sample_offset = self.sample_offset.saturating_add(effective);
+                (pts, duration)
+            }
+        };
+        if pts < self.last_pts {
+            return Err(encode_error(
+                path,
+                format!(
+                    "Vorbis timestamps went backwards ({pts} < {})",
+                    self.last_pts
+                ),
+            ));
+        }
+        self.last_pts = pts;
+        self.prev_bs = Some(cur_bs);
+        Ok(ContainerPacket {
+            track: 0,
+            pts,
+            dts: pts,
+            duration,
+            keyframe: true,
+            data: packet.data,
+        })
+    }
+}
+
+/// Incremental encoder for the four in-container audio codecs. It is created
 /// on the first decoded chunk, so its rate and channel count come from real
 /// PCM rather than guessed container metadata.
 enum StreamingAudioEncoder {
@@ -1100,6 +1572,14 @@ enum StreamingAudioEncoder {
         // The first packet is the LAME Info tag; its counts are only final
         // after `finish()`, so hold it back until the tag is completed.
         held_tag: Option<ContainerPacket>,
+    },
+    Vorbis {
+        channels: u8,
+        encoder: Option<Box<vorbis_enc::Encoder<OggPacketSink>>>,
+        sink: Arc<Mutex<OggPacketCollector>>,
+        planes: Vec<Vec<f32>>,
+        channel_order: &'static [usize],
+        timestamps: VorbisTimestamps,
     },
 }
 
@@ -1225,6 +1705,43 @@ impl StreamingAudioEncoder {
                         sample_offset: 0,
                         frame_samples: if rate >= 32_000 { 1_152 } else { 576 },
                         held_tag: None,
+                    },
+                    track,
+                ))
+            }
+            TargetAudioCodec::Vorbis => {
+                let channel_order = crate::audio::vorbis_plane_sources(usize::from(channels))
+                    .ok_or_else(|| {
+                        encode_error(
+                            Path::new("vorbis"),
+                            format!("Vorbis cannot safely map {channels} channels"),
+                        )
+                    })?;
+                let ch = u8::try_from(channels).map_err(|_| {
+                    encode_error(
+                        Path::new("vorbis"),
+                        format!("Vorbis channel count {channels} exceeds 255"),
+                    )
+                })?;
+                let parts = start_vorbis_encoder(rate, ch, config)?;
+                let track = ContainerTrack {
+                    codec: VideoCodec::Vorbis,
+                    width: None,
+                    height: None,
+                    channels: Some(channels),
+                    sample_rate: Some(rate),
+                    config: parts.private,
+                    timescale: US_TIMESCALE,
+                    presentation_edit: None,
+                };
+                Ok((
+                    Self::Vorbis {
+                        channels: ch,
+                        encoder: Some(Box::new(parts.encoder)),
+                        sink: parts.sink,
+                        planes: vec![Vec::with_capacity(VORBIS_CHUNK_FRAMES); usize::from(ch)],
+                        channel_order,
+                        timestamps: VorbisTimestamps::new(rate, parts.bs0, parts.bs1),
                     },
                     track,
                 ))
@@ -1369,6 +1886,51 @@ impl StreamingAudioEncoder {
                         out.push(previous);
                     }
                     *frames_emitted = frames_emitted.saturating_add(1);
+                }
+            }
+            Self::Vorbis {
+                channels,
+                encoder,
+                sink,
+                planes,
+                channel_order,
+                timestamps,
+                ..
+            } => {
+                let frames = pcm.len() / usize::from(*channels);
+                if frames == 0 {
+                    return Ok(out);
+                }
+                if pcm.len() > VORBIS_FRAME_SAMPLE_CAP {
+                    return Err(encode_error(
+                        Path::new("vorbis"),
+                        format!(
+                            "Vorbis chunk of {} samples exceeds the allocation cap",
+                            pcm.len()
+                        ),
+                    ));
+                }
+                for plane in planes.iter_mut() {
+                    plane.clear();
+                }
+                for frame_samples in pcm.chunks_exact(usize::from(*channels)) {
+                    for (plane, &source) in planes.iter_mut().zip(*channel_order) {
+                        if let Some(&value) = frame_samples.get(source) {
+                            plane.push(value);
+                        }
+                    }
+                }
+                let encoder = encoder.as_mut().ok_or_else(|| {
+                    encode_error(Path::new("vorbis"), "Vorbis encoder was already finished")
+                })?;
+                encoder.encode_audio_block(planes.iter()).map_err(|err| {
+                    encode_error(
+                        Path::new("vorbis"),
+                        format!("Vorbis encoding failed: {err}"),
+                    )
+                })?;
+                for packet in drain_ogg_sink(sink)? {
+                    out.push(timestamps.next_packet(packet)?);
                 }
             }
         }
@@ -1527,6 +2089,29 @@ impl StreamingAudioEncoder {
                         .saturating_mul(1_000_000)
                         / u64::from(OPUS_RATE);
                     out.push(last);
+                }
+                Ok(out)
+            }
+            Self::Vorbis {
+                encoder,
+                sink,
+                timestamps,
+                ..
+            } => {
+                let encoder = encoder.take().ok_or_else(|| {
+                    encode_error(Path::new("vorbis"), "Vorbis encoder was already finished")
+                })?;
+                let finished = (*encoder).finish().map_err(|err| {
+                    encode_error(
+                        Path::new("vorbis"),
+                        format!("failed to finalize Vorbis stream: {err}"),
+                    )
+                })?;
+                // `finish()` flushes the final EOS page into the sink.
+                drop(finished);
+                let mut out = Vec::new();
+                for packet in drain_ogg_sink(sink)? {
+                    out.push(timestamps.next_packet(packet)?);
                 }
                 Ok(out)
             }
@@ -2749,6 +3334,102 @@ mod tests {
         Ok(dir)
     }
 
+    fn ogg_page(header_type: u8, granulepos: i64, lacing: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut page = Vec::new();
+        page.extend_from_slice(b"OggS");
+        page.push(0); // stream version
+        page.push(header_type);
+        page.extend_from_slice(&granulepos.to_le_bytes());
+        page.extend_from_slice(&[0; 4]); // serial number
+        page.extend_from_slice(&[0; 4]); // page sequence
+        page.extend_from_slice(&[0; 4]); // CRC (not checked by the collector)
+        page.push(u8::try_from(lacing.len()).unwrap_or(0));
+        page.extend_from_slice(lacing);
+        page.extend_from_slice(body);
+        page
+    }
+
+    #[test]
+    fn ogg_collector_extracts_multi_segment_and_exact_255_packets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut collector = OggPacketCollector::default();
+        let body = vec![0x5A_u8; 255];
+        // A packet whose length is an exact multiple of 255 ends with a zero
+        // lacing byte, not with an implicit continuation.
+        let page = ogg_page(0, 255, &[255, 0], &body);
+        collector.push_bytes(&page)?;
+        let packets = collector.drain();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].data, body);
+        assert_eq!(packets[0].granulepos, 255);
+        assert!(!packets[0].eos_last);
+
+        let body = vec![0x33_u8; 510];
+        let page = ogg_page(0x04, 512, &[255, 255, 0], &body);
+        collector.push_bytes(&page)?;
+        let packets = collector.drain();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].data, body);
+        assert!(packets[0].eos_last);
+        assert_eq!(packets[0].granulepos, 512);
+        Ok(())
+    }
+
+    #[test]
+    fn ogg_collector_reassembles_packets_across_pages() -> Result<(), Box<dyn std::error::Error>> {
+        let mut collector = OggPacketCollector::default();
+        let first = vec![0x11_u8; 255];
+        collector.push_bytes(&ogg_page(0, -1, &[255], &first))?;
+        assert!(collector.drain().is_empty());
+
+        let tail = vec![0x22_u8; 4];
+        let next = vec![0x33_u8; 255];
+        let mut body = tail.clone();
+        body.extend_from_slice(&next);
+        collector.push_bytes(&ogg_page(0x01, 259, &[4, 255], &body))?;
+        let packets = collector.drain();
+        assert_eq!(packets.len(), 1);
+        let mut expected = first.clone();
+        expected.extend_from_slice(&tail);
+        assert_eq!(packets[0].data, expected);
+        assert_eq!(packets[0].granulepos, 259);
+
+        let final_body = [0x44_u8; 1];
+        collector.push_bytes(&ogg_page(0x01 | 0x04, 260, &[1], &final_body))?;
+        let packets = collector.drain();
+        assert_eq!(packets.len(), 1);
+        let mut expected = next;
+        expected.push(0x44);
+        assert_eq!(packets[0].data, expected);
+        assert!(packets[0].eos_last);
+        assert_eq!(packets[0].granulepos, 260);
+        Ok(())
+    }
+
+    #[test]
+    fn ogg_collector_marks_only_last_packet_on_eos_page() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut collector = OggPacketCollector::default();
+        let body = [1_u8, 2, 3, 4];
+        collector.push_bytes(&ogg_page(0x04, 1234, &[2, 2], &body))?;
+        let packets = collector.drain();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].data, vec![1, 2]);
+        assert!(!packets[0].eos_last);
+        assert_eq!(packets[1].data, vec![3, 4]);
+        assert!(packets[1].eos_last);
+        assert_eq!(packets[1].granulepos, 1234);
+        Ok(())
+    }
+
+    #[test]
+    fn ogg_collector_rejects_invalid_capture_pattern() {
+        let mut collector = OggPacketCollector::default();
+        let mut page = ogg_page(0, 0, &[1], &[7]);
+        page[0] = b'X';
+        assert!(collector.push_bytes(&page).is_err());
+    }
+
     fn frames(count: usize) -> Vec<Yuv420Frame> {
         (0..count)
             .map(|index| {
@@ -2961,6 +3642,234 @@ mod tests {
             VideoCodec::Vp9,
             VideoCodec::Opus,
         )?;
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn aac_and_opus_sources_transcode_to_vorbis_mkv_and_webm() -> Result<(), PipelineError> {
+        let dir = temp_dir("to-vorbis")?;
+        let mp4 = dir.join("aac.mp4");
+        let webm = dir.join("opus.webm");
+        let out_mkv = dir.join("vorbis.mkv");
+        let out_webm = dir.join("vorbis.webm");
+        make_source(
+            &mp4,
+            VideoContainerFormat::Mp4,
+            VideoEncodeMode::CpuH264 {
+                rate_control: fastconv_domain::VideoRateControl::DEFAULT,
+            },
+            TargetAudioCodec::Aac,
+        )?;
+        make_source(
+            &webm,
+            VideoContainerFormat::Webm,
+            VideoEncodeMode::CpuVp9 {
+                rate_control: fastconv_domain::VideoRateControl::DEFAULT,
+            },
+            TargetAudioCodec::Opus,
+        )?;
+
+        transcode(
+            &mp4,
+            &out_mkv,
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mkv,
+            VideoTrackAction::Encode(VideoEncodeMode::CpuH264 {
+                rate_control: fastconv_domain::VideoRateControl::DEFAULT,
+            }),
+            AudioTrackAction::Encode(default_config(TargetAudioCodec::Vorbis)),
+        )?;
+        assert_output(
+            &out_mkv,
+            VideoContainerFormat::Mkv,
+            VideoCodec::H264,
+            VideoCodec::Vorbis,
+        )?;
+
+        transcode(
+            &webm,
+            &out_webm,
+            VideoContainerFormat::Webm,
+            VideoContainerFormat::Webm,
+            VideoTrackAction::Copy,
+            AudioTrackAction::Encode(default_config(TargetAudioCodec::Vorbis)),
+        )?;
+        assert_output(
+            &out_webm,
+            VideoContainerFormat::Webm,
+            VideoCodec::Vp9,
+            VideoCodec::Vorbis,
+        )?;
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn vorbis_source_transcodes_to_aac_opus_and_vorbis() -> Result<(), PipelineError> {
+        let dir = temp_dir("from-vorbis")?;
+        let mkv = dir.join("in.mkv");
+        make_source(
+            &mkv,
+            VideoContainerFormat::Mkv,
+            VideoEncodeMode::CpuH264 {
+                rate_control: fastconv_domain::VideoRateControl::DEFAULT,
+            },
+            TargetAudioCodec::Vorbis,
+        )?;
+        let cases = [
+            (
+                "out.mp4",
+                VideoContainerFormat::Mp4,
+                VideoTrackAction::Encode(VideoEncodeMode::CpuH264 {
+                    rate_control: fastconv_domain::VideoRateControl::DEFAULT,
+                }),
+                TargetAudioCodec::Aac,
+                VideoCodec::H264,
+                VideoCodec::Aac,
+            ),
+            (
+                "out.webm",
+                VideoContainerFormat::Webm,
+                VideoTrackAction::Encode(VideoEncodeMode::CpuVp9 {
+                    rate_control: fastconv_domain::VideoRateControl::DEFAULT,
+                }),
+                TargetAudioCodec::Opus,
+                VideoCodec::Vp9,
+                VideoCodec::Opus,
+            ),
+            (
+                "out2.mkv",
+                VideoContainerFormat::Mkv,
+                VideoTrackAction::Copy,
+                TargetAudioCodec::Vorbis,
+                VideoCodec::H264,
+                VideoCodec::Vorbis,
+            ),
+        ];
+        for (name, format, video, audio, video_codec, audio_codec) in cases {
+            let target = dir.join(name);
+            transcode(
+                &mkv,
+                &target,
+                VideoContainerFormat::Mkv,
+                format,
+                video,
+                AudioTrackAction::Encode(default_config(audio)),
+            )?;
+            assert_output(&target, format, video_codec, audio_codec)?;
+        }
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn vorbis_options_set_rate_channels_and_bitrate() -> Result<(), PipelineError> {
+        let dir = temp_dir("vorbis-options")?;
+        let source = dir.join("in.mkv");
+        let target = dir.join("out.mkv");
+        make_source(
+            &source,
+            VideoContainerFormat::Mkv,
+            VideoEncodeMode::CpuH264 {
+                rate_control: fastconv_domain::VideoRateControl::DEFAULT,
+            },
+            TargetAudioCodec::Aac,
+        )?;
+        let config = audio_config(TargetAudioCodec::Vorbis, 128_000, 44_100, 1)?;
+        transcode(
+            &source,
+            &target,
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Mkv,
+            VideoTrackAction::Copy,
+            AudioTrackAction::Encode(config),
+        )?;
+        let media = demux_video(&target, VideoContainerFormat::Mkv)?;
+        let audio = media
+            .tracks
+            .iter()
+            .find(|track| track.codec == VideoCodec::Vorbis)
+            .ok_or_else(|| decode_error(&target, "Vorbis track missing after transcode"))?;
+        assert_eq!(audio.sample_rate, Some(44_100));
+        assert_eq!(audio.channels, Some(1));
+        let (ident, _, _) = unpack_xiph_laced_vorbis_headers(&audio.config).map_err(|reason| {
+            decode_error(
+                &target,
+                format!("invalid Vorbis CodecPrivate in output: {reason}"),
+            )
+        })?;
+        let (ident_channels, ident_rate, _, _) =
+            vorbis_ident_info(ident).map_err(|reason| decode_error(&target, reason))?;
+        assert_eq!(ident_channels, 1);
+        assert_eq!(ident_rate, 44_100);
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn vorbis_bitrate_option_changes_encoded_size() -> Result<(), PipelineError> {
+        let dir = temp_dir("vorbis-bitrate")?;
+        let samples = sine(9_600, 44_100, 2);
+        let encoded_bytes = |bps: u32| -> Result<u64, PipelineError> {
+            let (track, packets) = encode_audio_track(
+                &dir.join("x"),
+                &samples,
+                44_100,
+                2,
+                TargetAudioCodec::Vorbis,
+                audio_config(TargetAudioCodec::Vorbis, bps, 44_100, 2)?,
+            )?;
+            assert_eq!(track.codec, VideoCodec::Vorbis);
+            Ok(packets
+                .iter()
+                .map(|packet| u64::try_from(packet.data.len()).unwrap_or(u64::MAX))
+                .sum())
+        };
+        // `vorbis-enc` ABR templates cap the per-channel bitrate well below
+        // the domain's 512 kbps ceiling at 44.1 kHz stereo.
+        let low = encoded_bytes(64_000)?;
+        let high = encoded_bytes(192_000)?;
+        assert!(
+            low > 0 && high > low,
+            "expected higher bitrate to emit more bytes: {low} vs {high}"
+        );
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn vorbis_track_decodes_back_to_pcm() -> Result<(), PipelineError> {
+        let dir = temp_dir("vorbis-roundtrip")?;
+        let path = dir.join("x");
+        let samples = sine(4_800, 48_000, 2);
+        let (track, packets) = encode_audio_track(
+            &path,
+            &samples,
+            48_000,
+            2,
+            TargetAudioCodec::Vorbis,
+            default_config(TargetAudioCodec::Vorbis),
+        )?;
+        let (decoded, rate, channels) = decode_audio_track_pcm(&path, &track, &packets)?;
+        assert_ne!(decoded.len(), 0);
+        assert_eq!(rate, 48_000);
+        assert_eq!(channels, 2);
         fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
             path: dir.clone(),
             source,
