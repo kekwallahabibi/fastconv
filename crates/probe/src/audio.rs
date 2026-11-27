@@ -558,18 +558,22 @@ fn parse_ogg_page(bytes: &[u8], at: usize) -> Option<OggPageInfo<'_>> {
         return None;
     }
     let mut completed = Vec::new();
-    let mut start = 0_usize;
+    let mut packet_start = 0_usize;
+    let mut cursor = 0_usize;
     for &lace in table {
-        let next = start.checked_add(usize::from(lace))?;
-        if next > body.len() {
+        // A lace of 255 continues the current packet; only a shorter lace
+        // terminates it. The cursor therefore advances for every segment while
+        // the packet start stays put until the packet actually ends.
+        cursor = cursor.checked_add(usize::from(lace))?;
+        if cursor > body.len() {
             return None;
         }
         if lace < 255 {
-            completed.push(&body[start..next]);
-            start = next;
+            completed.push(&body[packet_start..cursor]);
+            packet_start = cursor;
         }
     }
-    if start != body.len() {
+    if packet_start != body.len() {
         // A packet still spanning into the next page is allowed in general,
         // but not on a header page where this parser is used.
         return None;
@@ -2715,6 +2719,42 @@ mod tests {
         stream.extend(pages[2].iter().copied());
         stream.extend_from_slice(&ogg_page_with(960, serial, 0, &[0_u8; 1]));
         for page in pages.iter().skip(3) {
+            stream.extend(page.iter().copied());
+        }
+        fs::write(&path, &stream).map_err(|err| err.to_string())?;
+        assert_eq!(
+            probe_audio(&path)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            Some(2_568)
+        );
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn opus_initial_offset_accepts_a_packet_spanning_lacing_values() -> Result<(), String> {
+        let dir = probe_temp_dir("opus-multilace-header");
+        let path = dir.join("tone.opus");
+        let serial = 0x5566_7788_u32;
+        let pages = split_ogg_pages(&opus_stream(serial, 1)?);
+        assert!(
+            pages.len() >= 3,
+            "expected two header and three audio pages"
+        );
+
+        // A 300-byte OpusTags packet needs lacing [255, 45]. Its second lace is
+        // 45 bytes into the packet, not 45 bytes into the page; the page parser
+        // must still sum it as one completed packet.
+        let mut tags = b"OpusTags".to_vec();
+        tags.extend_from_slice(&0_u32.to_le_bytes()); // empty vendor
+        tags.extend_from_slice(&0_u32.to_le_bytes()); // no comments
+        tags.resize(300, 0_u8);
+        let mut stream = Vec::new();
+        stream.extend(pages[0].iter().copied());
+        stream.extend_from_slice(&ogg_page_with(0, serial, 0, &tags));
+        for page in pages.iter().skip(2) {
             stream.extend(page.iter().copied());
         }
         fs::write(&path, &stream).map_err(|err| err.to_string())?;
