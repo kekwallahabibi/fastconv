@@ -17,6 +17,9 @@ use crate::PipelineError;
 
 /// Nonzero stream serial; each output file has exactly one logical bitstream.
 const STREAM_SERIAL: u32 = 0x4643_4F4E;
+/// Matches the PCM chunk size used by the WAV/AIFF writers so Ogg pages are
+/// flushed in large, amortized writes rather than one syscall per FLAC frame.
+const OGG_WRITE_BUF_BYTES: usize = 256 * 1024;
 const STREAM_INFO_BYTES: usize = 34;
 const IDENTIFICATION_BYTES: usize = 51;
 const COMMENT_BYTES: usize = 20;
@@ -157,7 +160,7 @@ pub(crate) fn write_ogg_flac(path: &Path, stream: &Stream) -> Result<(), Pipelin
     let comment = comment_packet(path)?;
 
     let file = File::create(path).map_err(|source| io_err(path, source))?;
-    let mut writer = PacketWriter::new(BufWriter::with_capacity(64 * 1024, file));
+    let mut writer = PacketWriter::new(BufWriter::with_capacity(OGG_WRITE_BUF_BYTES, file));
     writer
         .write_packet(
             identification.as_slice(),

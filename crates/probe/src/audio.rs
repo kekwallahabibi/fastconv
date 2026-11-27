@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -386,15 +386,128 @@ fn read_magic_prefix(file: &mut File, path: &Path) -> Result<[u8; MAGIC_PREFIX_B
     Ok(prefix)
 }
 
+/// At most this many trailing bytes are inspected when recovering an Ogg
+/// granule position. A longer tail only adds work and never improves certainty.
+const OGG_TAIL_SCAN_BYTES: u64 = 65_536;
+const OGG_PAGE_HEADER_FIXED: usize = 27;
+/// Guard against a pathological file made of millions of tiny ADTS frames.
+const MAX_ADTS_SCAN_FRAMES: u64 = 4_000_000;
+
+/// Recovers the decoded sample count of an Ogg Opus stream from its final page.
+///
+/// The granule position of the last page counts pre-skip samples too, so the
+/// decoded length is `granule - pre_skip`. A candidate is accepted only when it
+/// is a version-0 page whose lacing table and body end exactly at EOF and whose
+/// granule is non-negative and at least `pre_skip`; anything else yields `None`
+/// so the batch budget keeps its conservative unknown-length allowance.
+fn opus_total_samples(file: &mut File, pre_skip: u64) -> Option<u64> {
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(OGG_TAIL_SCAN_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::new();
+    file.take(OGG_TAIL_SCAN_BYTES).read_to_end(&mut tail).ok()?;
+    if tail.len() < OGG_PAGE_HEADER_FIXED + 1 {
+        return None;
+    }
+    for at in (0..=tail.len() - OGG_PAGE_HEADER_FIXED).rev() {
+        if &tail[at..at + 4] != b"OggS" || tail.get(at + 4) != Some(&0) {
+            continue;
+        }
+        let Some(&seg_byte) = tail.get(at + 26) else {
+            continue;
+        };
+        let segments = usize::from(seg_byte);
+        if segments == 0 {
+            continue;
+        }
+        let Some(table_end) = at
+            .checked_add(OGG_PAGE_HEADER_FIXED)
+            .and_then(|end| end.checked_add(segments))
+        else {
+            continue;
+        };
+        let Some(table) = tail.get(at + OGG_PAGE_HEADER_FIXED..table_end) else {
+            continue;
+        };
+        let Some(body_len) = table.iter().try_fold(0_usize, |total, &lacing| {
+            total.checked_add(usize::from(lacing))
+        }) else {
+            continue;
+        };
+        if table_end.checked_add(body_len) != Some(tail.len()) {
+            continue;
+        }
+        let Some(granule_bytes) = tail
+            .get(at + 6..at + 14)
+            .and_then(|slice| <[u8; 8]>::try_from(slice).ok())
+        else {
+            continue;
+        };
+        let granule = i64::from_le_bytes(granule_bytes);
+        if granule < 0 {
+            continue;
+        }
+        let Ok(granule) = u64::try_from(granule) else {
+            continue;
+        };
+        return granule.checked_sub(pre_skip);
+    }
+    None
+}
+
+/// Walks ADTS frames from the first header to EOF, summing the decoded samples
+/// each frame carries. A frame with two raw data blocks yields 2048 samples.
+/// Any malformed, truncated or oversized walk yields `None` rather than a
+/// guessed count.
+fn adts_total_samples(file: &mut File, start: u64) -> Option<u64> {
+    let len = file.metadata().ok()?.len();
+    if start >= len {
+        return None;
+    }
+    let mut reader = BufReader::with_capacity(64 * 1024, file.try_clone().ok()?);
+    reader.seek(SeekFrom::Start(start)).ok()?;
+    let mut header = [0_u8; 7];
+    let mut pos = start;
+    let mut total = 0_u64;
+    let mut frames = 0_u64;
+    while pos < len {
+        if frames >= MAX_ADTS_SCAN_FRAMES || len.saturating_sub(pos) < 7 {
+            return None;
+        }
+        reader.read_exact(&mut header).ok()?;
+        let parsed = rusty_aac::parse_adts(&header).ok()?;
+        if parsed.frame_length < parsed.header_len {
+            return None;
+        }
+        let frame_len = u64::try_from(parsed.frame_length).ok()?;
+        let end = pos.checked_add(frame_len)?;
+        if end > len {
+            return None;
+        }
+        let blocks = u64::from(rusty_aac::adts_raw_blocks(&header)).checked_add(1)?;
+        total = total.checked_add(blocks.checked_mul(1024)?)?;
+        frames = frames.checked_add(1)?;
+        let skip = i64::try_from(frame_len.checked_sub(7)?).ok()?;
+        reader.seek_relative(skip).ok()?;
+        pos = end;
+    }
+    (total > 0).then_some(total)
+}
+
 fn probe_opus(path: &Path, file: File) -> Result<AudioStreamInfo, ProbeError> {
+    let mut probe_file = file.try_clone().map_err(|source| ProbeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let reader = opus_pure::OggOpusReader::new(file)
         .map_err(|err| invalid_audio(path, format!("invalid Ogg Opus stream: {err}")))?;
     let head = reader.head();
     let channels = NonZeroU16::new(u16::from(head.channel_count))
         .ok_or_else(|| invalid_audio(path, "Opus channel count must not be zero"))?;
+    let total_samples = opus_total_samples(&mut probe_file, u64::from(head.pre_skip));
     // Ogg Opus always decodes at 48 kHz, regardless of the rate recorded at capture time.
     let sample_rate = NonZeroU32::new(48_000).unwrap_or(NonZeroU32::MIN);
-    AudioStreamInfo::new(channels, sample_rate, NonZeroU16::new(16), None)
+    AudioStreamInfo::new(channels, sample_rate, NonZeroU16::new(16), total_samples)
         .map_err(|err| invalid_audio(path, err.to_string()))
 }
 
@@ -436,7 +549,8 @@ fn probe_adts_aac(path: &Path, mut file: File) -> Result<AudioStreamInfo, ProbeE
         .ok_or_else(|| invalid_audio(path, "AAC channel count must not be zero"))?;
     let sample_rate = NonZeroU32::new(header.sample_rate)
         .ok_or_else(|| invalid_audio(path, "AAC sample rate must not be zero"))?;
-    AudioStreamInfo::new(channels, sample_rate, None, None)
+    let total_samples = adts_total_samples(&mut file, offset);
+    AudioStreamInfo::new(channels, sample_rate, None, total_samples)
         .map_err(|err| invalid_audio(path, err.to_string()))
 }
 
@@ -1835,6 +1949,119 @@ mod tests {
         assert_eq!(plan.mode(), AudioExecutionMode::CpuOggFlac);
 
         let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    fn probe_temp_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("fastconv-probe-{label}-{nanos}"));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn probes_adts_sample_counts_and_withholds_them_for_malformed_files() -> Result<(), String> {
+        let dir = probe_temp_dir("adts-count");
+        let path = dir.join("frames.aac");
+        let frame = |blocks: u8| -> Vec<u8> {
+            let mut header = rusty_aac::write_adts_header(&rusty_aac::AdtsHeader {
+                object_type: 2,
+                sample_rate: 48_000,
+                channels: 2,
+                frame_length: 9,
+                header_len: 7,
+            });
+            header[6] |= blocks;
+            let mut bytes = header;
+            bytes.extend_from_slice(&[0_u8; 2]);
+            bytes
+        };
+        let mut bytes = frame(0);
+        bytes.extend_from_slice(&frame(1));
+        bytes.extend_from_slice(&frame(0));
+        fs::write(&path, &bytes).map_err(|err| err.to_string())?;
+        assert_eq!(
+            probe_audio(&path)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            Some(4_096)
+        );
+
+        // A truncated final frame leaves the walk unable to prove the stream end.
+        let truncated = dir.join("truncated.aac");
+        fs::write(&truncated, &bytes[..bytes.len() - 1]).map_err(|err| err.to_string())?;
+        assert_eq!(
+            probe_audio(&truncated)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            None
+        );
+
+        // A broken second syncword is malformed, so no count is reported.
+        let corrupt = dir.join("corrupt.aac");
+        let mut corrupt_bytes = bytes.clone();
+        corrupt_bytes[9] = 0;
+        fs::write(&corrupt, &corrupt_bytes).map_err(|err| err.to_string())?;
+        assert_eq!(
+            probe_audio(&corrupt)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            None
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn probes_opus_sample_count_and_withholds_it_for_trailing_garbage() -> Result<(), String> {
+        let dir = probe_temp_dir("opus-count");
+        let path = dir.join("tone.opus");
+        let mut encoder = opus_pure::OpusEncoder::new(48_000, 2, opus_pure::Application::Audio)
+            .map_err(|err| err.to_string())?;
+        let head = opus_pure::OpusHead::for_encoder(&encoder, 48_000);
+        let mut writer =
+            opus_pure::OggOpusWriter::new(Vec::new(), head).map_err(|err| err.to_string())?;
+        let mut packet = vec![0_u8; opus_pure::MAX_PACKET_BYTES];
+        let silence = vec![0.0_f32; 960 * 2];
+        for _ in 0..3 {
+            let written = encoder
+                .encode(&silence, 960, &mut packet)
+                .map_err(|err| err.to_string())?;
+            writer
+                .write_packet(&packet[..written])
+                .map_err(|err| err.to_string())?;
+        }
+        let bytes = writer.finish().map_err(|err| err.to_string())?;
+        fs::write(&path, &bytes).map_err(|err| err.to_string())?;
+        // Three 20 ms packets decode to 2880 samples, of which the first
+        // `pre_skip` (312) are discarded by the Ogg Opus pre-roll.
+        assert_eq!(
+            probe_audio(&path)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            Some(2_568)
+        );
+
+        // Bytes after the final page make that page's end ambiguous.
+        let mut junk = bytes;
+        junk.extend_from_slice(b"trailing-garbage");
+        fs::write(&path, &junk).map_err(|err| err.to_string())?;
+        assert_eq!(
+            probe_audio(&path)
+                .map_err(|err| err.to_string())?
+                .stream
+                .total_samples(),
+            None
+        );
+
+        let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 }
