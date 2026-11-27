@@ -4,7 +4,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -776,26 +776,38 @@ fn resolve_target_depth(
         reason,
     };
     match (output, source_format, source_bits) {
+        // Narrowing f64 to f32 or 24-bit integer must be an explicit request.
+        (AudioOutputFormat::Wav | AudioOutputFormat::Aiff, AudioSampleFormat::Float, 64) => {
+            Err(encode_err(
+                "64-bit float source would be narrowed to 32-bit; use --bit-depth f32".to_owned(),
+            ))
+        }
+        (AudioOutputFormat::Flac, AudioSampleFormat::Float, 64) => Err(encode_err(
+            "64-bit float source would be narrowed to 24-bit; use --bit-depth 24".to_owned(),
+        )),
         (AudioOutputFormat::Wav | AudioOutputFormat::Aiff, AudioSampleFormat::Float, _) => {
             Ok(AudioBitDepth::Float32)
         }
         (AudioOutputFormat::Wav | AudioOutputFormat::Aiff, AudioSampleFormat::Int, 8) => {
             Ok(AudioBitDepth::Int8)
         }
+        // ALAC is 16-bit: keep its pre-existing default for integer widths it can
+        // store and for IEEE-float input (whose width may be unset or inferred as 32).
         (
             AudioOutputFormat::Wav | AudioOutputFormat::Aiff | AudioOutputFormat::Flac,
             AudioSampleFormat::Int,
             0 | 16,
         )
-        | (AudioOutputFormat::Alac, AudioSampleFormat::Int, 0 | 8 | 16) => Ok(AudioBitDepth::Int16),
+        | (AudioOutputFormat::Alac, AudioSampleFormat::Int, 0 | 8 | 16)
+        | (AudioOutputFormat::Alac, AudioSampleFormat::Float, 0 | 32) => Ok(AudioBitDepth::Int16),
         (AudioOutputFormat::Wav | AudioOutputFormat::Aiff, AudioSampleFormat::Int, 24) => {
             Ok(AudioBitDepth::Int24)
         }
         (AudioOutputFormat::Wav | AudioOutputFormat::Aiff, AudioSampleFormat::Int, 32) => {
             Ok(AudioBitDepth::Int32)
         }
-        // f32 has a 24-bit mantissa, so Int24 keeps every meaningful bit without
-        // pretending the source carried 32 bits of integer precision.
+        // Float input to FLAC is quantized to Int24. That keeps full precision
+        // only near full scale; quieter samples lose relative precision.
         (AudioOutputFormat::Flac, AudioSampleFormat::Float, _)
         | (AudioOutputFormat::Flac, AudioSampleFormat::Int, 24) => Ok(AudioBitDepth::Int24),
         (AudioOutputFormat::Flac, AudioSampleFormat::Int, 8) => Ok(AudioBitDepth::Int8),
@@ -855,8 +867,9 @@ fn quantize_for(output: AudioOutputFormat, depth: AudioBitDepth, buf: &mut Audio
         // Unsupported combinations are rejected before this point.
         _ => {}
     }
-    // Only one PCM representation is needed after quantization; release the float copy so peak
-    // memory stays bounded to a single full-file sample array per active worker.
+    // The float source and the integer target coexist during the `extend` above;
+    // `estimate_pcm_bytes` reserves that transient second array. After quantization
+    // only one representation is needed, so release the float copy for later items.
     buf.samples_f32.clear();
 }
 
@@ -1316,7 +1329,36 @@ fn encode_wav(
         .map_err(|err| PipelineError::EncodeFailed {
             path: path.to_path_buf(),
             reason: format!("failed to finalize WAV: {err}"),
-        })
+        })?;
+    if depth == AudioBitDepth::Int8 && buf.samples_i16.len() % 2 == 1 {
+        // Hound writes one byte per 8-bit sample but does not pad an odd-sized
+        // `data` chunk. RIFF requires word alignment, so append the pad byte and
+        // grow the RIFF size while leaving the data chunk length at the sample count.
+        let io_err = |source| PipelineError::Io {
+            path: path.to_path_buf(),
+            source,
+        };
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(io_err)?;
+        let mut riff_size = [0_u8; 4];
+        file.seek(SeekFrom::Start(4)).map_err(io_err)?;
+        file.read_exact(&mut riff_size).map_err(io_err)?;
+        let size = u32::from_le_bytes(riff_size)
+            .checked_add(1)
+            .ok_or_else(|| PipelineError::EncodeFailed {
+                path: path.to_path_buf(),
+                reason: "WAV RIFF size overflows".to_owned(),
+            })?;
+        file.seek(SeekFrom::End(0)).map_err(io_err)?;
+        file.write_all(&[0]).map_err(io_err)?;
+        file.seek(SeekFrom::Start(4)).map_err(io_err)?;
+        file.write_all(&size.to_le_bytes()).map_err(io_err)?;
+        file.flush().map_err(io_err)?;
+    }
+    Ok(())
 }
 
 // The resampler state, chunk buffer and output accumulation form one linear pipeline.
@@ -2354,6 +2396,39 @@ struct PcmEstimate {
     largest_buffer_bytes: u64,
 }
 
+/// Whether an item quantizes live `f32` samples into a second full-file integer
+/// array. Mirrors the direct-copy conditions in `decode_symphonia` using already
+/// validated probe metadata, so the batch budget charges the transient buffer
+/// only when a quantizing path is actually taken.
+fn quantizes_to_second_array(
+    item: &AudioBatchItem,
+    output: AudioOutputFormat,
+    options: &AudioEncodingOptions,
+) -> bool {
+    if !output.is_lossless() || options.bit_depth().is_some_and(AudioBitDepth::is_float) {
+        return false;
+    }
+    let stream = item.stream();
+    if stream.sample_format() != AudioSampleFormat::Int {
+        return true;
+    }
+    let bits = usize::from(stream.bits_per_sample().map_or(0, NonZeroU16::get));
+    let no_transform = options
+        .sample_rate()
+        .is_none_or(|rate| rate.hz() == stream.sample_rate().get())
+        && options.channels().is_none_or(|channels| {
+            usize::from(channels.get()) == usize::from(stream.channels().get())
+        });
+    let explicit = options.bit_depth();
+    let direct_i16 =
+        no_transform && bits == 16 && explicit.is_none_or(|depth| depth == AudioBitDepth::Int16);
+    let direct_i32 = no_transform
+        && matches!(output, AudioOutputFormat::Wav | AudioOutputFormat::Aiff)
+        && bits == 32
+        && explicit.is_none_or(|depth| depth == AudioBitDepth::Int32);
+    !direct_i16 && !direct_i32
+}
+
 fn estimate_pcm_bytes(
     item: &AudioBatchItem,
     output: AudioOutputFormat,
@@ -2417,6 +2492,12 @@ fn estimate_pcm_bytes(
             final_bytes
         };
         peak_bytes = peak_bytes.max(source_bytes.saturating_add(remix_output_bytes));
+    }
+    if quantizes_to_second_array(item, output, options) {
+        // The decoded f32 samples and the quantized i16/i32 array are both live
+        // across the extend loop, and the integer array keeps its capacity for
+        // later items. Charge a second full-file array at the wider 4-byte size.
+        peak_bytes = peak_bytes.max(final_bytes.saturating_add(final_bytes));
     }
     PcmEstimate {
         peak_bytes,
@@ -4000,8 +4081,9 @@ mod tests {
         );
         let grown = estimate_pcm_bytes(&item, AudioOutputFormat::Wav, &upsampled);
         assert_eq!(grown.largest_buffer_bytes, 2_000 * 6 * 4);
-        // Decoded input and the growing resample output coexist with the upmix output.
-        assert_eq!(grown.peak_bytes, 2_000 * 2 * 4 + 2_000 * 6 * 4);
+        // The remixed f32 samples and their quantized i32 copy are both live,
+        // which peaks higher than the decoded/resample coexistence (64_000).
+        assert_eq!(grown.peak_bytes, 2_000 * 6 * 4 + 2_000 * 6 * 4);
         let huge = item_frames(
             PathBuf::from("in.wav"),
             PathBuf::from("out.wav"),
@@ -4431,36 +4513,55 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    fn write_wav_f32(path: &Path, samples: &[f32], rate: u32, channels: u16) {
+    fn fixture_wav_err(path: &Path, err: &hound::Error) -> PipelineError {
+        PipelineError::EncodeFailed {
+            path: path.to_path_buf(),
+            reason: format!("fixture WAV write failed: {err}"),
+        }
+    }
+
+    fn write_wav_f32(
+        path: &Path,
+        samples: &[f32],
+        rate: u32,
+        channels: u16,
+    ) -> Result<(), PipelineError> {
         let spec = WavSpec {
             channels,
             sample_rate: rate,
             bits_per_sample: 32,
             sample_format: SampleFormat::Float,
         };
-        let Ok(mut writer) = WavWriter::create(path, spec) else {
-            return;
-        };
+        let mut writer =
+            WavWriter::create(path, spec).map_err(|err| fixture_wav_err(path, &err))?;
         for &sample in samples {
-            let _ = writer.write_sample(sample);
+            writer
+                .write_sample(sample)
+                .map_err(|err| fixture_wav_err(path, &err))?;
         }
-        let _ = writer.finalize();
+        writer.finalize().map_err(|err| fixture_wav_err(path, &err))
     }
 
-    fn write_wav_i32(path: &Path, samples: &[i32], rate: u32, channels: u16) {
+    fn write_wav_i32(
+        path: &Path,
+        samples: &[i32],
+        rate: u32,
+        channels: u16,
+    ) -> Result<(), PipelineError> {
         let spec = WavSpec {
             channels,
             sample_rate: rate,
             bits_per_sample: 32,
             sample_format: SampleFormat::Int,
         };
-        let Ok(mut writer) = WavWriter::create(path, spec) else {
-            return;
-        };
+        let mut writer =
+            WavWriter::create(path, spec).map_err(|err| fixture_wav_err(path, &err))?;
         for &sample in samples {
-            let _ = writer.write_sample(sample);
+            writer
+                .write_sample(sample)
+                .map_err(|err| fixture_wav_err(path, &err))?;
         }
-        let _ = writer.finalize();
+        writer.finalize().map_err(|err| fixture_wav_err(path, &err))
     }
 
     fn read_wav_f32(path: &Path) -> Vec<f32> {
@@ -4501,7 +4602,7 @@ mod tests {
         let src = dir.join("in.wav");
         let out = dir.join("out.wav");
         let samples = float_samples(4_096, 2);
-        write_wav_f32(&src, &samples, 48_000, 2);
+        write_wav_f32(&src, &samples, 48_000, 2)?;
         execute_audio_batch(&plan_with_options(
             vec![item_bits(
                 src,
@@ -4529,7 +4630,7 @@ mod tests {
         let aifc = dir.join("middle.aiff");
         let out = dir.join("out.wav");
         let samples = float_samples(4_096, 2);
-        write_wav_f32(&src, &samples, 48_000, 2);
+        write_wav_f32(&src, &samples, 48_000, 2)?;
         execute_audio_batch(&plan_with_options(
             vec![item_bits(
                 src,
@@ -4572,7 +4673,7 @@ mod tests {
         let dir = temp_dir("f32-targets");
         let src = dir.join("in.wav");
         let samples = float_samples(8_192, 2);
-        write_wav_f32(&src, &samples, 48_000, 2);
+        write_wav_f32(&src, &samples, 48_000, 2)?;
 
         let wav24 = dir.join("out24.wav");
         execute_audio_batch(&plan_with_options(
@@ -4677,7 +4778,7 @@ mod tests {
         let out = dir.join("out.wav");
         let samples = deep_samples(4_096);
         assert!(samples.iter().any(|sample| sample & 0xFF != 0));
-        write_wav_i32(&src, &samples, 48_000, 2);
+        write_wav_i32(&src, &samples, 48_000, 2)?;
         execute_audio_batch(&plan_with_options(
             vec![item_bits(
                 src,
@@ -4823,5 +4924,175 @@ mod tests {
         )?;
         let _ = fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    #[test]
+    fn rejects_implicit_64bit_float_narrowing() -> Result<(), PipelineError> {
+        let path = Path::new("in.wav");
+        let defaults = AudioEncodingOptions::default();
+        for output in [
+            AudioOutputFormat::Wav,
+            AudioOutputFormat::Aiff,
+            AudioOutputFormat::Flac,
+        ] {
+            assert!(
+                matches!(
+                    resolve_target_depth(path, output, 64, AudioSampleFormat::Float, &defaults),
+                    Err(PipelineError::EncodeFailed { .. })
+                ),
+                "{output} must reject implicit f64 narrowing"
+            );
+        }
+        let explicit = options_depth(AudioOutputFormat::Wav, AudioBitDepth::Float32);
+        assert_eq!(
+            resolve_target_depth(
+                path,
+                AudioOutputFormat::Wav,
+                64,
+                AudioSampleFormat::Float,
+                &explicit
+            )?,
+            AudioBitDepth::Float32
+        );
+        assert_eq!(
+            resolve_target_depth(
+                path,
+                AudioOutputFormat::Wav,
+                32,
+                AudioSampleFormat::Float,
+                &defaults
+            )?,
+            AudioBitDepth::Float32
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_default_float_to_alac_conversion() -> Result<(), PipelineError> {
+        let path = Path::new("in.wav");
+        let defaults = AudioEncodingOptions::default();
+        for bits in [0, 32] {
+            assert_eq!(
+                resolve_target_depth(
+                    path,
+                    AudioOutputFormat::Alac,
+                    bits,
+                    AudioSampleFormat::Float,
+                    &defaults
+                )?,
+                AudioBitDepth::Int16,
+                "float width {bits}"
+            );
+        }
+        assert!(matches!(
+            resolve_target_depth(
+                path,
+                AudioOutputFormat::Alac,
+                24,
+                AudioSampleFormat::Int,
+                &defaults
+            ),
+            Err(PipelineError::EncodeFailed { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn float_wav_converts_to_alac_without_explicit_depth() -> Result<(), PipelineError> {
+        let dir = temp_dir("f32-default-alac");
+        let src = dir.join("in.wav");
+        let out = dir.join("out.m4a");
+        write_wav_f32(&src, &float_samples(1_024, 2), 48_000, 2)?;
+        execute_audio_batch(&plan(
+            vec![item_bits(
+                src,
+                out.clone(),
+                AudioInputFormat::Wav,
+                2,
+                48_000,
+                32,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuAlac,
+        ))?;
+        let bytes = fs::read(&out).map_err(|source| PipelineError::Io {
+            path: out.clone(),
+            source,
+        })?;
+        assert!(!bytes.is_empty(), "ALAC output must not be empty");
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn odd_frame_eight_bit_wav_has_word_aligned_riff() -> Result<(), PipelineError> {
+        let dir = temp_dir("i8-odd-riff-pad");
+        let src = dir.join("in.wav");
+        let out = dir.join("out.wav");
+        write_wav(&src, &tone(5, 1), 48_000, 1);
+        execute_audio_batch(&plan_with_options(
+            vec![item_bits(
+                src,
+                out.clone(),
+                AudioInputFormat::Wav,
+                1,
+                48_000,
+                16,
+            )],
+            fastconv_domain::AudioExecutionMode::CpuWav,
+            options_depth(AudioOutputFormat::Wav, AudioBitDepth::Int8),
+        ))?;
+        let bytes = fs::read(&out).map_err(|source| PipelineError::Io {
+            path: out.clone(),
+            source,
+        })?;
+        assert_eq!(&bytes[..4], b"RIFF");
+        let riff_size = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        assert_eq!(usize::try_from(riff_size).unwrap_or(0) + 8, bytes.len());
+        let data_at = bytes
+            .windows(4)
+            .position(|window| window == b"data")
+            .ok_or_else(|| PipelineError::DecodeFailed {
+                path: out.clone(),
+                reason: "WAV has no data chunk".to_owned(),
+            })?;
+        let data_size = u32::from_le_bytes([
+            bytes[data_at + 4],
+            bytes[data_at + 5],
+            bytes[data_at + 6],
+            bytes[data_at + 7],
+        ]);
+        assert_eq!(data_size, 5);
+        assert_eq!(bytes.len() % 2, 0);
+        assert_eq!(bytes.last(), Some(&0));
+        let mut reader =
+            hound::WavReader::open(&out).map_err(|err| PipelineError::DecodeFailed {
+                path: out.clone(),
+                reason: format!("cannot reopen padded WAV: {err}"),
+            })?;
+        let samples: Vec<i8> = reader.samples::<i8>().filter_map(Result::ok).collect();
+        assert_eq!(samples.len(), 5);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn quantization_reserves_transient_second_array() {
+        let item = item_frames(
+            PathBuf::from("in.wav"),
+            PathBuf::from("out.wav"),
+            AudioInputFormat::Wav,
+            2,
+            48_000,
+            1_000,
+        );
+        let defaults = AudioEncodingOptions::default();
+        let direct = estimate_pcm_bytes(&item, AudioOutputFormat::Wav, &defaults);
+        let quantized = estimate_pcm_bytes(
+            &item,
+            AudioOutputFormat::Wav,
+            &options_depth(AudioOutputFormat::Wav, AudioBitDepth::Int32),
+        );
+        assert_eq!(direct.peak_bytes, 8_000);
+        assert_eq!(quantized.peak_bytes, 16_000);
     }
 }
