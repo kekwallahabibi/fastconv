@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Seek, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -18,15 +18,20 @@ use jixel::{
     encode_image_gray, encode_image_gray_alpha, encode_image_with_alpha,
 };
 use jpeg_encoder::{
-    ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor,
+    ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder as JpegEncoder, ImageBuffer,
+    JpegColorType as PlanarColorType, SamplingFactor,
 };
 use tiff::encoder::{Compression as TiffEncoderCompression, DeflateLevel, TiffEncoder, colortype};
 use tiff::tags::{ExtraSamples, Predictor, Tag};
+use yuv::{
+    BufferStoreMut, YuvConversionMode, YuvPlanarImageMut, YuvRange, YuvStandardMatrix,
+    rgb_to_yuv444, rgba_to_yuv444,
+};
 use zenwebp::{EncodeRequest, LosslessConfig, LossyConfig, PixelLayout};
 
 use crate::PipelineError;
 use crate::avif::{AvifEncodeRequest, encode_avif_into};
-use crate::bmp::{BmpFrameScratch, encode_bmp_into_frame};
+use crate::bmp::{BmpFrameScratch, encode_bmp_into_frame, prepare_bmp_in_place};
 use crate::decode::{
     DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat, decode_image_into,
     precreate_target_directories,
@@ -39,6 +44,11 @@ use crate::qoi::encode_qoi_into;
 
 const STREAM_IO_BUF_BYTES: usize = 512 * 1024;
 const PNG_IDAT_CHUNK_BYTES: usize = 256 * 1024;
+// The worker's reusable TIFF sink is capped so a batch of large uncompressed
+// images cannot pin one full encoded copy per worker. 2x the decoded bytes is
+// a conservative worst case for PackBits/LZW expansion.
+const MAX_TIFF_BUFFERED_BYTES: usize = 128 * 1024 * 1024;
+const TIFF_ENCODE_OVERHEAD_BOUND: usize = 1024 * 1024;
 
 /// Concrete CPU execution backend entry point.
 ///
@@ -436,7 +446,7 @@ struct EncodeBuffers<'a> {
 fn encode_item_pixels(
     item: &ImageBatchItem,
     encoder: CpuImageEncoder,
-    pixels: &[u8],
+    pixels: &mut [u8],
     decoded: DecodedFrameMeta,
     buffers: &mut EncodeBuffers<'_>,
     encode_threads: usize,
@@ -481,11 +491,17 @@ fn encode_item_pixels(
             pixels,
             decoded,
             buffers.bmp_frame,
+            buffers.aux,
             bmp_write_lock,
         ),
-        CpuImageEncoder::Tiff { compression } => {
-            encode_tiff_streaming(item.target(), compression, pixels, decoded, buffers.aux)
-        }
+        CpuImageEncoder::Tiff { compression } => encode_tiff_streaming(
+            item.target(),
+            compression,
+            pixels,
+            decoded,
+            buffers.aux,
+            buffers.encoded,
+        ),
         CpuImageEncoder::Jxl { compression, level } => {
             let jxl_output = encode_jxl_into(
                 item.target(),
@@ -551,14 +567,13 @@ fn convert_single_item(
         &mut scratch.file_bytes,
         &mut scratch.pixel_buf,
     )?;
-    let pixels =
-        scratch
-            .pixel_buf
-            .get(..decoded.byte_len)
-            .ok_or_else(|| PipelineError::DecodeFailed {
-                path: item.source().to_path_buf(),
-                reason: "decoded image frame exceeded allocated pixel buffer".to_owned(),
-            })?;
+    let pixels = scratch
+        .pixel_buf
+        .get_mut(..decoded.byte_len)
+        .ok_or_else(|| PipelineError::DecodeFailed {
+            path: item.source().to_path_buf(),
+            reason: "decoded image frame exceeded allocated pixel buffer".to_owned(),
+        })?;
 
     let mut buffers = EncodeBuffers {
         encoded: &mut scratch.encoded_buf,
@@ -722,40 +737,41 @@ fn encode_heic_streaming(
         return Err(PipelineError::EmptyOutput(target.to_path_buf()));
     }
 
+    // `encode_heic_into` already produces one contiguous buffer; a BufWriter
+    // would only add a 512 KiB allocation and a second copy of the same bytes.
     let (staging, file) = StagingFile::create_for(target)?;
-    let mut writer = BufWriter::with_capacity(STREAM_IO_BUF_BYTES, file);
-    writer
-        .write_all(&encoded)
+    let mut file = file;
+    file.write_all(&encoded)
         .map_err(|source| PipelineError::Io {
             path: target.to_path_buf(),
             source,
         })?;
-    writer.flush().map_err(|source| PipelineError::Io {
+    file.flush().map_err(|source| PipelineError::Io {
         path: target.to_path_buf(),
         source,
-    })?;
-    let file = writer.into_inner().map_err(|err| PipelineError::Io {
-        path: target.to_path_buf(),
-        source: err.into_error(),
     })?;
     staging.commit(target, file)?;
     Ok(u64::try_from(encoded.len()).unwrap_or(u64::MAX))
 }
 
-/// Prepares the whole BMP frame in parallel, then flushes it to disk under a
-/// shared lock. Only the contiguous 25 MiB write is serialized; decode, swizzle
-/// and header setup still overlap across workers.
+/// Writes a BMP under a shared lock. For RGB8/32-bit frames the decoded pixels
+/// are flipped and swizzled in place (one auxiliary row), so no 25 MiB full-frame
+/// scratch allocation or zero-fill is needed. Other formats take the existing
+/// full-frame path before the serialized write.
 fn encode_bmp_streaming(
     target: &Path,
-    pixels: &[u8],
+    pixels: &mut [u8],
     decoded: DecodedFrameMeta,
     frame: &mut BmpFrameScratch,
+    aux_buf: &mut Vec<u8>,
     write_lock: &Mutex<()>,
 ) -> Result<u64, PipelineError> {
-    let bytes = encode_bmp_into_frame(target, pixels, decoded, frame)?;
-    let len =
-        usize::try_from(bytes).map_err(|_| PipelineError::EmptyOutput(target.to_path_buf()))?;
-    if len == 0 {
+    let in_place = prepare_bmp_in_place(target, pixels, decoded, aux_buf)?;
+    let bytes = match &in_place {
+        Some(header) => header.total_bytes,
+        None => encode_bmp_into_frame(target, pixels, decoded, frame)?,
+    };
+    if bytes == 0 {
         return Err(PipelineError::EmptyOutput(target.to_path_buf()));
     }
 
@@ -768,11 +784,25 @@ fn encode_bmp_streaming(
         source,
     })?;
     let mut file = file;
-    file.write_all(&frame.bytes()[..len])
-        .map_err(|source| PipelineError::Io {
+    if let Some(header) = in_place {
+        file.write_all(&header.bytes[..header.len])
+            .map_err(|source| PipelineError::Io {
+                path: target.to_path_buf(),
+                source,
+            })?;
+        file.write_all(pixels).map_err(|source| PipelineError::Io {
             path: target.to_path_buf(),
             source,
         })?;
+    } else {
+        let len =
+            usize::try_from(bytes).map_err(|_| PipelineError::EmptyOutput(target.to_path_buf()))?;
+        file.write_all(&frame.bytes()[..len])
+            .map_err(|source| PipelineError::Io {
+                path: target.to_path_buf(),
+                source,
+            })?;
+    }
     file.flush().map_err(|source| PipelineError::Io {
         path: target.to_path_buf(),
         source,
@@ -826,6 +856,102 @@ fn encode_webp_into(
         path: target.to_path_buf(),
         reason: err.to_string(),
     })
+}
+
+/// `jpeg_encoder::ImageBuffer` adapter converting one RGB(A) row at a time with
+/// the SIMD yuv BT.601 full-range RGB→YCbCr path. Scratch planes are allocated
+/// once and reused; the encoder only needs the visible width per row.
+struct SimdJpegBuffer<'a> {
+    pixels: &'a [u8],
+    bpp: usize,
+    width: u16,
+    height: u16,
+    y: std::cell::RefCell<Vec<u8>>,
+    u: std::cell::RefCell<Vec<u8>>,
+    v: std::cell::RefCell<Vec<u8>>,
+    error: std::cell::RefCell<Option<yuv::YuvError>>,
+}
+
+impl SimdJpegBuffer<'_> {
+    fn new(pixels: &[u8], bpp: usize, width: u16, height: u16) -> SimdJpegBuffer<'_> {
+        let w = usize::from(width);
+        SimdJpegBuffer {
+            pixels,
+            bpp,
+            width,
+            height,
+            y: std::cell::RefCell::new(vec![0_u8; w]),
+            u: std::cell::RefCell::new(vec![0_u8; w]),
+            v: std::cell::RefCell::new(vec![0_u8; w]),
+            error: std::cell::RefCell::new(None),
+        }
+    }
+}
+
+impl ImageBuffer for &SimdJpegBuffer<'_> {
+    fn get_jpeg_color_type(&self) -> PlanarColorType {
+        PlanarColorType::Ycbcr
+    }
+
+    fn width(&self) -> u16 {
+        self.width
+    }
+
+    fn height(&self) -> u16 {
+        self.height
+    }
+
+    fn fill_buffers(&self, y: u16, buffers: &mut [Vec<u8>; 4]) {
+        let width = usize::from(self.width);
+        let row = usize::from(y).min(usize::from(self.height).saturating_sub(1));
+        let row_bytes = width * self.bpp;
+        let start = row * row_bytes;
+        let line = &self.pixels[start..start + row_bytes];
+        let plane_stride = u32::from(self.width);
+        // `yuv` strides are measured in source components, i.e. bytes here.
+        let src_stride = plane_stride * u32::try_from(self.bpp).unwrap_or(4);
+        let mut y_plane = self.y.borrow_mut();
+        let mut u_plane = self.u.borrow_mut();
+        let mut v_plane = self.v.borrow_mut();
+        let result = {
+            let mut image = YuvPlanarImageMut {
+                y_plane: BufferStoreMut::Borrowed(&mut y_plane[..width]),
+                y_stride: plane_stride,
+                u_plane: BufferStoreMut::Borrowed(&mut u_plane[..width]),
+                u_stride: plane_stride,
+                v_plane: BufferStoreMut::Borrowed(&mut v_plane[..width]),
+                v_stride: plane_stride,
+                width: plane_stride,
+                height: 1,
+            };
+            if self.bpp == 3 {
+                rgb_to_yuv444(
+                    &mut image,
+                    line,
+                    src_stride,
+                    YuvRange::Full,
+                    YuvStandardMatrix::Bt601,
+                    YuvConversionMode::Balanced,
+                )
+            } else {
+                rgba_to_yuv444(
+                    &mut image,
+                    line,
+                    src_stride,
+                    YuvRange::Full,
+                    YuvStandardMatrix::Bt601,
+                    YuvConversionMode::Balanced,
+                )
+            }
+        };
+        if let Err(err) = result {
+            *self.error.borrow_mut() = Some(err);
+            return;
+        }
+        buffers[0].extend_from_slice(&y_plane[..width]);
+        buffers[1].extend_from_slice(&u_plane[..width]);
+        buffers[2].extend_from_slice(&v_plane[..width]);
+    }
 }
 
 fn encode_jpeg_into(
@@ -907,12 +1033,36 @@ fn encode_jpeg_into(
             encoder.set_sampling_factor(SamplingFactor::R_4_4_4);
         }
     }
-    encoder
-        .encode(input_slice, width_u16, height_u16, color_type)
-        .map_err(|err| PipelineError::EncodeFailed {
-            path: target.to_path_buf(),
-            reason: err.to_string(),
-        })
+    match decoded.format {
+        DecodedPixelFormat::Rgb8 | DecodedPixelFormat::Rgba8 => {
+            let bpp = if color_type == JpegColorType::Rgba {
+                4
+            } else {
+                3
+            };
+            let adapter = SimdJpegBuffer::new(input_slice, bpp, width_u16, height_u16);
+            let result =
+                encoder
+                    .encode_image(&adapter)
+                    .map_err(|err| PipelineError::EncodeFailed {
+                        path: target.to_path_buf(),
+                        reason: err.to_string(),
+                    });
+            if let Some(err) = adapter.error.borrow_mut().take() {
+                return Err(PipelineError::EncodeFailed {
+                    path: target.to_path_buf(),
+                    reason: format!("SIMD RGB to JPEG YCbCr conversion failed: {err}"),
+                });
+            }
+            result
+        }
+        _ => encoder
+            .encode(input_slice, width_u16, height_u16, color_type)
+            .map_err(|err| PipelineError::EncodeFailed {
+                path: target.to_path_buf(),
+                reason: err.to_string(),
+            }),
+    }
 }
 
 fn expand_la8_to_rgba(
@@ -964,20 +1114,22 @@ fn tiff_encoder_settings(compression: TiffCompression) -> (TiffEncoderCompressio
     }
 }
 
-fn encode_tiff_streaming(
+const fn tiff_use_buffered_sink(pixels_len: usize) -> bool {
+    pixels_len
+        .saturating_mul(2)
+        .saturating_add(TIFF_ENCODE_OVERHEAD_BOUND)
+        <= MAX_TIFF_BUFFERED_BYTES
+}
+
+fn write_tiff_image<W: Write + Seek>(
     target: &Path,
     compression: TiffCompression,
     pixels: &[u8],
     decoded: DecodedFrameMeta,
     aux_buf: &mut Vec<u8>,
-) -> Result<u64, PipelineError> {
-    use std::io::Write;
-
-    use crate::PipelineError;
-
-    let (staging, file) = StagingFile::create_for(target)?;
-    let mut writer = BufWriter::with_capacity(STREAM_IO_BUF_BYTES, file);
-    let mut encoder = TiffEncoder::new(&mut writer).map_err(|err| PipelineError::EncodeFailed {
+    writer: &mut W,
+) -> Result<(), PipelineError> {
+    let mut encoder = TiffEncoder::new(writer).map_err(|err| PipelineError::EncodeFailed {
         path: target.to_path_buf(),
         reason: format!("failed to create TIFF encoder: {err}"),
     })?;
@@ -1032,6 +1184,47 @@ fn encode_tiff_streaming(
                 })?;
         }
     }
+    Ok(())
+}
+
+fn encode_tiff_streaming(
+    target: &Path,
+    compression: TiffCompression,
+    pixels: &[u8],
+    decoded: DecodedFrameMeta,
+    aux_buf: &mut Vec<u8>,
+    encoded_buf: &mut Vec<u8>,
+) -> Result<u64, PipelineError> {
+    // TIFF needs a seekable sink. Ordinary images use the worker's reusable
+    // buffer (one contiguous write to the staging file); images whose worst
+    // case exceeds the budget stream through a file-backed BufWriter instead,
+    // so a large uncompressed batch cannot pin a full output copy per worker.
+    if tiff_use_buffered_sink(pixels.len()) {
+        encoded_buf.clear();
+        {
+            let mut writer = io::Cursor::new(&mut *encoded_buf);
+            write_tiff_image(target, compression, pixels, decoded, aux_buf, &mut writer)?;
+        }
+        if encoded_buf.is_empty() {
+            return Err(PipelineError::EmptyOutput(target.to_path_buf()));
+        }
+        let (staging, mut file) = StagingFile::create_for(target)?;
+        file.write_all(encoded_buf)
+            .map_err(|source| PipelineError::Io {
+                path: target.to_path_buf(),
+                source,
+            })?;
+        file.flush().map_err(|source| PipelineError::Io {
+            path: target.to_path_buf(),
+            source,
+        })?;
+        staging.commit(target, file)?;
+        return Ok(u64::try_from(encoded_buf.len()).unwrap_or(u64::MAX));
+    }
+
+    let (staging, file) = StagingFile::create_for(target)?;
+    let mut writer = BufWriter::with_capacity(STREAM_IO_BUF_BYTES, file);
+    write_tiff_image(target, compression, pixels, decoded, aux_buf, &mut writer)?;
     let mut file = writer
         .into_inner()
         .map_err(|err| PipelineError::EncodeFailed {
@@ -1118,6 +1311,16 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static CPU_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn tiff_sink_budget_keeps_4k_buffered_and_streams_8k() {
+        // 4K RGB/RGBA must keep the fast cursor path used by the benchmark.
+        assert!(super::tiff_use_buffered_sink(3840 * 2160 * 3));
+        assert!(super::tiff_use_buffered_sink(3840 * 2160 * 4));
+        // An uncompressed 8K RGB frame must stream through the staging file
+        // instead of pinning a full encoded copy in the worker buffer.
+        assert!(!super::tiff_use_buffered_sink(8192 * 8192 * 3));
+    }
 
     struct FailOnceAfterIdatHeader {
         saw_idat_header: bool,
@@ -1228,7 +1431,7 @@ mod tests {
         let dir = env::temp_dir().join(format!("fastconv-cpu-perms-{}-{id}", process::id()));
         fs::create_dir_all(&dir)?;
 
-        let pixels = vec![99_u8; 8 * 8 * 3];
+        let mut pixels = vec![99_u8; 8 * 8 * 3];
         let meta = DecodedFrameMeta {
             width: 8,
             height: 8,
@@ -1247,7 +1450,14 @@ mod tests {
 
         encode_png_streaming(&png_target, &pixels, meta, CompressionLevel::Fast)?;
         let mut scratch = BmpFrameScratch::new();
-        encode_bmp_streaming(&bmp_target, &pixels, meta, &mut scratch, &Mutex::new(()))?;
+        encode_bmp_streaming(
+            &bmp_target,
+            &mut pixels,
+            meta,
+            &mut scratch,
+            &mut Vec::new(),
+            &Mutex::new(()),
+        )?;
 
         assert_eq!(
             fs::metadata(&png_target)?.permissions().mode() & 0o777,
@@ -1276,7 +1486,7 @@ mod tests {
         fs::write(&bmp_target, sentinel)?;
 
         // Truncated pixel slice triggers encode error during streaming.
-        let bad_pixels = vec![0_u8; 3];
+        let mut bad_pixels = vec![0_u8; 3];
         let meta = DecodedFrameMeta {
             width: 16,
             height: 16,
@@ -1292,9 +1502,10 @@ mod tests {
         assert!(
             encode_bmp_streaming(
                 &bmp_target,
-                &bad_pixels,
+                &mut bad_pixels,
                 meta,
                 &mut scratch,
+                &mut Vec::new(),
                 &Mutex::new(())
             )
             .is_err()
@@ -1354,6 +1565,7 @@ mod tests {
                 &pixels,
                 meta,
                 &mut aux_buf,
+                &mut Vec::new(),
             )?;
 
             let item = ImageBatchItem::new(
@@ -1391,6 +1603,7 @@ mod tests {
             &la_pixels,
             la_meta,
             &mut aux_buf,
+            &mut Vec::new(),
         )?;
         let la_item = ImageBatchItem::new(
             la_target,
@@ -1445,6 +1658,7 @@ mod tests {
                 TiffCompression::DEFAULT,
                 &[1_u8, 2, 3],
                 meta,
+                &mut Vec::new(),
                 &mut Vec::new(),
             ),
             Err(PipelineError::DecodeFailed { .. })
@@ -1509,7 +1723,14 @@ mod tests {
         for (name, compression, expected_tag) in modes {
             let mut aux_buf = Vec::new();
             let target = dir.join(format!("{name}.tif"));
-            let written = encode_tiff_streaming(&target, compression, &pixels, meta, &mut aux_buf)?;
+            let written = encode_tiff_streaming(
+                &target,
+                compression,
+                &pixels,
+                meta,
+                &mut aux_buf,
+                &mut Vec::new(),
+            )?;
             assert_eq!(written, fs::metadata(&target)?.len());
             let mut decoder = Decoder::new(std::io::BufReader::new(File::open(&target)?))?;
             assert_eq!(
@@ -1766,6 +1987,93 @@ mod tests {
                 diff < u64::try_from(rgb.len())? * 24,
                 "lossy WebP at {level} diverged too far"
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn simd_jpeg_buffer_matches_builtin_encoder() -> Result<(), Box<dyn std::error::Error>> {
+        use super::SimdJpegBuffer;
+        use jpeg_encoder::{
+            ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder as JpegEncoder,
+            SamplingFactor,
+        };
+        use zune_jpeg::JpegDecoder;
+        use zune_jpeg::zune_core::bytestream::ZCursor;
+        use zune_jpeg::zune_core::colorspace::ColorSpace;
+        use zune_jpeg::zune_core::options::DecoderOptions;
+
+        fn decode_rgb(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            let mut decoder = JpegDecoder::new_with_options(
+                ZCursor::new(bytes),
+                DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB),
+            );
+            decoder.decode_headers()?;
+            let len = decoder
+                .output_buffer_size()
+                .ok_or_else(|| std::io::Error::other("missing JPEG output buffer size"))?;
+            let mut out = vec![0_u8; len];
+            decoder.decode_into(&mut out)?;
+            Ok(out)
+        }
+
+        for (width, height) in [(16_u16, 16_u16), (53_u16, 37_u16), (17_u16, 15_u16)] {
+            for bpp in [3_usize, 4] {
+                let count = usize::from(width) * usize::from(height) * bpp;
+                let mut pixels: Vec<u8> = (0..count)
+                    .map(|i| u8::try_from((i * 29 + 13) % 256).unwrap_or(0))
+                    .collect();
+                if bpp == 4 {
+                    for pixel in pixels.as_chunks_mut::<4>().0 {
+                        pixel[3] = u8::MAX;
+                    }
+                }
+
+                let mut simd_out = Vec::new();
+                let adapter = SimdJpegBuffer::new(&pixels, bpp, width, height);
+                let mut enc = JpegEncoder::new(&mut simd_out, 85);
+                enc.set_sampling_factor(SamplingFactor::R_4_2_0);
+                enc.set_chroma_subsampling_method(ChromaSubsamplingMethod::Nearest);
+                enc.encode_image(&adapter)?;
+                assert!(adapter.error.borrow().is_none(), "SIMD conversion failed");
+
+                let mut scalar_out = Vec::new();
+                let mut enc = JpegEncoder::new(&mut scalar_out, 85);
+                enc.set_sampling_factor(SamplingFactor::R_4_2_0);
+                enc.set_chroma_subsampling_method(ChromaSubsamplingMethod::Nearest);
+                let color = if bpp == 3 {
+                    JpegColorType::Rgb
+                } else {
+                    JpegColorType::Rgba
+                };
+                enc.encode(&pixels, width, height, color)?;
+
+                let simd_len = simd_out.len();
+                let scalar_len = scalar_out.len();
+                assert!(
+                    simd_len * 4 >= scalar_len * 3 && simd_len * 3 <= scalar_len * 4,
+                    "byte size diverged at {width}x{height} bpp {bpp}: {simd_len} vs {scalar_len}"
+                );
+                let simd_rgb = decode_rgb(&simd_out)?;
+                let scalar_rgb = decode_rgb(&scalar_out)?;
+                assert_eq!(simd_rgb.len(), scalar_rgb.len());
+                let squared_error: i64 = simd_rgb
+                    .iter()
+                    .zip(&scalar_rgb)
+                    .map(|(&a, &b)| {
+                        let d = i64::from(a.abs_diff(b));
+                        d * d
+                    })
+                    .sum();
+                let mse = squared_error / i64::try_from(simd_rgb.len())?;
+                let psnr = if mse == 0 {
+                    f64::INFINITY
+                } else {
+                    let mse_f64 = f64::from(u32::try_from(mse)?);
+                    10.0 * (255.0_f64 * 255.0 / mse_f64).log10()
+                };
+                assert!(psnr > 32.0, "PSNR {psnr:.2} at {width}x{height} bpp {bpp}");
+            }
         }
         Ok(())
     }

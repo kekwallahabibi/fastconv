@@ -25,6 +25,9 @@ use crate::qoi::decode_qoi_slice_into;
 
 // 512 MiB decoded RGBA8, matching the probe budget for hostile headers.
 const MAX_TIFF_DECODED_BYTES: usize = 512 * 1024 * 1024;
+// Hostile metadata may claim an arbitrarily large file length; reserve at most
+// this much up front and let `read_to_end` grow the buffer for anything larger.
+const MAX_FILE_RESERVE_BYTES: usize = 512 * 1024 * 1024;
 
 /// Decoded 8-bit pixel format supported across CPU and GPU image pipelines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +104,31 @@ pub(crate) fn decode_image_into(
         path: item.source().to_path_buf(),
         source,
     })?;
+    // Reusing the worker's buffer avoids reallocating each image, but `read_to_end`
+    // still grows it in small steps on the first image. One bounded reservation
+    // from the file metadata removes those copies for every subsequent frame.
+    let reserve_hint = usize::try_from(
+        file.metadata()
+            .map_err(|source| PipelineError::Io {
+                path: item.source().to_path_buf(),
+                source,
+            })?
+            .len(),
+    )
+    .unwrap_or(0)
+    .min(MAX_FILE_RESERVE_BYTES)
+    .saturating_add(1);
+    if file_bytes.capacity() < reserve_hint {
+        file_bytes
+            .try_reserve(reserve_hint - file_bytes.len())
+            .map_err(|_| PipelineError::Io {
+                path: item.source().to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    format!("cannot reserve {reserve_hint} bytes for input image"),
+                ),
+            })?;
+    }
     file.read_to_end(file_bytes)
         .map_err(|source| PipelineError::Io {
             path: item.source().to_path_buf(),
@@ -311,6 +339,9 @@ fn decode_png_slice_into(
     let mut decoder = png::Decoder::new(io::Cursor::new(file_bytes));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     decoder.set_ignore_text_chunk(true);
+    // Colour management is uniform across decoders: never spend time parsing an
+    // embedded ICC profile whose bytes we discard anyway.
+    decoder.set_ignore_iccp_chunk(true);
 
     let mut reader = decoder
         .read_info()

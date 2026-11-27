@@ -79,9 +79,12 @@ pub(crate) fn encode_qoi_into(
         DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8 => 4_u8,
     };
 
-    // Reserve a realistic initial size without over-committing worst-case 5x pixel RAM.
+    // Reserve one byte per input byte up front. A 4K RGB frame emits roughly one
+    // QOI byte per channel, so reserving half the input forces a reallocate +
+    // copy of ~12.5 MiB near the end of encoding. We still stay far below the
+    // 5x worst case, which ordinary images never reach.
     let desired_cap = QOI_HEADER_LEN
-        .saturating_add(pixels.len() / 2)
+        .saturating_add(pixels.len())
         .saturating_add(64);
     if encoded_buf.capacity() < desired_cap {
         encoded_buf.reserve(desired_cap - encoded_buf.len());
@@ -175,14 +178,13 @@ fn encode_rgb8_body(
                     let red_green = vr.wrapping_sub(vg).wrapping_add(8);
                     let blue_green = vb.wrapping_sub(vg).wrapping_add(8);
                     if dg_luma < 64 && (red_green | blue_green) < 16 {
-                        stage[cursor] = QOI_OP_LUMA | dg_luma;
-                        stage[cursor + 1] = (red_green << 4) | blue_green;
+                        stage[cursor..cursor + 2].copy_from_slice(&[
+                            QOI_OP_LUMA | dg_luma,
+                            (red_green << 4) | blue_green,
+                        ]);
                         cursor += 2;
                     } else {
-                        stage[cursor] = QOI_OP_RGB;
-                        stage[cursor + 1] = r;
-                        stage[cursor + 2] = g;
-                        stage[cursor + 3] = b;
+                        stage[cursor..cursor + 4].copy_from_slice(&[QOI_OP_RGB, r, g, b]);
                         cursor += 4;
                     }
                 }
@@ -274,23 +276,18 @@ fn encode_rgba8_body(
                         let red_green = vr.wrapping_sub(vg).wrapping_add(8);
                         let blue_green = vb.wrapping_sub(vg).wrapping_add(8);
                         if dg_luma < 64 && (red_green | blue_green) < 16 {
-                            stage[cursor] = QOI_OP_LUMA | dg_luma;
-                            stage[cursor + 1] = (red_green << 4) | blue_green;
+                            stage[cursor..cursor + 2].copy_from_slice(&[
+                                QOI_OP_LUMA | dg_luma,
+                                (red_green << 4) | blue_green,
+                            ]);
                             cursor += 2;
                         } else {
-                            stage[cursor] = QOI_OP_RGB;
-                            stage[cursor + 1] = r;
-                            stage[cursor + 2] = g;
-                            stage[cursor + 3] = b;
+                            stage[cursor..cursor + 4].copy_from_slice(&[QOI_OP_RGB, r, g, b]);
                             cursor += 4;
                         }
                     }
                 } else {
-                    stage[cursor] = QOI_OP_RGBA;
-                    stage[cursor + 1] = r;
-                    stage[cursor + 2] = g;
-                    stage[cursor + 3] = b;
-                    stage[cursor + 4] = a;
+                    stage[cursor..cursor + 5].copy_from_slice(&[QOI_OP_RGBA, r, g, b, a]);
                     cursor += 5;
                 }
             }
@@ -843,9 +840,217 @@ fn decode_qoi_rgba_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_qoi_slice_into, encode_qoi_into};
+    use super::{
+        QOI_END_MARKER, decode_qoi_slice_into, encode_qoi_into, pack_rgba, qoi_hash_rgb_opaque,
+        qoi_hash_rgba, write_qoi_header,
+    };
     use crate::decode::{DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat};
     use std::path::Path;
+
+    /// Reference implementation that writes QOI opcodes directly to a `Vec`,
+    /// mirroring the pre-staging algorithm so the tightened byte packing can be
+    /// checked bit for bit.
+    fn reference_rgb(pixels: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut index = [0_u32; 64];
+        let (mut pr, mut pg, mut pb) = (0_u8, 0_u8, 0_u8);
+        let mut prev = pack_rgba(0, 0, 0, 255);
+        let mut run = 0_u8;
+        for &[r, g, b] in pixels.as_chunks::<3>().0 {
+            let packed = pack_rgba(r, g, b, 255);
+            if packed == prev {
+                run += 1;
+                if run == 62 {
+                    out.push(0xC0 | (run - 1));
+                    run = 0;
+                }
+                continue;
+            }
+            if run > 0 {
+                out.push(0xC0 | (run - 1));
+                run = 0;
+            }
+            let hash = qoi_hash_rgb_opaque(r, g, b);
+            if index[hash] == packed {
+                out.push(u8::try_from(hash).unwrap_or(0));
+            } else {
+                index[hash] = packed;
+                let vr = r.wrapping_sub(pr);
+                let vg = g.wrapping_sub(pg);
+                let vb = b.wrapping_sub(pb);
+                let (dr, dg, db) = (vr.wrapping_add(2), vg.wrapping_add(2), vb.wrapping_add(2));
+                if (dr | dg | db) < 4 {
+                    out.push(0x40 | (dr << 4) | (dg << 2) | db);
+                } else {
+                    let dg_luma = vg.wrapping_add(32);
+                    let red_green = vr.wrapping_sub(vg).wrapping_add(8);
+                    let blue_green = vb.wrapping_sub(vg).wrapping_add(8);
+                    if dg_luma < 64 && (red_green | blue_green) < 16 {
+                        out.extend_from_slice(&[0x80 | dg_luma, (red_green << 4) | blue_green]);
+                    } else {
+                        out.extend_from_slice(&[0xFE, r, g, b]);
+                    }
+                }
+            }
+            pr = r;
+            pg = g;
+            pb = b;
+            prev = packed;
+        }
+        if run > 0 {
+            out.push(0xC0 | (run - 1));
+        }
+        out
+    }
+
+    fn reference_rgba(pixels: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut index = [0_u32; 64];
+        let (mut pr, mut pg, mut pb, mut pa) = (0_u8, 0_u8, 0_u8, 255_u8);
+        let mut prev = pack_rgba(0, 0, 0, 255);
+        let mut run = 0_u8;
+        for &[r, g, b, a] in pixels.as_chunks::<4>().0 {
+            let packed = pack_rgba(r, g, b, a);
+            if packed == prev {
+                run += 1;
+                if run == 62 {
+                    out.push(0xC0 | (run - 1));
+                    run = 0;
+                }
+                continue;
+            }
+            if run > 0 {
+                out.push(0xC0 | (run - 1));
+                run = 0;
+            }
+            let hash = qoi_hash_rgba(r, g, b, a);
+            if index[hash] == packed {
+                out.push(u8::try_from(hash).unwrap_or(0));
+            } else {
+                index[hash] = packed;
+                if a == pa {
+                    let vr = r.wrapping_sub(pr);
+                    let vg = g.wrapping_sub(pg);
+                    let vb = b.wrapping_sub(pb);
+                    let (dr, dg, db) = (vr.wrapping_add(2), vg.wrapping_add(2), vb.wrapping_add(2));
+                    if (dr | dg | db) < 4 {
+                        out.push(0x40 | (dr << 4) | (dg << 2) | db);
+                    } else {
+                        let dg_luma = vg.wrapping_add(32);
+                        let red_green = vr.wrapping_sub(vg).wrapping_add(8);
+                        let blue_green = vb.wrapping_sub(vg).wrapping_add(8);
+                        if dg_luma < 64 && (red_green | blue_green) < 16 {
+                            out.extend_from_slice(&[0x80 | dg_luma, (red_green << 4) | blue_green]);
+                        } else {
+                            out.extend_from_slice(&[0xFE, r, g, b]);
+                        }
+                    }
+                } else {
+                    out.extend_from_slice(&[0xFF, r, g, b, a]);
+                }
+            }
+            pr = r;
+            pg = g;
+            pb = b;
+            pa = a;
+            prev = packed;
+        }
+        if run > 0 {
+            out.push(0xC0 | (run - 1));
+        }
+        out
+    }
+
+    #[test]
+    fn staged_encoder_is_bit_identical_to_direct_reference()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let p = Path::new("reference.qoi");
+        let (width, height) = (64_u32, 16_u32);
+        let rgba: Vec<u8> = (0..width as usize * height as usize * 4)
+            .map(|i| u8::try_from((i * 37 + 11) % 256).unwrap_or(0))
+            .collect();
+        let rgb: Vec<u8> = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b, _]| [r, g, b])
+            .collect();
+
+        let mut encoded = Vec::new();
+        encode_qoi_into(
+            p,
+            &rgb,
+            DecodedFrameMeta {
+                width,
+                height,
+                format: super::DecodedPixelFormat::Rgb8,
+                byte_len: rgb.len(),
+                input_file_bytes: 1,
+                has_non_opaque_native_alpha: false,
+            },
+            &mut encoded,
+        )?;
+        let mut expected = Vec::new();
+        write_qoi_header(&mut expected, width, height, 3);
+        expected.extend_from_slice(&reference_rgb(&rgb));
+        expected.extend_from_slice(&QOI_END_MARKER);
+        assert_eq!(encoded, expected, "RGB8 QOI changed");
+        assert!(
+            encoded.capacity() >= rgb.len() + super::QOI_HEADER_LEN,
+            "RGB8 encoder reserved too little and reallocated"
+        );
+
+        encoded.clear();
+        encode_qoi_into(
+            p,
+            &rgba,
+            DecodedFrameMeta {
+                width,
+                height,
+                format: super::DecodedPixelFormat::Rgba8,
+                byte_len: rgba.len(),
+                input_file_bytes: 1,
+                has_non_opaque_native_alpha: false,
+            },
+            &mut encoded,
+        )?;
+        expected.clear();
+        write_qoi_header(&mut expected, width, height, 4);
+        expected.extend_from_slice(&reference_rgba(&rgba));
+        expected.extend_from_slice(&QOI_END_MARKER);
+        assert_eq!(encoded, expected, "RGBA8 QOI changed");
+        Ok(())
+    }
+
+    #[test]
+    fn reserves_full_input_length_for_compressible_frames() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let p = Path::new("reserve.qoi");
+        let (width, height) = (1024_u32, 1_u32);
+        // All-black RGB encodes to ~39 bytes. With a fresh buffer, later growth
+        // cannot mask an undersized initial reservation (unlike the noisy
+        // fixture above, which emits ~4 KB).
+        let rgb = vec![0_u8; width as usize * height as usize * 3];
+        let mut encoded = Vec::new();
+        encode_qoi_into(
+            p,
+            &rgb,
+            DecodedFrameMeta {
+                width,
+                height,
+                format: super::DecodedPixelFormat::Rgb8,
+                byte_len: rgb.len(),
+                input_file_bytes: 1,
+                has_non_opaque_native_alpha: false,
+            },
+            &mut encoded,
+        )?;
+        assert!(
+            encoded.capacity() >= rgb.len() + super::QOI_HEADER_LEN,
+            "RGB8 encoder did not reserve the full input length up front"
+        );
+        Ok(())
+    }
 
     #[test]
     fn roundtrips_rgb_rgba_luma_and_la_losslessly() -> Result<(), Box<dyn std::error::Error>> {
