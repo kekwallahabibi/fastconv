@@ -5,11 +5,19 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use fastconv_domain::{
-    AudioBatchItem, AudioBatchPlan, AudioEncodingOptions, AudioExecutionMode, AudioInputFormat,
-    AudioOptionBitrate, AudioOptionChannels, AudioOptionSampleRate, AudioOutputFormat,
-    AudioQuality, AudioRateControl, AudioStreamInfo, DomainError, HardwareBackend, PathRole,
+    AudioBatchItem, AudioBatchPlan, AudioBitDepth, AudioEncodingOptions, AudioExecutionMode,
+    AudioInputFormat, AudioOptionBitrate, AudioOptionChannels, AudioOptionSampleRate,
+    AudioOutputFormat, AudioQuality, AudioRateControl, AudioSampleFormat, AudioStreamInfo,
+    DomainError, HardwareBackend, PathRole,
 };
-use symphonia::core::codecs::audio::{AudioDecoderOptions, well_known::CODEC_ID_ALAC};
+use symphonia::core::audio::sample::SampleFormat as SymphoniaSampleFormat;
+use symphonia::core::codecs::audio::{
+    AudioDecoderOptions,
+    well_known::{
+        CODEC_ID_ALAC, CODEC_ID_PCM_F32BE, CODEC_ID_PCM_F32LE, CODEC_ID_PCM_F64BE,
+        CODEC_ID_PCM_F64LE,
+    },
+};
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::formats::TrackType;
 use symphonia::core::formats::probe::Hint;
@@ -30,10 +38,12 @@ pub struct AudioEncodingRequest {
     pub rate_control: AudioRateControl,
     pub sample_rate: Option<AudioOptionSampleRate>,
     pub channels: Option<AudioOptionChannels>,
+    pub bit_depth: Option<AudioBitDepth>,
 }
 
 const BITRATE_PARSE_EXPECTED: &str =
     "a positive rate such as 128k, 192k, 320k, 128kbps, 128, or 128000";
+const BIT_DEPTH_PARSE_EXPECTED: &str = "8, 16, 24, 32, or f32";
 
 /// Parses the raw `--bitrate` value at the system boundary into a validated domain rate.
 ///
@@ -76,11 +86,35 @@ pub fn parse_audio_bitrate(raw: &str) -> Result<AudioOptionBitrate, DomainError>
     AudioOptionBitrate::new(bps)
 }
 
-/// Parses and validates the four raw encoding flag values into an [`AudioEncodingRequest`].
+/// Parses the raw `--bit-depth` value at the system boundary.
+///
+/// Signed integer aliases (`s8`/`s16`/`s24`/`s32`) and the spelling variants
+/// `float`/`float32` are accepted case-insensitively; 8-bit WAV input is unsigned,
+/// so `u8` is accepted as an alias for the 8-bit integer depth as well.
+///
+/// # Errors
+///
+/// Returns [`DomainError::InvalidAudioBitDepth`] for any unrecognized value.
+pub fn parse_audio_bit_depth(raw: &str) -> Result<AudioBitDepth, DomainError> {
+    let trimmed = raw.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "8" | "s8" | "u8" => Ok(AudioBitDepth::Int8),
+        "16" | "s16" => Ok(AudioBitDepth::Int16),
+        "24" | "s24" => Ok(AudioBitDepth::Int24),
+        "32" | "s32" => Ok(AudioBitDepth::Int32),
+        "f32" | "float" | "float32" => Ok(AudioBitDepth::Float32),
+        _ => Err(DomainError::InvalidAudioBitDepth {
+            raw: raw.to_owned(),
+            expected: BIT_DEPTH_PARSE_EXPECTED,
+        }),
+    }
+}
+
+/// Parses and validates the raw encoding flag values into an [`AudioEncodingRequest`].
 ///
 /// This is the single boundary where the CLI's raw `--bitrate`, `--quality`,
-/// `--sample-rate`, and `--channels` strings become domain types; the CLI only collects
-/// raw values and flag presence.
+/// `--sample-rate`, `--channels`, and `--bit-depth` strings become domain types;
+/// the CLI only collects raw values and flag presence.
 ///
 /// # Errors
 ///
@@ -90,6 +124,7 @@ pub fn parse_audio_encoding_request(
     quality: Option<&str>,
     sample_rate: Option<&str>,
     channels: Option<&str>,
+    bit_depth: Option<&str>,
 ) -> Result<AudioEncodingRequest, String> {
     if bitrate.is_some() && quality.is_some() {
         return Err("cannot combine --bitrate with --quality".to_owned());
@@ -130,10 +165,15 @@ pub fn parse_audio_encoding_request(
         }
         None => None,
     };
+    let bit_depth = bit_depth
+        .map(parse_audio_bit_depth)
+        .transpose()
+        .map_err(|err| err.to_string())?;
     Ok(AudioEncodingRequest {
         rate_control,
         sample_rate,
         channels,
+        bit_depth,
     })
 }
 
@@ -378,11 +418,45 @@ fn probe_symphonia(
         .sample_rate
         .and_then(NonZeroU32::new)
         .ok_or_else(|| invalid_audio(path, "audio sample rate must not be zero"))?;
+    // Symphonia 0.6.1's RIFF demuxer leaves both `bits_per_sample` and
+    // `sample_format` unset for the plain IEEE-float WAV tag (0x0003) and for
+    // AIFF-C `fl32`; the codec id is the only reliable float signal there.
+    let float_codec = matches!(
+        params.codec,
+        CODEC_ID_PCM_F32LE | CODEC_ID_PCM_F32BE | CODEC_ID_PCM_F64LE | CODEC_ID_PCM_F64BE
+    );
+    let float_samples = matches!(
+        params.sample_format,
+        Some(SymphoniaSampleFormat::F32 | SymphoniaSampleFormat::F64)
+    );
+    let sample_format = if float_codec || float_samples {
+        AudioSampleFormat::Float
+    } else {
+        AudioSampleFormat::Int
+    };
+    let inferred_bits = if matches!(params.codec, CODEC_ID_PCM_F32LE | CODEC_ID_PCM_F32BE) {
+        Some(32)
+    } else if matches!(params.codec, CODEC_ID_PCM_F64LE | CODEC_ID_PCM_F64BE) {
+        Some(64)
+    } else {
+        match params.sample_format {
+            Some(SymphoniaSampleFormat::F32) => Some(32),
+            Some(SymphoniaSampleFormat::F64) => Some(64),
+            _ => None,
+        }
+    };
     let bits_per_sample = params
         .bits_per_sample
+        .or(inferred_bits)
         .and_then(|bits| NonZeroU16::new(u16::try_from(bits).unwrap_or(u16::MAX)));
-    let stream = AudioStreamInfo::new(channels, sample_rate, bits_per_sample, track.num_frames)
-        .map_err(|err| invalid_audio(path, err.to_string()))?;
+    let stream = AudioStreamInfo::with_sample_format(
+        channels,
+        sample_rate,
+        bits_per_sample,
+        sample_format,
+        track.num_frames,
+    )
+    .map_err(|err| invalid_audio(path, err.to_string()))?;
     Ok((detected_format, stream))
 }
 
@@ -685,6 +759,7 @@ pub fn prepare_audio_batch(
             request.rate_control,
             request.sample_rate,
             request.channels,
+            request.bit_depth,
         )?;
         return prepare_directory_batch(source, target, format, threads, options);
     }
@@ -698,6 +773,7 @@ pub fn prepare_audio_batch(
         request.rate_control,
         request.sample_rate,
         request.channels,
+        request.bit_depth,
     )?;
     let canonical_source = canonical_or_parent(source)?;
     let canonical_target = canonical_or_parent(&resolved_target)?;
@@ -1045,22 +1121,23 @@ mod tests {
             ),
             sample_rate: Some(AudioOptionSampleRate::new(48_000).map_err(|err| err.to_string())?),
             channels: Some(AudioOptionChannels::new(2).map_err(|err| err.to_string())?),
+            bit_depth: None,
         };
         assert_eq!(
-            parse_audio_encoding_request(Some("192k"), None, Some("48000"), Some("2"))?,
+            parse_audio_encoding_request(Some("192k"), None, Some("48000"), Some("2"), None)?,
             expected
         );
         assert_eq!(
-            parse_audio_encoding_request(None, None, None, None)?,
+            parse_audio_encoding_request(None, None, None, None, None)?,
             AudioEncodingRequest::default()
         );
         assert_eq!(
-            parse_audio_encoding_request(None, Some("85"), None, None)?.rate_control,
+            parse_audio_encoding_request(None, Some("85"), None, None, None)?.rate_control,
             AudioRateControl::Quality(AudioQuality::new(85).map_err(|err| err.to_string())?)
         );
 
         for (bitrate, quality) in [(Some("128k"), Some("80")), (Some("128k"), Some("101"))] {
-            let Err(err) = parse_audio_encoding_request(bitrate, quality, None, None) else {
+            let Err(err) = parse_audio_encoding_request(bitrate, quality, None, None, None) else {
                 return Err("bitrate/quality must be rejected".to_owned());
             };
             assert!(
@@ -1077,7 +1154,8 @@ mod tests {
             ((None, None, None, Some("9")), "invalid --channels"),
             ((Some("abc"), None, None, None), "invalid audio bitrate"),
         ] {
-            let Err(err) = parse_audio_encoding_request(args.0, args.1, args.2, args.3) else {
+            let Err(err) = parse_audio_encoding_request(args.0, args.1, args.2, args.3, None)
+            else {
                 return Err(format!("malformed value must be rejected: {args:?}"));
             };
             assert!(err.contains(needle), "expected '{needle}' in '{err}'");
@@ -1187,5 +1265,248 @@ mod tests {
         let _ = fs::remove_dir_all(&source_dir);
         let _ = fs::remove_dir_all(&target_dir);
         Ok(())
+    }
+
+    #[test]
+    fn parses_bit_depth_tokens_at_the_boundary() {
+        for (raw, expected) in [
+            ("8", AudioBitDepth::Int8),
+            ("s8", AudioBitDepth::Int8),
+            ("u8", AudioBitDepth::Int8),
+            ("16", AudioBitDepth::Int16),
+            ("S16", AudioBitDepth::Int16),
+            ("24", AudioBitDepth::Int24),
+            (" s24 ", AudioBitDepth::Int24),
+            ("32", AudioBitDepth::Int32),
+            ("S32", AudioBitDepth::Int32),
+            ("f32", AudioBitDepth::Float32),
+            ("FLOAT", AudioBitDepth::Float32),
+            ("float32", AudioBitDepth::Float32),
+        ] {
+            assert_eq!(parse_audio_bit_depth(raw), Ok(expected), "raw={raw}");
+        }
+        for raw in [
+            "", " ", "0", "7", "12", "s64", "f64", "double", "abc", "-16",
+        ] {
+            assert!(
+                matches!(
+                    parse_audio_bit_depth(raw),
+                    Err(DomainError::InvalidAudioBitDepth { .. })
+                ),
+                "'{raw}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_bit_depth_in_the_raw_encoding_request() -> Result<(), String> {
+        let request = parse_audio_encoding_request(None, None, None, None, Some(" f32 "))?;
+        assert_eq!(request.bit_depth, Some(AudioBitDepth::Float32));
+        assert_eq!(
+            parse_audio_encoding_request(None, None, None, None, None)?.bit_depth,
+            None
+        );
+        let error = parse_audio_encoding_request(None, None, None, None, Some("64"))
+            .err()
+            .ok_or_else(|| "invalid depth must be rejected".to_owned())?;
+        assert!(error.contains("invalid audio bit depth"), "{error}");
+        Ok(())
+    }
+
+    fn probe_pcm_bytes(
+        tag: u16,
+        channels: u16,
+        bits: u16,
+        data: &[u8],
+        extensible: bool,
+    ) -> Vec<u8> {
+        let block_align = channels * (bits / 8);
+        let rate = 48_000_u32;
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&tag.to_le_bytes());
+        fmt.extend_from_slice(&channels.to_le_bytes());
+        fmt.extend_from_slice(&rate.to_le_bytes());
+        fmt.extend_from_slice(&rate.saturating_mul(u32::from(block_align)).to_le_bytes());
+        fmt.extend_from_slice(&block_align.to_le_bytes());
+        fmt.extend_from_slice(&bits.to_le_bytes());
+        if extensible {
+            fmt.extend_from_slice(&22_u16.to_le_bytes());
+            fmt.extend_from_slice(&bits.to_le_bytes());
+            fmt.extend_from_slice(&3_u32.to_le_bytes());
+            fmt.extend_from_slice(&[
+                0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38,
+                0x9B, 0x71,
+            ]);
+        }
+        let mut chunks = Vec::new();
+        chunks.extend_from_slice(b"fmt ");
+        chunks.extend_from_slice(&u32::try_from(fmt.len()).unwrap_or(0).to_le_bytes());
+        chunks.extend_from_slice(&fmt);
+        chunks.extend_from_slice(b"data");
+        chunks.extend_from_slice(&u32::try_from(data.len()).unwrap_or(0).to_le_bytes());
+        chunks.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            chunks.push(0);
+        }
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(
+            &u32::try_from(chunks.len().saturating_add(4))
+                .unwrap_or(0)
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(&chunks);
+        bytes
+    }
+
+    fn add_chunk(bytes: &mut Vec<u8>, id: [u8; 4], body: &[u8]) {
+        bytes.extend_from_slice(&id);
+        bytes.extend_from_slice(&u32::try_from(body.len()).unwrap_or(0).to_be_bytes());
+        bytes.extend_from_slice(body);
+        if body.len() % 2 == 1 {
+            bytes.push(0);
+        }
+    }
+
+    fn aiff_pcm_bytes(
+        compression: Option<&[u8; 4]>,
+        data: &[u8],
+        bits: u16,
+        frames: u32,
+    ) -> Vec<u8> {
+        let form_type = if compression.is_some() {
+            b"AIFC"
+        } else {
+            b"AIFF"
+        };
+        let mut chunks = Vec::new();
+        if compression.is_some() {
+            add_chunk(&mut chunks, *b"FVER", &0xA280_5140_u32.to_be_bytes());
+        }
+        let mut comm = Vec::new();
+        comm.extend_from_slice(&1_u16.to_be_bytes());
+        comm.extend_from_slice(&frames.to_be_bytes());
+        comm.extend_from_slice(&bits.to_be_bytes());
+        comm.extend_from_slice(&[0x40, 0x0E, 0xBB, 0x80, 0, 0, 0, 0, 0, 0]);
+        if let Some(kind) = compression {
+            comm.extend_from_slice(kind);
+            comm.extend_from_slice(b"\x0f32-bit floating");
+        }
+        add_chunk(&mut chunks, *b"COMM", &comm);
+        let mut ssnd = Vec::new();
+        ssnd.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd.extend_from_slice(&0_u32.to_be_bytes());
+        ssnd.extend_from_slice(data);
+        add_chunk(&mut chunks, *b"SSND", &ssnd);
+        let mut bytes = b"FORM".to_vec();
+        let payload = chunks.len().saturating_add(4);
+        bytes.extend_from_slice(&u32::try_from(payload).unwrap_or(0).to_be_bytes());
+        bytes.extend_from_slice(form_type);
+        bytes.extend_from_slice(&chunks);
+        bytes
+    }
+
+    #[test]
+    fn probes_32bit_integer_and_float_wav_and_aiff() -> Result<(), String> {
+        let dir = std::env::temp_dir().join(format!("fastconv-probe-32bit-{}", std::process::id()));
+        fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let i32_data: Vec<u8> = [1_i32, -2, i32::MAX - 7]
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        let f32_data: Vec<u8> = [0.25_f32, -0.5, 0.75]
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        // AIFF/AIFC sample payloads are big-endian.
+        let mut float_payload = Vec::new();
+        for sample in [0.25_f32, -0.5, 0.75] {
+            float_payload.extend_from_slice(&sample.to_be_bytes());
+        }
+        let int_payload: Vec<u8> = [1_i32, -2, i32::MAX - 7]
+            .iter()
+            .flat_map(|sample| sample.to_be_bytes())
+            .collect();
+        let cases: Vec<(&str, Vec<u8>, u16, AudioSampleFormat)> = vec![
+            (
+                "int32.wav",
+                probe_pcm_bytes(1, 1, 32, &i32_data, false),
+                32,
+                AudioSampleFormat::Int,
+            ),
+            (
+                "float32.wav",
+                probe_pcm_bytes(3, 1, 32, &f32_data, false),
+                32,
+                AudioSampleFormat::Float,
+            ),
+            (
+                "extfloat32.wav",
+                probe_pcm_bytes(0xFFFE, 1, 32, &f32_data, true),
+                32,
+                AudioSampleFormat::Float,
+            ),
+            (
+                "float32.aiff",
+                aiff_pcm_bytes(Some(b"fl32"), &float_payload, 32, 3),
+                32,
+                AudioSampleFormat::Float,
+            ),
+            (
+                "int32.aiff",
+                aiff_pcm_bytes(None, &int_payload, 32, 3),
+                32,
+                AudioSampleFormat::Int,
+            ),
+        ];
+        for (name, bytes, bits, expected_format) in cases {
+            let path = dir.join(name);
+            fs::write(&path, &bytes).map_err(|err| err.to_string())?;
+            let probed = probe_audio(&path).map_err(|err| err.to_string())?;
+            assert_eq!(probed.stream.sample_format(), expected_format, "{name}");
+            assert_eq!(
+                probed.stream.bits_per_sample().map(NonZeroU16::get),
+                Some(bits),
+                "{name}"
+            );
+            assert_eq!(probed.stream.channels().get(), 1, "{name}");
+            assert_eq!(probed.stream.sample_rate().get(), 48_000, "{name}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_bit_depth_for_lossy_targets_before_probing() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        for format in [
+            AudioOutputFormat::Mp3,
+            AudioOutputFormat::Aac,
+            AudioOutputFormat::M4a,
+            AudioOutputFormat::Opus,
+            AudioOutputFormat::Ogg,
+        ] {
+            let request = AudioEncodingRequest {
+                bit_depth: Some(AudioBitDepth::Int16),
+                ..AudioEncodingRequest::default()
+            };
+            let result = prepare_audio_batch(
+                &source,
+                Path::new(&format!("target/rejected.{}", format.extension())),
+                Some(format),
+                Some(NonZeroUsize::MIN),
+                HardwareBackend::Cpu,
+                request,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(ProbeError::InvalidDomain(
+                        DomainError::UnsupportedAudioBitDepth { .. }
+                    ))
+                ),
+                "{format} must reject --bit-depth"
+            );
+        }
     }
 }

@@ -2,7 +2,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use fastconv_domain::{
-    AudioOptionChannels, AudioOptionSampleRate, AudioOutputFormat, AudioRateControl,
+    AudioBitDepth, AudioOptionChannels, AudioOptionSampleRate, AudioOutputFormat, AudioRateControl,
     HardwareBackend,
 };
 
@@ -10,7 +10,8 @@ pub(crate) const AUDIO_HELP: &str = r"fastconv audio - convert audio files
 
 Usage:
   fastconv audio <source> <target> [--to <format>] [--bitrate <rate> | --quality <0..=100>]
-                 [--sample-rate <hz>] [--channels <1..=8>] [--threads <N>] [--backend <name>]
+                 [--sample-rate <hz>] [--channels <1..=8>] [--bit-depth <8|16|24|32|f32>]
+                 [--threads <N>] [--backend <name>]
 
 Arguments:
   <source>              Source audio file or directory
@@ -33,6 +34,12 @@ Options:
                         mp3 and aac/m4a accept only their codec rate tables.
   --channels <1..=8>    Output channel count (mp3/opus 1-2, aac/m4a/ogg 1-6
                         excluding 4, lossless 1-8). Remixing is deterministic.
+  --bit-depth <...>     Lossless PCM depth: 8, 16, 24, 32 or f32. Accepted by
+                        wav/aiff; flac accepts 8/16/24 and alac accepts 16.
+                        Rejected by all lossy targets. Default follows the source
+                        where the target stores it; otherwise float to flac gives
+                        24-bit integer, and float or 8-bit input to alac gives
+                        16-bit.
   --threads <N>         Number of parallel workers
   --backend <name>      cpu (default). Audio runs on CPU only; GPU backends
                         nvenc, vaapi, qsv, amf, videotoolbox, and vulkan are
@@ -57,6 +64,7 @@ pub(crate) struct AudioArgs {
     rate_control: AudioRateControl,
     sample_rate: Option<AudioOptionSampleRate>,
     channels: Option<AudioOptionChannels>,
+    bit_depth: Option<AudioBitDepth>,
     threads: Option<NonZeroUsize>,
     backend: HardwareBackend,
 }
@@ -95,6 +103,7 @@ struct AudioOptionState {
     quality: Option<String>,
     sample_rate: Option<String>,
     channels: Option<String>,
+    bit_depth: Option<String>,
 }
 
 impl AudioOptionState {
@@ -109,6 +118,7 @@ impl AudioOptionState {
             "--quality" => &mut self.quality,
             "--sample-rate" => &mut self.sample_rate,
             "--channels" => &mut self.channels,
+            "--bit-depth" => &mut self.bit_depth,
             _ => return Ok(None),
         };
         if slot.is_some() {
@@ -198,6 +208,7 @@ pub(crate) fn parse_audio_args(args: &[&str]) -> Result<AudioCommand, String> {
         options.quality.as_deref(),
         options.sample_rate.as_deref(),
         options.channels.as_deref(),
+        options.bit_depth.as_deref(),
     )?;
 
     Ok(AudioCommand::Run(AudioArgs {
@@ -207,6 +218,7 @@ pub(crate) fn parse_audio_args(args: &[&str]) -> Result<AudioCommand, String> {
         rate_control: request.rate_control,
         sample_rate: request.sample_rate,
         channels: request.channels,
+        bit_depth: request.bit_depth,
         threads,
         backend: backend.unwrap_or(HardwareBackend::Cpu),
     }))
@@ -229,6 +241,7 @@ pub(crate) fn run_audio(args: &AudioArgs) -> Result<(), String> {
             rate_control: args.rate_control,
             sample_rate: args.sample_rate,
             channels: args.channels,
+            bit_depth: args.bit_depth,
         },
     )
     .map_err(|err| err.to_string())?;
@@ -261,6 +274,7 @@ mod tests {
             "--quality <0..=100>",
             "--sample-rate <hz>",
             "--channels <1..=8>",
+            "--bit-depth <8|16|24|32|f32>",
             "--threads",
             "--backend",
             "-h, --help",
@@ -296,6 +310,7 @@ mod tests {
                 rate_control: AudioRateControl::Default,
                 sample_rate: None,
                 channels: None,
+                bit_depth: None,
                 threads: None,
                 backend: HardwareBackend::Cpu,
             })
@@ -312,6 +327,8 @@ mod tests {
             "48000",
             "--channels",
             "2",
+            "--bit-depth",
+            "f32",
             "--threads",
             "4",
             "--backend",
@@ -335,6 +352,7 @@ mod tests {
             flagged.channels,
             Some(AudioOptionChannels::new(2).map_err(|err| err.to_string())?)
         );
+        assert_eq!(flagged.bit_depth, Some(AudioBitDepth::Float32));
         assert_eq!(flagged.threads, NonZeroUsize::new(4));
         assert_eq!(flagged.backend, HardwareBackend::Gpu(GpuBackend::Nvenc));
         Ok(())
@@ -424,5 +442,33 @@ mod tests {
         assert!(parse_audio_args(&["a", "b", "--channels", "9"]).is_err());
         assert!(parse_audio_args(&["a", "b", "--channels", "abc"]).is_err());
         assert!(parse_audio_args(&["a", "b", "--channels", "2", "--channels", "4"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--bit-depth"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--bit-depth", "64"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--bit-depth", "16", "--bit-depth", "32"]).is_err());
+    }
+
+    #[test]
+    fn parses_every_bit_depth_alias() -> Result<(), String> {
+        for (raw, expected) in [
+            ("8", AudioBitDepth::Int8),
+            ("s8", AudioBitDepth::Int8),
+            ("u8", AudioBitDepth::Int8),
+            ("16", AudioBitDepth::Int16),
+            ("s16", AudioBitDepth::Int16),
+            ("24", AudioBitDepth::Int24),
+            ("s24", AudioBitDepth::Int24),
+            ("32", AudioBitDepth::Int32),
+            ("s32", AudioBitDepth::Int32),
+            ("f32", AudioBitDepth::Float32),
+            ("float", AudioBitDepth::Float32),
+            ("float32", AudioBitDepth::Float32),
+        ] {
+            let AudioCommand::Run(parsed) = parse_audio_args(&["a", "b", "--bit-depth", raw])?
+            else {
+                return Err("expected audio run args".to_owned());
+            };
+            assert_eq!(parsed.bit_depth, Some(expected), "--bit-depth {raw}");
+        }
+        Ok(())
     }
 }
