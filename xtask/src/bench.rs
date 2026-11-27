@@ -2489,6 +2489,7 @@ fn verify_image_batch_with_dims(
         ImageInputFormat::Tiff => "TIFF",
         ImageInputFormat::Jxl => "JPEG XL",
         ImageInputFormat::Avif => "AVIF",
+        ImageInputFormat::Heic => "HEIC",
         ImageInputFormat::Gif => "GIF",
         ImageInputFormat::Ico => "ICO",
         ImageInputFormat::Pnm => "PNM",
@@ -2504,6 +2505,7 @@ fn verify_image_batch_with_dims(
             | ImageInputFormat::Tiff
             | ImageInputFormat::Jxl
             | ImageInputFormat::Avif
+            | ImageInputFormat::Heic
             | ImageInputFormat::Gif
             | ImageInputFormat::Ico
             | ImageInputFormat::Pnm => {

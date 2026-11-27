@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -8,6 +9,8 @@ use fastconv_domain::{
     ImageDimensions, ImageEncodeOptions, ImageExecutionMode, ImageInputFormat, ImageOutputFormat,
     PathRole,
 };
+use heifer::heifer_isobmff::boxes::{ConstructionMethod, FileType, HevcConfig, Property};
+use heifer::heifer_isobmff::{BoxIter, HeifFile, Item, ItemId, read_box_header};
 use jxl::api::JxlBitstreamInput;
 use zune_jpeg::JpegDecoder;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
@@ -37,17 +40,43 @@ const MAX_STILL_IMAGE_PIXELS: u64 = 128 * 1024 * 1024;
 // into a reusable per-worker RGB/RGBA scratch buffer capped at 128 MiB, so eight
 // workers stay under ~1 GiB. Checked here, before the source pixels are decoded.
 const MAX_HEIC_PIXELS: u64 = 128 * 1024 * 1024;
+// A grid/overlay decoder keeps decoded inputs plus its canvas alive at once, but plain
+// grid tiles use per-worker scratch and are not retained. This is deliberately a
+// cumulative-work budget: every visited item (plain tiles included) is charged so a
+// hostile reference tree cannot multiply probe/decode work past one image's pixels.
+const MAX_HEIC_RETAINED_PIXELS: u64 = 128 * 1024 * 1024;
+// Repeatable `dimg` references can fan out exponentially while the final budget is
+// still small. Bound total visits so probing stays cheap regardless of fan-out.
+const MAX_HEIC_ITEM_VISITS: u64 = 8192;
+// Only the iovl descriptor prefix (version/flags/fill/canvas) is needed in the probe.
+const IOVL_DESCRIPTOR_MAX_BYTES: usize = 32;
 const MAX_HEIC_EXPANSION_BYTES: u64 = 128 * 1024 * 1024;
 // `heifer` encodes images as a grid of 512x512 tiles capped at 256 columns/rows;
 // a single axis above 256*512 is rejected only after decode, so screen it here.
 const MAX_HEIC_DIMENSION: u32 = 256 * 512;
+// Header-only HEIC probing reads `ftyp`, `meta` and `moov` but seeks over `mdat`.
+// These caps bound a hostile container's box count, metadata tables and buffered header bytes.
+const MAX_HEIC_TOP_LEVEL_BOXES: usize = 4096;
+const MAX_HEIC_HEADER_BYTES: usize = 64 * 1024 * 1024;
+// `heifer_isobmff::HeifFile::parse` joins `iinf`, `iloc` and `ipma` via linear scans and
+// clones `auxC` subtype bytes per associated item; bound these tables before calling it.
+const MAX_HEIC_META_ITEMS: usize = 16_384;
+const MAX_HEIC_AUXL_REFS: usize = 65_536;
+const MAX_HEIC_AUXC_BYTES: usize = 4096;
+// `heifer_isobmff::track::parse_tracks` scans `stsc` runs per `stco`/`co64` chunk; still
+// images carry at most single-sample tracks, so large track tables are never needed.
+const MAX_HEIC_MOOV_TRACKS: usize = 256;
+const MAX_HEIC_TRACK_TABLE_ENTRIES: usize = 1024;
+// Derived HEIF images (`grid`/`iovl`/`iden`) may nest, but far deeper than this is
+// pathological; heifer itself caps decoding at 4 levels.
+const MAX_HEIC_ITEM_DEPTH: u32 = 4;
 const MAX_GIF_DECODE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PNM_HEADER_BYTES: usize = 64 * 1024;
 const KNOWN_IMAGE_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "webp", "bmp", "qoi", "tif", "tiff", "jxl", "avif", "gif", "ico", "pnm",
-    "pbm", "pgm", "ppm", "pam",
+    "png", "jpg", "jpeg", "webp", "bmp", "qoi", "tif", "tiff", "jxl", "avif", "heic", "heif",
+    "gif", "ico", "pnm", "pbm", "pgm", "ppm", "pam",
 ];
-const UNRECOGNIZED_MAGIC_REASON: &str = "unrecognized image magic bytes (expected PNG, JPEG, WebP, BMP, QOI, TIFF, JPEG XL, AVIF, GIF, ICO, or PNM)";
+const UNRECOGNIZED_MAGIC_REASON: &str = "unrecognized image magic bytes (expected PNG, JPEG, WebP, BMP, QOI, TIFF, JPEG XL, AVIF, HEIC, GIF, ICO, or PNM)";
 
 /// Detected input container format and validated pixel dimensions from image headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +129,188 @@ fn is_avif_ftyp(header: &[u8]) -> bool {
         offset += 4;
     }
     false
+}
+
+/// How strongly an ISOBMFF `ftyp` box identifies a HEIC/HEIF image.
+///
+/// `mif1`/`mif2` alone are generic HEIF brands and may also be carried by other
+/// ISOBMFF files, so a directory entry whose classification rests only on those
+/// brands may be skipped when probing fails. Specific brands confirm an image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeicBrandKind {
+    None,
+    Generic,
+    Specific,
+}
+
+fn heic_brand_kind(brand: &[u8]) -> HeicBrandKind {
+    if matches!(
+        brand,
+        b"heic" | b"heix" | b"heim" | b"heis" | b"msf1" | b"hevc" | b"hevx"
+    ) {
+        HeicBrandKind::Specific
+    } else if matches!(brand, b"mif1" | b"mif2") {
+        HeicBrandKind::Generic
+    } else {
+        HeicBrandKind::None
+    }
+}
+
+/// Scans the `ftyp` box for HEIC/HEIF brands, including 64-bit extended sizes and
+/// size-0 boxes that extend to the end of the buffer. MP4/MOV (`isom`, `mp42`,
+/// `qt  `, `avc1`, …) reports [`HeicBrandKind::None`].
+fn heic_ftyp_brand_kind(header: &[u8]) -> HeicBrandKind {
+    if header.len() < 16 || header.get(4..8) != Some(b"ftyp".as_slice()) {
+        return HeicBrandKind::None;
+    }
+    let size32 = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    let (brand_start, box_end) = if size32 == 1 {
+        if header.len() < 24 {
+            return HeicBrandKind::None;
+        }
+        let largesize = u64::from_be_bytes([
+            header[8], header[9], header[10], header[11], header[12], header[13], header[14],
+            header[15],
+        ]);
+        if largesize < 24 {
+            return HeicBrandKind::None;
+        }
+        (
+            16_usize,
+            usize::try_from(largesize)
+                .unwrap_or(header.len())
+                .min(header.len()),
+        )
+    } else if size32 == 0 {
+        (8_usize, header.len())
+    } else {
+        if size32 < 16 {
+            return HeicBrandKind::None;
+        }
+        (
+            8_usize,
+            usize::try_from(size32)
+                .unwrap_or(header.len())
+                .min(header.len()),
+        )
+    };
+    let mut kind = HeicBrandKind::None;
+    merge_heic_brand(&mut kind, header.get(brand_start..brand_start + 4));
+    let mut offset = brand_start + 8;
+    while offset + 4 <= box_end {
+        merge_heic_brand(&mut kind, header.get(offset..offset + 4));
+        if kind == HeicBrandKind::Specific {
+            break;
+        }
+        offset += 4;
+    }
+    kind
+}
+
+fn merge_heic_brand(kind: &mut HeicBrandKind, brand: Option<&[u8]>) {
+    match brand.map(heic_brand_kind) {
+        Some(HeicBrandKind::Specific) => *kind = HeicBrandKind::Specific,
+        Some(HeicBrandKind::Generic) if *kind == HeicBrandKind::None => {
+            *kind = HeicBrandKind::Generic;
+        }
+        _ => {}
+    }
+}
+
+fn is_heic_ftyp(header: &[u8]) -> bool {
+    heic_ftyp_brand_kind(header) != HeicBrandKind::None
+}
+
+// The 64-byte magic prefix may cut an `ftyp` box short. Routing only needs the
+// brands, so cap the full-box read instead of buffering an arbitrary amount.
+const MAX_FTYP_SCAN_BYTES: u64 = 64 * 1024;
+
+/// Reads the whole first `ftyp` box (capped) so brands beyond the magic prefix are
+/// visible. Malformed/truncated boxes return `Ok(None)`: the regular
+/// `probe_heic`/`probe_avif` path then reports the real error.
+fn read_bounded_ftyp(file: &mut File, path: &Path) -> Result<Option<Vec<u8>>, ProbeError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    // A 64-bit `largesize` ftyp needs 16 header bytes before `read_box_header`
+    // can parse it; reading only the first 8 makes extended-size boxes fail.
+    let mut prefix = [0_u8; 16];
+    let filled = file.read(&mut prefix).map_err(|source| ProbeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if filled < prefix.len() {
+        return Ok(None);
+    }
+    let Ok(header) = read_box_header(&prefix) else {
+        return Ok(None);
+    };
+    if header.box_type.0 != *b"ftyp" {
+        return Ok(None);
+    }
+    let file_len = file
+        .seek(SeekFrom::End(0))
+        .map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let declared = header.size.unwrap_or(file_len);
+    if declared < header.header_size {
+        return Ok(None);
+    }
+    let len = declared.min(MAX_FTYP_SCAN_BYTES).min(file_len);
+    let Ok(len_usize) = usize::try_from(len) else {
+        return Ok(None);
+    };
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len_usize)
+        .map_err(|_| invalid_image(path, "cannot allocate HEIC ftyp buffer"))?;
+    buf.resize(len_usize, 0);
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.read_exact(&mut buf).map_err(|source| ProbeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(Some(buf))
+}
+
+/// Resolves a prefix sniff that identified HEIC: a full `ftyp` may list `avif`
+/// beyond the prefix, in which case the AVIF decoder owns the file.
+struct ResolvedSniff {
+    format: ImageInputFormat,
+    brands: HeicBrandKind,
+}
+
+fn resolve_sniffed_input(
+    file: &mut File,
+    path: &Path,
+    sniffed: ImageInputFormat,
+) -> Result<ResolvedSniff, ProbeError> {
+    if sniffed != ImageInputFormat::Heic {
+        return Ok(ResolvedSniff {
+            format: sniffed,
+            brands: HeicBrandKind::None,
+        });
+    }
+    let Some(ftyp) = read_bounded_ftyp(file, path)? else {
+        return Ok(ResolvedSniff {
+            format: sniffed,
+            brands: HeicBrandKind::None,
+        });
+    };
+    let brands = heic_ftyp_brand_kind(&ftyp);
+    let format = if is_avif_ftyp(&ftyp) {
+        ImageInputFormat::Avif
+    } else {
+        sniffed
+    };
+    Ok(ResolvedSniff { format, brands })
 }
 
 fn is_ico_header(header: &[u8], strict_ambiguous: bool) -> bool {
@@ -210,6 +421,8 @@ fn sniff_magic_format(header: &[u8], strict_ambiguous: bool) -> Option<ImageInpu
         Some(ImageInputFormat::Jxl)
     } else if is_avif_ftyp(header) {
         Some(ImageInputFormat::Avif)
+    } else if is_heic_ftyp(header) {
+        Some(ImageInputFormat::Heic)
     } else if header.starts_with(&GIF87A_MAGIC) || header.starts_with(&GIF89A_MAGIC) {
         Some(ImageInputFormat::Gif)
     } else if is_ico_header(header, strict_ambiguous) {
@@ -896,6 +1109,1112 @@ fn probe_avif(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
     Ok(ImageDimensions::new(width, height)?)
 }
 
+/// Finds one child box of a container box. Malformed children are ignored so the
+/// caller can fall back to the full parser, which reports the real error.
+fn heif_child_content(parent: &[u8], wanted: [u8; 4]) -> Option<&[u8]> {
+    BoxIter::new(parent)
+        .filter_map(Result::ok)
+        .find(|raw| raw.header.box_type.0 == wanted)
+        .map(|raw| raw.content)
+}
+
+/// Screens `moov/trak/mdia/minf/stbl` *before* `heifer_isobmff::track::parse_tracks`
+/// runs: rejects multi-sample tracks (before `stsz` materialises millions of samples)
+/// and caps track / `stco` / `co64` / `stsc` table counts (preventing quadratic
+/// chunk-to-run lookups inside `parse_tracks`).
+fn screen_heic_moov_tracks(header_buf: &[u8], path: &Path) -> Result<(), ProbeError> {
+    let mut track_count = 0_usize;
+    for moov in BoxIter::new(header_buf).filter_map(Result::ok) {
+        if moov.header.box_type.0 != *b"moov" {
+            continue;
+        }
+        for trak in BoxIter::new(moov.content).filter_map(Result::ok) {
+            if trak.header.box_type.0 != *b"trak" {
+                continue;
+            }
+            track_count = track_count.saturating_add(1);
+            if track_count > MAX_HEIC_MOOV_TRACKS {
+                return Err(invalid_image(
+                    path,
+                    "HEIC container exceeds the track count budget",
+                ));
+            }
+            let Some(mdia) = heif_child_content(trak.content, *b"mdia") else {
+                continue;
+            };
+            let Some(minf) = heif_child_content(mdia, *b"minf") else {
+                continue;
+            };
+            let Some(stbl) = heif_child_content(minf, *b"stbl") else {
+                continue;
+            };
+            for child in BoxIter::new(stbl).filter_map(Result::ok) {
+                match &child.header.box_type.0 {
+                    b"stsz" => {
+                        // FullBox: version, flags, sample_size, sample_count.
+                        // `heifer` ignores `version` and allocates `sample_count` entries,
+                        // so screen bytes 8..12 regardless of version.
+                        let Some(count) = child.content.get(8..12) else {
+                            continue;
+                        };
+                        let sample_count =
+                            u32::from_be_bytes([count[0], count[1], count[2], count[3]]);
+                        if sample_count > 1 {
+                            return Err(invalid_image(
+                                path,
+                                "animated/sequence HEIC is not supported by the still-image pipeline",
+                            ));
+                        }
+                    }
+                    b"stco" | b"co64" | b"stsc" => {
+                        let Some(count) = child.content.get(4..8) else {
+                            continue;
+                        };
+                        let entries = u32::from_be_bytes([count[0], count[1], count[2], count[3]]);
+                        if usize::try_from(entries).unwrap_or(usize::MAX)
+                            > MAX_HEIC_TRACK_TABLE_ENTRIES
+                        {
+                            return Err(invalid_image(
+                                path,
+                                "HEIC track sample table exceeds the entry budget",
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn screen_heic_iinf(content: &[u8], total_infe: &mut usize, path: &Path) -> Result<(), ProbeError> {
+    let Some(&version) = content.first() else {
+        return Ok(());
+    };
+    let start = if version == 0 { 6 } else { 8 };
+    let Some(entries) = content.get(start..) else {
+        return Ok(());
+    };
+    let mut seen_ids = HashSet::new();
+    for infe in BoxIter::new(entries).filter_map(Result::ok) {
+        if infe.header.box_type.0 != *b"infe" {
+            continue;
+        }
+        *total_infe = total_infe.saturating_add(1);
+        if *total_infe > MAX_HEIC_META_ITEMS {
+            return Err(invalid_image(
+                path,
+                "HEIC container exceeds the item count budget",
+            ));
+        }
+        let item_id = match infe.content.first() {
+            Some(&2) => infe
+                .content
+                .get(4..6)
+                .map(|b| u32::from(u16::from_be_bytes([b[0], b[1]]))),
+            Some(&3) => infe
+                .content
+                .get(4..8)
+                .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]])),
+            _ => None,
+        };
+        if let Some(id) = item_id
+            && !seen_ids.insert(id)
+        {
+            return Err(invalid_image(
+                path,
+                "HEIC container declares duplicate item IDs",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn screen_heic_iprp(content: &[u8], total_ipma: &mut usize, path: &Path) -> Result<(), ProbeError> {
+    for iprp_child in BoxIter::new(content).filter_map(Result::ok) {
+        match &iprp_child.header.box_type.0 {
+            b"ipma" => {
+                if let Some(bytes) = iprp_child.content.get(4..8) {
+                    let count = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    *total_ipma =
+                        total_ipma.saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
+                    if *total_ipma > MAX_HEIC_META_ITEMS {
+                        return Err(invalid_image(
+                            path,
+                            "HEIC property association table exceeds the entry budget",
+                        ));
+                    }
+                }
+            }
+            b"ipco" => {
+                for prop in BoxIter::new(iprp_child.content).filter_map(Result::ok) {
+                    if prop.header.box_type.0 == *b"auxC"
+                        && prop.content.len() > MAX_HEIC_AUXC_BYTES
+                    {
+                        return Err(invalid_image(
+                            path,
+                            "HEIC auxC property exceeds the byte budget",
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Inspects the active `meta` box in a single linear pass before `HeifFile::parse`:
+/// resolves the borrowed `idat` payload once (taking the last `meta` and last `idat`,
+/// matching `HeifFile::parse`), rejects duplicate item IDs, and caps `iinf`/`iloc`/`ipma`
+/// entry counts and `auxC` property sizes so `HeifFile::parse` cannot spend quadratic
+/// CPU time or multiply cloned buffers on crafted metadata.
+fn inspect_heic_meta<'a>(
+    header_buf: &'a [u8],
+    path: &Path,
+) -> Result<Option<&'a [u8]>, ProbeError> {
+    let mut last_meta = None;
+    for raw in BoxIter::new(header_buf).filter_map(Result::ok) {
+        if raw.header.box_type.0 == *b"meta" {
+            last_meta = Some(raw.content);
+        }
+    }
+    let Some(meta) = last_meta else {
+        return Ok(None);
+    };
+    // `meta` is a FullBox; child boxes follow its 4-byte version/flags.
+    let Some(children) = meta.get(4..) else {
+        return Ok(None);
+    };
+
+    let mut idat = None;
+    let mut total_infe = 0_usize;
+    let mut total_iloc = 0_usize;
+    let mut total_ipma = 0_usize;
+
+    for child in BoxIter::new(children).filter_map(Result::ok) {
+        match &child.header.box_type.0 {
+            b"idat" => idat = Some(child.content),
+            b"iinf" => screen_heic_iinf(child.content, &mut total_infe, path)?,
+            b"iloc" => {
+                let count = match child.content.first() {
+                    Some(&0 | &1) => child
+                        .content
+                        .get(6..8)
+                        .map(|b| u32::from(u16::from_be_bytes([b[0], b[1]]))),
+                    Some(&2) => child
+                        .content
+                        .get(6..10)
+                        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]])),
+                    _ => None,
+                };
+                if let Some(count) = count {
+                    total_iloc =
+                        total_iloc.saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
+                    if total_iloc > MAX_HEIC_META_ITEMS {
+                        return Err(invalid_image(
+                            path,
+                            "HEIC item location table exceeds the entry budget",
+                        ));
+                    }
+                }
+            }
+            b"iprp" => screen_heic_iprp(child.content, &mut total_ipma, path)?,
+            _ => {}
+        }
+    }
+
+    Ok(idat)
+}
+
+fn is_alpha_auxiliary_urn(urn: &str) -> bool {
+    matches!(
+        urn,
+        "urn:mpeg:hevc:2015:auxid:1" | "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha"
+    )
+}
+
+/// O(1) lookup index over a parsed [`HeifFile`], built once in linear time so
+/// the graph walk never hits `heifer_isobmff`'s linear scans over `items` or `references`.
+struct HeicIndex<'a> {
+    properties: &'a [Property],
+    items: HashMap<ItemId, &'a Item>,
+    dimg_refs: HashMap<ItemId, &'a [ItemId]>,
+    /// Direct `auxl` referrers per target item, pre-filtered to items that are
+    /// either alpha auxiliary images or missing from `items` (preserving invalid
+    /// reference errors while ensuring non-alpha `auxl` entries never cause
+    /// uncharged iterations during traversal).
+    alpha_or_invalid_auxl: HashMap<ItemId, Vec<ItemId>>,
+}
+
+impl<'a> HeicIndex<'a> {
+    fn build(container: &'a HeifFile<'a>, path: &Path) -> Result<Self, ProbeError> {
+        let mut items = HashMap::with_capacity(container.items.len());
+        for item in &container.items {
+            items.entry(item.id).or_insert(item);
+        }
+
+        let mut dimg_refs: HashMap<ItemId, &'a [ItemId]> = HashMap::new();
+        let mut alpha_cache: HashMap<ItemId, bool> = HashMap::new();
+        let mut auxl_by_target: HashMap<ItemId, (usize, Vec<ItemId>)> = HashMap::new();
+        let mut total_auxl_edges = 0_usize;
+
+        for (ref_idx, reference) in container.references.iter().enumerate() {
+            match &reference.ref_type.0 {
+                b"dimg" => {
+                    dimg_refs
+                        .entry(reference.from)
+                        .or_insert(reference.to.as_slice());
+                }
+                b"auxl" => {
+                    let relevant = *alpha_cache.entry(reference.from).or_insert_with(|| {
+                        match items.get(&reference.from) {
+                            None => true,
+                            Some(aux_item) => Self::properties_of(container.properties.as_slice(), aux_item)
+                                .any(|prop| {
+                                    matches!(prop, Property::AuxiliaryType(urn) if is_alpha_auxiliary_urn(urn))
+                                }),
+                        }
+                    });
+                    if !relevant {
+                        continue;
+                    }
+                    for &target in &reference.to {
+                        if !items.contains_key(&target) {
+                            continue;
+                        }
+                        let entry = auxl_by_target
+                            .entry(target)
+                            .or_insert_with(|| (usize::MAX, Vec::new()));
+                        if entry.0 == ref_idx {
+                            continue;
+                        }
+                        entry.0 = ref_idx;
+                        total_auxl_edges = total_auxl_edges.saturating_add(1);
+                        if total_auxl_edges > MAX_HEIC_AUXL_REFS {
+                            return Err(invalid_image(
+                                path,
+                                "HEIC container exceeds the auxiliary reference budget",
+                            ));
+                        }
+                        entry.1.push(reference.from);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let alpha_or_invalid_auxl = auxl_by_target
+            .into_iter()
+            .map(|(target, (_, sources))| (target, sources))
+            .collect();
+
+        Ok(Self {
+            properties: &container.properties,
+            items,
+            dimg_refs,
+            alpha_or_invalid_auxl,
+        })
+    }
+
+    fn properties_of(
+        properties: &'a [Property],
+        item: &'a Item,
+    ) -> impl Iterator<Item = &'a Property> {
+        item.properties.iter().filter_map(move |assoc| {
+            usize::from(assoc.index)
+                .checked_sub(1)
+                .and_then(|idx| properties.get(idx))
+        })
+    }
+
+    fn item(&self, id: ItemId, path: &Path, context: &str) -> Result<&'a Item, ProbeError> {
+        self.items
+            .get(&id)
+            .copied()
+            .ok_or_else(|| invalid_image(path, format!("{context}: unknown item {id}")))
+    }
+
+    fn item_properties(&self, item: &'a Item) -> impl Iterator<Item = &'a Property> {
+        Self::properties_of(self.properties, item)
+    }
+
+    fn hevc_config(&self, item: &'a Item) -> Option<&'a HevcConfig> {
+        self.item_properties(item).find_map(|prop| match prop {
+            Property::HevcConfig(config) => Some(config),
+            _ => None,
+        })
+    }
+
+    fn image_size(&self, item: &'a Item) -> Option<(u32, u32)> {
+        self.item_properties(item).find_map(|prop| match prop {
+            Property::ImageSize { width, height } => Some((*width, *height)),
+            _ => None,
+        })
+    }
+
+    fn dimg_targets(&self, from: ItemId) -> &'a [ItemId] {
+        self.dimg_refs.get(&from).copied().unwrap_or(&[])
+    }
+
+    fn alpha_or_invalid_auxl(&self, target: ItemId) -> &[ItemId] {
+        self.alpha_or_invalid_auxl
+            .get(&target)
+            .map_or(&[], Vec::as_slice)
+    }
+}
+
+/// Canvas width/height from an `iovl` overlay descriptor, mirroring heifer's
+/// `decode_overlay` byte layout: version, flags (bit 0 selects 32-bit fields),
+/// four u16 fill values, then width and height.
+fn heic_overlay_canvas(data: &[u8]) -> Option<(u32, u32)> {
+    let mut bytes = data.iter().copied();
+    if bytes.next()? != 0 {
+        return None;
+    }
+    let large = bytes.next()? & 1 != 0;
+    for _ in 0..4 {
+        let _ = u16::from_be_bytes([bytes.next()?, bytes.next()?]);
+    }
+    let mut field = || -> Option<u32> {
+        if large {
+            let value = [bytes.next()?, bytes.next()?, bytes.next()?, bytes.next()?];
+            Some(u32::from_be_bytes(value))
+        } else {
+            let value = [bytes.next()?, bytes.next()?];
+            Some(u32::from(u16::from_be_bytes(value)))
+        }
+    };
+    Some((field()?, field()?))
+}
+
+/// Canvas and tile geometry from a `grid` descriptor, mirroring heifer's `Grid::parse`:
+/// version, flags (bit 0 selects 32-bit output dimensions), rows-1, columns-1,
+/// then output width/height. Heifer uses the descriptor canvas, not `ispe`.
+fn heic_grid_canvas(data: &[u8]) -> Option<(u32, u32, u16, u16)> {
+    let mut bytes = data.iter().copied();
+    if bytes.next()? != 0 {
+        return None;
+    }
+    let large = bytes.next()? & 1 != 0;
+    let rows = u16::from(bytes.next()?) + 1;
+    let columns = u16::from(bytes.next()?) + 1;
+    let mut field = || -> Option<u32> {
+        if large {
+            Some(u32::from_be_bytes([
+                bytes.next()?,
+                bytes.next()?,
+                bytes.next()?,
+                bytes.next()?,
+            ]))
+        } else {
+            Some(u32::from(u16::from_be_bytes([
+                bytes.next()?,
+                bytes.next()?,
+            ])))
+        }
+    };
+    Some((field()?, field()?, rows, columns))
+}
+
+/// Total byte length of an item's extents, matching how heifer concatenates them.
+/// Extent bounds were already checked for every item before the graph walk.
+fn heic_item_data_len(
+    path: &Path,
+    item: &Item,
+    idat_len: Option<u64>,
+    file_len: u64,
+) -> Result<u64, ProbeError> {
+    let location = item
+        .location
+        .as_ref()
+        .ok_or_else(|| invalid_image(path, "HEIC derived item has no data location"))?;
+    let limit = if location.construction_method == ConstructionMethod::Idat {
+        idat_len
+            .ok_or_else(|| invalid_image(path, "HEIC derived item uses idat without an idat box"))?
+    } else {
+        file_len
+    };
+    let mut total = 0_u64;
+    for extent in &location.extents {
+        let length = if extent.length == 0 {
+            limit.saturating_sub(extent.offset)
+        } else {
+            extent.length
+        };
+        total = total
+            .checked_add(length)
+            .ok_or_else(|| invalid_image(path, "HEIC derived item data length overflow"))?;
+    }
+    Ok(total)
+}
+
+/// Shared traversal state: visit cap, retained-pixel tally, active recursion path,
+/// pre-resolved `idat` slice, and lazy derived-canvas caches.
+struct HeicWalk<'a> {
+    visits: u64,
+    retained: u64,
+    visiting: Vec<ItemId>,
+    file: &'a mut File,
+    file_len: u64,
+    idat: Option<&'a [u8]>,
+    overlay_canvases: HashMap<ItemId, (u32, u32)>,
+    grid_canvases: HashMap<ItemId, (u32, u32)>,
+}
+
+fn charge_heic_visit(visits: &mut u64, path: &Path) -> Result<(), ProbeError> {
+    *visits = visits
+        .checked_add(1)
+        .ok_or_else(|| invalid_image(path, "HEIC item visit count overflow"))?;
+    if *visits > MAX_HEIC_ITEM_VISITS {
+        return Err(invalid_image(
+            path,
+            "HEIC item graph exceeds the visit budget",
+        ));
+    }
+    Ok(())
+}
+
+/// Reads only the bounded prefix of a derived-item (`iovl`/`grid`) descriptor from
+/// its real storage. File-backed extents are read from the original file and
+/// idat-backed extents from the pre-resolved `idat` slice. No full item data is
+/// ever materialised and `header_buf` is never re-scanned.
+fn read_heic_item_descriptor(
+    file: &mut File,
+    path: &Path,
+    item: &Item,
+    idat_payload: Option<&[u8]>,
+    file_len: u64,
+) -> Result<Vec<u8>, ProbeError> {
+    let Some(location) = &item.location else {
+        return Err(invalid_image(path, "HEIC iovl item has no data location"));
+    };
+    if location.construction_method == ConstructionMethod::Item {
+        return Err(invalid_image(
+            path,
+            "HEIC iovl descriptor in constructed item data is not supported",
+        ));
+    }
+    let idat =
+        if location.construction_method == ConstructionMethod::Idat {
+            Some(idat_payload.ok_or_else(|| {
+                invalid_image(path, "HEIC iovl item uses idat without an idat box")
+            })?)
+        } else {
+            None
+        };
+    let idat_len = match idat {
+        Some(data) => u64::try_from(data.len())
+            .map_err(|_| invalid_image(path, "HEIC idat length overflow"))?,
+        None => 0,
+    };
+
+    let mut descriptor = Vec::with_capacity(IOVL_DESCRIPTOR_MAX_BYTES);
+    for extent in &location.extents {
+        if descriptor.len() >= IOVL_DESCRIPTOR_MAX_BYTES {
+            break;
+        }
+        let limit = if idat.is_some() { idat_len } else { file_len };
+        let length = if extent.length == 0 {
+            limit.saturating_sub(extent.offset)
+        } else {
+            extent.length
+        };
+        if extent.offset > limit || length > limit.saturating_sub(extent.offset) {
+            return Err(invalid_image(
+                path,
+                "HEIC iovl descriptor extent runs past its data source",
+            ));
+        }
+        let remaining = u64::try_from(IOVL_DESCRIPTOR_MAX_BYTES - descriptor.len())
+            .map_err(|_| invalid_image(path, "HEIC iovl descriptor budget overflow"))?;
+        let want = length.min(remaining);
+        if want == 0 {
+            continue;
+        }
+        let want_usize = usize::try_from(want)
+            .map_err(|_| invalid_image(path, "HEIC iovl descriptor size overflow"))?;
+        if let Some(data) = idat {
+            let offset = usize::try_from(extent.offset)
+                .map_err(|_| invalid_image(path, "HEIC iovl extent offset overflow"))?;
+            let end = offset
+                .checked_add(want_usize)
+                .ok_or_else(|| invalid_image(path, "HEIC iovl extent offset overflow"))?;
+            let chunk = data
+                .get(offset..end)
+                .ok_or_else(|| invalid_image(path, "truncated HEIC iovl descriptor"))?;
+            descriptor.extend_from_slice(chunk);
+        } else {
+            file.seek(SeekFrom::Start(extent.offset))
+                .map_err(|source| ProbeError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            let start = descriptor.len();
+            descriptor.resize(start + want_usize, 0);
+            read_exact_or_invalid(
+                file,
+                path,
+                &mut descriptor[start..],
+                "truncated HEIC iovl descriptor",
+            )?;
+        }
+    }
+    Ok(descriptor)
+}
+
+/// Lazily resolves and caches the canvas dimensions of a reachable `iovl` item.
+/// Unreachable `iovl` items are never read, and repeatedly referenced `iovl` items
+/// are read from storage at most once.
+fn resolve_heic_overlay_canvas(
+    walk: &mut HeicWalk<'_>,
+    item: &Item,
+    input_count: usize,
+    path: &Path,
+) -> Result<(u32, u32), ProbeError> {
+    if let Some(&canvas) = walk.overlay_canvases.get(&item.id) {
+        return Ok(canvas);
+    }
+    let descriptor = read_heic_item_descriptor(walk.file, path, item, walk.idat, walk.file_len)?;
+    let canvas = heic_overlay_canvas(&descriptor)
+        .ok_or_else(|| invalid_image(path, "invalid or truncated HEIC iovl descriptor"))?;
+    // Heifer reads one signed offset pair after the canvas header for every `dimg`
+    // input. Validate the full extent length against that table so probing rejects
+    // a file the decoder would reject with `truncated iovl data`, without reading
+    // the offsets themselves.
+    let large = descriptor.get(1).is_some_and(|flags| flags & 1 != 0);
+    let header_bytes = if large { 18 } else { 14 };
+    let pair_bytes = if large { 8 } else { 4 };
+    let required = u64::try_from(input_count)
+        .ok()
+        .and_then(|count| count.checked_mul(pair_bytes))
+        .and_then(|offsets| offsets.checked_add(header_bytes))
+        .ok_or_else(|| invalid_image(path, "HEIC iovl offset table size overflow"))?;
+    let idat_len = walk.idat.and_then(|data| u64::try_from(data.len()).ok());
+    let data_len = heic_item_data_len(path, item, idat_len, walk.file_len)?;
+    if data_len < required {
+        return Err(invalid_image(
+            path,
+            "HEIC iovl descriptor is missing input offsets",
+        ));
+    }
+    walk.overlay_canvases.insert(item.id, canvas);
+    Ok(canvas)
+}
+
+/// Lazily resolves and caches the descriptor canvas and tile geometry of a `grid`
+/// item. Heifer sizes the canvas from the descriptor, so a mismatch with `ispe`
+/// or a stale tile count is rejected here rather than at decode time.
+fn resolve_heic_grid_canvas(
+    walk: &mut HeicWalk<'_>,
+    item: &Item,
+    input_count: usize,
+    path: &Path,
+) -> Result<(u32, u32), ProbeError> {
+    if let Some(&canvas) = walk.grid_canvases.get(&item.id) {
+        return Ok(canvas);
+    }
+    let descriptor = read_heic_item_descriptor(walk.file, path, item, walk.idat, walk.file_len)?;
+    let (width, height, rows, columns) = heic_grid_canvas(&descriptor)
+        .ok_or_else(|| invalid_image(path, "invalid or truncated HEIC grid descriptor"))?;
+    let expected = usize::from(rows)
+        .checked_mul(usize::from(columns))
+        .ok_or_else(|| invalid_image(path, "HEIC grid geometry overflow"))?;
+    if input_count != expected {
+        return Err(invalid_image(
+            path,
+            format!("HEIC grid has {input_count} tiles but its descriptor requires {expected}"),
+        ));
+    }
+    let canvas = (width, height);
+    walk.grid_canvases.insert(item.id, canvas);
+    Ok(canvas)
+}
+
+/// Validates the coded geometry of one HEIC image item before any pixel is decoded,
+/// then applies its transformative properties in the same order as
+/// `heifer::decode_rgba8` (clean aperture, rotation, mirroring).
+#[allow(clippy::too_many_lines)] // One explicit branch per HEIF item type / transform property.
+fn heic_item_dimensions(
+    index: &HeicIndex<'_>,
+    id: ItemId,
+    depth: u32,
+    walk: &mut HeicWalk<'_>,
+    path: &Path,
+) -> Result<(u32, u32), ProbeError> {
+    charge_heic_visit(&mut walk.visits, path)?;
+    if depth > MAX_HEIC_ITEM_DEPTH {
+        return Err(invalid_image(
+            path,
+            "HEIC derived image items nested too deeply",
+        ));
+    }
+    if walk.visiting.contains(&id) {
+        return Err(invalid_image(
+            path,
+            "HEIC derived image item reference cycle",
+        ));
+    }
+    let item = index.item(id, path, "invalid HEIC item reference")?;
+
+    // `heifer` attaches direct `auxl` alpha planes (`referencing_items(id, b"auxl")`);
+    // reject non-HEVC alpha leaves and derived alpha on coded `hvc1` owners.
+    // Keep the first alpha's post-transform dimensions: heifer attaches it to a
+    // derived owner before applying the owner's own transforms.
+    let mut alpha_dims = None;
+    for &aux in index.alpha_or_invalid_auxl(id) {
+        let aux_item = index.item(aux, path, "invalid HEIC auxiliary item")?;
+        // heifer attaches a coded primary's alpha via `decode_hvc1`, which
+        // feeds the aux item straight into the HEVC bitstream reader. A
+        // derived alpha item is only supported on derived owners.
+        if matches!(&item.item_type.0, b"hvc1") && !matches!(&aux_item.item_type.0, b"hvc1") {
+            return Err(invalid_image(
+                path,
+                "derived alpha auxiliary image is not supported for a coded HEVC image",
+            ));
+        }
+        // Walk the whole alpha reference tree: `heic_item_dimensions`
+        // rejects non-HEVC leaves, validates geometry and charges the
+        // retained-pixel budget.
+        walk.visiting.push(id);
+        let dims = heic_item_dimensions(index, aux, depth + 1, walk, path)?;
+        walk.visiting.pop();
+        if alpha_dims.is_none() {
+            alpha_dims = Some(dims);
+        }
+    }
+
+    // Follow derives to their coded leaves: non-HEVC codecs must be rejected even
+    // when hidden behind a `grid`, `iovl` or `iden` primary item.
+    let mut base = None;
+    let mut overlay_canvas = None;
+    match &item.item_type.0 {
+        b"hvc1" => {
+            let config = index.hevc_config(item).ok_or_else(|| {
+                invalid_image(path, "HEVC image item is missing its hvcC property")
+            })?;
+            if !(8..=12).contains(&config.bit_depth_luma)
+                || !(8..=12).contains(&config.bit_depth_chroma)
+            {
+                return Err(invalid_image(
+                    path,
+                    format!(
+                        "unsupported HEVC bit depth {}/{} (expected 8..=12)",
+                        config.bit_depth_luma, config.bit_depth_chroma
+                    ),
+                ));
+            }
+        }
+        b"iden" => {
+            let [source] = index.dimg_targets(id) else {
+                return Err(invalid_image(
+                    path,
+                    "HEIC iden item without exactly one source",
+                ));
+            };
+            walk.visiting.push(id);
+            let source_dims = heic_item_dimensions(index, *source, depth + 1, walk, path)?;
+            walk.visiting.pop();
+            base = Some(source_dims);
+        }
+        b"grid" | b"iovl" => {
+            let inputs = index.dimg_targets(id);
+            if inputs.is_empty() {
+                return Err(invalid_image(
+                    path,
+                    "HEIC derived image item has no input images",
+                ));
+            }
+            if item.item_type.0 == *b"iovl" {
+                overlay_canvas = Some(resolve_heic_overlay_canvas(walk, item, inputs.len(), path)?);
+            } else {
+                let canvas = resolve_heic_grid_canvas(walk, item, inputs.len(), path)?;
+                let ispe = index.image_size(item).ok_or_else(|| {
+                    invalid_image(path, "HEIC image item is missing its ispe property")
+                })?;
+                if canvas != ispe {
+                    return Err(invalid_image(
+                        path,
+                        format!(
+                            "HEIC grid canvas {}x{} does not match ispe {}x{}",
+                            canvas.0, canvas.1, ispe.0, ispe.1
+                        ),
+                    ));
+                }
+            }
+            walk.visiting.push(id);
+            for &input in inputs {
+                heic_item_dimensions(index, input, depth + 1, walk, path)?;
+            }
+            walk.visiting.pop();
+        }
+        other => {
+            return Err(invalid_image(
+                path,
+                format!(
+                    "unsupported non-HEVC HEIC image item type `{}`",
+                    String::from_utf8_lossy(other)
+                ),
+            ));
+        }
+    }
+
+    let (mut width, mut height) = if let Some(dims) = base {
+        dims
+    } else {
+        index
+            .image_size(item)
+            .ok_or_else(|| invalid_image(path, "HEIC image item is missing its ispe property"))?
+    };
+    // Heifer attaches alpha to a derived image before applying that image's
+    // transforms, so the alpha must cover the pre-transform dimensions.
+    if !matches!(&item.item_type.0, b"hvc1")
+        && let Some((alpha_w, alpha_h)) = alpha_dims
+        && (alpha_w < width || alpha_h < height)
+    {
+        return Err(invalid_image(
+            path,
+            "HEIC alpha image is smaller than the image it covers",
+        ));
+    }
+    if let Some((canvas_w, canvas_h)) = overlay_canvas
+        && (canvas_w, canvas_h) != (width, height)
+    {
+        return Err(invalid_image(
+            path,
+            format!("HEIC iovl canvas {canvas_w}x{canvas_h} does not match ispe {width}x{height}"),
+        ));
+    }
+    if width == 0 || height == 0 {
+        return Err(invalid_image(
+            path,
+            format!("HEIC image has zero dimension {width}x{height}"),
+        ));
+    }
+    if width > MAX_HEIC_DIMENSION || height > MAX_HEIC_DIMENSION {
+        return Err(invalid_image(
+            path,
+            format!(
+                "HEIC dimensions {width}x{height} exceed the {MAX_HEIC_DIMENSION}-pixel per-axis limit"
+            ),
+        ));
+    }
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| invalid_image(path, "HEIC dimensions overflow pixel count"))?;
+    if pixels > MAX_STILL_IMAGE_PIXELS {
+        return Err(invalid_image(
+            path,
+            format!("HEIC pixel count ({pixels}) exceeds {MAX_STILL_IMAGE_PIXELS}-pixel limit"),
+        ));
+    }
+    // Count both the coded and the display buffer of every visited item. Repeated
+    // `dimg` references are visited separately, so each retained copy is charged.
+    walk.retained = walk
+        .retained
+        .checked_add(pixels)
+        .ok_or_else(|| invalid_image(path, "HEIC retained pixel budget overflow"))?;
+
+    for property in index.item_properties(item) {
+        match *property {
+            Property::CleanAperture {
+                width: (wn, wd),
+                height: (hn, hd),
+                horiz_offset: (hx, hxd),
+                vert_offset: (vy, vyd),
+            } => {
+                (width, height) = heic_clean_aperture_dimensions(
+                    path,
+                    width,
+                    height,
+                    (wn, wd),
+                    (hn, hd),
+                    (hx, hxd),
+                    (vy, vyd),
+                )?;
+            }
+            Property::Rotation(quarters) if quarters % 2 == 1 => {
+                std::mem::swap(&mut width, &mut height);
+            }
+            // Mirroring (`imir`) and unrecognised transform properties leave
+            // the display dimensions unchanged.
+            _ => {}
+        }
+    }
+    let display_pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| invalid_image(path, "HEIC display dimensions overflow pixel count"))?;
+    walk.retained = walk
+        .retained
+        .checked_add(display_pixels)
+        .ok_or_else(|| invalid_image(path, "HEIC retained pixel budget overflow"))?;
+    Ok((width, height))
+}
+
+/// `clap` crop geometry from ISO/IEC 14496-12, matching heifer's `clean_aperture`
+/// and `Image::crop` rounding/clamping so the probed size is exactly the decoded size.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn heic_clean_aperture_dimensions(
+    path: &Path,
+    width: u32,
+    height: u32,
+    crop_width: (u32, u32),
+    crop_height: (u32, u32),
+    horiz_offset: (i32, u32),
+    vert_offset: (i32, u32),
+) -> Result<(u32, u32), ProbeError> {
+    if crop_width.1 == 0 || crop_height.1 == 0 || horiz_offset.1 == 0 || vert_offset.1 == 0 {
+        return Err(invalid_image(
+            path,
+            "HEIC clap property has a zero denominator",
+        ));
+    }
+    let cw = f64::from(crop_width.0) / f64::from(crop_width.1);
+    let ch = f64::from(crop_height.0) / f64::from(crop_height.1);
+    let cx = f64::from(horiz_offset.0) / f64::from(horiz_offset.1) + (f64::from(width) - 1.0) / 2.0;
+    let cy = f64::from(vert_offset.0) / f64::from(vert_offset.1) + (f64::from(height) - 1.0) / 2.0;
+    let left = (cx - (cw - 1.0) / 2.0).round().max(0.0) as u32;
+    let top = (cy - (ch - 1.0) / 2.0).round().max(0.0) as u32;
+    let cropped_w = cw.round() as u32;
+    let cropped_h = ch.round() as u32;
+    // `Image::crop` clamps the origin and the requested size to the source image.
+    let x = left.min(width);
+    let y = top.min(height);
+    Ok((cropped_w.min(width - x), cropped_h.min(height - y)))
+}
+
+/// Header-only probe of a HEIC/HEIF still image. Top-level ISOBMFF boxes are walked
+/// with bounded count/byte budgets; only `ftyp`, `meta` and `moov` are buffered,
+/// while `mdat` is skipped by seeking. No pixel data is decoded here.
+#[allow(clippy::too_many_lines)] // Explicit box, brand, track, extent and item validation steps.
+fn probe_heic(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+    let file_len = file
+        .seek(SeekFrom::End(0))
+        .map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut header_buf = Vec::new();
+    let mut at = 0_u64;
+    let mut boxes = 0_usize;
+    while at < file_len {
+        boxes += 1;
+        if boxes > MAX_HEIC_TOP_LEVEL_BOXES {
+            return Err(invalid_image(
+                path,
+                "HEIC container has too many top-level boxes",
+            ));
+        }
+        let available = usize::try_from((file_len - at).min(32)).unwrap_or(32);
+        if available < 8 {
+            return Err(invalid_image(path, "truncated HEIC box header"));
+        }
+        file.seek(SeekFrom::Start(at))
+            .map_err(|source| ProbeError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let mut prefix = [0_u8; 32];
+        read_exact_or_invalid(
+            file,
+            path,
+            &mut prefix[..available],
+            "truncated HEIC box header",
+        )?;
+        let header = read_box_header(&prefix[..available])
+            .map_err(|err| invalid_image(path, format!("invalid HEIC box header: {err}")))?;
+        let total = header.size.unwrap_or(file_len - at);
+        if total < header.header_size || at.checked_add(total).is_none_or(|stop| stop > file_len) {
+            return Err(invalid_image(path, "HEIC box size out of range"));
+        }
+        if matches!(&header.box_type.0, b"ftyp" | b"meta" | b"moov") {
+            let len = usize::try_from(total)
+                .map_err(|_| invalid_image(path, "HEIC header box too large"))?;
+            if header_buf
+                .len()
+                .checked_add(len)
+                .is_none_or(|used| used > MAX_HEIC_HEADER_BYTES)
+            {
+                return Err(invalid_image(
+                    path,
+                    "HEIC header boxes exceed the byte budget",
+                ));
+            }
+            let start = header_buf.len();
+            header_buf
+                .try_reserve_exact(len)
+                .map_err(|_| invalid_image(path, "cannot allocate HEIC header buffer"))?;
+            header_buf.resize(start + len, 0);
+            file.seek(SeekFrom::Start(at))
+                .map_err(|source| ProbeError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            file.read_exact(&mut header_buf[start..])
+                .map_err(|source| ProbeError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        }
+        at += total;
+    }
+
+    // Check `ftyp` brands and `moov` sequence tracks before requiring a still-image
+    // `meta` box, so pure `.heics` sequences (without `meta`) still produce a clear
+    // animated/sequence rejection rather than a missing-meta error.
+    for raw_box in BoxIter::new(&header_buf) {
+        let raw_box =
+            raw_box.map_err(|err| invalid_image(path, format!("invalid HEIC box: {err}")))?;
+        if raw_box.header.box_type.0 == *b"ftyp" {
+            let file_type = FileType::parse(raw_box.content)
+                .map_err(|err| invalid_image(path, format!("invalid HEIC ftyp box: {err}")))?;
+            for brand in
+                std::iter::once(&file_type.major_brand).chain(file_type.compatible_brands.iter())
+            {
+                if matches!(&brand.0, b"avif" | b"avis") {
+                    return Err(invalid_image(
+                        path,
+                        "AVIF brand in HEIC container; route AVIF to the AVIF decoder",
+                    ));
+                }
+                if matches!(&brand.0, b"msf1" | b"hevc" | b"hevx") {
+                    return Err(invalid_image(
+                        path,
+                        "animated/sequence HEIC is not supported by the still-image pipeline",
+                    ));
+                }
+            }
+        }
+    }
+
+    // A file can omit sequence brands but still carry a picture/video track with
+    // more than one sample; that is an animation and must be rejected explicitly.
+    // Screen `moov` sample tables first so hostile `stsz`/`stco`/`stsc` counts
+    // are rejected before `parse_tracks` allocates or scans them.
+    screen_heic_moov_tracks(&header_buf, path)?;
+    let tracks = heifer::heifer_isobmff::track::parse_tracks(&header_buf)
+        .map_err(|err| invalid_image(path, format!("invalid HEIC track box: {err}")))?;
+    for track in &tracks {
+        let is_main = matches!(&track.handler.0, b"pict" | b"vide")
+            && !track
+                .references
+                .iter()
+                .any(|(kind, _)| matches!(&kind.0, b"thmb" | b"auxl"));
+        if is_main && track.samples.len() > 1 {
+            return Err(invalid_image(
+                path,
+                "animated/sequence HEIC is not supported by the still-image pipeline",
+            ));
+        }
+    }
+
+    // Resolve `meta/idat` once and cap metadata table sizes before `HeifFile::parse`.
+    let idat = inspect_heic_meta(&header_buf, path)?;
+    let container = HeifFile::parse(&header_buf)
+        .map_err(|err| invalid_image(path, format!("invalid HEIC container: {err}")))?;
+
+    // A truncated `mdat` must not be accepted just because its header is intact.
+    let idat_len = idat
+        .map(|data| u64::try_from(data.len()))
+        .transpose()
+        .map_err(|_| invalid_image(path, "HEIC idat length overflow"))?;
+    for item in &container.items {
+        let Some(location) = &item.location else {
+            continue;
+        };
+        for extent in &location.extents {
+            match location.construction_method {
+                ConstructionMethod::File => {
+                    let length = if extent.length == 0 {
+                        file_len.checked_sub(extent.offset).ok_or_else(|| {
+                            invalid_image(path, "HEIC item extent starts past EOF")
+                        })?
+                    } else {
+                        extent.length
+                    };
+                    if extent
+                        .offset
+                        .checked_add(length)
+                        .is_none_or(|stop| stop > file_len)
+                    {
+                        return Err(invalid_image(
+                            path,
+                            "HEIC item extent runs past the end of the file",
+                        ));
+                    }
+                }
+                ConstructionMethod::Idat => {
+                    let idat_len = idat_len.ok_or_else(|| {
+                        invalid_image(path, "HEIC idat item extent without an idat box")
+                    })?;
+                    let length = if extent.length == 0 {
+                        idat_len.saturating_sub(extent.offset)
+                    } else {
+                        extent.length
+                    };
+                    if extent.offset > idat_len || length > idat_len.saturating_sub(extent.offset) {
+                        return Err(invalid_image(
+                            path,
+                            "HEIC idat item extent runs past the end of idat",
+                        ));
+                    }
+                }
+                ConstructionMethod::Item => {}
+            }
+        }
+    }
+
+    let index = HeicIndex::build(&container, path)?;
+    let mut walk = HeicWalk {
+        visits: 0,
+        retained: 0,
+        visiting: Vec::new(),
+        file,
+        file_len,
+        idat,
+        overlay_canvases: HashMap::new(),
+        grid_canvases: HashMap::new(),
+    };
+    let (width, height) = heic_item_dimensions(&index, container.primary_id, 0, &mut walk, path)?;
+    // Plain coded images are already bounded per item. For a derived primary this
+    // tally is a cumulative work budget (plain grid tiles are counted deliberately
+    // even though they use per-worker scratch), so enforce it there.
+    let primary_type = index
+        .item(container.primary_id, path, "invalid HEIC primary item")?
+        .item_type
+        .0;
+    if matches!(&primary_type, b"grid" | b"iovl") && walk.retained > MAX_HEIC_RETAINED_PIXELS {
+        return Err(invalid_image(
+            path,
+            format!(
+                "HEIC cumulative retained-pixel work budget ({}) exceeds {MAX_HEIC_RETAINED_PIXELS}-pixel limit",
+                walk.retained
+            ),
+        ));
+    }
+    if width == 0 || height == 0 {
+        return Err(invalid_image(
+            path,
+            format!("invalid HEIC display dimensions {width}x{height}"),
+        ));
+    }
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| invalid_image(path, "HEIC display dimensions overflow pixel count"))?;
+    if pixels > MAX_STILL_IMAGE_PIXELS {
+        return Err(invalid_image(
+            path,
+            format!("HEIC pixel count ({pixels}) exceeds {MAX_STILL_IMAGE_PIXELS}-pixel limit"),
+        ));
+    }
+    Ok(ImageDimensions::new(width, height)?)
+}
+
 fn probe_gif(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
     let mut options = gif::DecodeOptions::new();
     options.set_memory_limit(gif::MemoryLimit::Bytes(
@@ -1383,6 +2702,7 @@ fn probe_opened_image(
         ImageInputFormat::Tiff => probe_tiff(file, path)?,
         ImageInputFormat::Jxl => probe_jxl(file, path)?,
         ImageInputFormat::Avif => probe_avif(file, path)?,
+        ImageInputFormat::Heic => probe_heic(&mut file, path)?,
         ImageInputFormat::Gif => probe_gif(file, path)?,
         ImageInputFormat::Ico => probe_ico(file, path)?,
         ImageInputFormat::Pnm => probe_pnm(&mut file, path)?,
@@ -1496,8 +2816,9 @@ pub fn probe_image(path: &Path) -> Result<ProbedImage, ProbeError> {
     })?;
     let (prefix, len) = read_magic_prefix(&mut file, path)?;
     let header_slice = prefix.get(..len).unwrap_or(&prefix);
-    let format = sniff_magic_format(header_slice, false)
+    let sniffed = sniff_magic_format(header_slice, false)
         .ok_or_else(|| invalid_image(path, UNRECOGNIZED_MAGIC_REASON))?;
+    let format = resolve_sniffed_input(&mut file, path, sniffed)?.format;
 
     probe_opened_image(file, path, format)
 }
@@ -1796,8 +3117,34 @@ fn probe_directory_entry(path: &Path) -> Result<Option<ProbedImage>, ProbeError>
     let (prefix, len) = read_magic_prefix(&mut file, path)?;
     let header_slice = prefix.get(..len).unwrap_or(&prefix);
     let strict_ambiguous = !has_any_extension(path, KNOWN_IMAGE_EXTENSIONS);
-    if let Some(format) = sniff_magic_format(header_slice, strict_ambiguous) {
-        return probe_opened_image(file, path, format).map(Some);
+    if let Some(sniffed) = sniff_magic_format(header_slice, strict_ambiguous) {
+        let resolved = resolve_sniffed_input(&mut file, path, sniffed)?;
+        return match probe_opened_image(file, path, resolved.format) {
+            Ok(probed) => Ok(Some(probed)),
+            Err(err) => {
+                // An unreadable file is an I/O failure, not an unknown image: the
+                // batch must report it instead of silently dropping the entry.
+                if matches!(err, ProbeError::Io { .. }) {
+                    return Err(err);
+                }
+                // Generic `mif1`/`mif2` brands alone do not confirm a still image.
+                // Without a known extension a failed probe is a non-image entry;
+                // a specific brand or a known extension still reports the error.
+                let brands = if resolved.brands == HeicBrandKind::None {
+                    heic_ftyp_brand_kind(header_slice)
+                } else {
+                    resolved.brands
+                };
+                if strict_ambiguous
+                    && sniffed == ImageInputFormat::Heic
+                    && resolved.format == ImageInputFormat::Heic
+                    && brands == HeicBrandKind::Generic
+                {
+                    return Ok(None);
+                }
+                Err(err)
+            }
+        };
     }
 
     if has_any_extension(path, KNOWN_IMAGE_EXTENSIONS) {
@@ -1942,8 +3289,12 @@ fn reject_canonical_same_path(source: &Path, target: &Path) -> Result<(), ProbeE
 #[cfg(test)]
 mod tests {
     use super::{
-        ImageBatchRequest, ProbedImage, prepare_image_batch, prepare_image_batch_inner,
-        prepare_image_batch_with_options, probe_image, validate_cpu_heic_admission,
+        HeicBrandKind, ImageBatchRequest, MAX_HEIC_AUXC_BYTES, MAX_HEIC_ITEM_VISITS,
+        MAX_HEIC_META_ITEMS, MAX_HEIC_TRACK_TABLE_ENTRIES, ProbedImage, charge_heic_visit,
+        heic_grid_canvas, heic_overlay_canvas, inspect_heic_meta, is_alpha_auxiliary_urn,
+        prepare_image_batch, prepare_image_batch_inner, prepare_image_batch_with_options,
+        probe_directory_entry, probe_image, resolve_sniffed_input, screen_heic_moov_tracks,
+        validate_cpu_heic_admission,
     };
     use crate::ProbeError;
     use fastconv_domain::{
@@ -3277,12 +4628,22 @@ mod tests {
             Some(ImageInputFormat::Avif)
         );
 
-        // MP4, MOV and HEIC containers must never be accepted as images.
+        // HEIC brands are now a supported still-image input container.
+        let mut heic = vec![0_u8; 24];
+        heic[0..4].copy_from_slice(&24_u32.to_be_bytes());
+        heic[4..8].copy_from_slice(b"ftyp");
+        heic[8..12].copy_from_slice(b"heic");
+        heic[12..20].copy_from_slice(b"mif1heic");
+        assert_eq!(
+            super::sniff_magic_format(&heic, false),
+            Some(ImageInputFormat::Heic)
+        );
+
+        // MP4 and MOV containers must still never be accepted as images.
         for (brand, compat) in [
             (&b"isom"[..], &b"isomiso2avc1mp41"[..]),
             (&b"mp42"[..], &b"isomiso2avc1mp41"[..]),
             (&b"qt  "[..], &b"qt  "[..]),
-            (&b"heic"[..], &b"mif1miaf"[..]),
         ] {
             let mut header = vec![0_u8; 32];
             let compat_len = u32::try_from(compat.len()).unwrap_or(0);
@@ -3307,6 +4668,933 @@ mod tests {
             Err(ProbeError::InvalidImage { .. })
         ));
 
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    fn write_heic_still(
+        path: &Path,
+        width: u32,
+        height: u32,
+        with_alpha: bool,
+    ) -> Result<Vec<u8>, ProbeError> {
+        let count = usize::try_from(width)
+            .ok()
+            .and_then(|w| w.checked_mul(usize::try_from(height).unwrap_or(0)))
+            .ok_or_else(|| ProbeError::InvalidImage {
+                path: path.to_path_buf(),
+                reason: "test image too large".to_owned(),
+            })?;
+        let channels = if with_alpha { 4 } else { 3 };
+        let mut pixels = Vec::with_capacity(count.saturating_mul(channels));
+        for index in 0..count {
+            let value = u8::try_from(index % 251).unwrap_or(0);
+            pixels.push(value);
+            pixels.push(value.wrapping_mul(3));
+            pixels.push(value.wrapping_mul(7));
+            if with_alpha {
+                pixels.push(if index % 7 == 0 { 96 } else { 255 });
+            }
+        }
+        let options = heifer::EncodeOptions::new().with_max_threads(1);
+        let bytes = if with_alpha {
+            heifer::encode_rgba8(width, height, &pixels, &options)
+        } else {
+            heifer::encode_rgb8(width, height, &pixels, &options)
+        }
+        .map_err(|err| ProbeError::InvalidImage {
+            path: path.to_path_buf(),
+            reason: format!("failed to build test HEIC: {err}"),
+        })?;
+        write_test_file(path, &bytes)?;
+        Ok(bytes)
+    }
+
+    fn write_test_file(path: &Path, bytes: &[u8]) -> Result<(), ProbeError> {
+        fs::write(path, bytes).map_err(|source| ProbeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn patch_ispe(bytes: &mut [u8], width: u32, height: u32) -> bool {
+        let Some(pos) = bytes.windows(4).position(|window| window == b"ispe") else {
+            return false;
+        };
+        // `pos` is the box type; width/height follow the 4-byte full-box header.
+        let width_at = pos + 8;
+        let height_at = pos + 12;
+        if height_at + 4 > bytes.len() {
+            return false;
+        }
+        bytes[width_at..width_at + 4].copy_from_slice(&width.to_be_bytes());
+        bytes[height_at..height_at + 4].copy_from_slice(&height.to_be_bytes());
+        true
+    }
+
+    #[test]
+    fn probes_heic_stills_rgb_rgba_odd_clap_and_mif1() -> Result<(), ProbeError> {
+        let root = create_temp_dir("heic-stills")?;
+        for (name, width, height, alpha) in [
+            ("rgb.heic", 64_u32, 48_u32, false),
+            ("rgba.heic", 53, 37, true),
+            // Odd dimensions are encoded with a `clap` crop; the probed size must
+            // match the exact decoded size, not the padded coded size.
+            ("odd.heic", 37, 29, false),
+        ] {
+            let path = root.join(name);
+            write_heic_still(&path, width, height, alpha)?;
+            let probed = probe_image(&path)?;
+            assert_eq!(probed.format, ImageInputFormat::Heic);
+            assert_eq!(
+                (
+                    probed.dimensions.width().get(),
+                    probed.dimensions.height().get()
+                ),
+                (width, height),
+                "{name}"
+            );
+        }
+
+        // A generic `mif1` major brand with an `heic` compatible brand is a still image.
+        let mif1_path = root.join("mif1.heic");
+        let mut mif1 = write_heic_still(&mif1_path, 32, 24, false)?;
+        mif1[8..12].copy_from_slice(b"mif1");
+        write_test_file(&mif1_path, &mif1)?;
+        assert_eq!(
+            probe_image(&mif1_path)?.dimensions,
+            ImageDimensions::new(32, 24)?
+        );
+        assert_eq!(
+            super::sniff_magic_format(&mif1, false),
+            Some(ImageInputFormat::Heic)
+        );
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_animated_heic_and_non_hevc_heif() -> Result<(), ProbeError> {
+        let root = create_temp_dir("heic-reject")?;
+
+        let first = heifer::Image::filled(32, 24, 8, [200, 100, 50, 255]);
+        let second = heifer::Image::filled(32, 24, 8, [50, 100, 200, 255]);
+        let sequence = heifer::encode_sequence(
+            &[first, second],
+            &[0.5, 0.5],
+            &heifer::EncodeOptions::new().with_max_threads(1),
+        )
+        .map_err(|err| ProbeError::InvalidImage {
+            path: root.join("animated.heic"),
+            reason: format!("failed to build HEICS fixture: {err}"),
+        })?;
+        let sequence_path = root.join("animated.heic");
+        write_test_file(&sequence_path, &sequence)?;
+        assert_eq!(
+            super::sniff_magic_format(&sequence, false),
+            Some(ImageInputFormat::Heic)
+        );
+        assert!(matches!(
+            probe_image(&sequence_path),
+            Err(ProbeError::InvalidImage { ref reason, .. })
+                if reason.contains("animated") || reason.contains("sequence")
+        ));
+
+        // Rewrite the coded item type from HEVC to AV1 while keeping the container valid.
+        let non_hevc_path = root.join("av01.heic");
+        let mut non_hevc = write_heic_still(&non_hevc_path, 32, 24, false)?;
+        let mut pos = 0_usize;
+        while pos + 4 <= non_hevc.len() {
+            if non_hevc[pos..pos + 4] == *b"hvc1" {
+                non_hevc[pos..pos + 4].copy_from_slice(b"av01");
+            }
+            pos += 1;
+        }
+        write_test_file(&non_hevc_path, &non_hevc)?;
+        assert!(matches!(
+            probe_image(&non_hevc_path),
+            Err(ProbeError::InvalidImage { ref reason, .. })
+                if reason.contains("non-HEVC")
+        ));
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_corrupt_truncated_zero_and_oversized_heic() -> Result<(), ProbeError> {
+        let root = create_temp_dir("heic-corrupt")?;
+        let valid_path = root.join("valid.heic");
+        let valid = write_heic_still(&valid_path, 48, 32, false)?;
+
+        let truncated_path = root.join("truncated.heic");
+        let split = valid.len() / 2;
+        write_test_file(&truncated_path, &valid[..split])?;
+        assert!(matches!(
+            probe_image(&truncated_path),
+            Err(ProbeError::InvalidImage { .. })
+        ));
+
+        let zero_path = root.join("zero.heic");
+        let mut zero = valid.clone();
+        assert!(patch_ispe(&mut zero, 0, 32));
+        write_test_file(&zero_path, &zero)?;
+        assert!(matches!(
+            probe_image(&zero_path),
+            Err(ProbeError::InvalidImage { ref reason, .. }) if reason.contains("zero dimension")
+        ));
+
+        let oversized_path = root.join("oversized.heic");
+        let mut oversized = valid.clone();
+        assert!(patch_ispe(&mut oversized, 70_000, 70_000));
+        write_test_file(&oversized_path, &oversized)?;
+        assert!(matches!(
+            probe_image(&oversized_path),
+            Err(ProbeError::InvalidImage { .. })
+        ));
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn heic_transform_ordering_matches_clean_aperture_then_rotation() -> Result<(), ProbeError> {
+        let root = create_temp_dir("heic-transforms")?;
+        let path = root.join("odd.heic");
+        let original = write_heic_still(&path, 37, 29, false)?;
+        assert_eq!(
+            probe_image(&path)?.dimensions,
+            ImageDimensions::new(37, 29)?
+        );
+
+        // Rewrite `pixi` into `irot`/`imir` properties to exercise transform
+        // geometry without changing box lengths or item references.
+        let pixi_at = original
+            .windows(4)
+            .position(|window| window == b"pixi")
+            .ok_or_else(|| ProbeError::InvalidImage {
+                path: path.clone(),
+                reason: "test HEIC has no pixi property".to_owned(),
+            })?;
+        let mut transformed = original.clone();
+        // `pixi_at` is the box type; the first content byte is the rotation value.
+        transformed[pixi_at..pixi_at + 4].copy_from_slice(b"irot");
+        // heifer associates `irot` before `clap` here, so rotation is applied to
+        // the coded 38x30 size and the clean aperture then crops the swapped image.
+        for (rotation, expected) in [(1_u8, (30_u32, 29_u32)), (2, (37, 29)), (3, (30, 29))] {
+            transformed[pixi_at + 4] = rotation;
+            write_test_file(&path, &transformed)?;
+            let probed = probe_image(&path)?;
+            assert_eq!(
+                (
+                    probed.dimensions.width().get(),
+                    probed.dimensions.height().get()
+                ),
+                expected,
+                "irot {rotation}"
+            );
+        }
+        transformed[pixi_at..pixi_at + 4].copy_from_slice(b"imir");
+        transformed[pixi_at + 4] = 0;
+        write_test_file(&path, &transformed)?;
+        // Replacing the rotation with a mirror leaves the clap-cropped size intact.
+        assert_eq!(
+            probe_image(&path)?.dimensions,
+            ImageDimensions::new(37, 29)?
+        );
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn sniffs_heic_brands_extended_sizes_and_avif_precedence() {
+        let mut extended = vec![0_u8; 32];
+        extended[0..4].copy_from_slice(&1_u32.to_be_bytes());
+        extended[4..8].copy_from_slice(b"ftyp");
+        extended[8..16].copy_from_slice(&32_u64.to_be_bytes());
+        extended[16..20].copy_from_slice(b"heic");
+        extended[24..28].copy_from_slice(b"mif1");
+        assert_eq!(
+            super::sniff_magic_format(&extended, false),
+            Some(ImageInputFormat::Heic)
+        );
+
+        let mut size_zero = vec![0_u8; 32];
+        size_zero[4..8].copy_from_slice(b"ftyp");
+        size_zero[8..12].copy_from_slice(b"mif1");
+        size_zero[12..16].copy_from_slice(b"heic");
+        assert_eq!(
+            super::sniff_magic_format(&size_zero, false),
+            Some(ImageInputFormat::Heic)
+        );
+
+        // AVIF always wins, including for a `mif1` file that also lists HEIC brands.
+        let mut avif_and_heic = vec![0_u8; 32];
+        avif_and_heic[0..4].copy_from_slice(&24_u32.to_be_bytes());
+        avif_and_heic[4..8].copy_from_slice(b"ftyp");
+        avif_and_heic[8..12].copy_from_slice(b"mif1");
+        avif_and_heic[12..16].copy_from_slice(&0_u32.to_be_bytes());
+        avif_and_heic[16..20].copy_from_slice(b"avif");
+        avif_and_heic[20..24].copy_from_slice(b"heic");
+        assert_eq!(
+            super::sniff_magic_format(&avif_and_heic, false),
+            Some(ImageInputFormat::Avif)
+        );
+
+        for brand in [
+            b"heix", b"heim", b"heis", b"mif2", b"msf1", b"hevc", b"hevx",
+        ] {
+            let mut header = vec![0_u8; 24];
+            header[0..4].copy_from_slice(&24_u32.to_be_bytes());
+            header[4..8].copy_from_slice(b"ftyp");
+            header[8..12].copy_from_slice(brand);
+            assert_eq!(
+                super::sniff_magic_format(&header, false),
+                Some(ImageInputFormat::Heic),
+                "brand {}",
+                String::from_utf8_lossy(brand)
+            );
+        }
+    }
+
+    fn patch_all_ispe(bytes: &mut [u8], width: u32, height: u32) -> usize {
+        let mut pos = 0_usize;
+        let mut patched = 0_usize;
+        while pos + 16 <= bytes.len() {
+            if bytes[pos..pos + 4] == *b"ispe" {
+                bytes[pos + 8..pos + 12].copy_from_slice(&width.to_be_bytes());
+                bytes[pos + 12..pos + 16].copy_from_slice(&height.to_be_bytes());
+                patched += 1;
+            }
+            pos += 1;
+        }
+        patched
+    }
+
+    #[test]
+    fn generic_heif_brands_skip_failed_directory_entries() -> Result<(), ProbeError> {
+        let root = create_temp_dir("heic-generic")?;
+        let valid = write_heic_still(&root.join("source.heic"), 32, 24, false)?;
+        let mut generic = valid.clone();
+        generic[8..12].copy_from_slice(b"mif1");
+        generic[16..24].copy_from_slice(b"mif1mif1");
+
+        // A valid still with only generic brands is still discovered when it has
+        // no known image extension.
+        let unnamed = root.join("generic_mif1");
+        write_test_file(&unnamed, &generic)?;
+        assert_eq!(
+            probe_directory_entry(&unnamed)?,
+            Some(ProbedImage {
+                format: ImageInputFormat::Heic,
+                dimensions: ImageDimensions::new(32, 24)?,
+            })
+        );
+
+        let mut broken = generic.clone();
+        assert!(patch_ispe(&mut broken, 0, 24));
+        let unnamed_broken = root.join("broken_mif1");
+        write_test_file(&unnamed_broken, &broken)?;
+        assert_eq!(probe_directory_entry(&unnamed_broken)?, None);
+        // An explicit single-file probe of the same bytes still reports the error.
+        assert!(matches!(
+            probe_image(&unnamed_broken),
+            Err(ProbeError::InvalidImage { .. })
+        ));
+
+        let known_broken = root.join("broken.heic");
+        write_test_file(&known_broken, &broken)?;
+        assert!(matches!(
+            probe_directory_entry(&known_broken),
+            Err(ProbeError::InvalidImage { .. })
+        ));
+
+        // A specific brand in the same ftyp confirms the image, so errors propagate.
+        let mut specific_broken = broken.clone();
+        specific_broken[16..20].copy_from_slice(b"heic");
+        let unnamed_specific = root.join("specific_mif1");
+        write_test_file(&unnamed_specific, &specific_broken)?;
+        assert!(matches!(
+            probe_directory_entry(&unnamed_specific),
+            Err(ProbeError::InvalidImage { .. })
+        ));
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_grid_retained_pixel_budget() -> Result<(), ProbeError> {
+        let root = create_temp_dir("heic-retained")?;
+        let path = root.join("grid.heic");
+        let mut grid = write_heic_still(&path, 600, 600, false)?;
+        assert!(grid.windows(4).any(|window| window == b"grid"));
+        // Each tile stays below the per-image limit (121 M pixels) but the four
+        // retained tiles plus canvas far exceed the aggregate budget.
+        // `heifer` shares one `ispe` among equally sized tiles, so three distinct
+        // boxes cover the tiles, the grid canvas and the thumbnail.
+        assert!(patch_all_ispe(&mut grid, 11_000, 11_000) >= 3);
+        // Patch the grid descriptor canvas too: heifer writes [0, flags, rows-1,
+        // columns-1, width u16, height u16], and this 600x600 grid has 2x2 tiles.
+        // Without this the new canvas-vs-ispe check fires before the budget check.
+        let old_canvas = [0_u8, 0, 1, 1, 0x02, 0x58, 0x02, 0x58];
+        let new_canvas = [0_u8, 0, 1, 1, 0x2A, 0xF8, 0x2A, 0xF8];
+        let mut patched_canvas = 0_usize;
+        for pos in 0..=grid.len().saturating_sub(old_canvas.len()) {
+            if grid[pos..pos + old_canvas.len()] == old_canvas {
+                grid[pos..pos + old_canvas.len()].copy_from_slice(&new_canvas);
+                patched_canvas += 1;
+            }
+        }
+        assert_eq!(patched_canvas, 1);
+        write_test_file(&path, &grid)?;
+        assert!(matches!(
+            probe_image(&path),
+            Err(ProbeError::InvalidImage { ref reason, .. }) if reason.contains("retained")
+        ));
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    fn isobmff_box(kind: [u8; 4], content: &[u8]) -> Vec<u8> {
+        let mut box_data = Vec::with_capacity(8 + content.len());
+        let size = u32::try_from(8 + content.len()).unwrap_or(0);
+        box_data.extend_from_slice(&size.to_be_bytes());
+        box_data.extend_from_slice(&kind);
+        box_data.extend_from_slice(content);
+        box_data
+    }
+
+    fn isobmff_full_box(kind: [u8; 4], version: u8, flags: [u8; 3], payload: &[u8]) -> Vec<u8> {
+        let mut content = Vec::with_capacity(4 + payload.len());
+        content.push(version);
+        content.extend_from_slice(&flags);
+        content.extend_from_slice(payload);
+        isobmff_box(kind, &content)
+    }
+
+    #[test]
+    fn screens_heic_sample_tables_idat_and_overlay_descriptors() -> Result<(), ProbeError> {
+        let path = Path::new("synthetic.heic");
+
+        let mut stsz = vec![0_u8; 12];
+        stsz[8..12].copy_from_slice(&2_u32.to_be_bytes());
+        let stbl = isobmff_box(*b"stbl", &isobmff_box(*b"stsz", &stsz));
+        let minf = isobmff_box(*b"minf", &stbl);
+        let mdia = isobmff_box(*b"mdia", &minf);
+        let trak = isobmff_box(*b"trak", &mdia);
+        let moov = isobmff_box(*b"moov", &trak);
+        assert!(matches!(
+            screen_heic_moov_tracks(&moov, path),
+            Err(ProbeError::InvalidImage { ref reason, .. }) if reason.contains("animated/sequence")
+        ));
+
+        // Non-zero stsz version must also be screened (heifer ignores the version byte).
+        stsz[0] = 1;
+        let stbl_v1 = isobmff_box(*b"stbl", &isobmff_box(*b"stsz", &stsz));
+        let moov_v1 = isobmff_box(
+            *b"moov",
+            &isobmff_box(
+                *b"trak",
+                &isobmff_box(*b"mdia", &isobmff_box(*b"minf", &stbl_v1)),
+            ),
+        );
+        assert!(matches!(
+            screen_heic_moov_tracks(&moov_v1, path),
+            Err(ProbeError::InvalidImage { ref reason, .. }) if reason.contains("animated/sequence")
+        ));
+
+        stsz[0] = 0;
+        stsz[8..12].copy_from_slice(&1_u32.to_be_bytes());
+        let stbl = isobmff_box(*b"stbl", &isobmff_box(*b"stsz", &stsz));
+        let moov = isobmff_box(
+            *b"moov",
+            &isobmff_box(
+                *b"trak",
+                &isobmff_box(*b"mdia", &isobmff_box(*b"minf", &stbl)),
+            ),
+        );
+        screen_heic_moov_tracks(&moov, path)?;
+
+        // Huge stco/stsc entry counts are rejected before parse_tracks runs quadratic lookups.
+        let mut stco = vec![0_u8; 8];
+        let over_entries = u32::try_from(MAX_HEIC_TRACK_TABLE_ENTRIES + 1).unwrap_or(u32::MAX);
+        stco[4..8].copy_from_slice(&over_entries.to_be_bytes());
+        let stbl_huge = isobmff_box(*b"stbl", &isobmff_box(*b"stco", &stco));
+        let moov_huge = isobmff_box(
+            *b"moov",
+            &isobmff_box(
+                *b"trak",
+                &isobmff_box(*b"mdia", &isobmff_box(*b"minf", &stbl_huge)),
+            ),
+        );
+        assert!(matches!(
+            screen_heic_moov_tracks(&moov_huge, path),
+            Err(ProbeError::InvalidImage { ref reason, .. }) if reason.contains("sample table")
+        ));
+
+        let mut meta_content = vec![0_u8; 4];
+        meta_content.extend_from_slice(&isobmff_box(*b"idat", &[1_u8; 4]));
+        meta_content.extend_from_slice(&isobmff_box(*b"idat", &[2_u8; 16]));
+        let meta = isobmff_box(*b"meta", &meta_content);
+        assert_eq!(inspect_heic_meta(&meta, path)?.map(<[u8]>::len), Some(16));
+
+        let mut small = vec![0_u8; 14];
+        small[10..12].copy_from_slice(&640_u16.to_be_bytes());
+        small[12..14].copy_from_slice(&480_u16.to_be_bytes());
+        assert_eq!(heic_overlay_canvas(&small), Some((640, 480)));
+        let mut large = vec![0_u8; 18];
+        large[1] = 1;
+        large[10..14].copy_from_slice(&70_000_u32.to_be_bytes());
+        large[14..18].copy_from_slice(&50_000_u32.to_be_bytes());
+        assert_eq!(heic_overlay_canvas(&large), Some((70_000, 50_000)));
+        assert_eq!(heic_overlay_canvas(&[0, 2]), None);
+
+        // Grid descriptors carry their own canvas and tile geometry (heifer's
+        // `Grid::parse` layout), independent of `ispe`.
+        let mut grid = vec![0_u8; 8];
+        grid[2] = 1;
+        grid[3] = 3;
+        grid[4..6].copy_from_slice(&4032_u16.to_be_bytes());
+        grid[6..8].copy_from_slice(&3024_u16.to_be_bytes());
+        assert_eq!(heic_grid_canvas(&grid), Some((4032, 3024, 2, 4)));
+        let mut large_grid = vec![0_u8; 12];
+        large_grid[1] = 1;
+        large_grid[4..8].copy_from_slice(&70_000_u32.to_be_bytes());
+        large_grid[8..12].copy_from_slice(&50_000_u32.to_be_bytes());
+        assert_eq!(heic_grid_canvas(&large_grid), Some((70_000, 50_000, 1, 1)));
+        assert_eq!(heic_grid_canvas(&[0, 0, 1]), None);
+        assert!(is_alpha_auxiliary_urn("urn:mpeg:hevc:2015:auxid:1"));
+        assert!(!is_alpha_auxiliary_urn("urn:mpeg:hevc:2015:auxid:2"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_heic_meta_table_dos_vectors_before_parsing() {
+        let path = Path::new("hostile.heic");
+
+        // Duplicate item IDs in iinf would let HeifFile::parse clone iloc extents repeatedly.
+        let mut infe_payload = Vec::new();
+        infe_payload.extend_from_slice(&1_u16.to_be_bytes());
+        infe_payload.extend_from_slice(&0_u16.to_be_bytes());
+        infe_payload.extend_from_slice(b"hvc1\0");
+        let infe = isobmff_full_box(*b"infe", 2, [0, 0, 0], &infe_payload);
+        let mut iinf_payload = Vec::new();
+        iinf_payload.extend_from_slice(&2_u16.to_be_bytes());
+        iinf_payload.extend_from_slice(&infe);
+        iinf_payload.extend_from_slice(&infe);
+        let meta_dup = isobmff_full_box(
+            *b"meta",
+            0,
+            [0, 0, 0],
+            &isobmff_full_box(*b"iinf", 0, [0, 0, 0], &iinf_payload),
+        );
+        assert!(matches!(
+            inspect_heic_meta(&meta_dup, path),
+            Err(ProbeError::InvalidImage { ref reason, .. }) if reason.contains("duplicate item IDs")
+        ));
+
+        // Oversized iloc entry count is rejected before HeifFile::parse.
+        let over_items = u16::try_from(MAX_HEIC_META_ITEMS + 1).unwrap_or(u16::MAX);
+        let mut iloc_payload = vec![0x44, 0x00];
+        iloc_payload.extend_from_slice(&over_items.to_be_bytes());
+        let meta_iloc = isobmff_full_box(
+            *b"meta",
+            0,
+            [0, 0, 0],
+            &isobmff_full_box(*b"iloc", 1, [0, 0, 0], &iloc_payload),
+        );
+        assert!(matches!(
+            inspect_heic_meta(&meta_iloc, path),
+            Err(ProbeError::InvalidImage { ref reason, .. }) if reason.contains("item location table")
+        ));
+
+        // Oversized ipma entry count is rejected before HeifFile::parse.
+        let over_ipma = u32::try_from(MAX_HEIC_META_ITEMS + 1).unwrap_or(u32::MAX);
+        let meta_ipma = isobmff_full_box(
+            *b"meta",
+            0,
+            [0, 0, 0],
+            &isobmff_box(
+                *b"iprp",
+                &isobmff_full_box(*b"ipma", 0, [0, 0, 0], &over_ipma.to_be_bytes()),
+            ),
+        );
+        assert!(matches!(
+            inspect_heic_meta(&meta_ipma, path),
+            Err(ProbeError::InvalidImage { ref reason, .. }) if reason.contains("property association")
+        ));
+
+        // Oversized auxC subtype payload is rejected before HeifFile::parse clones it per item.
+        let huge_auxc = isobmff_box(*b"auxC", &vec![0_u8; MAX_HEIC_AUXC_BYTES + 1]);
+        let meta_auxc = isobmff_full_box(
+            *b"meta",
+            0,
+            [0, 0, 0],
+            &isobmff_box(*b"iprp", &isobmff_box(*b"ipco", &huge_auxc)),
+        );
+        assert!(matches!(
+            inspect_heic_meta(&meta_auxc, path),
+            Err(ProbeError::InvalidImage { ref reason, .. }) if reason.contains("auxC")
+        ));
+    }
+
+    fn build_synthetic_heic_iprp(width: u32, height: u32, has_primary_overlay: bool) -> Vec<u8> {
+        let mut hvcc_payload = vec![0_u8; 23];
+        hvcc_payload[0] = 1; // configurationVersion
+        hvcc_payload[1] = 1; // profile
+        hvcc_payload[16] = 1; // chroma_format 4:2:0
+        hvcc_payload[17] = 0; // bit_depth_luma = 8
+        hvcc_payload[18] = 0; // bit_depth_chroma = 8
+        hvcc_payload[21] = 3; // nal_length_size = 4
+        hvcc_payload[22] = 0; // numOfArrays
+        let hvcc = isobmff_box(*b"hvcC", &hvcc_payload);
+
+        let mut ispe_payload = Vec::with_capacity(8);
+        ispe_payload.extend_from_slice(&width.to_be_bytes());
+        ispe_payload.extend_from_slice(&height.to_be_bytes());
+        let ispe = isobmff_full_box(*b"ispe", 0, [0, 0, 0], &ispe_payload);
+
+        let mut ipco_content = Vec::new();
+        ipco_content.extend_from_slice(&hvcc);
+        ipco_content.extend_from_slice(&ispe);
+        let ipco = isobmff_box(*b"ipco", &ipco_content);
+
+        let mut ipma_payload = Vec::new();
+        let ipma_count: u32 = if has_primary_overlay { 2 } else { 1 };
+        ipma_payload.extend_from_slice(&ipma_count.to_be_bytes());
+        ipma_payload.extend_from_slice(&1_u16.to_be_bytes());
+        ipma_payload.push(2);
+        ipma_payload.push(0x81);
+        ipma_payload.push(0x02);
+        if has_primary_overlay {
+            ipma_payload.extend_from_slice(&2_u16.to_be_bytes());
+            ipma_payload.push(1);
+            ipma_payload.push(0x02);
+        }
+        let ipma = isobmff_full_box(*b"ipma", 0, [0, 0, 0], &ipma_payload);
+        let mut iprp_content = Vec::new();
+        iprp_content.extend_from_slice(&ipco);
+        iprp_content.extend_from_slice(&ipma);
+        isobmff_box(*b"iprp", &iprp_content)
+    }
+
+    fn build_synthetic_heic_iloc(
+        item_count: u32,
+        has_primary_overlay: bool,
+        unrelated_iovls: u32,
+        idat_len: u32,
+    ) -> Vec<u8> {
+        let mut iloc_payload = Vec::new();
+        iloc_payload.push(0x44);
+        iloc_payload.push(0x00);
+        iloc_payload.extend_from_slice(&u16::try_from(item_count).unwrap_or(0).to_be_bytes());
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes());
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // ConstructionMethod::File
+        iloc_payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        iloc_payload.extend_from_slice(&1_u16.to_be_bytes()); // extent_count
+        iloc_payload.extend_from_slice(&0_u32.to_be_bytes()); // offset
+        iloc_payload.extend_from_slice(&4_u32.to_be_bytes()); // length
+
+        let push_idat_iloc = |buf: &mut Vec<u8>, id: u16| {
+            buf.extend_from_slice(&id.to_be_bytes());
+            buf.extend_from_slice(&1_u16.to_be_bytes()); // ConstructionMethod::Idat
+            buf.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+            buf.extend_from_slice(&1_u16.to_be_bytes()); // extent_count
+            buf.extend_from_slice(&0_u32.to_be_bytes()); // offset
+            buf.extend_from_slice(&idat_len.to_be_bytes()); // length
+        };
+        if has_primary_overlay {
+            push_idat_iloc(&mut iloc_payload, 2);
+        }
+        for idx in 0..unrelated_iovls {
+            let id = u16::try_from(10 + idx).unwrap_or(u16::MAX);
+            push_idat_iloc(&mut iloc_payload, id);
+        }
+        isobmff_full_box(*b"iloc", 1, [0, 0, 0], &iloc_payload)
+    }
+
+    /// Builds a minimal valid HEIC container with `free_before_idat` empty `free` boxes
+    /// preceding `idat` inside `meta`, an `hvc1` item (id 1, `width`x`height`), an
+    /// optional reachable `iovl` primary item (id 2) backed by `idat`, and
+    /// `unrelated_iovls` unreachable `idat`-backed `iovl` items (ids 10..).
+    fn build_synthetic_idat_overlay_heic(
+        width: u32,
+        height: u32,
+        free_before_idat: usize,
+        unrelated_iovls: u32,
+        primary_overlay: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let mut ftyp_payload = Vec::new();
+        ftyp_payload.extend_from_slice(b"heic");
+        ftyp_payload.extend_from_slice(&0_u32.to_be_bytes());
+        ftyp_payload.extend_from_slice(b"mif1heic");
+        let ftyp = isobmff_box(*b"ftyp", &ftyp_payload);
+
+        let mut hdlr_payload = vec![0_u8; 4];
+        hdlr_payload.extend_from_slice(b"pict");
+        hdlr_payload.extend_from_slice(&[0_u8; 13]);
+        let hdlr = isobmff_full_box(*b"hdlr", 0, [0, 0, 0], &hdlr_payload);
+
+        let has_primary = primary_overlay.is_some();
+        let primary_id: u16 = if has_primary { 2 } else { 1 };
+        let pitm = isobmff_full_box(*b"pitm", 0, [0, 0, 0], &primary_id.to_be_bytes());
+
+        let make_infe = |id: u16, kind: [u8; 4]| {
+            let mut p = Vec::with_capacity(9);
+            p.extend_from_slice(&id.to_be_bytes());
+            p.extend_from_slice(&0_u16.to_be_bytes());
+            p.extend_from_slice(&kind);
+            p.push(0);
+            isobmff_full_box(*b"infe", 2, [0, 0, 0], &p)
+        };
+
+        let item_count = 1_u32 + u32::from(has_primary) + unrelated_iovls;
+        let mut iinf_payload = Vec::new();
+        iinf_payload.extend_from_slice(&item_count.to_be_bytes());
+        iinf_payload.extend_from_slice(&make_infe(1, *b"hvc1"));
+        if has_primary {
+            iinf_payload.extend_from_slice(&make_infe(2, *b"iovl"));
+        }
+        for idx in 0..unrelated_iovls {
+            let id = u16::try_from(10 + idx).unwrap_or(u16::MAX);
+            iinf_payload.extend_from_slice(&make_infe(id, *b"iovl"));
+        }
+        let iinf = isobmff_full_box(*b"iinf", 1, [0, 0, 0], &iinf_payload);
+        let iprp = build_synthetic_heic_iprp(width, height, has_primary);
+        let iref = has_primary.then(|| {
+            let mut dimg_payload = Vec::new();
+            dimg_payload.extend_from_slice(&2_u16.to_be_bytes());
+            dimg_payload.extend_from_slice(&1_u16.to_be_bytes());
+            dimg_payload.extend_from_slice(&1_u16.to_be_bytes());
+            isobmff_full_box(
+                *b"iref",
+                0,
+                [0, 0, 0],
+                &isobmff_box(*b"dimg", &dimg_payload),
+            )
+        });
+
+        let idat_bytes = primary_overlay.unwrap_or(&[0xFF]);
+        let idat = isobmff_box(*b"idat", idat_bytes);
+        let idat_len = u32::try_from(idat_bytes.len()).unwrap_or(0);
+        let iloc = build_synthetic_heic_iloc(item_count, has_primary, unrelated_iovls, idat_len);
+
+        let mut meta_payload = Vec::with_capacity(
+            hdlr.len()
+                + pitm.len()
+                + iinf.len()
+                + iprp.len()
+                + iloc.len()
+                + free_before_idat * 8
+                + idat.len()
+                + 64,
+        );
+        meta_payload.extend_from_slice(&hdlr);
+        meta_payload.extend_from_slice(&pitm);
+        meta_payload.extend_from_slice(&iinf);
+        meta_payload.extend_from_slice(&iprp);
+        if let Some(iref_box) = iref {
+            meta_payload.extend_from_slice(&iref_box);
+        }
+        meta_payload.extend_from_slice(&iloc);
+        let free_box = isobmff_box(*b"free", &[]);
+        for _ in 0..free_before_idat {
+            meta_payload.extend_from_slice(&free_box);
+        }
+        meta_payload.extend_from_slice(&idat);
+        let meta = isobmff_full_box(*b"meta", 0, [0, 0, 0], &meta_payload);
+
+        let mut file_bytes = Vec::with_capacity(ftyp.len() + meta.len());
+        file_bytes.extend_from_slice(&ftyp);
+        file_bytes.extend_from_slice(&meta);
+        file_bytes
+    }
+
+    #[test]
+    fn probes_heic_with_many_free_boxes_and_unrelated_idat_overlays() -> Result<(), ProbeError> {
+        let root = create_temp_dir("heic-idat-linear")?;
+        let path = root.join("many_free_and_overlays.heic");
+        // 50,000 eight-byte `free` children before `idat` + 2,000 unrelated idat-backed
+        // `iovl` items. Resolving `idat` once and parsing overlays lazily keeps probing
+        // linear and ignores unreachable `iovl` items completely.
+        let bytes = build_synthetic_idat_overlay_heic(64, 48, 50_000, 2_000, None);
+        write_test_file(&path, &bytes)?;
+
+        let probed = probe_image(&path)?;
+        assert_eq!(probed.format, ImageInputFormat::Heic);
+        assert_eq!(probed.dimensions, ImageDimensions::new(64, 48)?);
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn validates_reachable_idat_overlay_after_many_free_boxes() -> Result<(), ProbeError> {
+        let root = create_temp_dir("heic-reachable-iovl")?;
+
+        let mut valid_desc = vec![0_u8; 18];
+        valid_desc[10..12].copy_from_slice(&64_u16.to_be_bytes());
+        valid_desc[12..14].copy_from_slice(&48_u16.to_be_bytes());
+        let ok_path = root.join("valid_iovl.heic");
+        let ok_bytes = build_synthetic_idat_overlay_heic(64, 48, 50_000, 128, Some(&valid_desc));
+        write_test_file(&ok_path, &ok_bytes)?;
+        let probed = probe_image(&ok_path)?;
+        assert_eq!(probed.format, ImageInputFormat::Heic);
+        assert_eq!(probed.dimensions, ImageDimensions::new(64, 48)?);
+
+        let mut mismatch_desc = valid_desc.clone();
+        mismatch_desc[10..12].copy_from_slice(&128_u16.to_be_bytes());
+        let mismatch_path = root.join("mismatch_iovl.heic");
+        let mismatch_bytes =
+            build_synthetic_idat_overlay_heic(64, 48, 1_000, 0, Some(&mismatch_desc));
+        write_test_file(&mismatch_path, &mismatch_bytes)?;
+        assert!(matches!(
+            probe_image(&mismatch_path),
+            Err(ProbeError::InvalidImage { ref reason, .. }) if reason.contains("does not match ispe")
+        ));
+
+        let trunc_path = root.join("truncated_iovl.heic");
+        let trunc_bytes = build_synthetic_idat_overlay_heic(64, 48, 1_000, 0, Some(&[0, 0, 1]));
+        write_test_file(&trunc_path, &trunc_bytes)?;
+        assert!(matches!(
+            probe_image(&trunc_path),
+            Err(ProbeError::InvalidImage { ref reason, .. })
+                if reason.contains("invalid or truncated HEIC iovl descriptor")
+        ));
+
+        // A descriptor ending after the canvas header lacks the offset pair
+        // heifer reads for its single `dimg` input; reject it before decode.
+        let missing_offsets_path = root.join("missing_offsets_iovl.heic");
+        let missing_offsets_bytes =
+            build_synthetic_idat_overlay_heic(64, 48, 1_000, 0, Some(&valid_desc[..14]));
+        write_test_file(&missing_offsets_path, &missing_offsets_bytes)?;
+        assert!(matches!(
+            probe_image(&missing_offsets_path),
+            Err(ProbeError::InvalidImage { ref reason, .. })
+                if reason.contains("missing input offsets")
+        ));
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn routes_late_avif_brand_to_avif_decoder() -> Result<(), ProbeError> {
+        let root = create_temp_dir("heic-avif-route")?;
+        let avif_path = root.join("valid.avif");
+        write_tiny_avif(&avif_path, 32, 32)?;
+        assert_eq!(probe_image(&avif_path)?.format, ImageInputFormat::Avif);
+
+        // A full ftyp with an avif compatible brand past the 64-byte prefix sniffs
+        // as HEIC. zenavif_parse requires an avif/avis major brand, so this
+        // synthetic buffer is not a decodable AVIF; what matters here is that the
+        // dispatch no longer treats it as HEIC.
+        let mut ftyp = vec![0_u8; 80];
+        ftyp[0..4].copy_from_slice(&80_u32.to_be_bytes());
+        ftyp[4..8].copy_from_slice(b"ftyp");
+        ftyp[8..12].copy_from_slice(b"mif1");
+        ftyp[64..68].copy_from_slice(b"avif");
+        let sniffed = super::sniff_magic_format(&ftyp[..64], false).ok_or_else(|| {
+            ProbeError::InvalidImage {
+                path: root.clone(),
+                reason: "synthetic ftyp was not sniffed as an image".to_owned(),
+            }
+        })?;
+        assert_eq!(sniffed, ImageInputFormat::Heic);
+        let path = root.join("late-avif");
+        write_test_file(&path, &ftyp)?;
+        let mut file = File::open(&path).map_err(|source| ProbeError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        assert_eq!(
+            resolve_sniffed_input(&mut file, &path, sniffed)?.format,
+            ImageInputFormat::Avif
+        );
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn heic_item_visit_budget_is_bounded() -> Result<(), ProbeError> {
+        let path = Path::new("budget.heic");
+        let mut visits = 0_u64;
+        for _ in 0..MAX_HEIC_ITEM_VISITS {
+            charge_heic_visit(&mut visits, path)?;
+        }
+        assert!(matches!(
+            charge_heic_visit(&mut visits, path),
+            Err(ProbeError::InvalidImage { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_extended_ftyp_brand_past_the_prefix() -> Result<(), ProbeError> {
+        let root = create_temp_dir("heic-extended-ftyp")?;
+        let path = root.join("extended");
+        let mut ftyp = vec![0_u8; 96];
+        ftyp[0..4].copy_from_slice(&1_u32.to_be_bytes());
+        ftyp[4..8].copy_from_slice(b"ftyp");
+        ftyp[8..16].copy_from_slice(&96_u64.to_be_bytes());
+        ftyp[16..20].copy_from_slice(b"mif1");
+        ftyp[64..68].copy_from_slice(b"heic");
+        write_test_file(&path, &ftyp)?;
+        assert_eq!(
+            super::sniff_magic_format(&ftyp[..64], true),
+            Some(ImageInputFormat::Heic)
+        );
+        let mut file = File::open(&path).map_err(|source| ProbeError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let sniffed = super::sniff_magic_format(&ftyp[..64], true).ok_or_else(|| {
+            ProbeError::InvalidImage {
+                path: path.clone(),
+                reason: "extended ftyp was not sniffed as HEIC".to_owned(),
+            }
+        })?;
+        assert_eq!(
+            resolve_sniffed_input(&mut file, &path, sniffed)?.brands,
+            HeicBrandKind::Specific
+        );
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn probes_large_transparent_heic_with_grid_alpha() -> Result<(), ProbeError> {
+        let root = create_temp_dir("heic-grid-alpha")?;
+        let path = root.join("large.heic");
+        let (width, height) = (600_u32, 600_u32);
+        let count = usize::try_from(width * height).unwrap_or(0);
+        let mut pixels = Vec::with_capacity(count.saturating_mul(4));
+        for index in 0..count {
+            let row = u32::try_from(index).unwrap_or(0) / width;
+            pixels.push(u8::try_from(index % 251).unwrap_or(0));
+            pixels.push(u8::try_from(row % 251).unwrap_or(0));
+            pixels.push(80);
+            pixels.push(if index % 997 == 0 { 96 } else { 255 });
+        }
+        let bytes = heifer::encode_rgba8(
+            width,
+            height,
+            &pixels,
+            &heifer::EncodeOptions::new().with_max_threads(1),
+        )
+        .map_err(|err| ProbeError::InvalidImage {
+            path: path.clone(),
+            reason: format!("failed to build grid-alpha HEIC: {err}"),
+        })?;
+        write_test_file(&path, &bytes)?;
+        let probed = probe_image(&path)?;
+        assert_eq!(probed.format, ImageInputFormat::Heic);
+        assert_eq!(probed.dimensions, ImageDimensions::new(width, height)?);
         fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
         Ok(())
     }

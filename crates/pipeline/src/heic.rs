@@ -1,18 +1,26 @@
-//! Pure-Rust CPU HEIC still-image encoding via `heifer`.
+//! Pure-Rust CPU HEIC still-image encoding and decoding via `heifer`.
 //!
 //! Validated decoded pixels are handed straight to `heifer`'s HEVC-Intra encoder:
 //! RGB8/RGBA8 are passed through untouched, while L8/La8 are expanded once into
 //! the reusable worker scratch buffer. The encoder keeps its default `Medium`
 //! speed/quality trade-off (no preset cheating); multi-core scaling comes from
 //! the batch workers plus `heifer`'s own 512-pixel tile threading.
+//!
+//! Decoding is bounded to one HEVC decoder thread (the batch already parallelizes
+//! across images) and to a fixed pixel budget. Opaque NVENC targets receive the
+//! decoder's RGBA buffer directly, avoiding a lossy RGB -> RGBA expansion.
 
 use std::path::Path;
 
 use fastconv_domain::ImageQuality;
 use heifer::EncodeOptions;
+use heifer::heifer_isobmff::boxes::FileType;
 
 use crate::PipelineError;
-use crate::decode::{DecodedFrameMeta, DecodedPixelFormat};
+use crate::decode::{DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat};
+
+// Half of heifer's default 2^28-pixel limit, matching the probe budget.
+const MAX_HEIC_DECODE_PIXELS: u64 = 128 * 1024 * 1024;
 
 const fn pixel_channels(format: DecodedPixelFormat) -> u64 {
     match format {
@@ -164,13 +172,188 @@ pub(crate) fn encode_heic_into(
     Ok(encoded)
 }
 
+fn decode_error(path: &Path, reason: impl Into<String>) -> PipelineError {
+    PipelineError::DecodeFailed {
+        path: path.to_path_buf(),
+        reason: reason.into(),
+    }
+}
+
+/// Sequence brands are a cheap, explicit rejection before any HEVC work. A file
+/// without them can still carry a picture/video track, so the track table is
+/// inspected as well.
+fn reject_sequence(source: &Path, file_bytes: &[u8]) -> Result<(), PipelineError> {
+    let header = heifer::heifer_isobmff::read_box_header(file_bytes)
+        .map_err(|err| decode_error(source, format!("invalid HEIC box header: {err}")))?;
+    if header.box_type.0 == *b"ftyp" {
+        let start = usize::try_from(header.header_size)
+            .map_err(|_| decode_error(source, "HEIC ftyp header size overflow"))?;
+        let content = match header.content_size() {
+            Some(len) => {
+                let len = usize::try_from(len)
+                    .map_err(|_| decode_error(source, "HEIC ftyp size overflow"))?;
+                let end = start
+                    .checked_add(len)
+                    .ok_or_else(|| decode_error(source, "HEIC ftyp size overflow"))?;
+                file_bytes
+                    .get(start..end)
+                    .ok_or_else(|| decode_error(source, "truncated HEIC ftyp box"))?
+            }
+            None => file_bytes
+                .get(start..)
+                .ok_or_else(|| decode_error(source, "truncated HEIC ftyp box"))?,
+        };
+        let file_type = FileType::parse(content)
+            .map_err(|err| decode_error(source, format!("invalid HEIC ftyp box: {err}")))?;
+        if [*b"msf1", *b"hevc", *b"hevx"]
+            .iter()
+            .any(|brand| file_type.has_brand(brand))
+        {
+            return Err(decode_error(
+                source,
+                "animated/sequence HEIC is not supported by the still-image pipeline",
+            ));
+        }
+    }
+    let sequence = heifer::read_sequence(file_bytes)
+        .map_err(|err| decode_error(source, format!("invalid HEIC track table: {err}")))?;
+    if sequence.is_some_and(|info| info.frames.len() > 1) {
+        return Err(decode_error(
+            source,
+            "animated/sequence HEIC is not supported by the still-image pipeline",
+        ));
+    }
+    Ok(())
+}
+
+/// Resizes `pixel_buf` with a checked reservation so a hostile header cannot
+/// force an unchecked multi-hundred-megabyte allocation.
+fn reserve_pixel_buf(
+    source: &Path,
+    pixel_buf: &mut Vec<u8>,
+    len: usize,
+) -> Result<(), PipelineError> {
+    pixel_buf.clear();
+    pixel_buf
+        .try_reserve_exact(len)
+        .map_err(|_| decode_error(source, "cannot allocate HEIC decoded pixel buffer"))?;
+    pixel_buf.resize(len, 0);
+    Ok(())
+}
+
+/// Decodes a validated HEIC still image into `pixel_buf` with `heifer`'s pure-Rust
+/// decoder. Returns the exact decoded dimensions, native pixel format and byte
+/// length written into the buffer.
+pub(crate) fn decode_heic_slice_into(
+    source: &Path,
+    file_bytes: &[u8],
+    hint: DecodeTargetHint,
+    pixel_buf: &mut Vec<u8>,
+) -> Result<(u32, u32, DecodedPixelFormat, usize), PipelineError> {
+    reject_sequence(source, file_bytes)?;
+    let options = heifer::Options::new()
+        .with_max_threads(1)
+        .with_max_pixels(MAX_HEIC_DECODE_PIXELS);
+    // Keep coded samples: `decode_srgb_rgba8` would reject PQ/HLG and non-RGB ICC
+    // inputs that decode fine today, and colour management is a repo-wide policy
+    // (JPEG/AVIF also pass samples through) rather than a HEIC-only decision.
+    let image = heifer::decode_rgba8(file_bytes, &options)
+        .map_err(|err| decode_error(source, format!("HEIC decode failed: {err}")))?;
+    let (width, height) = (image.width, image.height);
+    if width == 0 || height == 0 {
+        return Err(decode_error(
+            source,
+            format!("HEIC decoded zero dimension {width}x{height}"),
+        ));
+    }
+    let count = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| decode_error(source, "HEIC decoded dimensions overflow pixel count"))?;
+    if count > MAX_HEIC_DECODE_PIXELS {
+        return Err(decode_error(
+            source,
+            format!(
+                "HEIC decoded pixel count ({count}) exceeds {MAX_HEIC_DECODE_PIXELS}-pixel limit"
+            ),
+        ));
+    }
+    let expected = usize::try_from(count)
+        .ok()
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| decode_error(source, "HEIC decoded buffer size overflow"))?;
+    if image.data.len() != expected {
+        return Err(decode_error(
+            source,
+            format!(
+                "HEIC decoded buffer length {} does not match expected {expected}",
+                image.data.len()
+            ),
+        ));
+    }
+    let pixels = usize::try_from(count)
+        .map_err(|_| decode_error(source, "HEIC decoded pixel count overflow"))?;
+
+    match hint {
+        DecodeTargetHint::Native => {
+            if image.has_alpha {
+                reserve_pixel_buf(source, pixel_buf, expected)?;
+                pixel_buf.copy_from_slice(&image.data);
+                Ok((width, height, DecodedPixelFormat::Rgba8, expected))
+            } else {
+                let rgb_len = pixels
+                    .checked_mul(3)
+                    .ok_or_else(|| decode_error(source, "HEIC RGB buffer size overflow"))?;
+                reserve_pixel_buf(source, pixel_buf, rgb_len)?;
+                for (out, pixel) in pixel_buf
+                    .as_chunks_mut::<3>()
+                    .0
+                    .iter_mut()
+                    .zip(image.data.as_chunks::<4>().0)
+                {
+                    out.copy_from_slice(&pixel[..3]);
+                }
+                Ok((width, height, DecodedPixelFormat::Rgb8, rgb_len))
+            }
+        }
+        #[cfg(feature = "nvenc")]
+        DecodeTargetHint::OpaqueRgba8 => {
+            if image.has_alpha
+                && image
+                    .data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] < 255)
+            {
+                return Err(PipelineError::UnsupportedPixelFormat {
+                    path: source.to_path_buf(),
+                    format: "non-opaque alpha channel (NVENC HEVC-Intra HEIC currently supports opaque images)".to_owned(),
+                });
+            }
+            reserve_pixel_buf(source, pixel_buf, expected)?;
+            pixel_buf.copy_from_slice(&image.data);
+            Ok((width, height, DecodedPixelFormat::Rgba8, expected))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::encode_heic_into;
-    use crate::PipelineError;
-    use crate::decode::{DecodedFrameMeta, DecodedPixelFormat};
-    use fastconv_domain::ImageQuality;
-    use std::path::Path;
+    use super::{decode_heic_slice_into, encode_heic_into};
+    use crate::decode::{
+        DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat, decode_image_into,
+    };
+    use crate::{PipelineError, execute_image_batch};
+    use fastconv_domain::{
+        ImageBatchItem, ImageBatchPlan, ImageDimensions, ImageExecutionMode, ImageInputFormat,
+        ImageOutputFormat, ImageQuality,
+    };
+    use std::env;
+    use std::fs;
+    use std::num::NonZeroUsize;
+    use std::path::{Path, PathBuf};
+    use std::process;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const TARGET: &str = "test.heic";
 
@@ -399,5 +582,308 @@ mod tests {
             ),
             Err(PipelineError::DecodeFailed { .. })
         ));
+    }
+
+    static E2E_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn e2e_temp_dir() -> Result<PathBuf, PipelineError> {
+        let id = E2E_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = env::temp_dir().join(format!("fastconv-heic-e2e-{}-{id}", process::id()));
+        fs::create_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(dir)
+    }
+
+    fn one_worker() -> Result<NonZeroUsize, PipelineError> {
+        NonZeroUsize::new(1).ok_or(PipelineError::WorkerPanicked)
+    }
+
+    fn write_heic_source(
+        path: &Path,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+        format: DecodedPixelFormat,
+    ) -> Result<(), PipelineError> {
+        let mut aux = Vec::new();
+        let bytes = encode(
+            pixels,
+            meta(width, height, format, pixels.len()),
+            90,
+            &mut aux,
+        )?;
+        fs::write(path, bytes).map_err(|source| PipelineError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn convert_heic(
+        source: &Path,
+        target: &Path,
+        format: ImageOutputFormat,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let item = ImageBatchItem::new(
+            source.to_path_buf(),
+            target.to_path_buf(),
+            ImageInputFormat::Heic,
+            ImageDimensions::new(width, height)?,
+        )?;
+        let plan = ImageBatchPlan::new(
+            vec![item],
+            ImageExecutionMode::resolve_cpu(format, None)?,
+            one_worker()?,
+        )?;
+        let report = execute_image_batch(&plan)?;
+        if report.files_converted().get() != 1 {
+            return Err("HEIC batch did not convert exactly one file".into());
+        }
+        Ok(())
+    }
+
+    fn decode_output(
+        path: &Path,
+        format: ImageInputFormat,
+        width: u32,
+        height: u32,
+    ) -> Result<(DecodedFrameMeta, Vec<u8>), Box<dyn std::error::Error>> {
+        let item = ImageBatchItem::new(
+            path.to_path_buf(),
+            path.with_extension("decoded"),
+            format,
+            ImageDimensions::new(width, height)?,
+        )?;
+        let mut file_bytes = Vec::new();
+        let mut pixels = Vec::new();
+        let decoded = decode_image_into(
+            &item,
+            DecodeTargetHint::Native,
+            &mut file_bytes,
+            &mut pixels,
+        )?;
+        Ok((decoded, pixels))
+    }
+
+    fn extract_rgb(
+        pixels: &[u8],
+        format: DecodedPixelFormat,
+        count: usize,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        match format {
+            DecodedPixelFormat::Rgb8 => Ok(pixels
+                .get(..count.saturating_mul(3))
+                .ok_or("short RGB8 decode")?
+                .to_vec()),
+            DecodedPixelFormat::Rgba8 => {
+                let data = pixels
+                    .get(..count.saturating_mul(4))
+                    .ok_or("short RGBA8 decode")?;
+                Ok(data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+                    .collect())
+            }
+            DecodedPixelFormat::L8 | DecodedPixelFormat::La8 => {
+                Err("unexpected grayscale output from a colour roundtrip".into())
+            }
+        }
+    }
+
+    fn mean_alpha_diff(
+        pixels: &[u8],
+        format: DecodedPixelFormat,
+        expected: &[u8],
+        count: usize,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
+        if format != DecodedPixelFormat::Rgba8 {
+            return Ok(0.0);
+        }
+        let data = pixels
+            .get(..count.saturating_mul(4))
+            .ok_or("short RGBA8 decode")?;
+        let total: u64 = data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(expected.as_chunks::<4>().0)
+            .map(|(pixel, expected)| u64::from(pixel[3].abs_diff(expected[3])))
+            .sum();
+        let total = f64::from(u32::try_from(total).unwrap_or(u32::MAX));
+        let samples = f64::from(u32::try_from(count).unwrap_or(u32::MAX));
+        Ok(total / samples)
+    }
+
+    #[test]
+    fn heic_roundtrips_to_every_cpu_still_format() -> Result<(), Box<dyn std::error::Error>> {
+        let root = e2e_temp_dir()?;
+        let (width, height) = (64_u32, 48_u32);
+        let rgb = gradient_rgb(width, height);
+        let source = root.join("rgb.heic");
+        write_heic_source(&source, width, height, &rgb, DecodedPixelFormat::Rgb8)?;
+
+        // Start from the HEIC decoder itself, then feed it back through the
+        // full batch pipeline for every CPU output container.
+        let mut file_bytes = Vec::new();
+        let mut pixels = Vec::new();
+        let item = ImageBatchItem::new(
+            source.clone(),
+            root.join("unused.out"),
+            ImageInputFormat::Heic,
+            ImageDimensions::new(width, height)?,
+        )?;
+        let decoded = decode_image_into(
+            &item,
+            DecodeTargetHint::Native,
+            &mut file_bytes,
+            &mut pixels,
+        )?;
+        assert_eq!((decoded.width, decoded.height), (width, height));
+        assert_eq!(decoded.format, DecodedPixelFormat::Rgb8);
+        assert!(psnr(&pixels[..decoded.byte_len], &rgb) > 30.0);
+
+        for (index, (ext, output, input)) in [
+            ("png", ImageOutputFormat::Png, ImageInputFormat::Png),
+            ("webp", ImageOutputFormat::Webp, ImageInputFormat::Webp),
+            ("jpg", ImageOutputFormat::Jpeg, ImageInputFormat::Jpeg),
+            ("bmp", ImageOutputFormat::Bmp, ImageInputFormat::Bmp),
+            ("qoi", ImageOutputFormat::Qoi, ImageInputFormat::Qoi),
+            ("tif", ImageOutputFormat::Tiff, ImageInputFormat::Tiff),
+            ("heic", ImageOutputFormat::Heic, ImageInputFormat::Heic),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let target = root.join(format!("rgb_{index}.{ext}"));
+            convert_heic(&source, &target, output, width, height)?;
+            let (meta, decoded_pixels) = decode_output(&target, input, width, height)?;
+            assert_eq!((meta.width, meta.height), (width, height), "{ext} size");
+            let decoded_rgb = extract_rgb(&decoded_pixels, meta.format, (width * height) as usize)?;
+            let fidelity = psnr(&decoded_rgb, &rgb);
+            assert!(fidelity > 24.0, "{ext} fidelity was {fidelity} dB");
+        }
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn heic_alpha_roundtrips_with_odd_clap_dimensions_and_jpeg_rejects_alpha()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = e2e_temp_dir()?;
+        let (width, height) = (37_u32, 29_u32);
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                rgba.extend_from_slice(&[
+                    u8::try_from((x * 6) % 256).unwrap_or(0),
+                    u8::try_from((y * 8) % 256).unwrap_or(0),
+                    u8::try_from(((x + y) * 3) % 256).unwrap_or(0),
+                    if (x + y) % 5 == 0 { 96 } else { 255 },
+                ]);
+            }
+        }
+        let source = root.join("alpha.heic");
+        write_heic_source(&source, width, height, &rgba, DecodedPixelFormat::Rgba8)?;
+
+        for (index, (ext, output, input)) in [
+            ("png", ImageOutputFormat::Png, ImageInputFormat::Png),
+            ("webp", ImageOutputFormat::Webp, ImageInputFormat::Webp),
+            ("qoi", ImageOutputFormat::Qoi, ImageInputFormat::Qoi),
+            ("tif", ImageOutputFormat::Tiff, ImageInputFormat::Tiff),
+            ("bmp", ImageOutputFormat::Bmp, ImageInputFormat::Bmp),
+            ("heic", ImageOutputFormat::Heic, ImageInputFormat::Heic),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let target = root.join(format!("alpha_{index}.{ext}"));
+            convert_heic(&source, &target, output, width, height)?;
+            let (meta, decoded_pixels) = decode_output(&target, input, width, height)?;
+            assert_eq!((meta.width, meta.height), (width, height), "{ext} size");
+            assert_eq!(meta.format, DecodedPixelFormat::Rgba8, "{ext} alpha");
+            let decoded_rgb = extract_rgb(&decoded_pixels, meta.format, (width * height) as usize)?;
+            let expected_rgb = rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+                .collect::<Vec<_>>();
+            assert!(psnr(&decoded_rgb, &expected_rgb) > 24.0, "{ext} RGB");
+            let alpha_diff = mean_alpha_diff(
+                &decoded_pixels,
+                meta.format,
+                &rgba,
+                (width * height) as usize,
+            )?;
+            assert!(alpha_diff < 20.0, "{ext} alpha drift was {alpha_diff}");
+        }
+
+        let jpeg_target = root.join("alpha.jpg");
+        let jpeg_result = convert_heic(
+            &source,
+            &jpeg_target,
+            ImageOutputFormat::Jpeg,
+            width,
+            height,
+        );
+        let Err(jpeg_error) = jpeg_result else {
+            return Err("JPEG conversion unexpectedly accepted an alpha image".into());
+        };
+        let Some(pipeline_error) = jpeg_error.downcast_ref::<PipelineError>() else {
+            return Err("JPEG rejection was not a PipelineError".into());
+        };
+        assert!(
+            matches!(
+                pipeline_error,
+                PipelineError::UnsupportedPixelFormat { format, .. }
+                    if format.contains("JPEG does not support transparency")
+            ),
+            "unexpected JPEG error: {pipeline_error}"
+        );
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn heic_decode_rejects_animated_and_sequence_brands() -> Result<(), PipelineError> {
+        let mut aux = Vec::new();
+        let rgb = gradient_rgb(32, 24);
+        let still = encode(
+            &rgb,
+            meta(32, 24, DecodedPixelFormat::Rgb8, rgb.len()),
+            80,
+            &mut aux,
+        )?;
+        let mut pixels = Vec::new();
+        let (width, height, format, len) = decode_heic_slice_into(
+            Path::new(TARGET),
+            &still,
+            DecodeTargetHint::Native,
+            &mut pixels,
+        )?;
+        assert_eq!(
+            (width, height, format, len),
+            (32, 24, DecodedPixelFormat::Rgb8, 32 * 24 * 3)
+        );
+
+        let mut animated = still.clone();
+        animated[8..12].copy_from_slice(b"msf1");
+        assert!(matches!(
+            decode_heic_slice_into(
+                Path::new(TARGET),
+                &animated,
+                DecodeTargetHint::Native,
+                &mut pixels,
+            ),
+            Err(PipelineError::DecodeFailed { .. })
+        ));
+        Ok(())
     }
 }

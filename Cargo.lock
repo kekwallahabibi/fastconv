@@ -565,6 +565,7 @@ dependencies = [
  "containr",
  "fastconv-domain",
  "gif",
+ "heifer",
  "ico",
  "jpeg-encoder",
  "jxl",
