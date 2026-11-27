@@ -815,6 +815,18 @@ impl AudioEncodingOptions {
     }
 }
 
+/// FNV-1a 64-bit hash of a byte slice, used to bind a saved WAV layout to the
+/// exact header bytes the probe validated.
+#[must_use]
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
 /// Validated canonical signed-integer PCM layout of a RIFF/WAVE `data` chunk.
 ///
 /// The boundary probe parses the WAV header once and records the exact payload
@@ -832,6 +844,10 @@ pub struct PcmWavLayout {
     channel_mask: u32,
     data_offset: u64,
     data_bytes: u64,
+    /// FNV-1a of the file bytes before the payload. Re-checked by the pipeline
+    /// so a same-length replacement with a moved `data` chunk cannot be read at
+    /// a stale offset.
+    header_fingerprint: u64,
 }
 
 impl PcmWavLayout {
@@ -841,6 +857,9 @@ impl PcmWavLayout {
     ///
     /// Returns [`DomainError::InvalidPcmWavLayout`] when the values cannot
     /// describe a whole number of signed-integer PCM frames.
+    // Eight independent header facts must be validated together; introducing a
+    // wrapper struct would only move the same arity one level down.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         channels: NonZeroU16,
         bits_per_sample: NonZeroU16,
@@ -849,6 +868,7 @@ impl PcmWavLayout {
         channel_mask: u32,
         data_offset: u64,
         data_bytes: u64,
+        header_fingerprint: u64,
     ) -> Result<Self, DomainError> {
         let invalid = |reason| DomainError::InvalidPcmWavLayout { reason };
         if !(1..=8).contains(&channels.get()) {
@@ -881,6 +901,7 @@ impl PcmWavLayout {
             channel_mask,
             data_offset,
             data_bytes,
+            header_fingerprint,
         })
     }
 
@@ -920,8 +941,13 @@ impl PcmWavLayout {
     }
 
     #[must_use]
-    pub fn total_samples(self) -> u64 {
-        self.data_bytes / u64::from(self.block_align.get())
+    pub const fn total_samples(self) -> u64 {
+        self.data_bytes / self.block_align.get() as u64
+    }
+
+    #[must_use]
+    pub const fn header_fingerprint(self) -> u64 {
+        self.header_fingerprint
     }
 }
 
@@ -985,8 +1011,17 @@ impl AudioStreamInfo {
     }
 
     /// Attaches the validated canonical PCM WAV layout parsed at the boundary.
+    ///
+    /// The layout is authoritative: every stream field is derived from it so
+    /// admission budgets and conversion cannot disagree when symphonia reported
+    /// different outer metadata for the same file.
     #[must_use]
     pub const fn with_pcm_wav_layout(mut self, layout: PcmWavLayout) -> Self {
+        self.channels = layout.channels();
+        self.sample_rate = layout.sample_rate();
+        self.bits_per_sample = Some(layout.bits_per_sample());
+        self.sample_format = AudioSampleFormat::Int;
+        self.total_samples = Some(layout.total_samples());
         self.pcm_wav_layout = Some(layout);
         self
     }
@@ -1555,6 +1590,41 @@ mod tests {
         )?;
         assert_eq!(float.sample_format(), AudioSampleFormat::Float);
         assert_eq!(float.bits_per_sample(), bits);
+        Ok(())
+    }
+
+    #[test]
+    fn wav_layout_overrides_mismatched_stream_metadata() -> Result<(), DomainError> {
+        let layout = PcmWavLayout::new(
+            NonZeroU16::new(1).unwrap_or(NonZeroU16::MIN),
+            NonZeroU16::new(16).unwrap_or(NonZeroU16::MIN),
+            NonZeroU32::new(44_100).unwrap_or(NonZeroU32::MIN),
+            NonZeroU16::new(2).unwrap_or(NonZeroU16::MIN),
+            0,
+            44,
+            4_000,
+            fnv1a64(b"header"),
+        )?;
+        // Deliberately wrong outer metadata for the same file: stereo, 48 kHz,
+        // float and a different frame count.
+        let outer = AudioStreamInfo::with_sample_format(
+            NonZeroU16::new(2).unwrap_or(NonZeroU16::MIN),
+            NonZeroU32::new(48_000).unwrap_or(NonZeroU32::MIN),
+            NonZeroU16::new(32),
+            AudioSampleFormat::Float,
+            Some(999),
+        )?
+        .with_pcm_wav_layout(layout);
+        assert_eq!(outer.channels().get(), 1);
+        assert_eq!(outer.sample_rate().get(), 44_100);
+        assert_eq!(
+            outer.bits_per_sample(),
+            NonZeroU16::new(16),
+            "layout bit depth must win"
+        );
+        assert_eq!(outer.sample_format(), AudioSampleFormat::Int);
+        assert_eq!(outer.total_samples(), Some(2_000));
+        assert_eq!(outer.pcm_wav_layout(), Some(layout));
         Ok(())
     }
 

@@ -8,7 +8,7 @@ pub use audio::{
     AudioBatchItem, AudioBatchPlan, AudioBitDepth, AudioConversionReport, AudioEncodingOptions,
     AudioExecutionMode, AudioInputFormat, AudioOptionBitrate, AudioOptionChannels,
     AudioOptionSampleRate, AudioOutputFormat, AudioQuality, AudioRateControl, AudioSampleFormat,
-    AudioStreamInfo, AudioTargetCodec, PcmWavLayout, aac_frame_capacity_bps,
+    AudioStreamInfo, AudioTargetCodec, PcmWavLayout, aac_frame_capacity_bps, fnv1a64,
 };
 pub use hardware::{
     CpuInfo, DetectedGpuBackend, GpuAdapterInfo, GpuCapability, GpuVendor, HostHardware, SimdLevel,
