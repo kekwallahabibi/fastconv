@@ -136,23 +136,33 @@ pub fn execute(plan: &ExecutionPlan) -> Result<(), PipelineError> {
 /// Returns [`PipelineError`] if reading, decoding, GPU compute/encode, or writing any image fails.
 pub fn execute_image_batch(plan: &ImageBatchPlan) -> Result<ImageConversionReport, PipelineError> {
     match plan.mode() {
-        ImageExecutionMode::CpuWebp(compression) => {
-            cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Webp(compression))
+        ImageExecutionMode::CpuWebp { compression, level } => {
+            cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Webp { compression, level })
         }
-        ImageExecutionMode::CpuJpeg { quality } => {
-            cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Jpeg { quality })
+        ImageExecutionMode::CpuJpeg { quality, chroma } => {
+            cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Jpeg { quality, chroma })
         }
-        ImageExecutionMode::CpuPng => cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Png),
+        ImageExecutionMode::CpuPng { level } => {
+            cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Png { level })
+        }
         ImageExecutionMode::CpuBmp => cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Bmp),
         ImageExecutionMode::CpuQoi => cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Qoi),
-        ImageExecutionMode::CpuTiff => cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Tiff),
-        ImageExecutionMode::CpuJxl(compression) => {
-            cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Jxl(compression))
+        ImageExecutionMode::CpuTiff { compression } => {
+            cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Tiff { compression })
         }
-        ImageExecutionMode::CpuAvif { quality } => cpu::execute_cpu_image_batch(
+        ImageExecutionMode::CpuJxl { compression, level } => {
+            cpu::execute_cpu_image_batch(plan, CpuImageEncoder::Jxl { compression, level })
+        }
+        ImageExecutionMode::CpuAvif {
+            quality,
+            level,
+            chroma,
+        } => cpu::execute_cpu_image_batch(
             plan,
             CpuImageEncoder::Avif {
                 quality,
+                level,
+                chroma,
                 threads: 1,
             },
         ),
@@ -167,9 +177,10 @@ pub fn execute_image_batch(plan: &ImageBatchPlan) -> Result<ImageConversionRepor
 mod tests {
     use super::{PipelineError, execute, execute_image_batch};
     use fastconv_domain::{
-        ConversionRequest, DomainError, ExecutionPlan, GpuBackend, HardwareBackend, ImageBatchItem,
-        ImageBatchPlan, ImageCompression, ImageDimensions, ImageExecutionMode, ImageInputFormat,
-        ImageQuality, MediaKind,
+        ChromaSubsampling, CompressionLevel, ConversionRequest, DomainError, ExecutionPlan,
+        GpuBackend, HardwareBackend, ImageBatchItem, ImageBatchPlan, ImageCompression,
+        ImageDimensions, ImageExecutionMode, ImageInputFormat, ImageQuality, MediaKind,
+        TiffCompression,
     };
     use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
     use std::env;
@@ -332,9 +343,12 @@ mod tests {
                     ImageDimensions::new(32, 24)?,
                 )?,
             ],
-            ImageExecutionMode::CpuWebp(ImageCompression::Lossy {
-                quality: ImageQuality::DEFAULT,
-            }),
+            ImageExecutionMode::CpuWebp {
+                compression: ImageCompression::Lossy {
+                    quality: ImageQuality::DEFAULT,
+                },
+                level: CompressionLevel::Balanced,
+            },
             workers,
         )?;
 
@@ -356,7 +370,10 @@ mod tests {
                 ImageInputFormat::Png,
                 ImageDimensions::new(32, 24)?,
             )?],
-            ImageExecutionMode::CpuWebp(ImageCompression::Lossless),
+            ImageExecutionMode::CpuWebp {
+                compression: ImageCompression::Lossless,
+                level: CompressionLevel::Balanced,
+            },
             NonZeroUsize::MIN,
         )?;
         let lossless_report = execute_image_batch(&lossless_plan)?;
@@ -470,6 +487,7 @@ mod tests {
             ],
             ImageExecutionMode::CpuJpeg {
                 quality: ImageQuality::DEFAULT,
+                chroma: ChromaSubsampling::Yuv420,
             },
             workers,
         )?;
@@ -539,7 +557,10 @@ mod tests {
                     ImageDimensions::new(32, 48)?,
                 )?,
             ],
-            ImageExecutionMode::CpuWebp(ImageCompression::Lossless),
+            ImageExecutionMode::CpuWebp {
+                compression: ImageCompression::Lossless,
+                level: CompressionLevel::Balanced,
+            },
             workers,
         )?;
         let webp_report = execute_image_batch(&mixed_webp_plan)?;
@@ -586,6 +607,7 @@ mod tests {
             )?],
             ImageExecutionMode::CpuJpeg {
                 quality: ImageQuality::DEFAULT,
+                chroma: ChromaSubsampling::Yuv420,
             },
             NonZeroUsize::MIN,
         )?;
@@ -614,9 +636,12 @@ mod tests {
                 ImageInputFormat::Jpeg,
                 ImageDimensions::new(32, 32)?,
             )?],
-            ImageExecutionMode::CpuWebp(ImageCompression::Lossy {
-                quality: ImageQuality::DEFAULT,
-            }),
+            ImageExecutionMode::CpuWebp {
+                compression: ImageCompression::Lossy {
+                    quality: ImageQuality::DEFAULT,
+                },
+                level: CompressionLevel::Balanced,
+            },
             NonZeroUsize::MIN,
         )?;
         assert!(matches!(
@@ -649,6 +674,7 @@ mod tests {
             )?],
             ImageExecutionMode::CpuJpeg {
                 quality: ImageQuality::DEFAULT,
+                chroma: ChromaSubsampling::Yuv420,
             },
             NonZeroUsize::MIN,
         )?;
@@ -675,6 +701,7 @@ mod tests {
             )?],
             ImageExecutionMode::CpuJpeg {
                 quality: ImageQuality::new(0)?,
+                chroma: ChromaSubsampling::Yuv420,
             },
             NonZeroUsize::MIN,
         )?;
@@ -786,7 +813,10 @@ mod tests {
                 jpeg_item(qoi_rgb, webp_rgb.clone(), ImageInputFormat::Qoi, 53, 37)?,
                 jpeg_item(qoi_rgba, webp_rgba.clone(), ImageInputFormat::Qoi, 53, 37)?,
             ],
-            ImageExecutionMode::CpuWebp(ImageCompression::Lossless),
+            ImageExecutionMode::CpuWebp {
+                compression: ImageCompression::Lossless,
+                level: CompressionLevel::Balanced,
+            },
             workers,
         )?)?;
 
@@ -797,7 +827,9 @@ mod tests {
                 jpeg_item(webp_rgb, png_rgb.clone(), ImageInputFormat::Webp, 53, 37)?,
                 jpeg_item(webp_rgba, png_rgba.clone(), ImageInputFormat::Webp, 53, 37)?,
             ],
-            ImageExecutionMode::CpuPng,
+            ImageExecutionMode::CpuPng {
+                level: CompressionLevel::Fast,
+            },
             workers,
         )?)?;
 
@@ -866,6 +898,7 @@ mod tests {
             )?],
             ImageExecutionMode::CpuJpeg {
                 quality: ImageQuality::DEFAULT,
+                chroma: ChromaSubsampling::Yuv420,
             },
             NonZeroUsize::MIN,
         )?)?;
@@ -883,6 +916,7 @@ mod tests {
             )?],
             ImageExecutionMode::CpuJpeg {
                 quality: ImageQuality::DEFAULT,
+                chroma: ChromaSubsampling::Yuv420,
             },
             NonZeroUsize::MIN,
         )?;
@@ -914,7 +948,10 @@ mod tests {
                 53,
                 37,
             )?],
-            ImageExecutionMode::CpuWebp(ImageCompression::Lossless),
+            ImageExecutionMode::CpuWebp {
+                compression: ImageCompression::Lossless,
+                level: CompressionLevel::Balanced,
+            },
             NonZeroUsize::MIN,
         )?)?;
         execute_image_batch(&ImageBatchPlan::new(
@@ -979,9 +1016,12 @@ mod tests {
                     37,
                 )?,
             ],
-            ImageExecutionMode::CpuWebp(ImageCompression::Lossy {
-                quality: ImageQuality::DEFAULT,
-            }),
+            ImageExecutionMode::CpuWebp {
+                compression: ImageCompression::Lossy {
+                    quality: ImageQuality::DEFAULT,
+                },
+                level: CompressionLevel::Balanced,
+            },
             workers,
         )?;
         assert_eq!(execute_image_batch(&mixed_plan)?.files_converted().get(), 5);
@@ -1017,9 +1057,12 @@ mod tests {
                 256,
                 256,
             )?],
-            ImageExecutionMode::CpuWebp(ImageCompression::Lossy {
-                quality: ImageQuality::DEFAULT,
-            }),
+            ImageExecutionMode::CpuWebp {
+                compression: ImageCompression::Lossy {
+                    quality: ImageQuality::DEFAULT,
+                },
+                level: CompressionLevel::Balanced,
+            },
             NonZeroUsize::MIN,
         )?)?;
         execute_image_batch(&ImageBatchPlan::new(
@@ -1122,6 +1165,8 @@ mod tests {
             vec![jpeg_item(src, avif.clone(), ImageInputFormat::Png, 64, 48)?],
             ImageExecutionMode::CpuAvif {
                 quality: ImageQuality::new(95)?,
+                level: CompressionLevel::Fast,
+                chroma: ChromaSubsampling::Yuv420,
             },
             NonZeroUsize::MIN,
         )?)?;
@@ -1136,7 +1181,9 @@ mod tests {
                 64,
                 48,
             )?],
-            ImageExecutionMode::CpuPng,
+            ImageExecutionMode::CpuPng {
+                level: CompressionLevel::Fast,
+            },
             NonZeroUsize::MIN,
         )?)?;
         let decoded = decode_test_png(&out)?;
@@ -1194,7 +1241,9 @@ mod tests {
             assert_eq!(&fs::read(&gif)?[..3], b"GIF");
             execute_image_batch(&ImageBatchPlan::new(
                 vec![jpeg_item(gif, out.clone(), ImageInputFormat::Gif, 53, 37)?],
-                ImageExecutionMode::CpuPng,
+                ImageExecutionMode::CpuPng {
+                    level: CompressionLevel::Fast,
+                },
                 NonZeroUsize::MIN,
             )?)?;
             let decoded = decode_test_png(&out)?;
@@ -1258,7 +1307,9 @@ mod tests {
             )?)?;
             execute_image_batch(&ImageBatchPlan::new(
                 vec![jpeg_item(ico, out.clone(), ImageInputFormat::Ico, 32, 32)?],
-                ImageExecutionMode::CpuPng,
+                ImageExecutionMode::CpuPng {
+                    level: CompressionLevel::Fast,
+                },
                 NonZeroUsize::MIN,
             )?)?;
             let decoded = decode_test_png(&out)?;
@@ -1347,7 +1398,9 @@ mod tests {
             )?)?;
             execute_image_batch(&ImageBatchPlan::new(
                 vec![jpeg_item(pnm, out.clone(), ImageInputFormat::Pnm, 53, 37)?],
-                ImageExecutionMode::CpuPng,
+                ImageExecutionMode::CpuPng {
+                    level: CompressionLevel::Fast,
+                },
                 NonZeroUsize::MIN,
             )?)?;
             let decoded = decode_test_png(&out)?;
@@ -1357,6 +1410,160 @@ mod tests {
                 "{name} metadata"
             );
             assert_eq!(decoded.pixels, expected, "{name} pixels");
+        }
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    fn jpeg_luma_sampling(bytes: &[u8]) -> Option<(u8, u8)> {
+        let mut pos = 2_usize;
+        while pos + 1 < bytes.len() {
+            if bytes[pos] != 0xFF {
+                pos += 1;
+                continue;
+            }
+            let marker = bytes[pos + 1];
+            if (0xC0..=0xC2).contains(&marker) {
+                let sampling = *bytes.get(pos + 11)?;
+                return Some((sampling >> 4, sampling & 0x0F));
+            }
+            if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
+                pos += 2;
+                continue;
+            }
+            let segment_len = usize::from(u16::from_be_bytes([
+                *bytes.get(pos + 2)?,
+                *bytes.get(pos + 3)?,
+            ]));
+            pos = pos.checked_add(2)?.checked_add(segment_len)?;
+        }
+        None
+    }
+
+    #[test]
+    fn jpeg_chroma_modes_roundtrip_and_report_sampling_factors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = create_temp_dir("jpeg-chroma")?;
+        let width = 32_u32;
+        let height = 32_u32;
+        let width_usize = usize::try_from(width)?;
+        let pixel_count = usize::try_from(height)? * width_usize;
+        let pixels: Vec<u8> = (0..pixel_count)
+            .flat_map(|i| {
+                let x = i % width_usize;
+                let y = i / width_usize;
+                if (x / 4 + y / 4) % 2 == 0 {
+                    [255_u8, 32, 32]
+                } else {
+                    [32_u8, 32, 255]
+                }
+            })
+            .collect();
+        let src = root.join("src.png");
+        write_test_png(&src, width, height, png::ColorType::Rgb, &pixels)?;
+
+        let quality = ImageQuality::new(95)?;
+        let mut diffs = Vec::new();
+        for (chroma, expected_sampling) in [
+            (ChromaSubsampling::Yuv420, (2_u8, 2_u8)),
+            (ChromaSubsampling::Yuv444, (1_u8, 1_u8)),
+        ] {
+            let target = root.join(format!("{chroma}.jpg"));
+            execute_image_batch(&ImageBatchPlan::new(
+                vec![jpeg_item(
+                    src.clone(),
+                    target.clone(),
+                    ImageInputFormat::Png,
+                    width,
+                    height,
+                )?],
+                ImageExecutionMode::CpuJpeg { quality, chroma },
+                NonZeroUsize::MIN,
+            )?)?;
+            let bytes = fs::read(&target)?;
+            assert_eq!(
+                jpeg_luma_sampling(&bytes),
+                Some(expected_sampling),
+                "JPEG SOF sampling for {chroma}"
+            );
+            let decoded = JpegDecoder::new(ZCursor::new(bytes.as_slice())).decode()?;
+            assert_eq!(decoded.len(), pixels.len());
+            diffs.push(mean_abs_channel_diff(&decoded, &pixels)?);
+        }
+        assert!(
+            diffs[1] <= diffs[0],
+            "4:4:4 should preserve saturated chroma at least as well as 4:2:0: {diffs:?}"
+        );
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn dispatches_explicit_encoder_controls_to_the_cpu_backends()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = create_temp_dir("control-dispatch")?;
+        let src = root.join("src.png");
+        let pixels = make_rgb_gradient(32, 24);
+        write_test_png(&src, 32, 24, png::ColorType::Rgb, &pixels)?;
+
+        for (index, (mode, ext)) in [
+            (
+                ImageExecutionMode::CpuTiff {
+                    compression: TiffCompression::Packbits,
+                },
+                "tiff",
+            ),
+            (
+                ImageExecutionMode::CpuPng {
+                    level: CompressionLevel::Best,
+                },
+                "png",
+            ),
+            (
+                ImageExecutionMode::CpuWebp {
+                    compression: ImageCompression::Lossless,
+                    level: CompressionLevel::Best,
+                },
+                "webp",
+            ),
+            (
+                ImageExecutionMode::CpuJxl {
+                    compression: ImageCompression::Lossless,
+                    level: CompressionLevel::Balanced,
+                },
+                "jxl",
+            ),
+            (
+                ImageExecutionMode::CpuAvif {
+                    quality: ImageQuality::new(95)?,
+                    level: CompressionLevel::Balanced,
+                    chroma: ChromaSubsampling::Yuv444,
+                },
+                "avif",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let target = root.join(format!("out_{index}.{ext}"));
+            let report = execute_image_batch(&ImageBatchPlan::new(
+                vec![jpeg_item(
+                    src.clone(),
+                    target.clone(),
+                    ImageInputFormat::Png,
+                    32,
+                    24,
+                )?],
+                mode,
+                NonZeroUsize::MIN,
+            )?)?;
+            assert_eq!(report.files_converted().get(), 1, "{ext} dispatch");
+            assert!(
+                !fs::read(&target)?.is_empty(),
+                "{ext} produced empty output"
+            );
         }
 
         fs::remove_dir_all(&root)?;

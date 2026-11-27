@@ -56,6 +56,9 @@ fn global_help_is_available_through_all_entry_points() -> Result<(), String> {
         "-h, --help",
         "-V, --version",
         "--hwdecode <auto|cpu|nvdec>",
+        "--compression-level <fast|balanced|best>",
+        "--tiff-compression <deflate|lzw|packbits|none>",
+        "--chroma <420|444>",
         "fastconv <command> --help",
         "fastconv help <command>",
     ] {
@@ -125,7 +128,9 @@ fn probe_help_documents_detected_hardware() -> Result<(), String> {
 fn convert_help_documents_accepted_flags_and_rules() -> Result<(), String> {
     let text = stdout(&["convert", "--help"])?;
     for needle in [
-        "fastconv convert <source> <target> [--to <format>] [--quality <0..=100> | --lossless] [--threads <N>] [--backend <name>]",
+        "[--compression-level <fast|balanced|best>]",
+        "[--tiff-compression <deflate|lzw|packbits|none>]",
+        "[--chroma <420|444>]",
         "<source>",
         "<target>",
         "--to <format>",
@@ -160,6 +165,13 @@ fn convert_help_documents_accepted_flags_and_rules() -> Result<(), String> {
         "amf",
         "videotoolbox",
         "vulkan",
+        "default: fast for png/tiff/jxl/avif",
+        "balanced for webp",
+        "Supported only for .tiff on the cpu backend",
+        "Rejected: bmp, qoi, ico, pnm, jpeg, gif, heic",
+        "with lzw/packbits/none",
+        "jpeg and avif on the cpu backend",
+        "bmp, qoi, tiff, jxl, gif, ico, pnm and heic",
     ] {
         assert!(text.contains(needle), "convert help missing '{needle}'");
     }

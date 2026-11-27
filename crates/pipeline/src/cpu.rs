@@ -10,20 +10,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 
 use fastconv_domain::{
-    ExecutionPlan, HardwareBackend, ImageBatchItem, ImageBatchPlan, ImageCompression,
-    ImageConversionReport, ImageQuality,
+    ChromaSubsampling, CompressionLevel, ExecutionPlan, HardwareBackend, ImageBatchItem,
+    ImageBatchPlan, ImageCompression, ImageConversionReport, ImageQuality, TiffCompression,
 };
 use jixel::{
     EncodeConfig, EncodeError as JixelEncodeError, Speed, distance_from_quality, encode_image,
     encode_image_gray, encode_image_gray_alpha, encode_image_with_alpha,
 };
-use jpeg_encoder::{ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder as JpegEncoder};
-use tiff::encoder::{Compression as TiffCompression, DeflateLevel, TiffEncoder, colortype};
+use jpeg_encoder::{
+    ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor,
+};
+use tiff::encoder::{Compression as TiffEncoderCompression, DeflateLevel, TiffEncoder, colortype};
 use tiff::tags::{ExtraSamples, Predictor, Tag};
 use zenwebp::{EncodeRequest, LosslessConfig, LossyConfig, PixelLayout};
 
 use crate::PipelineError;
-use crate::avif::encode_avif_into;
+use crate::avif::{AvifEncodeRequest, encode_avif_into};
 use crate::bmp::{BmpFrameScratch, encode_bmp_into_frame};
 use crate::decode::{
     DecodeTargetHint, DecodedFrameMeta, DecodedPixelFormat, decode_image_into,
@@ -49,17 +51,30 @@ pub const fn execute(_plan: &ExecutionPlan) -> Result<(), PipelineError> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CpuImageEncoder {
-    Webp(ImageCompression),
+    Webp {
+        compression: ImageCompression,
+        level: CompressionLevel,
+    },
     Jpeg {
         quality: ImageQuality,
+        chroma: ChromaSubsampling,
     },
-    Png,
+    Png {
+        level: CompressionLevel,
+    },
     Bmp,
     Qoi,
-    Tiff,
-    Jxl(ImageCompression),
+    Tiff {
+        compression: TiffCompression,
+    },
+    Jxl {
+        compression: ImageCompression,
+        level: CompressionLevel,
+    },
     Avif {
         quality: ImageQuality,
+        level: CompressionLevel,
+        chroma: ChromaSubsampling,
         threads: usize,
     },
     Gif,
@@ -268,7 +283,7 @@ pub(crate) fn execute_cpu_image_batch(
     // worker count, so a small batch of heavy images still uses idle cores.
     let configured_workers = plan.worker_threads().get();
     let (worker_count, inner_threads) = match encoder {
-        CpuImageEncoder::Jxl(_) => {
+        CpuImageEncoder::Jxl { .. } => {
             let count = configured_workers.min(items.len()).clamp(1, 8);
             (count, (configured_workers / count).max(1))
         }
@@ -400,6 +415,109 @@ fn execute_parallel(
     ))
 }
 
+struct EncodeBuffers<'a> {
+    encoded: &'a mut Vec<u8>,
+    aux: &'a mut Vec<u8>,
+    bmp_frame: &'a mut BmpFrameScratch,
+}
+
+fn encode_item_pixels(
+    item: &ImageBatchItem,
+    encoder: CpuImageEncoder,
+    pixels: &[u8],
+    decoded: DecodedFrameMeta,
+    buffers: &mut EncodeBuffers<'_>,
+    encode_threads: usize,
+    bmp_write_lock: &Mutex<()>,
+) -> Result<u64, PipelineError> {
+    match encoder {
+        CpuImageEncoder::Webp { compression, level } => {
+            buffers.encoded.clear();
+            encode_webp_into(
+                item.target(),
+                compression,
+                level,
+                pixels,
+                decoded,
+                buffers.encoded,
+            )?;
+            write_encoded_buffer(item.target(), buffers.encoded)
+        }
+        CpuImageEncoder::Jpeg { quality, chroma } => {
+            buffers.encoded.clear();
+            encode_jpeg_into(
+                item,
+                quality,
+                chroma,
+                pixels,
+                decoded,
+                buffers.aux,
+                buffers.encoded,
+            )?;
+            write_encoded_buffer(item.target(), buffers.encoded)
+        }
+        CpuImageEncoder::Qoi => {
+            buffers.encoded.clear();
+            encode_qoi_into(item.target(), pixels, decoded, buffers.encoded)?;
+            write_encoded_buffer(item.target(), buffers.encoded)
+        }
+        CpuImageEncoder::Png { level } => {
+            encode_png_streaming(item.target(), pixels, decoded, level)
+        }
+        CpuImageEncoder::Bmp => encode_bmp_streaming(
+            item.target(),
+            pixels,
+            decoded,
+            buffers.bmp_frame,
+            bmp_write_lock,
+        ),
+        CpuImageEncoder::Tiff { compression } => {
+            encode_tiff_streaming(item.target(), compression, pixels, decoded, buffers.aux)
+        }
+        CpuImageEncoder::Jxl { compression, level } => {
+            let jxl_output = encode_jxl_into(
+                item.target(),
+                compression,
+                level,
+                pixels,
+                decoded,
+                encode_threads,
+            )?;
+            write_encoded_buffer(item.target(), &jxl_output)
+        }
+        CpuImageEncoder::Avif {
+            quality,
+            level,
+            chroma,
+            threads,
+        } => {
+            buffers.encoded.clear();
+            encode_avif_into(AvifEncodeRequest {
+                target: item.target(),
+                quality,
+                level,
+                chroma,
+                threads: threads.max(encode_threads),
+                pixels,
+                decoded,
+                encoded_buf: buffers.encoded,
+            })?;
+            write_encoded_buffer(item.target(), buffers.encoded)
+        }
+        CpuImageEncoder::Gif => {
+            buffers.encoded.clear();
+            encode_gif_into(item.target(), pixels, decoded, buffers.aux, buffers.encoded)?;
+            write_encoded_buffer(item.target(), buffers.encoded)
+        }
+        CpuImageEncoder::Ico => {
+            buffers.encoded.clear();
+            encode_ico_into(item.target(), pixels, decoded, buffers.encoded)?;
+            write_encoded_buffer(item.target(), buffers.encoded)
+        }
+        CpuImageEncoder::Pnm => encode_pnm_streaming(item.target(), pixels, decoded, buffers.aux),
+    }
+}
+
 fn convert_single_item(
     item: &ImageBatchItem,
     encoder: CpuImageEncoder,
@@ -422,83 +540,20 @@ fn convert_single_item(
                 reason: "decoded image frame exceeded allocated pixel buffer".to_owned(),
             })?;
 
-    let output_bytes = match encoder {
-        CpuImageEncoder::Webp(compression) => {
-            scratch.encoded_buf.clear();
-            encode_webp_into(
-                item.target(),
-                compression,
-                pixels,
-                decoded,
-                &mut scratch.encoded_buf,
-            )?;
-            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
-        }
-        CpuImageEncoder::Jpeg { quality } => {
-            scratch.encoded_buf.clear();
-            encode_jpeg_into(
-                item,
-                quality,
-                pixels,
-                decoded,
-                &mut scratch.aux_buf,
-                &mut scratch.encoded_buf,
-            )?;
-            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
-        }
-        CpuImageEncoder::Qoi => {
-            scratch.encoded_buf.clear();
-            encode_qoi_into(item.target(), pixels, decoded, &mut scratch.encoded_buf)?;
-            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
-        }
-        CpuImageEncoder::Png => encode_png_streaming(item.target(), pixels, decoded)?,
-        CpuImageEncoder::Bmp => encode_bmp_streaming(
-            item.target(),
-            pixels,
-            decoded,
-            &mut scratch.bmp_frame,
-            bmp_write_lock,
-        )?,
-        CpuImageEncoder::Tiff => {
-            encode_tiff_streaming(item.target(), pixels, decoded, &mut scratch.aux_buf)?
-        }
-        CpuImageEncoder::Jxl(compression) => {
-            let jxl_output =
-                encode_jxl_into(item.target(), compression, pixels, decoded, encode_threads)?;
-            write_encoded_buffer(item.target(), &jxl_output)?
-        }
-        CpuImageEncoder::Avif { quality, threads } => {
-            scratch.encoded_buf.clear();
-            encode_avif_into(
-                item.target(),
-                quality,
-                threads.max(encode_threads),
-                pixels,
-                decoded,
-                &mut scratch.encoded_buf,
-            )?;
-            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
-        }
-        CpuImageEncoder::Gif => {
-            scratch.encoded_buf.clear();
-            encode_gif_into(
-                item.target(),
-                pixels,
-                decoded,
-                &mut scratch.aux_buf,
-                &mut scratch.encoded_buf,
-            )?;
-            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
-        }
-        CpuImageEncoder::Ico => {
-            scratch.encoded_buf.clear();
-            encode_ico_into(item.target(), pixels, decoded, &mut scratch.encoded_buf)?;
-            write_encoded_buffer(item.target(), &scratch.encoded_buf)?
-        }
-        CpuImageEncoder::Pnm => {
-            encode_pnm_streaming(item.target(), pixels, decoded, &mut scratch.aux_buf)?
-        }
+    let mut buffers = EncodeBuffers {
+        encoded: &mut scratch.encoded_buf,
+        aux: &mut scratch.aux_buf,
+        bmp_frame: &mut scratch.bmp_frame,
     };
+    let output_bytes = encode_item_pixels(
+        item,
+        encoder,
+        pixels,
+        decoded,
+        &mut buffers,
+        encode_threads,
+        bmp_write_lock,
+    )?;
 
     Ok((decoded.input_file_bytes, output_bytes))
 }
@@ -514,10 +569,19 @@ fn write_encoded_buffer(target: &Path, encoded_buf: &[u8]) -> Result<u64, Pipeli
     Ok(u64::try_from(encoded_buf.len()).unwrap_or(u64::MAX))
 }
 
+const fn png_compression(level: CompressionLevel) -> png::Compression {
+    match level {
+        CompressionLevel::Fast => png::Compression::Fastest,
+        CompressionLevel::Balanced => png::Compression::Balanced,
+        CompressionLevel::Best => png::Compression::High,
+    }
+}
+
 fn encode_png_to_writer<W: Write>(
     target: &Path,
     pixels: &[u8],
     decoded: DecodedFrameMeta,
+    level: CompressionLevel,
     sink: W,
 ) -> Result<u64, PipelineError> {
     let mut writer = CountingWriter::new(sink);
@@ -531,9 +595,9 @@ fn encode_png_to_writer<W: Write>(
             DecodedPixelFormat::Rgba8 => png::ColorType::Rgba,
         });
         encoder.set_depth(png::BitDepth::Eight);
-        // `Compression::Fastest` selects `fdeflate` + `Filter::Up` for high CPU throughput
-        // while keeping PNG file sizes well compressed and avoiding full-frame zlib buffering.
-        encoder.set_compression(png::Compression::Fastest);
+        // Fast uses fdeflate + `Filter::Up`; Balanced and High spend more effort for
+        // progressively smaller output. All three remain streamable with bounded IDAT chunks.
+        encoder.set_compression(png_compression(level));
 
         let mut png_writer = encoder
             .write_header()
@@ -592,10 +656,11 @@ fn encode_png_streaming(
     target: &Path,
     pixels: &[u8],
     decoded: DecodedFrameMeta,
+    level: CompressionLevel,
 ) -> Result<u64, PipelineError> {
     let (staging, file) = StagingFile::create_for(target)?;
     let mut buf_writer = BufWriter::with_capacity(STREAM_IO_BUF_BYTES, file);
-    let bytes = encode_png_to_writer(target, pixels, decoded, &mut buf_writer)?;
+    let bytes = encode_png_to_writer(target, pixels, decoded, level, &mut buf_writer)?;
     let file = buf_writer.into_inner().map_err(|err| PipelineError::Io {
         path: target.to_path_buf(),
         source: err.into_error(),
@@ -664,9 +729,18 @@ fn encode_bmp_streaming(
     Ok(bytes)
 }
 
+const fn webp_method(level: CompressionLevel) -> u8 {
+    match level {
+        CompressionLevel::Fast => 2,
+        CompressionLevel::Balanced => 4,
+        CompressionLevel::Best => 6,
+    }
+}
+
 fn encode_webp_into(
     target: &Path,
     compression: ImageCompression,
+    level: CompressionLevel,
     pixels: &[u8],
     decoded: DecodedFrameMeta,
     encoded_buf: &mut Vec<u8>,
@@ -677,16 +751,19 @@ fn encode_webp_into(
         DecodedPixelFormat::Rgb8 => PixelLayout::Rgb8,
         DecodedPixelFormat::Rgba8 => PixelLayout::Rgba8,
     };
+    // Method 4 (Balanced) is zenwebp's default and the previous fastconv behaviour.
+    let method = webp_method(level);
 
-    // `LossyConfig::new()` defaults to method 4 — the prior 0.2.0 speed/quality balance.
     let encode_res = match compression {
         ImageCompression::Lossy { quality } => {
-            let config = LossyConfig::new().with_quality(quality.as_f32());
+            let config = LossyConfig::new()
+                .with_quality(quality.as_f32())
+                .with_method(method);
             EncodeRequest::lossy(&config, pixels, layout, decoded.width, decoded.height)
                 .encode_into(encoded_buf)
         }
         ImageCompression::Lossless => {
-            let config = LosslessConfig::new();
+            let config = LosslessConfig::new().with_method(method);
             EncodeRequest::lossless(&config, pixels, layout, decoded.width, decoded.height)
                 .encode_into(encoded_buf)
         }
@@ -701,6 +778,7 @@ fn encode_webp_into(
 fn encode_jpeg_into(
     item: &ImageBatchItem,
     quality: ImageQuality,
+    chroma: ChromaSubsampling,
     pixels: &[u8],
     decoded: DecodedFrameMeta,
     aux_buf: &mut Vec<u8>,
@@ -767,7 +845,15 @@ fn encode_jpeg_into(
     };
 
     let mut encoder = JpegEncoder::new(encoded_buf, quality.get().max(1));
-    encoder.set_chroma_subsampling_method(ChromaSubsamplingMethod::Nearest);
+    match chroma {
+        ChromaSubsampling::Yuv420 => {
+            encoder.set_sampling_factor(SamplingFactor::R_4_2_0);
+            encoder.set_chroma_subsampling_method(ChromaSubsamplingMethod::Nearest);
+        }
+        ChromaSubsampling::Yuv444 => {
+            encoder.set_sampling_factor(SamplingFactor::R_4_4_4);
+        }
+    }
     encoder
         .encode(input_slice, width_u16, height_u16, color_type)
         .map_err(|err| PipelineError::EncodeFailed {
@@ -806,8 +892,28 @@ fn expand_la8_to_rgba(
     Ok(needed)
 }
 
+fn tiff_encoder_settings(compression: TiffCompression) -> (TiffEncoderCompression, Predictor) {
+    match compression {
+        TiffCompression::Deflate { level } => {
+            let level = match level {
+                CompressionLevel::Fast => DeflateLevel::Fast,
+                CompressionLevel::Balanced => DeflateLevel::Balanced,
+                CompressionLevel::Best => DeflateLevel::Best,
+            };
+            (
+                TiffEncoderCompression::Deflate(level),
+                Predictor::Horizontal,
+            )
+        }
+        TiffCompression::Lzw => (TiffEncoderCompression::Lzw, Predictor::Horizontal),
+        TiffCompression::Packbits => (TiffEncoderCompression::Packbits, Predictor::None),
+        TiffCompression::None => (TiffEncoderCompression::Uncompressed, Predictor::None),
+    }
+}
+
 fn encode_tiff_streaming(
     target: &Path,
+    compression: TiffCompression,
     pixels: &[u8],
     decoded: DecodedFrameMeta,
     aux_buf: &mut Vec<u8>,
@@ -822,9 +928,10 @@ fn encode_tiff_streaming(
         path: target.to_path_buf(),
         reason: format!("failed to create TIFF encoder: {err}"),
     })?;
+    let (encoder_compression, predictor) = tiff_encoder_settings(compression);
     encoder = encoder
-        .with_compression(TiffCompression::Deflate(DeflateLevel::Fast))
-        .with_predictor(Predictor::Horizontal);
+        .with_compression(encoder_compression)
+        .with_predictor(predictor);
 
     match decoded.format {
         DecodedPixelFormat::L8 => encoder
@@ -896,9 +1003,18 @@ fn encode_tiff_streaming(
     Ok(bytes)
 }
 
+const fn jxl_speed(level: CompressionLevel) -> Speed {
+    match level {
+        CompressionLevel::Fast => Speed::Fastest,
+        CompressionLevel::Balanced => Speed::Medium,
+        CompressionLevel::Best => Speed::Slow,
+    }
+}
+
 fn encode_jxl_into(
     target: &Path,
     compression: ImageCompression,
+    level: CompressionLevel,
     pixels: &[u8],
     decoded: DecodedFrameMeta,
     inner_threads: usize,
@@ -906,7 +1022,7 @@ fn encode_jxl_into(
     let width = decoded.width as usize;
     let height = decoded.height as usize;
     let mut config = EncodeConfig::default();
-    config.speed = Speed::Fastest;
+    config.speed = jxl_speed(level);
     config.num_threads = inner_threads.max(1);
 
     match compression {
@@ -939,6 +1055,7 @@ mod tests {
     use crate::PipelineError;
     use crate::bmp::BmpFrameScratch;
     use crate::decode::{DecodedFrameMeta, DecodedPixelFormat};
+    use fastconv_domain::{CompressionLevel, ImageQuality, TiffCompression};
     use std::env;
     use std::fs;
     use std::io::{self, Write};
@@ -1019,7 +1136,13 @@ mod tests {
             has_non_opaque_native_alpha: false,
         };
         let mut sink = FailOnceAfterIdatHeader::new();
-        let res = encode_png_to_writer(Path::new("fault.png"), &pixels, meta, &mut sink);
+        let res = encode_png_to_writer(
+            Path::new("fault.png"),
+            &pixels,
+            meta,
+            CompressionLevel::Fast,
+            &mut sink,
+        );
         assert!(sink.failed_once, "fault injector should have failed IDAT");
         assert!(matches!(res, Err(PipelineError::Io { .. })));
 
@@ -1028,7 +1151,13 @@ mod tests {
             saw_idat: false,
             returned_zero: false,
         };
-        let zero_res = encode_png_to_writer(Path::new("zero.png"), &pixels, meta, &mut zero_sink);
+        let zero_res = encode_png_to_writer(
+            Path::new("zero.png"),
+            &pixels,
+            meta,
+            CompressionLevel::Fast,
+            &mut zero_sink,
+        );
         assert!(zero_sink.returned_zero);
         assert!(matches!(
             zero_res,
@@ -1063,7 +1192,7 @@ mod tests {
         fs::set_permissions(&png_target, fs::Permissions::from_mode(0o600))?;
         fs::set_permissions(&bmp_target, fs::Permissions::from_mode(0o600))?;
 
-        encode_png_streaming(&png_target, &pixels, meta)?;
+        encode_png_streaming(&png_target, &pixels, meta, CompressionLevel::Fast)?;
         let mut scratch = BmpFrameScratch::new();
         encode_bmp_streaming(&bmp_target, &pixels, meta, &mut scratch, &Mutex::new(()))?;
 
@@ -1103,7 +1232,9 @@ mod tests {
             input_file_bytes: 1,
             has_non_opaque_native_alpha: false,
         };
-        assert!(encode_png_streaming(&png_target, &bad_pixels, meta).is_err());
+        assert!(
+            encode_png_streaming(&png_target, &bad_pixels, meta, CompressionLevel::Fast).is_err()
+        );
         let mut scratch = BmpFrameScratch::new();
         assert!(
             encode_bmp_streaming(
@@ -1164,7 +1295,13 @@ mod tests {
                 has_non_opaque_native_alpha: false,
             };
             let target = dir.join(name);
-            encode_tiff_streaming(&target, &pixels, meta, &mut aux_buf)?;
+            encode_tiff_streaming(
+                &target,
+                TiffCompression::DEFAULT,
+                &pixels,
+                meta,
+                &mut aux_buf,
+            )?;
 
             let item = ImageBatchItem::new(
                 target,
@@ -1195,7 +1332,13 @@ mod tests {
             has_non_opaque_native_alpha: false,
         };
         let la_target = dir.join("la8.tif");
-        encode_tiff_streaming(&la_target, &la_pixels, la_meta, &mut aux_buf)?;
+        encode_tiff_streaming(
+            &la_target,
+            TiffCompression::DEFAULT,
+            &la_pixels,
+            la_meta,
+            &mut aux_buf,
+        )?;
         let la_item = ImageBatchItem::new(
             la_target,
             dir.join("la8.out.png"),
@@ -1220,11 +1363,125 @@ mod tests {
             expected_rgba.as_slice()
         );
 
-        let odd_la_target = dir.join("odd_la8.tif");
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tiff_rejects_a_pixel_buffer_shorter_than_declared() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use super::encode_tiff_streaming;
+
+        let meta = DecodedFrameMeta {
+            width: 15,
+            height: 11,
+            format: DecodedPixelFormat::La8,
+            byte_len: 3,
+            input_file_bytes: 1,
+            has_non_opaque_native_alpha: false,
+        };
+        let dir = env::temp_dir().join(format!(
+            "fastconv-cpu-tiff-short-{}-{}",
+            process::id(),
+            CPU_TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir)?;
         assert!(matches!(
-            encode_tiff_streaming(&odd_la_target, &[1_u8, 2, 3], la_meta, &mut aux_buf),
+            encode_tiff_streaming(
+                &dir.join("odd_la8.tif"),
+                TiffCompression::DEFAULT,
+                &[1_u8, 2, 3],
+                meta,
+                &mut Vec::new(),
+            ),
             Err(PipelineError::DecodeFailed { .. })
         ));
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tiff_all_compression_modes_roundtrip_and_declare_their_tag()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_tiff_streaming;
+        use crate::decode::{DecodeTargetHint, decode_image_into};
+        use fastconv_domain::{ImageBatchItem, ImageDimensions, ImageInputFormat};
+        use std::fs::File;
+        use tiff::decoder::Decoder;
+        use tiff::tags::Tag;
+
+        let id = CPU_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = env::temp_dir().join(format!("fastconv-cpu-tiff-modes-{}-{id}", process::id()));
+        fs::create_dir_all(&dir)?;
+
+        let pixels: Vec<u8> = (0..17 * 13 * 3)
+            .map(|i| u8::try_from((i * 29 + 7) % 256).unwrap_or(0))
+            .collect();
+        let meta = DecodedFrameMeta {
+            width: 17,
+            height: 13,
+            format: DecodedPixelFormat::Rgb8,
+            byte_len: pixels.len(),
+            input_file_bytes: 1,
+            has_non_opaque_native_alpha: false,
+        };
+        // TIFF compression tags: None=1, LZW=5, Deflate=8, PackBits=32773.
+        let modes = [
+            (
+                "deflate_fast",
+                TiffCompression::Deflate {
+                    level: CompressionLevel::Fast,
+                },
+                8_u16,
+            ),
+            (
+                "deflate_balanced",
+                TiffCompression::Deflate {
+                    level: CompressionLevel::Balanced,
+                },
+                8,
+            ),
+            (
+                "deflate_best",
+                TiffCompression::Deflate {
+                    level: CompressionLevel::Best,
+                },
+                8,
+            ),
+            ("lzw", TiffCompression::Lzw, 5),
+            ("packbits", TiffCompression::Packbits, 32_773),
+            ("none", TiffCompression::None, 1),
+        ];
+
+        for (name, compression, expected_tag) in modes {
+            let mut aux_buf = Vec::new();
+            let target = dir.join(format!("{name}.tif"));
+            let written = encode_tiff_streaming(&target, compression, &pixels, meta, &mut aux_buf)?;
+            assert_eq!(written, fs::metadata(&target)?.len());
+            let mut decoder = Decoder::new(std::io::BufReader::new(File::open(&target)?))?;
+            assert_eq!(
+                decoder.get_tag_unsigned::<u16>(Tag::Compression)?,
+                expected_tag,
+                "compression tag for {name}"
+            );
+
+            let item = ImageBatchItem::new(
+                target,
+                dir.join(format!("{name}.png")),
+                ImageInputFormat::Tiff,
+                ImageDimensions::new(17, 13)?,
+            )?;
+            let mut file_bytes = Vec::new();
+            let mut decoded_buf = Vec::new();
+            let roundtrip = decode_image_into(
+                &item,
+                DecodeTargetHint::Native,
+                &mut file_bytes,
+                &mut decoded_buf,
+            )?;
+            assert_eq!(roundtrip.format, DecodedPixelFormat::Rgb8);
+            assert_eq!(&decoded_buf[..roundtrip.byte_len], pixels.as_slice());
+        }
 
         fs::remove_dir_all(&dir)?;
         Ok(())
@@ -1245,85 +1502,218 @@ mod tests {
         let mut file_bytes = Vec::new();
         let mut decoded_buf = Vec::new();
 
-        for (name, format, channels) in [
-            ("l8.jxl", DecodedPixelFormat::L8, 1_usize),
-            ("la8.jxl", DecodedPixelFormat::La8, 2_usize),
-            ("rgb8.jxl", DecodedPixelFormat::Rgb8, 3_usize),
-            ("rgba8.jxl", DecodedPixelFormat::Rgba8, 4_usize),
+        for level in [
+            CompressionLevel::Fast,
+            CompressionLevel::Balanced,
+            CompressionLevel::Best,
         ] {
-            let pixels: Vec<u8> = (0..16 * 16 * channels)
-                .map(|i| u8::try_from((i * 31 + 11) % 256).unwrap_or(0))
+            for (name, format, channels) in [
+                ("l8.jxl", DecodedPixelFormat::L8, 1_usize),
+                ("la8.jxl", DecodedPixelFormat::La8, 2_usize),
+                ("rgb8.jxl", DecodedPixelFormat::Rgb8, 3_usize),
+                ("rgba8.jxl", DecodedPixelFormat::Rgba8, 4_usize),
+            ] {
+                let pixels: Vec<u8> = (0..16 * 16 * channels)
+                    .map(|i| u8::try_from((i * 31 + 11) % 256).unwrap_or(0))
+                    .collect();
+                let meta = DecodedFrameMeta {
+                    width: 16,
+                    height: 16,
+                    format,
+                    byte_len: pixels.len(),
+                    input_file_bytes: 1,
+                    has_non_opaque_native_alpha: false,
+                };
+                let target = dir.join(format!("{level:?}_{name}"));
+                let encoded =
+                    encode_jxl_into(&target, ImageCompression::Lossless, level, &pixels, meta, 1)?;
+                fs::write(&target, &encoded)?;
+
+                let item = ImageBatchItem::new(
+                    target,
+                    dir.join(format!("{level:?}_{name}.out.png")),
+                    ImageInputFormat::Jxl,
+                    ImageDimensions::new(16, 16)?,
+                )?;
+                let roundtrip = decode_image_into(
+                    &item,
+                    DecodeTargetHint::Native,
+                    &mut file_bytes,
+                    &mut decoded_buf,
+                )?;
+                assert_eq!(roundtrip.width, 16);
+                assert_eq!(roundtrip.height, 16);
+                assert_eq!(roundtrip.format, format);
+                assert_eq!(roundtrip.byte_len, pixels.len());
+                assert_eq!(&decoded_buf[..roundtrip.byte_len], pixels.as_slice());
+            }
+
+            let lossy_pixels: Vec<u8> = (0..16 * 16 * 3)
+                .map(|i| u8::try_from((i * 17) % 256).unwrap_or(0))
                 .collect();
-            let meta = DecodedFrameMeta {
+            let lossy_meta = DecodedFrameMeta {
                 width: 16,
                 height: 16,
-                format,
-                byte_len: pixels.len(),
+                format: DecodedPixelFormat::Rgb8,
+                byte_len: lossy_pixels.len(),
                 input_file_bytes: 1,
                 has_non_opaque_native_alpha: false,
             };
-            let target = dir.join(name);
-            let encoded = encode_jxl_into(&target, ImageCompression::Lossless, &pixels, meta, 1)?;
-            fs::write(&target, &encoded)?;
-
-            let item = ImageBatchItem::new(
-                target,
-                dir.join(format!("{name}.out.png")),
+            let lossy_target = dir.join(format!("{level:?}_lossy.jxl"));
+            let lossy_encoded = encode_jxl_into(
+                &lossy_target,
+                ImageCompression::Lossy {
+                    quality: ImageQuality::new(80)?,
+                },
+                level,
+                &lossy_pixels,
+                lossy_meta,
+                1,
+            )?;
+            fs::write(&lossy_target, &lossy_encoded)?;
+            let lossy_item = ImageBatchItem::new(
+                lossy_target,
+                dir.join(format!("{level:?}_lossy.out.png")),
                 ImageInputFormat::Jxl,
                 ImageDimensions::new(16, 16)?,
             )?;
-            let roundtrip = decode_image_into(
-                &item,
+            let lossy_roundtrip = decode_image_into(
+                &lossy_item,
                 DecodeTargetHint::Native,
                 &mut file_bytes,
                 &mut decoded_buf,
             )?;
-            assert_eq!(roundtrip.width, 16);
-            assert_eq!(roundtrip.height, 16);
-            assert_eq!(roundtrip.format, format);
-            assert_eq!(roundtrip.byte_len, pixels.len());
-            assert_eq!(&decoded_buf[..roundtrip.byte_len], pixels.as_slice());
+            assert_eq!(lossy_roundtrip.width, 16);
+            assert_eq!(lossy_roundtrip.height, 16);
+            assert_eq!(lossy_roundtrip.format, DecodedPixelFormat::Rgb8);
         }
 
-        let lossy_pixels: Vec<u8> = (0..16 * 16 * 3)
-            .map(|i| u8::try_from((i * 17) % 256).unwrap_or(0))
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn png_levels_roundtrip_exactly_and_spend_more_effort_for_smaller_output()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Cursor;
+
+        let width = 64_usize;
+        let height = 48_usize;
+        let pixels: Vec<u8> = (0..height * width * 3)
+            .map(|i| u8::try_from((i / 3 % 16) * 13 + (i % 3) * 7).unwrap_or(0))
             .collect();
-        let lossy_meta = DecodedFrameMeta {
-            width: 16,
-            height: 16,
+        let meta = DecodedFrameMeta {
+            width: u32::try_from(width)?,
+            height: u32::try_from(height)?,
             format: DecodedPixelFormat::Rgb8,
-            byte_len: lossy_pixels.len(),
+            byte_len: pixels.len(),
             input_file_bytes: 1,
             has_non_opaque_native_alpha: false,
         };
-        let lossy_target = dir.join("lossy.jxl");
-        let lossy_encoded = encode_jxl_into(
-            &lossy_target,
-            ImageCompression::Lossy {
-                quality: ImageQuality::new(80)?,
-            },
-            &lossy_pixels,
-            lossy_meta,
-            1,
-        )?;
-        fs::write(&lossy_target, &lossy_encoded)?;
-        let lossy_item = ImageBatchItem::new(
-            lossy_target,
-            dir.join("lossy.out.png"),
-            ImageInputFormat::Jxl,
-            ImageDimensions::new(16, 16)?,
-        )?;
-        let lossy_roundtrip = decode_image_into(
-            &lossy_item,
-            DecodeTargetHint::Native,
-            &mut file_bytes,
-            &mut decoded_buf,
-        )?;
-        assert_eq!(lossy_roundtrip.width, 16);
-        assert_eq!(lossy_roundtrip.height, 16);
-        assert_eq!(lossy_roundtrip.format, DecodedPixelFormat::Rgb8);
 
-        fs::remove_dir_all(&dir)?;
+        let mut sizes = Vec::new();
+        for level in [
+            CompressionLevel::Fast,
+            CompressionLevel::Balanced,
+            CompressionLevel::Best,
+        ] {
+            let mut encoded = Vec::new();
+            let written =
+                encode_png_to_writer(Path::new("levels.png"), &pixels, meta, level, &mut encoded)?;
+            assert_eq!(usize::try_from(written)?, encoded.len());
+
+            let mut reader = png::Decoder::new(Cursor::new(&encoded))
+                .read_info()
+                .map_err(|err| format!("invalid PNG at {level}: {err}"))?;
+            let mut decoded = vec![0_u8; reader.output_buffer_size().ok_or("PNG buffer")?];
+            let frame = reader
+                .next_frame(&mut decoded)
+                .map_err(|err| format!("failed to decode PNG at {level}: {err}"))?;
+            decoded.truncate(frame.buffer_size());
+            assert_eq!(decoded, pixels, "pixel-exact PNG roundtrip at {level}");
+            sizes.push(encoded.len());
+        }
+        assert!(
+            sizes[2] <= sizes[0],
+            "Best PNG should be <= Fast PNG: {sizes:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn webp_levels_roundtrip_lossy_and_lossless() -> Result<(), Box<dyn std::error::Error>> {
+        use super::encode_webp_into;
+        use fastconv_domain::ImageCompression;
+
+        let rgb: Vec<u8> = (0..32_usize * 24 * 3)
+            .map(|i| u8::try_from((i * 11) % 256).unwrap_or(0))
+            .collect();
+        let rgba: Vec<u8> = rgb
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &[r, g, b])| [r, g, b, if i % 5 == 0 { 128 } else { 255 }])
+            .collect();
+        let opaque_meta = DecodedFrameMeta {
+            width: 32,
+            height: 24,
+            format: DecodedPixelFormat::Rgb8,
+            byte_len: rgb.len(),
+            input_file_bytes: 1,
+            has_non_opaque_native_alpha: false,
+        };
+        let alpha_meta = DecodedFrameMeta {
+            width: 32,
+            height: 24,
+            format: DecodedPixelFormat::Rgba8,
+            byte_len: rgba.len(),
+            input_file_bytes: 1,
+            has_non_opaque_native_alpha: true,
+        };
+
+        for level in [
+            CompressionLevel::Fast,
+            CompressionLevel::Balanced,
+            CompressionLevel::Best,
+        ] {
+            let mut lossless = Vec::new();
+            encode_webp_into(
+                Path::new("lossless.webp"),
+                ImageCompression::Lossless,
+                level,
+                &rgba,
+                alpha_meta,
+                &mut lossless,
+            )?;
+            let (decoded_rgba, w, h) = zenwebp::oneshot::decode_rgba(&lossless)?;
+            assert_eq!((w, h), (32, 24));
+            assert_eq!(decoded_rgba, rgba, "lossless WebP at {level}");
+
+            let mut lossy = Vec::new();
+            encode_webp_into(
+                Path::new("lossy.webp"),
+                ImageCompression::Lossy {
+                    quality: ImageQuality::new(85)?,
+                },
+                level,
+                &rgb,
+                opaque_meta,
+                &mut lossy,
+            )?;
+            let (decoded_rgb, w, h) = zenwebp::oneshot::decode_rgb(&lossy)?;
+            assert_eq!((w, h), (32, 24));
+            assert_eq!(decoded_rgb.len(), rgb.len());
+            let diff: u64 = decoded_rgb
+                .iter()
+                .zip(&rgb)
+                .map(|(&a, &b)| u64::from(a.abs_diff(b)))
+                .sum();
+            assert!(
+                diff < u64::try_from(rgb.len())? * 24,
+                "lossy WebP at {level} diverged too far"
+            );
+        }
         Ok(())
     }
 }

@@ -12,8 +12,9 @@ pub use hardware::{
     CpuInfo, DetectedGpuBackend, GpuAdapterInfo, GpuCapability, GpuVendor, HostHardware, SimdLevel,
 };
 pub use image::{
-    ImageBatchItem, ImageBatchPlan, ImageCompression, ImageConversionReport, ImageDimensions,
-    ImageExecutionMode, ImageInputFormat, ImageOutputFormat, ImageQuality,
+    ChromaSubsampling, CompressionLevel, ImageBatchItem, ImageBatchPlan, ImageCompression,
+    ImageConversionReport, ImageDimensions, ImageEncodeOptions, ImageExecutionMode,
+    ImageInputFormat, ImageOutputFormat, ImageQuality, TiffCompression, TiffCompressionKind,
 };
 pub use metrics::{BenchmarkMetrics, BenchmarkSample, PeakMemory, Throughput, WorkloadUnit};
 pub use video::{

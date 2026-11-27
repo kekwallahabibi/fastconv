@@ -185,6 +185,98 @@ impl fmt::Display for ImageCompression {
     }
 }
 
+/// Effort/speed tradeoff for image encoders that expose multiple compression levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum CompressionLevel {
+    Fast,
+    Balanced,
+    Best,
+}
+
+impl fmt::Display for CompressionLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Fast => "fast",
+            Self::Balanced => "balanced",
+            Self::Best => "best",
+        };
+        f.write_str(label)
+    }
+}
+
+/// User-selected TIFF compression family, before an effort level is resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum TiffCompressionKind {
+    Deflate,
+    Lzw,
+    Packbits,
+    None,
+}
+
+impl fmt::Display for TiffCompressionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Deflate => "deflate",
+            Self::Lzw => "lzw",
+            Self::Packbits => "packbits",
+            Self::None => "none",
+        };
+        f.write_str(label)
+    }
+}
+
+/// Validated TIFF compression, making `CompressionLevel` + non-Deflate combinations
+/// compile-time unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum TiffCompression {
+    Deflate { level: CompressionLevel },
+    Lzw,
+    Packbits,
+    None,
+}
+
+impl TiffCompression {
+    pub const DEFAULT: Self = Self::Deflate {
+        level: CompressionLevel::Fast,
+    };
+}
+
+impl fmt::Display for TiffCompression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Deflate { level } => write!(f, "deflate level={level}"),
+            Self::Lzw => f.write_str("lzw"),
+            Self::Packbits => f.write_str("packbits"),
+            Self::None => f.write_str("none"),
+        }
+    }
+}
+
+/// Chroma subsampling for formats that expose a 4:2:0 / 4:4:4 choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum ChromaSubsampling {
+    Yuv420,
+    Yuv444,
+}
+
+impl fmt::Display for ChromaSubsampling {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Yuv420 => "4:2:0",
+            Self::Yuv444 => "4:4:4",
+        };
+        f.write_str(label)
+    }
+}
+
+/// Optional encoder controls validated once at the probe boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
+pub struct ImageEncodeOptions {
+    pub compression_level: Option<CompressionLevel>,
+    pub tiff_compression: Option<TiffCompressionKind>,
+    pub chroma: Option<ChromaSubsampling>,
+}
+
 /// Compile-time-legal combination of output image format, codec mode, and hardware backend.
 ///
 /// Illegal pairings (e.g. NVENC + WebP/JPEG/PNG/BMP/QOI/TIFF/JXL/AVIF/GIF/ICO/PNM,
@@ -192,18 +284,37 @@ impl fmt::Display for ImageCompression {
 /// PNG/BMP/QOI/TIFF/ICO/PNM, or hardware-absent video encoder backends) cannot be constructed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum ImageExecutionMode {
-    CpuWebp(ImageCompression),
-    CpuJpeg { quality: ImageQuality },
-    CpuPng,
+    CpuWebp {
+        compression: ImageCompression,
+        level: CompressionLevel,
+    },
+    CpuJpeg {
+        quality: ImageQuality,
+        chroma: ChromaSubsampling,
+    },
+    CpuPng {
+        level: CompressionLevel,
+    },
     CpuBmp,
     CpuQoi,
-    CpuTiff,
-    CpuJxl(ImageCompression),
-    CpuAvif { quality: ImageQuality },
+    CpuTiff {
+        compression: TiffCompression,
+    },
+    CpuJxl {
+        compression: ImageCompression,
+        level: CompressionLevel,
+    },
+    CpuAvif {
+        quality: ImageQuality,
+        level: CompressionLevel,
+        chroma: ChromaSubsampling,
+    },
     CpuGif,
     CpuIco,
     CpuPnm,
-    NvencHeic { quality: ImageQuality },
+    NvencHeic {
+        quality: ImageQuality,
+    },
 }
 
 impl ImageExecutionMode {
@@ -211,82 +322,164 @@ impl ImageExecutionMode {
     ///
     /// When `compression` is `None`, selects the natural default for `format` (lossy quality 80
     /// for WebP/JPEG/JXL/AVIF, lossless for PNG/BMP/QOI/TIFF/ICO/PNM, and indexed 256-color
-    /// quantization for GIF).
+    /// quantization for GIF). Omitted encoder options keep the pre-existing encoder defaults.
     ///
     /// # Errors
     ///
-    /// Returns [`DomainError::UnsupportedImagePipeline`] if `format` has no native CPU encoder
-    /// or the explicitly requested compression mode is incompatible with `format`.
+    /// Returns [`DomainError::UnsupportedImagePipeline`] if `format` has no native CPU encoder,
+    /// the compression mode is incompatible with `format`, or an encoder option is not supported.
     pub fn resolve_cpu(
         format: ImageOutputFormat,
         compression: Option<ImageCompression>,
     ) -> Result<Self, DomainError> {
+        Self::resolve_cpu_with_options(format, compression, ImageEncodeOptions::default())
+    }
+
+    /// Resolves a CPU-only [`ImageExecutionMode`] with explicit encoder options.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::UnsupportedImagePipeline`] for incompatible compression modes or
+    /// encoder options; see [`validate_encode_options`].
+    pub fn resolve_cpu_with_options(
+        format: ImageOutputFormat,
+        compression: Option<ImageCompression>,
+        options: ImageEncodeOptions,
+    ) -> Result<Self, DomainError> {
+        validate_encode_options(format, HardwareBackend::Cpu, options)?;
+        Self::resolve_cpu_validated(format, compression, options)
+    }
+
+    fn resolve_cpu_validated(
+        format: ImageOutputFormat,
+        compression: Option<ImageCompression>,
+        options: ImageEncodeOptions,
+    ) -> Result<Self, DomainError> {
         match format {
-            ImageOutputFormat::Webp => Ok(Self::CpuWebp(compression.unwrap_or(
-                ImageCompression::Lossy {
-                    quality: ImageQuality::DEFAULT,
-                },
-            ))),
-            ImageOutputFormat::Jpeg => match compression {
-                None => Ok(Self::CpuJpeg {
-                    quality: ImageQuality::DEFAULT,
-                }),
-                Some(ImageCompression::Lossy { quality }) => Ok(Self::CpuJpeg { quality }),
-                Some(ImageCompression::Lossless) => Err(DomainError::UnsupportedImagePipeline {
-                    format,
-                    backend: HardwareBackend::Cpu,
-                    reason:
-                        "JPEG is a lossy format and does not support --lossless; use --quality 0..=100"
-                            .to_owned(),
-                }),
-            },
-            ImageOutputFormat::Png => resolve_lossless_only_cpu(format, "PNG", compression, Self::CpuPng),
-            ImageOutputFormat::Bmp => resolve_lossless_only_cpu(format, "BMP", compression, Self::CpuBmp),
-            ImageOutputFormat::Qoi => resolve_lossless_only_cpu(format, "QOI", compression, Self::CpuQoi),
-            ImageOutputFormat::Tiff => {
-                resolve_lossless_only_cpu(format, "TIFF", compression, Self::CpuTiff)
+            ImageOutputFormat::Webp => Ok(Self::webp_mode(compression, options)),
+            ImageOutputFormat::Jxl => Ok(Self::jxl_mode(compression, options)),
+            ImageOutputFormat::Jpeg => Self::jpeg_mode(compression, options),
+            ImageOutputFormat::Png => resolve_lossless_only_cpu(
+                format,
+                "PNG",
+                compression,
+                Self::png_mode(options),
+            ),
+            ImageOutputFormat::Bmp => {
+                resolve_lossless_only_cpu(format, "BMP", compression, Self::CpuBmp)
             }
-            ImageOutputFormat::Jxl => Ok(Self::CpuJxl(compression.unwrap_or(
-                ImageCompression::Lossy {
-                    quality: ImageQuality::DEFAULT,
-                },
-            ))),
-            ImageOutputFormat::Avif => match compression {
-                None => Ok(Self::CpuAvif {
-                    quality: ImageQuality::DEFAULT,
-                }),
-                Some(ImageCompression::Lossy { quality }) => Ok(Self::CpuAvif { quality }),
-                Some(ImageCompression::Lossless) => Err(DomainError::UnsupportedImagePipeline {
-                    format,
-                    backend: HardwareBackend::Cpu,
-                    reason:
-                        "AVIF via ravif is lossy-only and does not support --lossless; use --quality 0..=100"
-                            .to_owned(),
-                }),
-            },
-            ImageOutputFormat::Gif => match compression {
-                None => Ok(Self::CpuGif),
-                Some(ImageCompression::Lossy { .. }) => Err(DomainError::UnsupportedImagePipeline {
-                    format,
-                    backend: HardwareBackend::Cpu,
-                    reason: "GIF uses fixed 256-color palette quantization and does not accept --quality; omit --quality".to_owned(),
-                }),
-                Some(ImageCompression::Lossless) => Err(DomainError::UnsupportedImagePipeline {
-                    format,
-                    backend: HardwareBackend::Cpu,
-                    reason: "GIF is limited to a 256-color palette and cannot guarantee lossless encoding for truecolor images; omit --lossless".to_owned(),
-                }),
-            },
+            ImageOutputFormat::Qoi => {
+                resolve_lossless_only_cpu(format, "QOI", compression, Self::CpuQoi)
+            }
+            ImageOutputFormat::Tiff => resolve_lossless_only_cpu(
+                format,
+                "TIFF",
+                compression,
+                Self::tiff_mode(options),
+            ),
+            ImageOutputFormat::Avif => Self::avif_mode(compression, options),
             ImageOutputFormat::Ico => {
                 resolve_lossless_only_cpu(format, "ICO", compression, Self::CpuIco)
             }
             ImageOutputFormat::Pnm => {
                 resolve_lossless_only_cpu(format, "PNM", compression, Self::CpuPnm)
             }
+            ImageOutputFormat::Gif => Self::gif_mode(compression),
             ImageOutputFormat::Heic => Err(DomainError::UnsupportedImagePipeline {
                 format,
                 backend: HardwareBackend::Cpu,
                 reason: "no native CPU HEVC encoder is implemented for .heic; use --backend nvenc on NVIDIA hardware".to_owned(),
+            }),
+        }
+    }
+
+    fn webp_mode(compression: Option<ImageCompression>, options: ImageEncodeOptions) -> Self {
+        Self::CpuWebp {
+            compression: compression.unwrap_or(default_lossy()),
+            level: options
+                .compression_level
+                .unwrap_or(CompressionLevel::Balanced),
+        }
+    }
+
+    fn jxl_mode(compression: Option<ImageCompression>, options: ImageEncodeOptions) -> Self {
+        Self::CpuJxl {
+            compression: compression.unwrap_or(default_lossy()),
+            level: options.compression_level.unwrap_or(CompressionLevel::Fast),
+        }
+    }
+
+    fn jpeg_mode(
+        compression: Option<ImageCompression>,
+        options: ImageEncodeOptions,
+    ) -> Result<Self, DomainError> {
+        let quality = match compression {
+            None => ImageQuality::DEFAULT,
+            Some(ImageCompression::Lossy { quality }) => quality,
+            Some(ImageCompression::Lossless) => {
+                return Err(DomainError::UnsupportedImagePipeline {
+                    format: ImageOutputFormat::Jpeg,
+                    backend: HardwareBackend::Cpu,
+                    reason: "JPEG is a lossy format and does not support --lossless; use --quality 0..=100".to_owned(),
+                });
+            }
+        };
+        Ok(Self::CpuJpeg {
+            chroma: options
+                .chroma
+                .unwrap_or_else(|| default_jpeg_chroma(quality)),
+            quality,
+        })
+    }
+
+    fn png_mode(options: ImageEncodeOptions) -> Self {
+        Self::CpuPng {
+            level: options.compression_level.unwrap_or(CompressionLevel::Fast),
+        }
+    }
+
+    fn tiff_mode(options: ImageEncodeOptions) -> Self {
+        Self::CpuTiff {
+            compression: resolve_tiff_compression(options),
+        }
+    }
+
+    fn avif_mode(
+        compression: Option<ImageCompression>,
+        options: ImageEncodeOptions,
+    ) -> Result<Self, DomainError> {
+        let quality = match compression {
+            None => ImageQuality::DEFAULT,
+            Some(ImageCompression::Lossy { quality }) => quality,
+            Some(ImageCompression::Lossless) => {
+                return Err(DomainError::UnsupportedImagePipeline {
+                    format: ImageOutputFormat::Avif,
+                    backend: HardwareBackend::Cpu,
+                    reason:
+                        "AVIF is lossy-only and does not support --lossless; use --quality 0..=100"
+                            .to_owned(),
+                });
+            }
+        };
+        Ok(Self::CpuAvif {
+            quality,
+            level: options.compression_level.unwrap_or(CompressionLevel::Fast),
+            chroma: options.chroma.unwrap_or(ChromaSubsampling::Yuv420),
+        })
+    }
+
+    fn gif_mode(compression: Option<ImageCompression>) -> Result<Self, DomainError> {
+        match compression {
+            None => Ok(Self::CpuGif),
+            Some(ImageCompression::Lossy { .. }) => Err(DomainError::UnsupportedImagePipeline {
+                format: ImageOutputFormat::Gif,
+                backend: HardwareBackend::Cpu,
+                reason: "GIF uses fixed 256-color palette quantization and does not accept --quality; omit --quality".to_owned(),
+            }),
+            Some(ImageCompression::Lossless) => Err(DomainError::UnsupportedImagePipeline {
+                format: ImageOutputFormat::Gif,
+                backend: HardwareBackend::Cpu,
+                reason: "GIF is limited to a 256-color palette and cannot guarantee lossless encoding for truecolor images; omit --lossless".to_owned(),
             }),
         }
     }
@@ -299,15 +492,39 @@ impl ImageExecutionMode {
     /// # Errors
     ///
     /// Returns [`DomainError::UnsupportedImagePipeline`] if the requested combination of
-    /// format, compression mode, and backend is not supported on `hardware`.
+    /// format, compression mode, options, and backend is not supported on `hardware`.
     pub fn resolve(
         format: ImageOutputFormat,
         compression: Option<ImageCompression>,
         backend: HardwareBackend,
         hardware: &HostHardware,
     ) -> Result<Self, DomainError> {
+        Self::resolve_with_options(
+            format,
+            compression,
+            ImageEncodeOptions::default(),
+            backend,
+            hardware,
+        )
+    }
+
+    /// Resolves a validated [`ImageExecutionMode`] with explicit encoder options.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::UnsupportedImagePipeline`] for unsupported options or backends.
+    pub fn resolve_with_options(
+        format: ImageOutputFormat,
+        compression: Option<ImageCompression>,
+        options: ImageEncodeOptions,
+        backend: HardwareBackend,
+        hardware: &HostHardware,
+    ) -> Result<Self, DomainError> {
+        validate_encode_options(format, backend, options)?;
         match (format, backend) {
-            (format, HardwareBackend::Cpu) => Self::resolve_cpu(format, compression),
+            (format, HardwareBackend::Cpu) => {
+                Self::resolve_cpu_validated(format, compression, options)
+            }
             (ImageOutputFormat::Webp, HardwareBackend::Gpu(GpuBackend::Nvenc)) => Err(
                 nvenc_unsupported_image_error(format, "VP8/WebP", ".webp", hardware),
             ),
@@ -375,13 +592,13 @@ impl ImageExecutionMode {
     #[must_use]
     pub const fn output_format(self) -> ImageOutputFormat {
         match self {
-            Self::CpuWebp(_) => ImageOutputFormat::Webp,
+            Self::CpuWebp { .. } => ImageOutputFormat::Webp,
             Self::CpuJpeg { .. } => ImageOutputFormat::Jpeg,
-            Self::CpuPng => ImageOutputFormat::Png,
+            Self::CpuPng { .. } => ImageOutputFormat::Png,
             Self::CpuBmp => ImageOutputFormat::Bmp,
             Self::CpuQoi => ImageOutputFormat::Qoi,
-            Self::CpuTiff => ImageOutputFormat::Tiff,
-            Self::CpuJxl(_) => ImageOutputFormat::Jxl,
+            Self::CpuTiff { .. } => ImageOutputFormat::Tiff,
+            Self::CpuJxl { .. } => ImageOutputFormat::Jxl,
             Self::CpuAvif { .. } => ImageOutputFormat::Avif,
             Self::CpuGif => ImageOutputFormat::Gif,
             Self::CpuIco => ImageOutputFormat::Ico,
@@ -393,13 +610,13 @@ impl ImageExecutionMode {
     #[must_use]
     pub const fn backend(self) -> HardwareBackend {
         match self {
-            Self::CpuWebp(_)
+            Self::CpuWebp { .. }
             | Self::CpuJpeg { .. }
-            | Self::CpuPng
+            | Self::CpuPng { .. }
             | Self::CpuBmp
             | Self::CpuQoi
-            | Self::CpuTiff
-            | Self::CpuJxl(_)
+            | Self::CpuTiff { .. }
+            | Self::CpuJxl { .. }
             | Self::CpuAvif { .. }
             | Self::CpuGif
             | Self::CpuIco
@@ -412,14 +629,20 @@ impl ImageExecutionMode {
 impl fmt::Display for ImageExecutionMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CpuWebp(compression) => write!(f, "webp {compression}"),
-            Self::CpuJpeg { quality } => write!(f, "jpeg q={}", quality.get()),
-            Self::CpuPng => f.write_str("png lossless"),
+            Self::CpuWebp { compression, level } => write!(f, "webp {compression} level={level}"),
+            Self::CpuJpeg { quality, chroma } => {
+                write!(f, "jpeg q={} {chroma}", quality.get())
+            }
+            Self::CpuPng { level } => write!(f, "png lossless level={level}"),
             Self::CpuBmp => f.write_str("bmp lossless"),
             Self::CpuQoi => f.write_str("qoi lossless"),
-            Self::CpuTiff => f.write_str("tiff lossless"),
-            Self::CpuJxl(compression) => write!(f, "jxl {compression}"),
-            Self::CpuAvif { quality } => write!(f, "avif av1 q={}", quality.get()),
+            Self::CpuTiff { compression } => write!(f, "tiff lossless {compression}"),
+            Self::CpuJxl { compression, level } => write!(f, "jxl {compression} level={level}"),
+            Self::CpuAvif {
+                quality,
+                level,
+                chroma,
+            } => write!(f, "avif av1 q={} level={level} {chroma}", quality.get()),
             Self::CpuGif => f.write_str("gif indexed"),
             Self::CpuIco => f.write_str("ico lossless"),
             Self::CpuPnm => f.write_str("pnm lossless"),
@@ -428,6 +651,105 @@ impl fmt::Display for ImageExecutionMode {
             }
         }
     }
+}
+
+const fn default_lossy() -> ImageCompression {
+    ImageCompression::Lossy {
+        quality: ImageQuality::DEFAULT,
+    }
+}
+
+/// `jpeg-encoder 0.7.1` downsamples chroma below quality 90 and uses 4:4:4 above it.
+const fn default_jpeg_chroma(quality: ImageQuality) -> ChromaSubsampling {
+    if quality.get() < 90 {
+        ChromaSubsampling::Yuv420
+    } else {
+        ChromaSubsampling::Yuv444
+    }
+}
+
+fn resolve_tiff_compression(options: ImageEncodeOptions) -> TiffCompression {
+    match options
+        .tiff_compression
+        .unwrap_or(TiffCompressionKind::Deflate)
+    {
+        TiffCompressionKind::Deflate => TiffCompression::Deflate {
+            level: options.compression_level.unwrap_or(CompressionLevel::Fast),
+        },
+        TiffCompressionKind::Lzw => TiffCompression::Lzw,
+        TiffCompressionKind::Packbits => TiffCompression::Packbits,
+        TiffCompressionKind::None => TiffCompression::None,
+    }
+}
+
+/// Validates optional encoder controls exactly once, before any mode is constructed.
+///
+/// GPU execution never exposes these CPU encoder knobs; TIFF compression is exclusive to
+/// Deflate-capable CPU TIFF, effort only applies to encoders with multiple speed presets, and
+/// chroma subsampling only applies to JPEG and AVIF.
+fn validate_encode_options(
+    format: ImageOutputFormat,
+    backend: HardwareBackend,
+    options: ImageEncodeOptions,
+) -> Result<(), DomainError> {
+    let cpu = HardwareBackend::Cpu;
+    if options.tiff_compression.is_some() && (backend != cpu || format != ImageOutputFormat::Tiff) {
+        return Err(DomainError::UnsupportedImagePipeline {
+            format,
+            backend,
+            reason: "--tiff-compression is only supported for .tiff on the cpu backend".to_owned(),
+        });
+    }
+    if options.compression_level.is_some() {
+        if backend != cpu {
+            return Err(DomainError::UnsupportedImagePipeline {
+                format,
+                backend,
+                reason: "--compression-level is a cpu encoder option and is not supported on gpu backends".to_owned(),
+            });
+        }
+        if format == ImageOutputFormat::Tiff
+            && matches!(
+                options.tiff_compression,
+                Some(
+                    TiffCompressionKind::Lzw
+                        | TiffCompressionKind::Packbits
+                        | TiffCompressionKind::None
+                )
+            )
+        {
+            return Err(DomainError::UnsupportedImagePipeline {
+                format,
+                backend,
+                reason: "TIFF compression does not accept --compression-level; use --tiff-compression deflate or omit --compression-level".to_owned(),
+            });
+        }
+        if !matches!(
+            format,
+            ImageOutputFormat::Png
+                | ImageOutputFormat::Webp
+                | ImageOutputFormat::Jxl
+                | ImageOutputFormat::Avif
+                | ImageOutputFormat::Tiff
+        ) {
+            return Err(DomainError::UnsupportedImagePipeline {
+                format,
+                backend,
+                reason: "--compression-level (fast|balanced|best) is only supported for png, webp, jxl, avif, and deflate-compressed tiff".to_owned(),
+            });
+        }
+    }
+    if options.chroma.is_some()
+        && (backend != cpu || !matches!(format, ImageOutputFormat::Jpeg | ImageOutputFormat::Avif))
+    {
+        return Err(DomainError::UnsupportedImagePipeline {
+            format,
+            backend,
+            reason: "--chroma (420|444) is only supported for jpeg and avif on the cpu backend"
+                .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn resolve_lossless_only_cpu(
@@ -700,8 +1022,9 @@ impl ImageConversionReport {
 #[cfg(test)]
 mod tests {
     use super::{
-        ImageBatchItem, ImageBatchPlan, ImageCompression, ImageDimensions, ImageExecutionMode,
-        ImageInputFormat, ImageOutputFormat, ImageQuality,
+        ChromaSubsampling, CompressionLevel, ImageBatchItem, ImageBatchPlan, ImageCompression,
+        ImageDimensions, ImageEncodeOptions, ImageExecutionMode, ImageInputFormat,
+        ImageOutputFormat, ImageQuality, TiffCompression, TiffCompressionKind,
     };
     use crate::{
         CpuInfo, DetectedGpuBackend, DomainError, GpuAdapterInfo, GpuBackend, GpuCapability,
@@ -759,8 +1082,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_valid_cpu_and_nvenc_modes_including_defaults() -> Result<(), DomainError> {
-        let rtx = rtx_2060_hardware()?;
+    fn resolves_valid_cpu_modes_including_defaults() -> Result<(), DomainError> {
         let cpu_only = cpu_only_hardware()?;
         let lossy = Some(ImageCompression::Lossy {
             quality: ImageQuality::DEFAULT,
@@ -773,9 +1095,12 @@ mod tests {
                 HardwareBackend::Cpu,
                 &cpu_only
             )?,
-            ImageExecutionMode::CpuWebp(ImageCompression::Lossy {
-                quality: ImageQuality::DEFAULT
-            })
+            ImageExecutionMode::CpuWebp {
+                compression: ImageCompression::Lossy {
+                    quality: ImageQuality::DEFAULT,
+                },
+                level: CompressionLevel::Balanced,
+            }
         );
         assert_eq!(
             ImageExecutionMode::resolve(
@@ -784,9 +1109,12 @@ mod tests {
                 HardwareBackend::Cpu,
                 &cpu_only
             )?,
-            ImageExecutionMode::CpuWebp(ImageCompression::Lossy {
-                quality: ImageQuality::DEFAULT
-            })
+            ImageExecutionMode::CpuWebp {
+                compression: ImageCompression::Lossy {
+                    quality: ImageQuality::DEFAULT,
+                },
+                level: CompressionLevel::Balanced,
+            }
         );
         assert_eq!(
             ImageExecutionMode::resolve(
@@ -796,7 +1124,8 @@ mod tests {
                 &cpu_only
             )?,
             ImageExecutionMode::CpuJpeg {
-                quality: ImageQuality::DEFAULT
+                quality: ImageQuality::DEFAULT,
+                chroma: ChromaSubsampling::Yuv420,
             }
         );
         assert_eq!(
@@ -806,7 +1135,9 @@ mod tests {
                 HardwareBackend::Cpu,
                 &cpu_only
             )?,
-            ImageExecutionMode::CpuPng
+            ImageExecutionMode::CpuPng {
+                level: CompressionLevel::Fast,
+            }
         );
         assert_eq!(
             ImageExecutionMode::resolve(
@@ -815,7 +1146,9 @@ mod tests {
                 HardwareBackend::Cpu,
                 &cpu_only
             )?,
-            ImageExecutionMode::CpuPng
+            ImageExecutionMode::CpuPng {
+                level: CompressionLevel::Fast,
+            }
         );
         assert_eq!(
             ImageExecutionMode::resolve(
@@ -835,6 +1168,15 @@ mod tests {
             )?,
             ImageExecutionMode::CpuQoi
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_nvenc_heic_defaults() -> Result<(), DomainError> {
+        let rtx = rtx_2060_hardware()?;
+        let lossy = Some(ImageCompression::Lossy {
+            quality: ImageQuality::DEFAULT,
+        });
         assert_eq!(
             ImageExecutionMode::resolve(
                 ImageOutputFormat::Heic,
@@ -1079,23 +1421,35 @@ mod tests {
                 HardwareBackend::Cpu,
                 &cpu_only
             )?,
-            ImageExecutionMode::CpuJxl(ImageCompression::Lossy {
-                quality: ImageQuality::DEFAULT
-            })
+            ImageExecutionMode::CpuJxl {
+                compression: ImageCompression::Lossy {
+                    quality: ImageQuality::DEFAULT,
+                },
+                level: CompressionLevel::Fast,
+            }
         );
         assert_eq!(
             ImageExecutionMode::CpuAvif {
-                quality: ImageQuality::DEFAULT
+                quality: ImageQuality::DEFAULT,
+                level: CompressionLevel::Fast,
+                chroma: ChromaSubsampling::Yuv420,
             }
             .output_format(),
             ImageOutputFormat::Avif
         );
         assert_eq!(
-            ImageExecutionMode::CpuJxl(ImageCompression::Lossless).output_format(),
+            ImageExecutionMode::CpuJxl {
+                compression: ImageCompression::Lossless,
+                level: CompressionLevel::Fast,
+            }
+            .output_format(),
             ImageOutputFormat::Jxl
         );
         assert_eq!(
-            ImageExecutionMode::CpuTiff.output_format(),
+            ImageExecutionMode::CpuTiff {
+                compression: TiffCompression::DEFAULT,
+            }
+            .output_format(),
             ImageOutputFormat::Tiff
         );
 
@@ -1190,9 +1544,12 @@ mod tests {
         let requested_workers = NonZeroUsize::new(8).ok_or(DomainError::EmptyBatch)?;
         let plan = ImageBatchPlan::new(
             valid_items,
-            ImageExecutionMode::CpuWebp(ImageCompression::Lossy {
-                quality: ImageQuality::DEFAULT,
-            }),
+            ImageExecutionMode::CpuWebp {
+                compression: ImageCompression::Lossy {
+                    quality: ImageQuality::DEFAULT,
+                },
+                level: CompressionLevel::Balanced,
+            },
             requested_workers,
         )?;
 
@@ -1238,7 +1595,10 @@ mod tests {
     #[test]
     fn rejects_empty_batch_duplicate_targets_and_source_overwrite() -> Result<(), DomainError> {
         let workers = NonZeroUsize::MIN;
-        let lossless = ImageExecutionMode::CpuWebp(ImageCompression::Lossless);
+        let lossless = ImageExecutionMode::CpuWebp {
+            compression: ImageCompression::Lossless,
+            level: CompressionLevel::Balanced,
+        };
         assert_eq!(
             ImageBatchPlan::new(Vec::new(), lossless, workers),
             Err(DomainError::EmptyBatch)
@@ -1523,6 +1883,434 @@ mod tests {
         assert_eq!(plan.items()[3].input_format(), ImageInputFormat::Pnm);
         assert_eq!(plan.output_format(), ImageOutputFormat::Gif);
         assert_eq!(plan.backend(), HardwareBackend::Cpu);
+        Ok(())
+    }
+
+    #[test]
+    fn new_encoder_types_display_exact_labels() {
+        assert_eq!(CompressionLevel::Fast.to_string(), "fast");
+        assert_eq!(CompressionLevel::Balanced.to_string(), "balanced");
+        assert_eq!(CompressionLevel::Best.to_string(), "best");
+
+        assert_eq!(TiffCompressionKind::Deflate.to_string(), "deflate");
+        assert_eq!(TiffCompressionKind::Lzw.to_string(), "lzw");
+        assert_eq!(TiffCompressionKind::Packbits.to_string(), "packbits");
+        assert_eq!(TiffCompressionKind::None.to_string(), "none");
+
+        assert_eq!(
+            TiffCompression::DEFAULT,
+            TiffCompression::Deflate {
+                level: CompressionLevel::Fast,
+            }
+        );
+        assert_eq!(TiffCompression::DEFAULT.to_string(), "deflate level=fast");
+        assert_eq!(
+            TiffCompression::Deflate {
+                level: CompressionLevel::Best,
+            }
+            .to_string(),
+            "deflate level=best"
+        );
+        assert_eq!(TiffCompression::Lzw.to_string(), "lzw");
+        assert_eq!(TiffCompression::Packbits.to_string(), "packbits");
+        assert_eq!(TiffCompression::None.to_string(), "none");
+
+        assert_eq!(ChromaSubsampling::Yuv420.to_string(), "4:2:0");
+        assert_eq!(ChromaSubsampling::Yuv444.to_string(), "4:4:4");
+        assert_eq!(
+            ImageEncodeOptions::default(),
+            ImageEncodeOptions {
+                compression_level: None,
+                tiff_compression: None,
+                chroma: None,
+            }
+        );
+    }
+
+    #[test]
+    fn every_format_resolves_the_documented_encoder_defaults() -> Result<(), DomainError> {
+        for (format, expected) in [
+            (
+                ImageOutputFormat::Webp,
+                ImageExecutionMode::CpuWebp {
+                    compression: ImageCompression::Lossy {
+                        quality: ImageQuality::DEFAULT,
+                    },
+                    level: CompressionLevel::Balanced,
+                },
+            ),
+            (
+                ImageOutputFormat::Jpeg,
+                ImageExecutionMode::CpuJpeg {
+                    quality: ImageQuality::DEFAULT,
+                    chroma: ChromaSubsampling::Yuv420,
+                },
+            ),
+            (
+                ImageOutputFormat::Png,
+                ImageExecutionMode::CpuPng {
+                    level: CompressionLevel::Fast,
+                },
+            ),
+            (ImageOutputFormat::Bmp, ImageExecutionMode::CpuBmp),
+            (ImageOutputFormat::Qoi, ImageExecutionMode::CpuQoi),
+            (
+                ImageOutputFormat::Tiff,
+                ImageExecutionMode::CpuTiff {
+                    compression: TiffCompression::DEFAULT,
+                },
+            ),
+            (
+                ImageOutputFormat::Jxl,
+                ImageExecutionMode::CpuJxl {
+                    compression: ImageCompression::Lossy {
+                        quality: ImageQuality::DEFAULT,
+                    },
+                    level: CompressionLevel::Fast,
+                },
+            ),
+            (
+                ImageOutputFormat::Avif,
+                ImageExecutionMode::CpuAvif {
+                    quality: ImageQuality::DEFAULT,
+                    level: CompressionLevel::Fast,
+                    chroma: ChromaSubsampling::Yuv420,
+                },
+            ),
+            (ImageOutputFormat::Gif, ImageExecutionMode::CpuGif),
+            (ImageOutputFormat::Ico, ImageExecutionMode::CpuIco),
+            (ImageOutputFormat::Pnm, ImageExecutionMode::CpuPnm),
+        ] {
+            assert_eq!(
+                ImageExecutionMode::resolve_cpu(format, None)?,
+                expected,
+                "default mode for .{format}"
+            );
+        }
+
+        // jpeg-encoder 0.7.1 switches from 4:2:0 to 4:4:4 at quality 90.
+        assert_eq!(
+            ImageExecutionMode::resolve_cpu(
+                ImageOutputFormat::Jpeg,
+                Some(ImageCompression::Lossy {
+                    quality: ImageQuality::new(89)?,
+                }),
+            )?,
+            ImageExecutionMode::CpuJpeg {
+                quality: ImageQuality::new(89)?,
+                chroma: ChromaSubsampling::Yuv420,
+            }
+        );
+        assert_eq!(
+            ImageExecutionMode::resolve_cpu(
+                ImageOutputFormat::Jpeg,
+                Some(ImageCompression::Lossy {
+                    quality: ImageQuality::new(90)?,
+                }),
+            )?,
+            ImageExecutionMode::CpuJpeg {
+                quality: ImageQuality::new(90)?,
+                chroma: ChromaSubsampling::Yuv444,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_all_valid_compression_level_combinations() -> Result<(), DomainError> {
+        let lossy = Some(ImageCompression::Lossy {
+            quality: ImageQuality::DEFAULT,
+        });
+        let best = |kind| ImageEncodeOptions {
+            compression_level: Some(kind),
+            ..ImageEncodeOptions::default()
+        };
+
+        assert_eq!(
+            ImageExecutionMode::resolve_cpu_with_options(
+                ImageOutputFormat::Png,
+                None,
+                best(CompressionLevel::Best),
+            )?,
+            ImageExecutionMode::CpuPng {
+                level: CompressionLevel::Best,
+            }
+        );
+        assert_eq!(
+            ImageExecutionMode::resolve_cpu_with_options(
+                ImageOutputFormat::Webp,
+                lossy,
+                best(CompressionLevel::Fast),
+            )?,
+            ImageExecutionMode::CpuWebp {
+                compression: ImageCompression::Lossy {
+                    quality: ImageQuality::DEFAULT,
+                },
+                level: CompressionLevel::Fast,
+            }
+        );
+        assert_eq!(
+            ImageExecutionMode::resolve_cpu_with_options(
+                ImageOutputFormat::Webp,
+                Some(ImageCompression::Lossless),
+                best(CompressionLevel::Best),
+            )?,
+            ImageExecutionMode::CpuWebp {
+                compression: ImageCompression::Lossless,
+                level: CompressionLevel::Best,
+            }
+        );
+        assert_eq!(
+            ImageExecutionMode::resolve_cpu_with_options(
+                ImageOutputFormat::Jxl,
+                Some(ImageCompression::Lossless),
+                best(CompressionLevel::Balanced),
+            )?,
+            ImageExecutionMode::CpuJxl {
+                compression: ImageCompression::Lossless,
+                level: CompressionLevel::Balanced,
+            }
+        );
+        assert_eq!(
+            ImageExecutionMode::resolve_cpu_with_options(
+                ImageOutputFormat::Jxl,
+                lossy,
+                best(CompressionLevel::Best),
+            )?,
+            ImageExecutionMode::CpuJxl {
+                compression: ImageCompression::Lossy {
+                    quality: ImageQuality::DEFAULT,
+                },
+                level: CompressionLevel::Best,
+            }
+        );
+        assert_eq!(
+            ImageExecutionMode::resolve_cpu_with_options(
+                ImageOutputFormat::Avif,
+                lossy,
+                ImageEncodeOptions {
+                    compression_level: Some(CompressionLevel::Best),
+                    chroma: Some(ChromaSubsampling::Yuv444),
+                    ..ImageEncodeOptions::default()
+                },
+            )?,
+            ImageExecutionMode::CpuAvif {
+                quality: ImageQuality::DEFAULT,
+                level: CompressionLevel::Best,
+                chroma: ChromaSubsampling::Yuv444,
+            }
+        );
+        assert_eq!(
+            ImageExecutionMode::resolve_cpu_with_options(
+                ImageOutputFormat::Jpeg,
+                lossy,
+                ImageEncodeOptions {
+                    chroma: Some(ChromaSubsampling::Yuv444),
+                    ..ImageEncodeOptions::default()
+                },
+            )?,
+            ImageExecutionMode::CpuJpeg {
+                quality: ImageQuality::DEFAULT,
+                chroma: ChromaSubsampling::Yuv444,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_all_valid_tiff_compression_combinations() -> Result<(), DomainError> {
+        for (kind, expected) in [
+            (TiffCompressionKind::Deflate, TiffCompression::DEFAULT),
+            (TiffCompressionKind::Lzw, TiffCompression::Lzw),
+            (TiffCompressionKind::Packbits, TiffCompression::Packbits),
+            (TiffCompressionKind::None, TiffCompression::None),
+        ] {
+            assert_eq!(
+                ImageExecutionMode::resolve_cpu_with_options(
+                    ImageOutputFormat::Tiff,
+                    None,
+                    ImageEncodeOptions {
+                        tiff_compression: Some(kind),
+                        ..ImageEncodeOptions::default()
+                    },
+                )?,
+                ImageExecutionMode::CpuTiff {
+                    compression: expected,
+                },
+                "TIFF compression {kind}"
+            );
+        }
+        assert_eq!(
+            ImageExecutionMode::resolve_cpu_with_options(
+                ImageOutputFormat::Tiff,
+                None,
+                ImageEncodeOptions {
+                    compression_level: Some(CompressionLevel::Best),
+                    tiff_compression: Some(TiffCompressionKind::Deflate),
+                    ..ImageEncodeOptions::default()
+                },
+            )?,
+            ImageExecutionMode::CpuTiff {
+                compression: TiffCompression::Deflate {
+                    level: CompressionLevel::Best,
+                },
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_compression_level_on_formats_and_tiff_modes_without_it() -> Result<(), DomainError> {
+        let level = ImageEncodeOptions {
+            compression_level: Some(CompressionLevel::Balanced),
+            ..ImageEncodeOptions::default()
+        };
+        for format in [
+            ImageOutputFormat::Bmp,
+            ImageOutputFormat::Qoi,
+            ImageOutputFormat::Ico,
+            ImageOutputFormat::Pnm,
+            ImageOutputFormat::Jpeg,
+            ImageOutputFormat::Gif,
+            ImageOutputFormat::Heic,
+        ] {
+            let rejected = ImageExecutionMode::resolve_cpu_with_options(format, None, level);
+            assert!(
+                matches!(
+                    rejected,
+                    Err(DomainError::UnsupportedImagePipeline {
+                        format: rejected_format,
+                        backend: HardwareBackend::Cpu,
+                        ref reason,
+                    }) if rejected_format == format && reason.contains("--compression-level")
+                ),
+                "--compression-level must be rejected for .{format}"
+            );
+        }
+
+        for kind in [
+            TiffCompressionKind::Lzw,
+            TiffCompressionKind::Packbits,
+            TiffCompressionKind::None,
+        ] {
+            let rejected = ImageExecutionMode::resolve_cpu_with_options(
+                ImageOutputFormat::Tiff,
+                None,
+                ImageEncodeOptions {
+                    compression_level: Some(CompressionLevel::Best),
+                    tiff_compression: Some(kind),
+                    ..ImageEncodeOptions::default()
+                },
+            );
+            assert!(
+                matches!(
+                    rejected,
+                    Err(DomainError::UnsupportedImagePipeline {
+                        format: ImageOutputFormat::Tiff,
+                        ref reason,
+                        ..
+                    }) if reason.contains("deflate")
+                ),
+                "--compression-level must be rejected for TIFF {kind}"
+            );
+        }
+
+        let nvenc_heic = ImageExecutionMode::resolve_with_options(
+            ImageOutputFormat::Heic,
+            Some(ImageCompression::Lossy {
+                quality: ImageQuality::DEFAULT,
+            }),
+            level,
+            HardwareBackend::Gpu(GpuBackend::Nvenc),
+            &rtx_2060_hardware()?,
+        );
+        assert!(matches!(
+            nvenc_heic,
+            Err(DomainError::UnsupportedImagePipeline {
+                format: ImageOutputFormat::Heic,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_chroma_on_every_format_except_jpeg_and_avif() {
+        let chroma = ImageEncodeOptions {
+            chroma: Some(ChromaSubsampling::Yuv444),
+            ..ImageEncodeOptions::default()
+        };
+        for format in [
+            ImageOutputFormat::Webp,
+            ImageOutputFormat::Png,
+            ImageOutputFormat::Bmp,
+            ImageOutputFormat::Qoi,
+            ImageOutputFormat::Tiff,
+            ImageOutputFormat::Jxl,
+            ImageOutputFormat::Gif,
+            ImageOutputFormat::Ico,
+            ImageOutputFormat::Pnm,
+            ImageOutputFormat::Heic,
+        ] {
+            let rejected = ImageExecutionMode::resolve_cpu_with_options(format, None, chroma);
+            assert!(
+                matches!(
+                    rejected,
+                    Err(DomainError::UnsupportedImagePipeline {
+                        format: rejected_format,
+                        backend: HardwareBackend::Cpu,
+                        ref reason,
+                    }) if rejected_format == format && reason.contains("--chroma")
+                ),
+                "--chroma must be rejected for .{format}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_tiff_compression_on_other_formats_and_gpu_backends() -> Result<(), DomainError> {
+        let rtx = rtx_2060_hardware()?;
+        let options = ImageEncodeOptions {
+            tiff_compression: Some(TiffCompressionKind::Lzw),
+            ..ImageEncodeOptions::default()
+        };
+        for format in [
+            ImageOutputFormat::Webp,
+            ImageOutputFormat::Heic,
+            ImageOutputFormat::Jpeg,
+            ImageOutputFormat::Png,
+            ImageOutputFormat::Bmp,
+            ImageOutputFormat::Qoi,
+            ImageOutputFormat::Jxl,
+            ImageOutputFormat::Avif,
+            ImageOutputFormat::Gif,
+            ImageOutputFormat::Ico,
+            ImageOutputFormat::Pnm,
+        ] {
+            assert!(matches!(
+                ImageExecutionMode::resolve_cpu_with_options(format, None, options),
+                Err(DomainError::UnsupportedImagePipeline {
+                    format: rejected_format,
+                    backend: HardwareBackend::Cpu,
+                    ref reason,
+                }) if rejected_format == format && reason.contains("--tiff-compression")
+            ));
+        }
+        for backend in [
+            HardwareBackend::Gpu(GpuBackend::Nvenc),
+            HardwareBackend::Gpu(GpuBackend::Vulkan),
+        ] {
+            assert!(matches!(
+                ImageExecutionMode::resolve_with_options(
+                    ImageOutputFormat::Tiff,
+                    None,
+                    options,
+                    backend,
+                    &rtx,
+                ),
+                Err(DomainError::UnsupportedImagePipeline { .. })
+            ));
+        }
         Ok(())
     }
 }

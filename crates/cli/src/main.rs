@@ -8,12 +8,15 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use fastconv_domain::{
-    GpuBackend, HardwareBackend, ImageCompression, ImageOutputFormat, ImageQuality,
+    ChromaSubsampling, CompressionLevel, GpuBackend, HardwareBackend, ImageCompression,
+    ImageEncodeOptions, ImageOutputFormat, ImageQuality, TiffCompressionKind,
 };
 
 const GLOBAL_HELP: &str = r"Usage:
   fastconv probe
-  fastconv convert <source> <target> [--to <format>] [--quality <0..=100> | --lossless] [--threads <N>] [--backend <name>]
+  fastconv convert <source> <target> [--to <format>] [--quality <0..=100> | --lossless]
+                 [--compression-level <fast|balanced|best>] [--tiff-compression <deflate|lzw|packbits|none>]
+                 [--chroma <420|444>] [--threads <N>] [--backend <name>]
   fastconv audio <source> <target> [--to <format>] [--threads <N>] [--backend <name>]
   fastconv remux <source> <target> [--to <mp4|mkv|webm|mov|avi|ts>] [--threads <N>]
   fastconv video <source> <target> [--to <format>] [--vcodec <codec>]
@@ -57,7 +60,9 @@ Options:
 const CONVERT_HELP: &str = r"fastconv convert - convert still images
 
 Usage:
-  fastconv convert <source> <target> [--to <format>] [--quality <0..=100> | --lossless] [--threads <N>] [--backend <name>]
+  fastconv convert <source> <target> [--to <format>] [--quality <0..=100> | --lossless]
+                 [--compression-level <fast|balanced|best>] [--tiff-compression <deflate|lzw|packbits|none>]
+                 [--chroma <420|444>] [--threads <N>] [--backend <name>]
 
 Arguments:
   <source>              Source image file or directory
@@ -75,6 +80,22 @@ Options:
                         Supported: webp, jxl, and the lossless-only formats
                         png, bmp, qoi, tiff, ico, pnm (lossless by default).
                         Rejected: jpeg, avif, heic, gif.
+  --compression-level <fast|balanced|best>
+                        Effort/speed tradeoff (default: fast for png/tiff/jxl/avif,
+                        balanced for webp). Supported: png, webp (lossy and
+                        lossless), jxl (lossy and lossless), avif, and tiff with
+                        --tiff-compression deflate (or no --tiff-compression).
+                        Rejected: bmp, qoi, ico, pnm, jpeg, gif, heic, and tiff
+                        with lzw/packbits/none; CPU only.
+  --tiff-compression <deflate|lzw|packbits|none>
+                        TIFF compression family (default: deflate level=fast).
+                        Supported only for .tiff on the cpu backend; rejected for
+                        every other format and on gpu backends. Combine with
+                        --compression-level only for deflate.
+  --chroma <420|444>    Chroma subsampling (default: 4:2:0 for jpeg quality <90
+                        and avif, 4:4:4 for jpeg quality >=90). Supported only for
+                        jpeg and avif on the cpu backend; rejected for webp, png,
+                        bmp, qoi, tiff, jxl, gif, ico, pnm and heic.
   --threads <N>         Number of parallel workers
   --backend <name>      cpu (default) or nvenc (HEIC only; CPU has no native
                         HEIC encoder). vaapi, qsv, amf, videotoolbox, and vulkan
@@ -129,6 +150,7 @@ struct ConvertArgs {
     source: PathBuf,
     target: PathBuf,
     compression: Option<ImageCompression>,
+    options: ImageEncodeOptions,
     to: Option<ImageOutputFormat>,
     threads: Option<NonZeroUsize>,
     backend: HardwareBackend,
@@ -196,108 +218,210 @@ fn parse_target_format(value: &str) -> Result<ImageOutputFormat, String> {
     }
 }
 
-fn parse_convert_args(args: &[&str]) -> Result<ConvertCommand, String> {
-    let mut positional: Vec<&str> = Vec::new();
-    let mut quality_arg: Option<ImageQuality> = None;
-    let mut lossless = false;
-    let mut to: Option<ImageOutputFormat> = None;
-    let mut threads: Option<NonZeroUsize> = None;
-    let mut backend: Option<HardwareBackend> = None;
+fn parse_compression_level(value: &str) -> Result<CompressionLevel, String> {
+    match value {
+        "fast" => Ok(CompressionLevel::Fast),
+        "balanced" => Ok(CompressionLevel::Balanced),
+        "best" => Ok(CompressionLevel::Best),
+        other => Err(format!(
+            "invalid --compression-level '{other}' (expected fast, balanced, or best)"
+        )),
+    }
+}
 
+fn parse_tiff_compression(value: &str) -> Result<TiffCompressionKind, String> {
+    match value {
+        "deflate" => Ok(TiffCompressionKind::Deflate),
+        "lzw" => Ok(TiffCompressionKind::Lzw),
+        "packbits" => Ok(TiffCompressionKind::Packbits),
+        "none" => Ok(TiffCompressionKind::None),
+        other => Err(format!(
+            "invalid --tiff-compression '{other}' (expected deflate, lzw, packbits, or none)"
+        )),
+    }
+}
+
+fn parse_chroma(value: &str) -> Result<ChromaSubsampling, String> {
+    match value {
+        "420" => Ok(ChromaSubsampling::Yuv420),
+        "444" => Ok(ChromaSubsampling::Yuv444),
+        other => Err(format!("invalid --chroma '{other}' (expected 420 or 444)")),
+    }
+}
+
+#[derive(Default)]
+struct ConvertParse<'a> {
+    positional: Vec<&'a str>,
+    quality_arg: Option<ImageQuality>,
+    lossless: bool,
+    to: Option<ImageOutputFormat>,
+    threads: Option<NonZeroUsize>,
+    backend: Option<HardwareBackend>,
+    options: ImageEncodeOptions,
+}
+
+enum FlagStep {
+    Help,
+    Next(usize),
+}
+
+fn flag_value<'a>(
+    args: &'a [&'a str],
+    index: usize,
+    flag: &str,
+) -> Result<(&'a str, usize), String> {
+    let raw = args
+        .get(index + 1)
+        .copied()
+        .ok_or_else(|| format!("missing value for {flag}"))?;
+    Ok((raw, index + 2))
+}
+
+fn apply_core_flag<'a>(
+    state: &mut ConvertParse<'a>,
+    args: &'a [&'a str],
+    i: usize,
+) -> Result<FlagStep, String> {
+    let next = match args[i] {
+        "--lossless" => {
+            if state.lossless {
+                return Err("duplicate flag '--lossless'".to_owned());
+            }
+            if state.quality_arg.is_some() {
+                return Err("cannot combine --lossless with --quality".to_owned());
+            }
+            state.lossless = true;
+            i + 1
+        }
+        "--quality" => {
+            if state.quality_arg.is_some() {
+                return Err("duplicate flag '--quality'".to_owned());
+            }
+            if state.lossless {
+                return Err("cannot combine --quality with --lossless".to_owned());
+            }
+            let (raw, next) = flag_value(args, i, "--quality")?;
+            let parsed = raw
+                .parse::<u8>()
+                .map_err(|err| format!("invalid --quality '{raw}': {err}"))?;
+            state.quality_arg = Some(ImageQuality::new(parsed).map_err(|err| err.to_string())?);
+            next
+        }
+        "--to" => {
+            if state.to.is_some() {
+                return Err("duplicate flag '--to'".to_owned());
+            }
+            let (raw, next) = flag_value(args, i, "--to")?;
+            state.to = Some(parse_target_format(raw)?);
+            next
+        }
+        "--threads" => {
+            if state.threads.is_some() {
+                return Err("duplicate flag '--threads'".to_owned());
+            }
+            let (raw, next) = flag_value(args, i, "--threads")?;
+            let parsed = raw
+                .parse::<NonZeroUsize>()
+                .map_err(|err| format!("invalid --threads '{raw}': {err}"))?;
+            state.threads = Some(parsed);
+            next
+        }
+        _ => {
+            if state.backend.is_some() {
+                return Err("duplicate flag '--backend'".to_owned());
+            }
+            let (raw, next) = flag_value(args, i, "--backend")?;
+            state.backend = Some(parse_backend(raw)?);
+            next
+        }
+    };
+    Ok(FlagStep::Next(next))
+}
+
+fn apply_encoder_flag<'a>(
+    state: &mut ConvertParse<'a>,
+    args: &'a [&'a str],
+    i: usize,
+) -> Result<FlagStep, String> {
+    let next = match args[i] {
+        "--compression-level" => {
+            if state.options.compression_level.is_some() {
+                return Err("duplicate flag '--compression-level'".to_owned());
+            }
+            let (raw, next) = flag_value(args, i, "--compression-level")?;
+            state.options.compression_level = Some(parse_compression_level(raw)?);
+            next
+        }
+        "--tiff-compression" => {
+            if state.options.tiff_compression.is_some() {
+                return Err("duplicate flag '--tiff-compression'".to_owned());
+            }
+            let (raw, next) = flag_value(args, i, "--tiff-compression")?;
+            state.options.tiff_compression = Some(parse_tiff_compression(raw)?);
+            next
+        }
+        _ => {
+            if state.options.chroma.is_some() {
+                return Err("duplicate flag '--chroma'".to_owned());
+            }
+            let (raw, next) = flag_value(args, i, "--chroma")?;
+            state.options.chroma = Some(parse_chroma(raw)?);
+            next
+        }
+    };
+    Ok(FlagStep::Next(next))
+}
+
+fn apply_convert_flag<'a>(
+    state: &mut ConvertParse<'a>,
+    args: &'a [&'a str],
+    i: usize,
+) -> Result<FlagStep, String> {
+    match args[i] {
+        "-h" | "--help" => Ok(FlagStep::Help),
+        "--lossless" | "--quality" | "--to" | "--threads" | "--backend" => {
+            apply_core_flag(state, args, i)
+        }
+        "--compression-level" | "--tiff-compression" | "--chroma" => {
+            apply_encoder_flag(state, args, i)
+        }
+        flag if flag.starts_with('-') => Err(format!("unknown flag '{flag}'")),
+        value => {
+            state.positional.push(value);
+            Ok(FlagStep::Next(i + 1))
+        }
+    }
+}
+
+fn parse_convert_args(args: &[&str]) -> Result<ConvertCommand, String> {
+    let mut state = ConvertParse::default();
     let mut i = 0_usize;
-    while let Some(&arg) = args.get(i) {
-        match arg {
-            "-h" | "--help" => return Ok(ConvertCommand::Help),
-            "--lossless" => {
-                if lossless {
-                    return Err("duplicate flag '--lossless'".to_owned());
-                }
-                if quality_arg.is_some() {
-                    return Err("cannot combine --lossless with --quality".to_owned());
-                }
-                lossless = true;
-                i += 1;
-            }
-            "--quality" => {
-                if quality_arg.is_some() {
-                    return Err("duplicate flag '--quality'".to_owned());
-                }
-                if lossless {
-                    return Err("cannot combine --quality with --lossless".to_owned());
-                }
-                let raw = args
-                    .get(i + 1)
-                    .copied()
-                    .ok_or_else(|| "missing value for --quality".to_owned())?;
-                let parsed = raw
-                    .parse::<u8>()
-                    .map_err(|err| format!("invalid --quality '{raw}': {err}"))?;
-                quality_arg = Some(ImageQuality::new(parsed).map_err(|err| err.to_string())?);
-                i += 2;
-            }
-            "--to" => {
-                if to.is_some() {
-                    return Err("duplicate flag '--to'".to_owned());
-                }
-                let raw = args
-                    .get(i + 1)
-                    .copied()
-                    .ok_or_else(|| "missing value for --to".to_owned())?;
-                to = Some(parse_target_format(raw)?);
-                i += 2;
-            }
-            "--threads" => {
-                if threads.is_some() {
-                    return Err("duplicate flag '--threads'".to_owned());
-                }
-                let raw = args
-                    .get(i + 1)
-                    .copied()
-                    .ok_or_else(|| "missing value for --threads".to_owned())?;
-                let parsed = raw
-                    .parse::<NonZeroUsize>()
-                    .map_err(|err| format!("invalid --threads '{raw}': {err}"))?;
-                threads = Some(parsed);
-                i += 2;
-            }
-            "--backend" => {
-                if backend.is_some() {
-                    return Err("duplicate flag '--backend'".to_owned());
-                }
-                let raw = args
-                    .get(i + 1)
-                    .copied()
-                    .ok_or_else(|| "missing value for --backend".to_owned())?;
-                backend = Some(parse_backend(raw)?);
-                i += 2;
-            }
-            flag if flag.starts_with('-') => {
-                return Err(format!("unknown flag '{flag}'"));
-            }
-            value => {
-                positional.push(value);
-                i += 1;
-            }
+    while i < args.len() {
+        match apply_convert_flag(&mut state, args, i)? {
+            FlagStep::Help => return Ok(ConvertCommand::Help),
+            FlagStep::Next(next) => i = next,
         }
     }
 
-    let [source, target] = positional.as_slice() else {
+    let [source, target] = state.positional.as_slice() else {
         return Err("expected `fastconv convert <source> <target> [options]`".to_owned());
     };
-
-    let compression = if lossless {
+    let compression = if state.lossless {
         Some(ImageCompression::Lossless)
     } else {
-        quality_arg.map(|quality| ImageCompression::Lossy { quality })
+        state
+            .quality_arg
+            .map(|quality| ImageCompression::Lossy { quality })
     };
 
     Ok(ConvertCommand::Run(ConvertArgs {
         source: PathBuf::from(source),
         target: PathBuf::from(target),
         compression,
-        to,
-        threads,
-        backend: backend.unwrap_or(HardwareBackend::Cpu),
+        options: state.options,
+        to: state.to,
+        threads: state.threads,
+        backend: state.backend.unwrap_or(HardwareBackend::Cpu),
     }))
 }
 
@@ -357,10 +481,11 @@ fn run_probe() -> Result<(), String> {
 }
 
 fn run_convert(args: &ConvertArgs) -> Result<(), String> {
-    let plan = fastconv_probe::prepare_image_batch(
+    let plan = fastconv_probe::prepare_image_batch_with_options(
         &args.source,
         &args.target,
         args.compression,
+        args.options,
         args.to,
         args.threads,
         args.backend,
@@ -500,7 +625,8 @@ mod tests {
         ConvertArgs, ConvertCommand, ProbeCommand, help_text, parse_convert_args, parse_probe_args,
     };
     use fastconv_domain::{
-        GpuBackend, HardwareBackend, ImageCompression, ImageOutputFormat, ImageQuality,
+        ChromaSubsampling, CompressionLevel, GpuBackend, HardwareBackend, ImageCompression,
+        ImageEncodeOptions, ImageOutputFormat, ImageQuality, TiffCompressionKind,
     };
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
@@ -553,6 +679,7 @@ mod tests {
                 source: PathBuf::from("in.png"),
                 target: PathBuf::from("out.webp"),
                 compression: None,
+                options: ImageEncodeOptions::default(),
                 to: None,
                 threads: None,
                 backend: HardwareBackend::Cpu,
@@ -645,5 +772,100 @@ mod tests {
         assert!(parse_convert_args(&["a.png", "b.webp", "--threads", "0"]).is_err());
         assert!(parse_convert_args(&["a.png", "b.webp", "--backend", "magic"]).is_err());
         assert!(parse_convert_args(&["a.png", "b.webp", "--unknown"]).is_err());
+    }
+
+    #[test]
+    fn parses_encoder_control_flags() -> Result<(), String> {
+        let ConvertCommand::Run(parsed) = parse_convert_args(&[
+            "in.png",
+            "out.tiff",
+            "--compression-level",
+            "best",
+            "--tiff-compression",
+            "lzw",
+            "--chroma",
+            "444",
+        ])?
+        else {
+            return Err("expected ConvertCommand::Run".to_owned());
+        };
+        assert_eq!(
+            parsed.options.compression_level,
+            Some(CompressionLevel::Best)
+        );
+        assert_eq!(
+            parsed.options.tiff_compression,
+            Some(TiffCompressionKind::Lzw)
+        );
+        assert_eq!(parsed.options.chroma, Some(ChromaSubsampling::Yuv444));
+
+        for (value, expected) in [
+            ("fast", CompressionLevel::Fast),
+            ("balanced", CompressionLevel::Balanced),
+            ("best", CompressionLevel::Best),
+        ] {
+            let ConvertCommand::Run(level) =
+                parse_convert_args(&["a.png", "b.png", "--compression-level", value])?
+            else {
+                return Err("expected ConvertCommand::Run".to_owned());
+            };
+            assert_eq!(level.options.compression_level, Some(expected));
+        }
+        for (value, expected) in [
+            ("deflate", TiffCompressionKind::Deflate),
+            ("lzw", TiffCompressionKind::Lzw),
+            ("packbits", TiffCompressionKind::Packbits),
+            ("none", TiffCompressionKind::None),
+        ] {
+            let ConvertCommand::Run(kind) =
+                parse_convert_args(&["a.png", "b.tiff", "--tiff-compression", value])?
+            else {
+                return Err("expected ConvertCommand::Run".to_owned());
+            };
+            assert_eq!(kind.options.tiff_compression, Some(expected));
+        }
+        for (value, expected) in [
+            ("420", ChromaSubsampling::Yuv420),
+            ("444", ChromaSubsampling::Yuv444),
+        ] {
+            let ConvertCommand::Run(chroma) =
+                parse_convert_args(&["a.png", "b.jpg", "--chroma", value])?
+            else {
+                return Err("expected ConvertCommand::Run".to_owned());
+            };
+            assert_eq!(chroma.options.chroma, Some(expected));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_and_duplicate_encoder_control_flags() {
+        for args in [
+            &["a.png", "b.webp", "--compression-level"][..],
+            &["a.png", "b.webp", "--tiff-compression"][..],
+            &["a.png", "b.webp", "--chroma"][..],
+            &["a.png", "b.webp", "--compression-level", "ultra"][..],
+            &["a.png", "b.webp", "--tiff-compression", "jpeg"][..],
+            &["a.png", "b.webp", "--chroma", "422"][..],
+            &[
+                "a.png",
+                "b.webp",
+                "--compression-level",
+                "fast",
+                "--compression-level",
+                "best",
+            ][..],
+            &[
+                "a.png",
+                "b.tiff",
+                "--tiff-compression",
+                "lzw",
+                "--tiff-compression",
+                "none",
+            ][..],
+            &["a.png", "b.jpg", "--chroma", "420", "--chroma", "444"][..],
+        ] {
+            assert!(parse_convert_args(args).is_err(), "must reject {args:?}");
+        }
     }
 }
