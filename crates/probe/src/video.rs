@@ -496,11 +496,17 @@ fn audio_facts(track: &Track) -> (Option<u16>, Option<u32>) {
 fn stream_info(track: &Track, ident_facts: Option<(u16, u32)>) -> VideoStreamInfo {
     let (width, height) = dimensions(track);
     let (mut channels, mut sample_rate) = audio_facts(track);
-    // A validated Vorbis ident header is authoritative when the Matroska audio
-    // element omitted these facts, so probed streams always report real values.
+    // containr collapses missing Matroska Audio children to spec defaults
+    // (1 channel, 8000 Hz) without exposing child presence. The validated
+    // Vorbis ident header is authoritative for the encoded stream, so those
+    // defaults must not mask it; explicit non-default values still win.
     if let Some((ident_channels, ident_rate)) = ident_facts {
-        channels = channels.or(Some(ident_channels));
-        sample_rate = sample_rate.or(Some(ident_rate));
+        if channels.is_none_or(|value| value == 1) {
+            channels = Some(ident_channels);
+        }
+        if sample_rate.is_none_or(|value| value == 8000) {
+            sample_rate = Some(ident_rate);
+        }
     }
     let language = track.language.iso639_mapped().map(str::to_owned);
     VideoStreamInfo::new(
@@ -2373,7 +2379,9 @@ mod tests {
         }
         let marker = 0x100_u16 >> width;
         for shift in (0..width).rev() {
-            let byte = u8::try_from((len >> (7 * shift)) & 0x7F).unwrap_or(0);
+            // EBML VINT_DATA is a big-endian integer of 8-bit octets, not
+            // 7-bit groups; only the first octet's marker bit is reserved.
+            let byte = u8::try_from((len >> (8 * shift)) & 0xFF).unwrap_or(0);
             out.push(if shift == width - 1 {
                 byte | u8::try_from(marker).unwrap_or(0)
             } else {
@@ -2382,6 +2390,23 @@ mod tests {
         }
         out.extend_from_slice(body);
         out
+    }
+
+    #[test]
+    fn ebml_el_vint_encodes_exact_body_boundaries() -> Result<(), Box<dyn std::error::Error>> {
+        for len in [126, 127, 128, 255] {
+            let body = vec![0x5A_u8; len];
+            let encoded = ebml_el_vint(0xAE, &body);
+            let size_bytes = encoded.get(1..).ok_or("missing size VINT")?;
+            let (size, vint_len) = ebml_vint_size(size_bytes).ok_or("size VINT did not decode")?;
+            assert_eq!(size, len, "wrong size for {len}-byte body");
+            assert_eq!(
+                encoded.get(1 + vint_len..).ok_or("truncated body")?,
+                body.as_slice(),
+                "wrong body boundary for {len}-byte body"
+            );
+        }
+        Ok(())
     }
 
     fn vorbis_ident_bytes() -> Vec<u8> {
@@ -2408,7 +2433,14 @@ mod tests {
         private
     }
 
-    fn mkv_with_vorbis(private: &[u8]) -> Vec<u8> {
+    /// Selectable Matroska `Audio` children; `None` omits the child entirely.
+    #[derive(Default)]
+    struct AudioFacts {
+        channels: Option<u64>,
+        sampling_frequency: Option<f64>,
+    }
+
+    fn mkv_with_vorbis(private: &[u8], audio: Option<AudioFacts>) -> Vec<u8> {
         let mut header = Vec::new();
         header.extend(ebml_uint(0x4286, 1));
         header.extend(ebml_uint(0x42F2, 4));
@@ -2427,6 +2459,16 @@ mod tests {
         entry.extend(ebml_uint(0x83, 2)); // audio track
         entry.extend(ebml_el(0x86, b"A_VORBIS"));
         entry.extend(ebml_el_vint(0x63A2, private));
+        if let Some(audio) = audio {
+            let mut audio_body = Vec::new();
+            if let Some(channels) = audio.channels {
+                audio_body.extend(ebml_uint(0x9F, channels));
+            }
+            if let Some(rate) = audio.sampling_frequency {
+                audio_body.extend(ebml_el(0xB5, &rate.to_be_bytes()));
+            }
+            entry.extend(ebml_el_vint(0xE1, &audio_body));
+        }
         segment.extend(ebml_el_vint(0x1654_AE6B, &ebml_el_vint(0xAE, &entry)));
         let mut bytes = ebml_el_vint(0x1A45_DFA3, &header);
         bytes.extend(ebml_el_vint(0x1853_8067, &segment));
@@ -2436,7 +2478,7 @@ mod tests {
     #[test]
     fn probe_accepts_vorbis_and_falls_back_to_ident_facts() -> Result<(), Box<dyn std::error::Error>>
     {
-        let path = temp_file("vorbis-ok", &mkv_with_vorbis(&vorbis_codec_private()))?;
+        let path = temp_file("vorbis-ok", &mkv_with_vorbis(&vorbis_codec_private(), None))?;
         let probed = probe_video(&path)?;
         let audio = probed
             .streams
@@ -2450,6 +2492,65 @@ mod tests {
                 .is_some_and(|value| value.get() == 44_100)
         );
         fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn vorbis_ident_facts_override_matroska_audio_defaults()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            ("empty Audio", AudioFacts::default(), 2, 44_100),
+            (
+                "Channels only",
+                AudioFacts {
+                    channels: Some(2),
+                    sampling_frequency: None,
+                },
+                2,
+                44_100,
+            ),
+            (
+                "SamplingFrequency only",
+                AudioFacts {
+                    channels: None,
+                    sampling_frequency: Some(44_100.0),
+                },
+                2,
+                44_100,
+            ),
+            (
+                "explicit non-defaults",
+                AudioFacts {
+                    channels: Some(6),
+                    sampling_frequency: Some(48_000.0),
+                },
+                6,
+                48_000,
+            ),
+        ];
+        for (label, audio, expected_channels, expected_rate) in cases {
+            let path = temp_file(
+                "vorbis-audio",
+                &mkv_with_vorbis(&vorbis_codec_private(), Some(audio)),
+            )?;
+            let probed = probe_video(&path)?;
+            let stream = probed
+                .streams
+                .iter()
+                .find(|stream| stream.codec() == VideoCodec::Vorbis)
+                .ok_or("no Vorbis stream was probed")?;
+            assert_eq!(
+                stream.channels().map(std::num::NonZero::get),
+                Some(expected_channels),
+                "{label}: wrong channels"
+            );
+            assert_eq!(
+                stream.sample_rate().map(std::num::NonZero::get),
+                Some(expected_rate),
+                "{label}: wrong sample rate"
+            );
+            fs::remove_file(&path)?;
+        }
         Ok(())
     }
 
@@ -2468,7 +2569,7 @@ mod tests {
             }
         }
         for private in variants {
-            let path = temp_file("vorbis-bad", &mkv_with_vorbis(&private))?;
+            let path = temp_file("vorbis-bad", &mkv_with_vorbis(&private, None))?;
             let result = probe_video(&path);
             assert!(
                 matches!(result, Err(ProbeError::InvalidVideo { .. })),
@@ -2481,7 +2582,7 @@ mod tests {
 
     #[test]
     fn probe_rejects_missing_vorbis_codec_private() -> Result<(), Box<dyn std::error::Error>> {
-        let path = temp_file("vorbis-missing", &mkv_with_vorbis(&[]))?;
+        let path = temp_file("vorbis-missing", &mkv_with_vorbis(&[], None))?;
         let result = probe_video(&path);
         assert!(
             matches!(result, Err(ProbeError::InvalidVideo { .. })),

@@ -73,7 +73,7 @@ const MAX_DECODED_BYTES_PER_TRACK: u64 = 1_073_741_824;
 const AUDIO_PCM_CHUNK_FRAMES: usize = 4_096;
 const AUDIO_PACKET_BATCH_SIZE: usize = 32;
 const AUDIO_QUEUE_CAPACITY: usize = 16;
-/// Cap on a single decoded Vorbis frame and on the reusable plane buffers.
+/// Cap on a single decoded Vorbis frame.
 /// A hostile packet can never make us resize beyond this bound.
 const VORBIS_FRAME_SAMPLE_CAP: usize = 8_192 * 32;
 /// Number of PCM frames fed to `vorbis-enc` per `encode_audio_block` call.
@@ -1897,38 +1897,38 @@ impl StreamingAudioEncoder {
                 timestamps,
                 ..
             } => {
-                let frames = pcm.len() / usize::from(*channels);
-                if frames == 0 {
+                let ch = usize::from(*channels);
+                if pcm.len() / ch == 0 {
                     return Ok(out);
-                }
-                if pcm.len() > VORBIS_FRAME_SAMPLE_CAP {
-                    return Err(encode_error(
-                        Path::new("vorbis"),
-                        format!(
-                            "Vorbis chunk of {} samples exceeds the allocation cap",
-                            pcm.len()
-                        ),
-                    ));
-                }
-                for plane in planes.iter_mut() {
-                    plane.clear();
-                }
-                for frame_samples in pcm.chunks_exact(usize::from(*channels)) {
-                    for (plane, &source) in planes.iter_mut().zip(*channel_order) {
-                        if let Some(&value) = frame_samples.get(source) {
-                            plane.push(value);
-                        }
-                    }
                 }
                 let encoder = encoder.as_mut().ok_or_else(|| {
                     encode_error(Path::new("vorbis"), "Vorbis encoder was already finished")
                 })?;
-                encoder.encode_audio_block(planes.iter()).map_err(|err| {
-                    encode_error(
-                        Path::new("vorbis"),
-                        format!("Vorbis encoding failed: {err}"),
-                    )
-                })?;
+                // A resampled+remixed push can exceed one encoded block, so feed
+                // bounded blocks instead of rejecting the whole chunk: this keeps
+                // the reusable planes within their reserved capacity.
+                let block_samples = VORBIS_CHUNK_FRAMES.saturating_mul(ch);
+                for block in pcm.chunks(block_samples) {
+                    if block.len() < ch {
+                        continue;
+                    }
+                    for plane in planes.iter_mut() {
+                        plane.clear();
+                    }
+                    for frame_samples in block.chunks_exact(ch) {
+                        for (plane, &source) in planes.iter_mut().zip(*channel_order) {
+                            if let Some(&value) = frame_samples.get(source) {
+                                plane.push(value);
+                            }
+                        }
+                    }
+                    encoder.encode_audio_block(planes.iter()).map_err(|err| {
+                        encode_error(
+                            Path::new("vorbis"),
+                            format!("Vorbis encoding failed: {err}"),
+                        )
+                    })?;
+                }
                 for packet in drain_ogg_sink(sink)? {
                     out.push(timestamps.next_packet(packet)?);
                 }
@@ -3996,6 +3996,30 @@ mod tests {
         assert!(
             !packets.is_empty(),
             "streaming AAC must emit packets before finish so the bounded queue bounds memory"
+        );
+        assert!(packets.iter().all(|packet| packet.duration > 0));
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_vorbis_accepts_a_push_larger_than_one_encoded_block() -> Result<(), PipelineError>
+    {
+        // A resample+remix step can hand over more than the old decoded-frame
+        // cap in one push; it must be split, not rejected.
+        let channels = 6_u16;
+        let frames = VORBIS_FRAME_SAMPLE_CAP / usize::from(channels) + VORBIS_CHUNK_FRAMES;
+        let samples = sine(frames, 48_000, channels);
+        assert!(samples.len() > VORBIS_FRAME_SAMPLE_CAP);
+        let (mut encoder, _) = StreamingAudioEncoder::start(
+            TargetAudioCodec::Vorbis,
+            channels,
+            48_000,
+            default_config(TargetAudioCodec::Vorbis),
+        )?;
+        let packets = encoder.push(&samples)?;
+        assert!(
+            !packets.is_empty(),
+            "streaming Vorbis must emit packets from a multi-block push"
         );
         assert!(packets.iter().all(|packet| packet.duration > 0));
         Ok(())
