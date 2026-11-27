@@ -18,6 +18,7 @@ use crate::PipelineError;
 use crate::avif::decode_avif_slice_into;
 use crate::bmp::decode_bmp_slice_into;
 use crate::gif::decode_gif_slice_into;
+use crate::heic::decode_heic_slice_into;
 use crate::ico::decode_ico_slice_into;
 use crate::pnm::decode_pnm_slice_into;
 use crate::qoi::decode_qoi_slice_into;
@@ -167,6 +168,20 @@ pub(crate) fn decode_image_into(
                 format,
                 byte_len,
                 input_file_bytes,
+                has_non_opaque_native_alpha: false,
+            })
+        }
+        ImageInputFormat::Heic => {
+            let (width, height, format, byte_len) =
+                decode_heic_slice_into(item.source(), file_bytes.as_slice(), hint, pixel_buf)?;
+            verify_decoded_dimensions(item, width, height)?;
+            Ok(DecodedFrameMeta {
+                width,
+                height,
+                format,
+                byte_len,
+                input_file_bytes,
+                // HEIC alpha is rejected up-front for opaque-only GPU targets.
                 has_non_opaque_native_alpha: false,
             })
         }

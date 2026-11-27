@@ -61,6 +61,7 @@ pub enum ImageInputFormat {
     Tiff,
     Jxl,
     Avif,
+    Heic,
     Gif,
     Ico,
     Pnm,
@@ -78,6 +79,7 @@ impl ImageInputFormat {
             Self::Tiff => "tiff",
             Self::Jxl => "jxl",
             Self::Avif => "avif",
+            Self::Heic => "heic",
             Self::Gif => "gif",
             Self::Ico => "ico",
             Self::Pnm => "pnm",
@@ -1767,6 +1769,7 @@ mod tests {
     fn new_image_formats_report_extensions_and_display() {
         for (format, ext) in [
             (ImageInputFormat::Avif, "avif"),
+            (ImageInputFormat::Heic, "heic"),
             (ImageInputFormat::Gif, "gif"),
             (ImageInputFormat::Ico, "ico"),
             (ImageInputFormat::Pnm, "pnm"),
@@ -1783,6 +1786,15 @@ mod tests {
             assert_eq!(format.extension(), ext);
             assert_eq!(format.to_string(), ext);
         }
+    }
+
+    #[test]
+    fn heic_input_format_uses_heic_extension_and_display() {
+        assert_eq!(ImageInputFormat::Heic.extension(), "heic");
+        assert_eq!(ImageInputFormat::Heic.to_string(), "heic");
+        // HEIF files are detected by their ISOBMFF brand, so both file extensions
+        // resolve to the same validated input format.
+        assert_ne!(ImageInputFormat::Heic, ImageInputFormat::Avif);
     }
 
     #[test]

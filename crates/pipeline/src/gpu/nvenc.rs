@@ -634,7 +634,10 @@ mod enabled {
         mut rgba_bytes: Vec<u8>,
     ) -> Result<DecodedRgbaFrame, PipelineError> {
         match item.input_format() {
-            ImageInputFormat::Jpeg | ImageInputFormat::Qoi | ImageInputFormat::Bmp => {
+            ImageInputFormat::Jpeg
+            | ImageInputFormat::Qoi
+            | ImageInputFormat::Bmp
+            | ImageInputFormat::Heic => {
                 let decoded = decode_image_into(
                     item,
                     DecodeTargetHint::OpaqueRgba8,
@@ -2648,6 +2651,77 @@ mod enabled {
                 Err(gpu_err) => Err(gpu_err),
             }
         })
+    }
+
+    #[cfg(test)]
+    mod heic_decode_tests {
+        use super::decode_to_rgba_frame;
+        use crate::PipelineError;
+        use fastconv_domain::{ImageBatchItem, ImageDimensions, ImageInputFormat};
+        use std::env;
+        use std::fs;
+        use std::path::Path;
+        use std::process;
+
+        fn write_heic(
+            path: &Path,
+            width: u32,
+            height: u32,
+            pixels: &[u8],
+        ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            let bytes = heifer::encode_rgba8(
+                width,
+                height,
+                pixels,
+                &heifer::EncodeOptions::new().with_max_threads(1),
+            )?;
+            fs::write(path, &bytes)?;
+            Ok(bytes)
+        }
+
+        #[test]
+        fn heic_feeds_opaque_rgba_directly_and_rejects_transparency()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let dir = env::temp_dir().join(format!("fastconv-nvenc-heic-{}-decode", process::id()));
+            fs::create_dir_all(&dir)?;
+            let (width, height) = (32_u32, 24_u32);
+            let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+            for index in 0..width * height {
+                let value = u8::try_from(index % 251).unwrap_or(0);
+                rgba.extend_from_slice(&[value, value.wrapping_mul(3), value.wrapping_mul(7), 255]);
+            }
+            let opaque = dir.join("opaque.heic");
+            write_heic(&opaque, width, height, &rgba)?;
+            let item = ImageBatchItem::new(
+                opaque,
+                dir.join("out.heic"),
+                ImageInputFormat::Heic,
+                ImageDimensions::new(width, height)?,
+            )?;
+            let mut file_bytes = Vec::new();
+            let mut pixel_buf = Vec::new();
+            let frame =
+                decode_to_rgba_frame(0, &item, &mut file_bytes, &mut pixel_buf, Vec::new())?;
+            assert_eq!((frame.width, frame.height), (width, height));
+            assert_eq!(frame.rgba_bytes.len(), (width * height * 4) as usize);
+
+            rgba[3] = 96;
+            let transparent = dir.join("transparent.heic");
+            write_heic(&transparent, width, height, &rgba)?;
+            let item = ImageBatchItem::new(
+                transparent,
+                dir.join("out2.heic"),
+                ImageInputFormat::Heic,
+                ImageDimensions::new(width, height)?,
+            )?;
+            assert!(matches!(
+                decode_to_rgba_frame(0, &item, &mut file_bytes, &mut pixel_buf, Vec::new()),
+                Err(PipelineError::UnsupportedPixelFormat { .. })
+            ));
+
+            fs::remove_dir_all(&dir)?;
+            Ok(())
+        }
     }
 }
 

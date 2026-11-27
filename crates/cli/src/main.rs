@@ -109,8 +109,8 @@ Options:
   -h, --help            Print this help
 
 Supported input formats:
-  png, jpeg, webp, bmp, qoi, tiff, jxl, avif, gif, ico, pnm
-  Aliases: jpg -> jpeg, tif -> tiff, ppm/pgm/pbm/pam -> pnm
+  png, jpeg, webp, bmp, qoi, tiff, jxl, avif, heic, gif, ico, pnm
+  Aliases: jpg -> jpeg, tif -> tiff, heif -> heic, ppm/pgm/pbm/pam -> pnm
   GIF uses a fixed 256-color palette quantization and accepts neither --quality
   nor --lossless.";
 

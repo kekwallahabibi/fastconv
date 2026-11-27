@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 containr.workspace = true
 gif.workspace = true
+heifer.workspace = true
 ico.workspace = true
 zenavif-parse.workspace = true
 opus-pure.workspace = true
