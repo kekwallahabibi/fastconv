@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -43,6 +44,11 @@ const MAX_HEIC_PIXELS: u64 = 128 * 1024 * 1024;
 // Sum the coded+display pixels of the whole reference tree so repeated or
 // nested `dimg` entries cannot multiply retained memory past one image budget.
 const MAX_HEIC_RETAINED_PIXELS: u64 = 128 * 1024 * 1024;
+// Repeatable `dimg` references can fan out exponentially while the final budget is
+// still small. Bound total visits so probing stays cheap regardless of fan-out.
+const MAX_HEIC_ITEM_VISITS: u64 = 8192;
+// Only the iovl descriptor prefix (version/flags/fill/canvas) is needed in the probe.
+const IOVL_DESCRIPTOR_MAX_BYTES: usize = 32;
 const MAX_HEIC_EXPANSION_BYTES: u64 = 128 * 1024 * 1024;
 // `heifer` encodes images as a grid of 512x512 tiles capped at 256 columns/rows;
 // a single axis above 256*512 is rejected only after decode, so screen it here.
@@ -218,7 +224,9 @@ fn read_bounded_ftyp(file: &mut File, path: &Path) -> Result<Option<Vec<u8>>, Pr
             path: path.to_path_buf(),
             source,
         })?;
-    let mut prefix = [0_u8; 8];
+    // A 64-bit `largesize` ftyp needs 16 header bytes before `read_box_header`
+    // can parse it; reading only the first 8 makes extended-size boxes fail.
+    let mut prefix = [0_u8; 16];
     let filled = file.read(&mut prefix).map_err(|source| ProbeError::Io {
         path: path.to_path_buf(),
         source,
@@ -1191,6 +1199,86 @@ fn heic_overlay_canvas(data: &[u8]) -> Option<(u32, u32)> {
     Some((field()?, field()?))
 }
 
+/// Shared traversal state: a hard visit cap and pre-resolved overlay canvases.
+struct HeicWalk<'a> {
+    visits: u64,
+    overlay_canvases: &'a HashMap<ItemId, (u32, u32)>,
+}
+
+fn charge_heic_visit(walk: &mut HeicWalk<'_>, path: &Path) -> Result<(), ProbeError> {
+    walk.visits = walk
+        .visits
+        .checked_add(1)
+        .ok_or_else(|| invalid_image(path, "HEIC item visit count overflow"))?;
+    if walk.visits > MAX_HEIC_ITEM_VISITS {
+        return Err(invalid_image(
+            path,
+            "HEIC item graph exceeds the visit budget",
+        ));
+    }
+    Ok(())
+}
+
+/// Reads the bounded prefix of an `iovl` descriptor from its real storage. The
+/// `HeifFile` borrows the compact header buffer (no `mdat`), so file-backed
+/// extents must be resolved against the original file; idat-backed items are
+/// already present in the header buffer and use the container accessor.
+fn read_heic_overlay_descriptor(
+    file: &mut File,
+    path: &Path,
+    container: &HeifFile<'_>,
+    id: ItemId,
+    file_len: u64,
+) -> Result<Vec<u8>, ProbeError> {
+    let item = container
+        .item(id)
+        .map_err(|err| invalid_image(path, format!("invalid HEIC iovl item: {err}")))?;
+    let Some(location) = &item.location else {
+        return Err(invalid_image(path, "HEIC iovl item has no data location"));
+    };
+    if location.construction_method != ConstructionMethod::File {
+        let data = container
+            .item_data(id)
+            .map_err(|err| invalid_image(path, format!("invalid HEIC iovl data: {err}")))?;
+        let end = data.len().min(IOVL_DESCRIPTOR_MAX_BYTES);
+        return Ok(data[..end].to_vec());
+    }
+
+    let mut descriptor = Vec::with_capacity(IOVL_DESCRIPTOR_MAX_BYTES);
+    for extent in &location.extents {
+        if descriptor.len() >= IOVL_DESCRIPTOR_MAX_BYTES {
+            break;
+        }
+        let length = if extent.length == 0 {
+            file_len.saturating_sub(extent.offset)
+        } else {
+            extent.length
+        };
+        let remaining = u64::try_from(IOVL_DESCRIPTOR_MAX_BYTES - descriptor.len())
+            .map_err(|_| invalid_image(path, "HEIC iovl descriptor budget overflow"))?;
+        let want = length.min(remaining);
+        if want == 0 {
+            continue;
+        }
+        file.seek(SeekFrom::Start(extent.offset))
+            .map_err(|source| ProbeError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let want = usize::try_from(want)
+            .map_err(|_| invalid_image(path, "HEIC iovl descriptor size overflow"))?;
+        let start = descriptor.len();
+        descriptor.resize(start + want, 0);
+        read_exact_or_invalid(
+            file,
+            path,
+            &mut descriptor[start..],
+            "truncated HEIC iovl descriptor",
+        )?;
+    }
+    Ok(descriptor)
+}
+
 /// Validates the coded geometry of one HEIC image item before any pixel is decoded,
 /// then applies its transformative properties in the same order as
 /// `heifer::decode_rgba8` (clean aperture, rotation, mirroring).
@@ -1201,8 +1289,10 @@ fn heic_item_dimensions(
     depth: u32,
     visiting: &mut Vec<ItemId>,
     retained: &mut u64,
+    walk: &mut HeicWalk<'_>,
     path: &Path,
 ) -> Result<(u32, u32), ProbeError> {
+    charge_heic_visit(walk, path)?;
     if depth > MAX_HEIC_ITEM_DEPTH {
         return Err(invalid_image(
             path,
@@ -1229,15 +1319,12 @@ fn heic_item_dimensions(
                 matches!(property, Property::AuxiliaryType(urn) if is_alpha_auxiliary_urn(urn))
             });
         if alpha {
-            let aux_item = container.item(aux).map_err(|err| {
-                invalid_image(path, format!("invalid HEIC auxiliary item: {err}"))
-            })?;
-            if aux_item.item_type.0 != *b"hvc1" {
-                return Err(invalid_image(
-                    path,
-                    "non-HEVC alpha auxiliary image is not supported by the still-image pipeline",
-                ));
-            }
+            // Alpha items may be `grid`/`iovl` roots (large images). Walk their
+            // whole reference tree: `heic_item_dimensions` rejects non-HEVC
+            // leaves, validates geometry and charges the retained-pixel budget.
+            visiting.push(id);
+            heic_item_dimensions(container, aux, depth + 1, visiting, retained, walk, path)?;
+            visiting.pop();
         }
     }
 
@@ -1273,19 +1360,21 @@ fn heic_item_dimensions(
                 ));
             };
             visiting.push(id);
-            let source_dims =
-                heic_item_dimensions(container, *source, depth + 1, visiting, retained, path)?;
+            let source_dims = heic_item_dimensions(
+                container,
+                *source,
+                depth + 1,
+                visiting,
+                retained,
+                walk,
+                path,
+            )?;
             visiting.pop();
             base = Some(source_dims);
         }
         b"grid" | b"iovl" => {
             if item.item_type.0 == *b"iovl" {
-                let data = container
-                    .item_data(id)
-                    .map_err(|err| invalid_image(path, format!("invalid HEIC iovl data: {err}")))?;
-                overlay_canvas = Some(heic_overlay_canvas(&data).ok_or_else(|| {
-                    invalid_image(path, "invalid or truncated HEIC iovl descriptor")
-                })?);
+                overlay_canvas = walk.overlay_canvases.get(&id).copied();
             }
             let inputs = container.referenced_items(id, b"dimg");
             if inputs.is_empty() {
@@ -1296,7 +1385,7 @@ fn heic_item_dimensions(
             }
             visiting.push(id);
             for &input in inputs {
-                heic_item_dimensions(container, input, depth + 1, visiting, retained, path)?;
+                heic_item_dimensions(container, input, depth + 1, visiting, retained, walk, path)?;
             }
             visiting.pop();
         }
@@ -1611,14 +1700,32 @@ fn probe_heic(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeErro
         }
     }
 
+    // Read every iovl descriptor up front from its real storage: file-backed
+    // descriptors live in `mdat`, which the compact header buffer excludes.
+    let mut overlay_canvases = HashMap::new();
+    for item in &container.items {
+        if item.item_type.0 == *b"iovl" {
+            let descriptor =
+                read_heic_overlay_descriptor(file, path, &container, item.id, file_len)?;
+            let canvas = heic_overlay_canvas(&descriptor)
+                .ok_or_else(|| invalid_image(path, "invalid or truncated HEIC iovl descriptor"))?;
+            overlay_canvases.insert(item.id, canvas);
+        }
+    }
+
     let mut visiting = Vec::new();
     let mut retained = 0_u64;
+    let mut walk = HeicWalk {
+        visits: 0,
+        overlay_canvases: &overlay_canvases,
+    };
     let (width, height) = heic_item_dimensions(
         &container,
         container.primary_id,
         0,
         &mut visiting,
         &mut retained,
+        &mut walk,
         path,
     )?;
     // Plain coded images are already bounded per item. A derived primary keeps
@@ -2723,10 +2830,11 @@ fn reject_canonical_same_path(source: &Path, target: &Path) -> Result<(), ProbeE
 #[cfg(test)]
 mod tests {
     use super::{
-        ImageBatchRequest, ProbedImage, heic_has_multi_sample_track, heic_idat_content_len,
-        heic_overlay_canvas, is_alpha_auxiliary_urn, prepare_image_batch,
-        prepare_image_batch_inner, prepare_image_batch_with_options, probe_directory_entry,
-        probe_image, resolve_sniffed_input, validate_cpu_heic_admission,
+        HeicBrandKind, HeicWalk, ImageBatchRequest, MAX_HEIC_ITEM_VISITS, ProbedImage,
+        charge_heic_visit, heic_has_multi_sample_track, heic_idat_content_len, heic_overlay_canvas,
+        is_alpha_auxiliary_urn, prepare_image_batch, prepare_image_batch_inner,
+        prepare_image_batch_with_options, probe_directory_entry, probe_image,
+        resolve_sniffed_input, validate_cpu_heic_admission,
     };
     use crate::ProbeError;
     use fastconv_domain::{
@@ -4559,6 +4667,89 @@ mod tests {
             ImageInputFormat::Avif
         );
 
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn heic_item_visit_budget_is_bounded() -> Result<(), ProbeError> {
+        let path = Path::new("budget.heic");
+        let canvases = std::collections::HashMap::new();
+        let mut walk = HeicWalk {
+            visits: 0,
+            overlay_canvases: &canvases,
+        };
+        for _ in 0..MAX_HEIC_ITEM_VISITS {
+            charge_heic_visit(&mut walk, path)?;
+        }
+        assert!(matches!(
+            charge_heic_visit(&mut walk, path),
+            Err(ProbeError::InvalidImage { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_extended_ftyp_brand_past_the_prefix() -> Result<(), ProbeError> {
+        let root = create_temp_dir("heic-extended-ftyp")?;
+        let path = root.join("extended");
+        let mut ftyp = vec![0_u8; 96];
+        ftyp[0..4].copy_from_slice(&1_u32.to_be_bytes());
+        ftyp[4..8].copy_from_slice(b"ftyp");
+        ftyp[8..16].copy_from_slice(&96_u64.to_be_bytes());
+        ftyp[16..20].copy_from_slice(b"mif1");
+        ftyp[64..68].copy_from_slice(b"heic");
+        write_test_file(&path, &ftyp)?;
+        assert_eq!(
+            super::sniff_magic_format(&ftyp[..64], true),
+            Some(ImageInputFormat::Heic)
+        );
+        let mut file = File::open(&path).map_err(|source| ProbeError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let sniffed = super::sniff_magic_format(&ftyp[..64], true).ok_or_else(|| {
+            ProbeError::InvalidImage {
+                path: path.clone(),
+                reason: "extended ftyp was not sniffed as HEIC".to_owned(),
+            }
+        })?;
+        assert_eq!(
+            resolve_sniffed_input(&mut file, &path, sniffed)?.brands,
+            HeicBrandKind::Specific
+        );
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn probes_large_transparent_heic_with_grid_alpha() -> Result<(), ProbeError> {
+        let root = create_temp_dir("heic-grid-alpha")?;
+        let path = root.join("large.heic");
+        let (width, height) = (600_u32, 600_u32);
+        let count = usize::try_from(width * height).unwrap_or(0);
+        let mut pixels = Vec::with_capacity(count.saturating_mul(4));
+        for index in 0..count {
+            let row = u32::try_from(index).unwrap_or(0) / width;
+            pixels.push(u8::try_from(index % 251).unwrap_or(0));
+            pixels.push(u8::try_from(row % 251).unwrap_or(0));
+            pixels.push(80);
+            pixels.push(if index % 997 == 0 { 96 } else { 255 });
+        }
+        let bytes = heifer::encode_rgba8(
+            width,
+            height,
+            &pixels,
+            &heifer::EncodeOptions::new().with_max_threads(1),
+        )
+        .map_err(|err| ProbeError::InvalidImage {
+            path: path.clone(),
+            reason: format!("failed to build grid-alpha HEIC: {err}"),
+        })?;
+        write_test_file(&path, &bytes)?;
+        let probed = probe_image(&path)?;
+        assert_eq!(probed.format, ImageInputFormat::Heic);
+        assert_eq!(probed.dimensions, ImageDimensions::new(width, height)?);
         fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
         Ok(())
     }
