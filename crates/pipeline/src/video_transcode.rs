@@ -859,7 +859,7 @@ fn encode_mp3_track(
     }
     let channels = target_channels;
     let mut encoder = rusty_mp3::Mp3Encoder::new(rusty_mp3::Mp3EncoderConfig {
-        bitrate_kbps: configured_mp3_kbps(config),
+        bitrate_kbps: checked_mp3_bitrate_kbps(config, rate, path)?,
         vbr_quality: None,
     });
     encoder
@@ -992,10 +992,27 @@ fn configured_mp3_kbps(config: AudioEncodeConfig) -> u32 {
     })
 }
 
+/// Resolves and validates the concrete MP3 pair before encoder creation.
+/// Either field can come from a worker default rather than an explicit option,
+/// so the band check must run on what the encoder actually receives.
+fn checked_mp3_bitrate_kbps(
+    config: AudioEncodeConfig,
+    rate: u32,
+    path: &Path,
+) -> Result<u32, PipelineError> {
+    let kbps = configured_mp3_kbps(config);
+    config
+        .validate_effective_mp3(kbps.saturating_mul(1_000), rate)
+        .map_err(|err| encode_error(path, err.to_string()))?;
+    Ok(kbps)
+}
+
 /// Interleaved channel remix. `from == to` borrows the input unchanged; any
 /// other ratio is expressed per frame with bounded lookups so a truncated PCM
 /// chunk can never panic. Mono/stereo are the sources for multichannel AAC
-/// upmixes, while multichannel sources are folded down by channel index.
+/// upmixes. Multichannel to stereo folds every source channel into both output
+/// channels by averaging it with the left/right pair, so center, LFE and
+/// surround content survives without exceeding the peak input sample.
 fn mix_to_channels(pcm: &[f32], from: usize, to: usize) -> Result<Cow<'_, [f32]>, PipelineError> {
     let invalid = || {
         encode_error(
@@ -1019,6 +1036,14 @@ fn mix_to_channels(pcm: &[f32], from: usize, to: usize) -> Result<Cow<'_, [f32]>
         if to == 1 {
             let sum = frame.iter().fold(0.0_f32, |acc, sample| acc + *sample);
             out.push(sum / divisor);
+            continue;
+        }
+        if from > 2 && to == 2 {
+            let average = frame.iter().fold(0.0_f32, |sum, sample| sum + *sample) / divisor;
+            let left = frame.first().copied().unwrap_or(0.0);
+            let right = frame.get(1).copied().unwrap_or(left);
+            out.push(f32::midpoint(left, average));
+            out.push(f32::midpoint(right, average));
             continue;
         }
         for channel in 0..to {
@@ -1168,7 +1193,7 @@ impl StreamingAudioEncoder {
                 }
                 let mp3_encoder =
                     Box::new(rusty_mp3::Mp3Encoder::new(rusty_mp3::Mp3EncoderConfig {
-                        bitrate_kbps: configured_mp3_kbps(config),
+                        bitrate_kbps: checked_mp3_bitrate_kbps(config, rate, Path::new("mp3"))?,
                         vbr_quality: None,
                     }));
                 let track = ContainerTrack {
@@ -2690,7 +2715,8 @@ mod tests {
     use crate::video_container::{ContainerMedia, mux_video};
     use fastconv_domain::{
         AnimationLoop, AudioBitrate, AudioChannels, AudioEncodeOptions, AudioSampleRate,
-        TargetVideoCodec, VideoBitrate, VideoContainerFormat, VideoRateControl, VideoStreamKind,
+        DomainError, TargetVideoCodec, VideoBitrate, VideoContainerFormat, VideoRateControl,
+        VideoStreamKind,
     };
     use std::num::NonZeroUsize;
     use std::process::{Command, ExitStatus, Stdio};
@@ -4897,11 +4923,59 @@ mod tests {
         assert_eq!(six_from_stereo[1], 0.8);
         assert_eq!(six_from_stereo[2], 0.5);
         let two_from_six = mix_to_channels(&surround, 6, 2)?;
-        assert_eq!(two_from_six.as_ref(), [0.1, 0.2]);
+        // The average of all six channels (0.35) is folded into the stereo
+        // pair, so channels 2-5 reach the output and the peak stays bounded.
+        assert!((two_from_six[0] - 0.225).abs() < 0.000_1);
+        assert!((two_from_six[1] - 0.275).abs() < 0.000_1);
+        let center_only = [0.0_f32, 0.0, 1.0, 0.0, 0.0, 0.0];
+        let folded = mix_to_channels(&center_only, 6, 2)?;
+        assert!(folded[0] > 0.0 && folded[1] > 0.0);
+        assert_eq!(mix_to_channels(&[1.0_f32; 6], 6, 2)?.as_ref(), [1.0, 1.0]);
         let one_from_six = mix_to_channels(&surround, 6, 1)?;
         assert!((one_from_six[0] - 0.35).abs() < 0.000_1);
         assert!(mix_to_channels(&[1.0], 0, 2).is_err());
         assert!(mix_to_channels(&[1.0], 2, 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn mp3_effective_bitrate_band_is_checked_before_encoder_creation() -> Result<(), PipelineError>
+    {
+        let config =
+            |bitrate: Option<u32>, rate: Option<u32>| -> Result<AudioEncodeConfig, PipelineError> {
+                let to_err = |err: DomainError| PipelineError::RemuxFailed {
+                    path: PathBuf::new(),
+                    reason: err.to_string(),
+                };
+                let bitrate = bitrate
+                    .map(|bps| AudioBitrate::new(bps).map_err(to_err))
+                    .transpose()?;
+                let rate = rate
+                    .map(|hz| AudioSampleRate::new(hz).map_err(to_err))
+                    .transpose()?;
+                AudioEncodeConfig::new(
+                    TargetAudioCodec::Mp3,
+                    AudioEncodeOptions::new(bitrate, rate, None),
+                )
+                .map_err(to_err)
+            };
+        // Rate-only override inherits the 192 kbps default: out of band below 32 kHz.
+        let rate_only = config(None, Some(22_050))?;
+        assert!(checked_mp3_bitrate_kbps(rate_only, 22_050, Path::new("mp3")).is_err());
+        // Bitrate-only override inherits a 48 kHz source: below the floor.
+        let bitrate_only = config(Some(16_000), None)?;
+        assert!(checked_mp3_bitrate_kbps(bitrate_only, 48_000, Path::new("mp3")).is_err());
+        // Valid pairs keep working in both bands.
+        let valid_low = config(Some(128_000), Some(22_050))?;
+        assert_eq!(
+            checked_mp3_bitrate_kbps(valid_low, 22_050, Path::new("mp3"))?,
+            128
+        );
+        let valid_high = config(Some(64_000), Some(48_000))?;
+        assert_eq!(
+            checked_mp3_bitrate_kbps(valid_high, 48_000, Path::new("mp3"))?,
+            64
+        );
         Ok(())
     }
 

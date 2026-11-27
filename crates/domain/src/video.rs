@@ -648,6 +648,16 @@ impl AudioEncodeConfig {
         8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000,
     ];
 
+    /// Rate-dependent MP3 band: below 32 kHz the ceiling is 160 kbps, at or
+    /// above it the floor is 32 kbps.
+    const fn mp3_band(sample_rate_hz: u32) -> (u32, u32) {
+        if sample_rate_hz >= 32_000 {
+            (32_000, 320_000)
+        } else {
+            (8_000, 160_000)
+        }
+    }
+
     /// Validates `options` against the concrete codec's supported range.
     ///
     /// # Errors
@@ -673,11 +683,7 @@ impl AudioEncodeConfig {
                 && let Some(sample_rate) = options.sample_rate()
             {
                 let hz = sample_rate.hz();
-                let (min, max) = if hz >= 32_000 {
-                    (32_000, 320_000)
-                } else {
-                    (8_000, 160_000)
-                };
+                let (min, max) = Self::mp3_band(hz);
                 if !(min..=max).contains(&bps) {
                     return Err(unsupported(format!(
                         "MP3 bitrate {rate} is outside {min}..={max} bps at {sample_rate}"
@@ -716,6 +722,35 @@ impl AudioEncodeConfig {
             sample_rate: options.sample_rate(),
             channels: options.channels(),
         })
+    }
+
+    /// Validates the effective MP3 bitrate/sample-rate pair after the worker
+    /// has resolved its defaults. [`Self::new`] can only inspect values the
+    /// caller supplied; an omitted field is replaced by a codec default that
+    /// could otherwise reach the encoder out of band.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::UnsupportedAudioEncodeOption`] when the effective
+    /// pair is outside the rate-dependent MP3 band. Other codecs are unaffected.
+    pub fn validate_effective_mp3(
+        self,
+        bitrate_bps: u32,
+        sample_rate_hz: u32,
+    ) -> Result<(), DomainError> {
+        if self.codec != TargetAudioCodec::Mp3 {
+            return Ok(());
+        }
+        let (min, max) = Self::mp3_band(sample_rate_hz);
+        if !(min..=max).contains(&bitrate_bps) {
+            return Err(DomainError::UnsupportedAudioEncodeOption {
+                codec: self.codec,
+                reason: format!(
+                    "MP3 bitrate {bitrate_bps} bps is outside {min}..={max} bps at {sample_rate_hz} Hz"
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Applies no overrides; the pipeline keeps its per-codec defaults.
@@ -3347,6 +3382,22 @@ mod tests {
         let high_options = AudioEncodeOptions::new(Some(bps), Some(high), None);
         assert!(AudioEncodeConfig::new(TargetAudioCodec::Mp3, low_options).is_ok());
         assert!(AudioEncodeConfig::new(TargetAudioCodec::Mp3, high_options).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn effective_mp3_pair_checks_worker_defaults() -> Result<(), DomainError> {
+        let config = AudioEncodeConfig::default_for(TargetAudioCodec::Mp3);
+        // A rate-only override inherits 192 kbps, too high below 32 kHz.
+        assert!(config.validate_effective_mp3(192_000, 22_050).is_err());
+        // A bitrate-only override inherits a 48 kHz source, below the floor.
+        assert!(config.validate_effective_mp3(16_000, 48_000).is_err());
+        // Valid pairs stay valid in both bands.
+        config.validate_effective_mp3(128_000, 22_050)?;
+        config.validate_effective_mp3(64_000, 48_000)?;
+        // Other codecs have no rate-dependent band.
+        AudioEncodeConfig::default_for(TargetAudioCodec::Aac)
+            .validate_effective_mp3(16_000, 22_050)?;
         Ok(())
     }
 
