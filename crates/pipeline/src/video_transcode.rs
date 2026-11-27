@@ -1010,9 +1010,9 @@ fn checked_mp3_bitrate_kbps(
 /// Interleaved channel remix. `from == to` borrows the input unchanged; any
 /// other ratio is expressed per frame with bounded lookups so a truncated PCM
 /// chunk can never panic. Mono/stereo are the sources for multichannel AAC
-/// upmixes. Multichannel to stereo folds every source channel into both output
-/// channels by averaging it with the left/right pair, so center, LFE and
-/// surround content survives without exceeding the peak input sample.
+/// upmixes. Every reduction to fewer channels folds the full source average
+/// into each retained channel, so center, LFE and surround content survives
+/// without exceeding the peak input sample.
 fn mix_to_channels(pcm: &[f32], from: usize, to: usize) -> Result<Cow<'_, [f32]>, PipelineError> {
     let invalid = || {
         encode_error(
@@ -1044,6 +1044,17 @@ fn mix_to_channels(pcm: &[f32], from: usize, to: usize) -> Result<Cow<'_, [f32]>
             let right = frame.get(1).copied().unwrap_or(left);
             out.push(f32::midpoint(left, average));
             out.push(f32::midpoint(right, average));
+            continue;
+        }
+        if from > to {
+            // Mono and stereo reductions are handled above. For any other
+            // target layout, blend the full-source average into every retained
+            // channel so discarded channels still reach the output.
+            let average = frame.iter().fold(0.0_f32, |sum, sample| sum + *sample) / divisor;
+            for channel in 0..to {
+                let direct = frame.get(channel).copied().unwrap_or(0.0);
+                out.push(f32::midpoint(direct, average));
+            }
             continue;
         }
         for channel in 0..to {
@@ -4935,6 +4946,27 @@ mod tests {
         assert!((one_from_six[0] - 0.35).abs() < 0.000_1);
         assert!(mix_to_channels(&[1.0], 0, 2).is_err());
         assert!(mix_to_channels(&[1.0], 2, 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn non_stereo_reductions_preserve_every_source_channel() -> Result<(), PipelineError> {
+        for to in [3_usize, 5] {
+            for source_channel in 0..6 {
+                let mut frame = [0.0_f32; 6];
+                frame[source_channel] = 1.0;
+                let mixed = mix_to_channels(&frame, 6, to)?;
+                assert_eq!(mixed.len(), to);
+                assert!(
+                    mixed.iter().any(|sample| *sample > 0.0),
+                    "6->{to} dropped source channel {source_channel}"
+                );
+            }
+        }
+        assert_eq!(
+            mix_to_channels(&[1.0_f32; 6], 6, 3)?.as_ref(),
+            [1.0, 1.0, 1.0]
+        );
         Ok(())
     }
 
