@@ -868,6 +868,19 @@ pub(crate) fn mux_avi(
                 .get(..2)
                 .ok_or_else(|| avi_error(target_path, "missing AAC AudioSpecificConfig"))?;
             wrap_adts(asc, &packet.data).map_err(|reason| avi_error(target_path, reason))?
+        } else if track.codec == VideoCodec::Pcm {
+            let format = track
+                .pcm_format
+                .ok_or_else(|| avi_error(target_path, "PCM track has no sample format"))?;
+            let block_align = usize::from(track.channels.unwrap_or(2).max(1))
+                .saturating_mul(usize::from(format.bytes_per_sample()));
+            if block_align == 0 || !packet.data.len().is_multiple_of(block_align) {
+                return Err(avi_error(
+                    target_path,
+                    "AVI PCM chunk is not a whole number of frames",
+                ));
+            }
+            packet.data.clone()
         } else {
             packet.data.clone()
         };
@@ -1008,6 +1021,46 @@ mod tests {
         let out = demux_avi(&path)?;
         std::fs::remove_file(&path)?;
         Ok(out)
+    }
+
+    #[test]
+    fn avi_rejects_pcm_chunks_that_are_not_whole_frames() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let media = ContainerMedia {
+            tracks: vec![ContainerTrack {
+                codec: VideoCodec::Pcm,
+                width: None,
+                height: None,
+                channels: Some(2),
+                sample_rate: Some(48_000),
+                config: Vec::new(),
+                timescale: US_TIMESCALE,
+                presentation_edit: None,
+                pcm_format: Some(PcmFormat::S16Le),
+            }],
+            packets: (0..2)
+                .map(|index| ContainerPacket {
+                    track: 0,
+                    pts: i64::from(index) * 1_042,
+                    dts: i64::from(index) * 1_042,
+                    duration: 1_042,
+                    keyframe: true,
+                    // 6 bytes is 1.5 stereo S16 frames; the 12-byte total
+                    // alone would satisfy the header's whole-frame check.
+                    data: vec![0_u8; 6],
+                })
+                .collect(),
+        };
+        let path = temp_path("pcm-partial");
+        let file = File::create(&path)?;
+        let result = mux_avi(&file, &path, &media);
+        drop(file);
+        std::fs::remove_file(&path)?;
+        assert!(
+            result.is_err(),
+            "each PCM chunk must contain a whole number of frames"
+        );
+        Ok(())
     }
 
     #[test]

@@ -1651,6 +1651,9 @@ pub(crate) fn extract_dfla_from_sample_entry(raw: &[u8]) -> Result<Vec<u8>, Stri
 }
 
 /// Extracts the canonical STREAMINFO from a `dfLa` full box body.
+/// Production muxing keeps the whole metadata chain; this helper is only used
+/// by the container-helper tests that check the standalone `dfLa` parsing.
+#[cfg(test)]
 pub(crate) fn extract_flac_streaminfo_from_dfla(data: &[u8]) -> Result<[u8; 34], String> {
     if data.len() < 4 || data[..4] != [0, 0, 0, 0] {
         return Err("dfLa must be version 0 with zero flags".to_owned());
@@ -1681,7 +1684,13 @@ pub(crate) fn build_flac_mp4_sample_entry(
     entry.extend_from_slice(&1_u16.to_be_bytes());
     entry.extend_from_slice(&[0; 8]);
     entry.extend_from_slice(&channels.to_be_bytes());
-    entry.extend_from_slice(&16_u16.to_be_bytes());
+    // The sample entry's sample_size must agree with STREAMINFO's bit depth or
+    // strict readers (e.g. Chromium) reject the track. Callers pass validated
+    // STREAMINFO, so the legacy 16-bit default only covers an impossible parse
+    // error and keeps 16-bit entries byte-for-byte unchanged.
+    let sample_size =
+        parse_flac_streaminfo(streaminfo).map_or(16_u16, |(_, _, bits)| u16::from(bits));
+    entry.extend_from_slice(&sample_size.to_be_bytes());
     entry.extend_from_slice(&[0; 4]);
     let rate = if sample_rate <= 0xFFFF {
         sample_rate << 16
@@ -2644,6 +2653,31 @@ mod tests {
         let dfla = extract_dfla_from_sample_entry(&entry)?;
         assert_eq!(dfla[..4], [0, 0, 0, 0]);
         assert_eq!(extract_flac_streaminfo_from_dfla(&dfla)?, si);
+        Ok(())
+    }
+
+    #[test]
+    fn flac_mp4_sample_entry_sample_size_follows_streaminfo() -> Result<(), String> {
+        let si16 = flac_streaminfo(48_000, 2, 16);
+        let si24 = flac_streaminfo(48_000, 2, 24);
+        let entry16 = build_flac_mp4_sample_entry(2, 48_000, &si16);
+        let entry24 = build_flac_mp4_sample_entry(2, 48_000, &si24);
+
+        // The AudioSampleEntry sample_size at bytes 26..28 must match STREAMINFO.
+        assert_eq!(&entry16[26..28], &16_u16.to_be_bytes());
+        assert_eq!(&entry24[26..28], &24_u16.to_be_bytes());
+
+        // The 16-bit entry stays byte-for-byte legacy: moving STREAMINFO to 24
+        // bits changes only the declared size and the embedded STREAMINFO body.
+        let mut legacy = entry24.clone();
+        legacy[26..28].copy_from_slice(&16_u16.to_be_bytes());
+        legacy[52..86].copy_from_slice(&si16);
+        assert_eq!(entry16, legacy);
+
+        let dfla16 = extract_dfla_from_sample_entry(&entry16)?;
+        assert_eq!(extract_flac_streaminfo_from_dfla(&dfla16)?, si16);
+        let dfla24 = extract_dfla_from_sample_entry(&entry24)?;
+        assert_eq!(extract_flac_streaminfo_from_dfla(&dfla24)?, si24);
         Ok(())
     }
 

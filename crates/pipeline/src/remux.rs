@@ -255,6 +255,31 @@ fn reject_unrepresentable_mkv_metadata(source: &Path, target: &Path) -> Result<(
     Ok(())
 }
 
+/// Fails before any path is taken when an MP4/MOV source carries title or
+/// chapter metadata that the canonical `demux_video` -> `mux_video` route
+/// cannot carry (`ContainerMedia` has no metadata or chapter field). Stream
+/// copy keeps both, so only the canonical route needs this guard.
+fn reject_unrepresentable_mp4_metadata(source: &Path, target: &Path) -> Result<(), PipelineError> {
+    let reader = WindowedFileReader::open(source).map_err(|err| PipelineError::Io {
+        path: source.to_path_buf(),
+        source: err,
+    })?;
+    let input = containr::mp4::Demuxer::open(reader).map_err(|err| container_err(source, &err))?;
+    if !input.chapters().is_empty() {
+        return Err(remux_failed(
+            target,
+            "MP4/MOV chapters cannot be preserved on the canonical remux route; refusing to drop data",
+        ));
+    }
+    if !input.metadata().is_empty() {
+        return Err(remux_failed(
+            target,
+            "MP4/MOV title/tag metadata cannot be preserved on the canonical remux route; refusing to drop data",
+        ));
+    }
+    Ok(())
+}
+
 /// Remuxes a single file without re-encoding, rejecting unsupported codecs.
 fn remux_file(item: &VideoRemuxItem, target: &File) -> Result<(), PipelineError> {
     let source = item.source();
@@ -268,6 +293,13 @@ fn remux_file(item: &VideoRemuxItem, target: &File) -> Result<(), PipelineError>
     ) && !direct
     {
         reject_unrepresentable_mkv_metadata(source, item.target())?;
+    }
+    if matches!(
+        item.input_format(),
+        VideoContainerFormat::Mp4 | VideoContainerFormat::Mov
+    ) && !direct
+    {
+        reject_unrepresentable_mp4_metadata(source, item.target())?;
     }
     for stream in item.streams() {
         if !stream.codec().supported_in(output) {
@@ -1957,6 +1989,124 @@ mod container_tests {
         writer.flush()?;
         drop(writer);
         std::fs::remove_file(base)?;
+        Ok(())
+    }
+
+    fn write_mp4_with_chapter_or_tag(
+        path: &Path,
+        media: &ContainerMedia,
+        chapter: bool,
+        tag: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base = temp_path("mp4-metadata-base", "mp4");
+        write_container(&base, VideoContainerFormat::Mp4, media)?;
+        let reader = WindowedFileReader::open(&base)?;
+        let mut input = containr::mp4::Demuxer::open(reader)?;
+        let file = File::create(path)?;
+        let options = containr::mp4::MuxOptions {
+            brand: Brand::Isom,
+            faststart: false,
+            ..containr::mp4::MuxOptions::default()
+        };
+        let movie_timescale = options.movie_timescale;
+        let mut output = containr::mp4::Muxer::new(file, options)?;
+        let mut plans = Vec::new();
+        for track in input.tracks() {
+            let packets = read_packets(input.track_packets(track.id)?, &base)?;
+            let plan = containr::mp4::StreamCopy::plan(track, &packets, movie_timescale)?;
+            let id = output.add_track(plan.spec.clone())?;
+            plans.push((track.id, plan, id));
+        }
+        if chapter {
+            output.set_chapters(vec![containr::Chapter {
+                start: 0,
+                duration: Some(1_000_000_000),
+                timescale: 1_000_000_000,
+                title: "Intro".to_owned(),
+                source: containr::ChapterSource::Chpl,
+            }])?;
+        }
+        if tag {
+            output.set_metadata(vec![containr::MetadataItem {
+                scope: containr::MetadataScope::Tag(containr::TagScope {
+                    target_type_value: 50,
+                    target: containr::TagTarget::Segment,
+                    binary: false,
+                }),
+                key: containr::MetadataKey::Named(b"TITLE".to_vec()),
+                value: b"Sample".to_vec(),
+                data: Vec::new(),
+            }])?;
+        }
+        let mut buf = Vec::new();
+        for packet in input.packets() {
+            let packet = packet?;
+            let Some((_, plan, id)) = plans
+                .iter()
+                .find(|(track_id, _, _)| *track_id == packet.track_id)
+            else {
+                continue;
+            };
+            input.read_packet_into(&packet, &mut buf)?;
+            let block = plan.packet(&packet, &buf)?;
+            output.write_packet(*id, &block)?;
+        }
+        output.finish()?;
+        std::fs::remove_file(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mp4_canonical_route_rejects_chapters_and_tags_with_mp3()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let media = h264_mp3_media();
+        for (name, chapter, tag) in [("chapter", true, false), ("tag", false, true)] {
+            let source = temp_path(&format!("mp4-{name}-source"), "mov");
+            let target = temp_path(&format!("mp4-{name}-target"), "mp4");
+            write_mp4_with_chapter_or_tag(&source, &media, chapter, tag)?;
+            let reader = WindowedFileReader::open(&source)?;
+            let demuxer = containr::mp4::Demuxer::open(reader)?;
+            // containr may emit both a chapter track and a Nero chapter for
+            // one logical chapter; only presence matters to the guard.
+            assert_eq!(!demuxer.chapters().is_empty(), chapter);
+            assert_eq!(!demuxer.metadata().is_empty(), tag);
+
+            // MP3 disables stream copy, so the MOV source takes the canonical
+            // route; chapters and tags must fail before a target is published.
+            let result = remux(
+                &source,
+                &target,
+                VideoContainerFormat::Mov,
+                VideoContainerFormat::Mp4,
+            );
+            assert!(
+                matches!(result, Err(PipelineError::RemuxFailed { .. })),
+                "{name} metadata was dropped instead of rejected: {result:?}"
+            );
+            assert!(
+                !target.exists(),
+                "no target was published after {name} rejection"
+            );
+            std::fs::remove_file(source)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mp4_canonical_route_without_metadata_still_remuxes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let source = temp_path("mp4-metadata-free-source", "mov");
+        let target = temp_path("mp4-metadata-free-target", "mp4");
+        write_container(&source, VideoContainerFormat::Mov, &h264_mp3_media())?;
+        remux(
+            &source,
+            &target,
+            VideoContainerFormat::Mov,
+            VideoContainerFormat::Mp4,
+        )?;
+        assert!(target.exists());
+        std::fs::remove_file(source)?;
+        std::fs::remove_file(target)?;
         Ok(())
     }
 

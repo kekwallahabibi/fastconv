@@ -507,18 +507,31 @@ where
     let ordered = decode_order(packets);
     let channels = track.channels.unwrap_or(2).max(1);
     let mut chunk = Vec::new();
+    // `cursor` advances past emitted blocks so a large chunk is not shifted
+    // from the front once per output block; the consumed prefix is compacted
+    // once per call instead.
+    let mut cursor = 0_usize;
     let mut last_rate = 0_u32;
     let mut last_channels = 0_u16;
     let emit_ready = |chunk: &mut Vec<f32>,
+                      cursor: &mut usize,
                       rate: u32,
                       decoded: u16,
                       on_chunk: &mut F|
      -> Result<(), PipelineError> {
         let ready = AUDIO_PCM_CHUNK_FRAMES.saturating_mul(usize::from(decoded.max(1)));
-        while chunk.len() >= ready {
-            let slice = chunk[..ready].to_vec();
-            on_chunk(&slice, rate, decoded)?;
-            chunk.drain(..ready);
+        loop {
+            let available = chunk.len().saturating_sub(*cursor);
+            if available < ready {
+                break;
+            }
+            let end = cursor.saturating_add(ready);
+            on_chunk(&chunk[*cursor..end], rate, decoded)?;
+            *cursor = end;
+        }
+        if *cursor > 0 {
+            chunk.drain(..*cursor);
+            *cursor = 0;
         }
         Ok(())
     };
@@ -567,7 +580,7 @@ where
                         chunk.extend_from_slice(samples);
                     }
                 }
-                emit_ready(&mut chunk, OPUS_RATE, channels, &mut on_chunk)?;
+                emit_ready(&mut chunk, &mut cursor, OPUS_RATE, channels, &mut on_chunk)?;
             }
             last_rate = OPUS_RATE;
             last_channels = channels;
@@ -586,7 +599,13 @@ where
                 last_rate = frame.sample_rate;
                 last_channels = frame.channels;
                 chunk.extend_from_slice(&frame.samples);
-                emit_ready(&mut chunk, last_rate, last_channels, &mut on_chunk)?;
+                emit_ready(
+                    &mut chunk,
+                    &mut cursor,
+                    last_rate,
+                    last_channels,
+                    &mut on_chunk,
+                )?;
             }
         }
         VideoCodec::Mp3 => {
@@ -657,7 +676,13 @@ where
                     audio_frame.copy_to_slice_interleaved(&mut *slot);
                     chunk.extend_from_slice(&slot[..count]);
                 }
-                emit_ready(&mut chunk, last_rate, last_channels, &mut on_chunk)?;
+                emit_ready(
+                    &mut chunk,
+                    &mut cursor,
+                    last_rate,
+                    last_channels,
+                    &mut on_chunk,
+                )?;
             }
         }
         VideoCodec::Vorbis => {
@@ -710,7 +735,13 @@ where
                 }
                 last_rate = ident_rate;
                 last_channels = ident_channels;
-                emit_ready(&mut chunk, last_rate, last_channels, &mut on_chunk)?;
+                emit_ready(
+                    &mut chunk,
+                    &mut cursor,
+                    last_rate,
+                    last_channels,
+                    &mut on_chunk,
+                )?;
             }
         }
         VideoCodec::Flac => {
@@ -760,7 +791,13 @@ where
                 }
                 last_rate = flac_rate;
                 last_channels = flac_channels;
-                emit_ready(&mut chunk, last_rate, last_channels, &mut on_chunk)?;
+                emit_ready(
+                    &mut chunk,
+                    &mut cursor,
+                    last_rate,
+                    last_channels,
+                    &mut on_chunk,
+                )?;
             }
         }
         VideoCodec::Pcm => {
@@ -774,6 +811,14 @@ where
             }
             last_rate = track.sample_rate.unwrap_or(0);
             last_channels = channels;
+            // Convert at most one output block of whole frames at a time so a
+            // large packet is never duplicated wholesale as f32 and `chunk`
+            // stays at one block plus one slice.
+            let slice_bytes = AUDIO_PCM_CHUNK_FRAMES
+                .max(1)
+                .saturating_mul(frame_bytes)
+                .max(1);
+            let mut decoded_bytes = 0_u64;
             for packet in ordered {
                 if cancelled.load(Ordering::Acquire) {
                     return Ok(());
@@ -784,11 +829,27 @@ where
                         "PCM packet is not a whole number of frames",
                     ));
                 }
-                if u64::try_from(chunk.len()).unwrap_or(u64::MAX) > MAX_DECODED_BYTES_PER_TRACK {
-                    return Err(decode_error(path, "PCM audio exceeds the allocation cap"));
+                for slice in packet.data.chunks(slice_bytes) {
+                    if slice.len() % frame_bytes != 0 {
+                        return Err(decode_error(
+                            path,
+                            "PCM packet is not a whole number of frames",
+                        ));
+                    }
+                    let samples = u64::try_from(slice.len() / frame_bytes)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(u64::from(channels));
+                    decoded_bytes = decoded_bytes.saturating_add(samples.saturating_mul(4));
+                    enforce_decoded_budget(path, decoded_bytes)?;
+                    chunk.extend_from_slice(&pcm_bytes_to_f32(slice, format));
+                    emit_ready(
+                        &mut chunk,
+                        &mut cursor,
+                        last_rate,
+                        last_channels,
+                        &mut on_chunk,
+                    )?;
                 }
-                chunk.extend_from_slice(&pcm_bytes_to_f32(&packet.data, format));
-                emit_ready(&mut chunk, last_rate, last_channels, &mut on_chunk)?;
             }
         }
         other => {
@@ -1133,7 +1194,10 @@ fn encode_mp3_track(
     clippy::cast_precision_loss
 )]
 fn to_s16_i32(sample: f32) -> i32 {
-    (sample * 32_767.0).round().clamp(-32_768.0, 32_767.0) as i32
+    // Decoding divides signed samples by 32768, so -1.0 must map back to
+    // -32768 (not -32767). Multiplying by 32768 keeps the negative endpoint
+    // exact; clamping still keeps +1.0 inside i16's asymmetric positive max.
+    (sample * 32_768.0).round().clamp(-32_768.0, 32_767.0) as i32
 }
 
 /// Interleaved `f32` to signed 16-bit little-endian PCM bytes.
@@ -1172,10 +1236,11 @@ fn flac_streaminfo(
     let mut info = FlacStreamInfo::new(rate, usize::from(channels), 16).map_err(|err| {
         encode_error(Path::new("flac"), format!("invalid FLAC StreamInfo: {err}"))
     })?;
-    // Tail blocks are padded to FLAC_MIN_BLOCK_FRAMES, so the declared
-    // minimum must use the same constant or strict decoders see an illegal
-    // final block that is shorter than STREAMINFO's min_block_size.
-    info.set_block_sizes(FLAC_MIN_BLOCK_FRAMES, FLAC_CHUNK_FRAMES)
+    // Fixed-block frames must declare equal min/max bounds: when they differ,
+    // readers treat frame numbers as absolute sample positions and a second
+    // 4096-sample block lands at sample 1 instead of 4096, breaking seeks.
+    // The final shorter block is excluded from the min-block-size rule.
+    info.set_block_sizes(FLAC_CHUNK_FRAMES, FLAC_CHUNK_FRAMES)
         .map_err(|err| {
             encode_error(
                 Path::new("flac"),
@@ -6759,19 +6824,20 @@ mod tests {
                 .iter()
                 .find(|track| track.codec == VideoCodec::Flac)
                 .ok_or_else(|| decode_error(&target, "no FLAC track"))?;
-            // STREAMINFO's declared minimum must cover the padded tail frames.
-            let min_block = u16::from_be_bytes(
-                audio
-                    .config
-                    .get(..2)
-                    .ok_or_else(|| decode_error(&target, "short FLAC STREAMINFO"))?
-                    .try_into()
-                    .map_err(|_| decode_error(&target, "invalid FLAC min block size"))?,
-            );
+            // Fixed-size frames need equal STREAMINFO bounds; unequal bounds
+            // make readers treat frame numbers as absolute sample offsets.
+            let bounds: [u8; 4] = audio
+                .config
+                .get(..4)
+                .ok_or_else(|| decode_error(&target, "short FLAC STREAMINFO"))?
+                .try_into()
+                .map_err(|_| decode_error(&target, "invalid FLAC STREAMINFO bounds"))?;
+            let min_block = u16::from_be_bytes([bounds[0], bounds[1]]);
+            let max_block = u16::from_be_bytes([bounds[2], bounds[3]]);
             assert_eq!(
-                usize::from(min_block),
-                FLAC_MIN_BLOCK_FRAMES,
-                "declared FLAC min block disagrees with tail padding in {name}"
+                (usize::from(min_block), usize::from(max_block)),
+                (FLAC_CHUNK_FRAMES, FLAC_CHUNK_FRAMES),
+                "FLAC STREAMINFO block bounds must both be {FLAC_CHUNK_FRAMES} in {name}"
             );
             let packets: Vec<_> = media
                 .packets
@@ -7012,6 +7078,105 @@ mod tests {
             VideoCodec::H264,
             VideoCodec::Pcm,
         )?;
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn flac_streaminfo_declares_equal_fixed_block_bounds() -> Result<(), PipelineError> {
+        let info = flac_streaminfo(48_000, 2, 0)?;
+        let bytes = flac_streaminfo_bytes(&info)?;
+        let min = u16::from_be_bytes([bytes[0], bytes[1]]);
+        let max = u16::from_be_bytes([bytes[2], bytes[3]]);
+        assert_eq!(
+            (usize::from(min), usize::from(max)),
+            (FLAC_CHUNK_FRAMES, FLAC_CHUNK_FRAMES),
+            "fixed-block FLAC must declare equal min/max block sizes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn s16_quantization_roundtrips_both_signed_endpoints() {
+        // -1.0 decodes from S16Le -32768 and must re-encode to -32768 exactly;
+        // the positive endpoint is 32767/32768 (i16 has no +32768).
+        let positive = 32_767.0_f32 / 32_768.0_f32;
+        assert_eq!(to_s16_i32(-1.0_f32), -32_768);
+        assert_eq!(to_s16_i32(positive), 32_767);
+        assert_eq!(to_s16_i32(1.0_f32), 32_767);
+
+        // PCM output and FLAC frames both consume these i32 samples directly,
+        // so the endpoints survive either output path.
+        let mut raw = Vec::with_capacity(4);
+        raw.extend_from_slice(&(-32_768_i16).to_le_bytes());
+        raw.extend_from_slice(&32_767_i16.to_le_bytes());
+        assert_eq!(pcm_to_s16le(&[-1.0_f32, positive]), raw);
+        assert_eq!(
+            pcm_bytes_to_f32(&raw, PcmFormat::S16Le),
+            [-1.0_f32, positive]
+        );
+    }
+
+    #[test]
+    fn pcm_large_packet_streams_bounded_blocks() -> Result<(), PipelineError> {
+        let dir = temp_dir("pcm-large-packet")?;
+        let path = dir.join("x");
+        let channels = 1_u16;
+        let blocks = 8_usize;
+        let frames = AUDIO_PCM_CHUNK_FRAMES.saturating_mul(blocks) + 13;
+        let mut data = Vec::with_capacity(frames.saturating_mul(2));
+        for frame in 0..frames {
+            let raw = if frame % 2 == 0 {
+                -32_768_i16
+            } else {
+                32_767_i16
+            };
+            data.extend_from_slice(&raw.to_le_bytes());
+        }
+        let track = ContainerTrack {
+            codec: VideoCodec::Pcm,
+            width: None,
+            height: None,
+            channels: Some(channels),
+            sample_rate: Some(48_000),
+            config: Vec::new(),
+            timescale: US_TIMESCALE,
+            presentation_edit: None,
+            pcm_format: Some(PcmFormat::S16Le),
+        };
+        let packets = vec![ContainerPacket {
+            track: 0,
+            pts: 0,
+            dts: 0,
+            duration: 0,
+            keyframe: true,
+            data,
+        }];
+        let mut block_lens = Vec::new();
+        let mut decoded = Vec::new();
+        decode_audio_track_chunks(
+            &path,
+            &track,
+            &packets,
+            &AtomicBool::new(false),
+            |chunk, rate, decoded_channels| {
+                assert_eq!(rate, 48_000);
+                assert_eq!(decoded_channels, channels);
+                block_lens.push(chunk.len());
+                decoded.extend_from_slice(chunk);
+                Ok(())
+            },
+        )?;
+        let ready = AUDIO_PCM_CHUNK_FRAMES.saturating_mul(usize::from(channels));
+        assert_eq!(block_lens.len(), blocks + 1);
+        assert!(block_lens[..blocks].iter().all(|&len| len == ready));
+        assert_eq!(block_lens[blocks], 13);
+        assert_eq!(decoded.len(), frames);
+        assert_eq!(decoded[0], -1.0_f32);
+        assert_eq!(decoded[1], 32_767.0_f32 / 32_768.0_f32);
         fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
             path: dir.clone(),
             source,

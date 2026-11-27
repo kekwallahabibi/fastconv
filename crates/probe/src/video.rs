@@ -735,7 +735,14 @@ fn child_box(raw: &[u8], start: usize, fourcc: [u8; 4]) -> Option<&[u8]> {
     while idx.checked_add(8)? <= raw.len() {
         let size = u32::from_be_bytes(raw.get(idx..idx.checked_add(4)?)?.try_into().ok()?);
         let kind = raw.get(idx + 4..idx + 8)?;
-        let header = if size == 1 { 16 } else { 8 };
+        // ISOBMFF size 1 means the real 64-bit size follows the 8-byte header;
+        // using the marker itself as the size skips every largesize child.
+        let (declared_size, header) = if size == 1 {
+            let large = u64::from_be_bytes(<[u8; 8]>::try_from(raw.get(idx + 8..idx + 16)?).ok()?);
+            (large, 16_usize)
+        } else {
+            (u64::from(size), 8_usize)
+        };
         let body_start = idx.checked_add(header)?;
         if body_start > raw.len() {
             return None;
@@ -743,7 +750,7 @@ fn child_box(raw: &[u8], start: usize, fourcc: [u8; 4]) -> Option<&[u8]> {
         let body_len = if size == 0 {
             raw.len().saturating_sub(body_start)
         } else {
-            usize::try_from(size).ok()?.checked_sub(header)?
+            usize::try_from(declared_size).ok()?.checked_sub(header)?
         };
         let body_end = body_start.checked_add(body_len)?;
         if body_end > raw.len() {
@@ -4678,6 +4685,26 @@ mod tests {
         assert!(err_contains(&probe_video(&path), "CodecPrivate"));
         fs::remove_file(&path)?;
         Ok(())
+    }
+
+    #[test]
+    fn child_box_reads_isobmff_largesize_children() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&1_u32.to_be_bytes());
+        raw.extend_from_slice(b"free");
+        raw.extend_from_slice(&20_u64.to_be_bytes());
+        raw.extend_from_slice(&[0_u8; 4]);
+        raw.extend_from_slice(&1_u32.to_be_bytes());
+        raw.extend_from_slice(b"dfLa");
+        raw.extend_from_slice(&19_u64.to_be_bytes());
+        raw.extend_from_slice(&[7_u8, 8, 9]);
+        assert_eq!(child_box(&raw, 0, *b"dfLa"), Some(&[7, 8, 9][..]));
+
+        let mut normal = Vec::new();
+        normal.extend_from_slice(&11_u32.to_be_bytes());
+        normal.extend_from_slice(b"dfLa");
+        normal.extend_from_slice(&[1_u8, 2, 3]);
+        assert_eq!(child_box(&normal, 0, *b"dfLa"), Some(&[1, 2, 3][..]));
     }
 
     #[test]
