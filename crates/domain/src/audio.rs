@@ -15,6 +15,7 @@ pub enum AudioInputFormat {
     Mp3,
     Vorbis,
     Opus,
+    OggFlac,
     Aac,
     M4a,
     Alac,
@@ -28,7 +29,7 @@ impl AudioInputFormat {
             Self::Wav => "wav",
             Self::Flac => "flac",
             Self::Mp3 => "mp3",
-            Self::Vorbis => "ogg",
+            Self::Vorbis | Self::OggFlac => "ogg",
             Self::Opus => "opus",
             Self::Aac => "aac",
             Self::M4a | Self::Alac => "m4a",
@@ -43,6 +44,7 @@ impl AudioInputFormat {
             Self::Flac => "FLAC",
             Self::Mp3 => "MP3",
             Self::Vorbis => "Ogg Vorbis",
+            Self::OggFlac => "Ogg FLAC",
             Self::Opus => "Ogg Opus",
             Self::Aac => "AAC (ADTS)",
             Self::M4a => "M4A",
@@ -146,9 +148,130 @@ impl AudioOutputFormat {
             _ => Self::from_extension(ext) == Some(self),
         }
     }
+
+    /// The codec used when `--codec` is absent.
+    #[must_use]
+    pub const fn default_codec(self) -> AudioTargetCodec {
+        match self {
+            Self::Wav | Self::Aiff => AudioTargetCodec::Pcm,
+            Self::Flac => AudioTargetCodec::Flac,
+            Self::Opus => AudioTargetCodec::Opus,
+            Self::Ogg => AudioTargetCodec::Vorbis,
+            Self::Mp3 => AudioTargetCodec::Mp3,
+            Self::Aac | Self::M4a => AudioTargetCodec::Aac,
+            Self::Alac => AudioTargetCodec::Alac,
+        }
+    }
+
+    /// Codecs this container can carry, in help-message order.
+    #[must_use]
+    pub const fn supported_codecs(self) -> &'static [AudioTargetCodec] {
+        match self {
+            Self::Ogg => &[
+                AudioTargetCodec::Vorbis,
+                AudioTargetCodec::Opus,
+                AudioTargetCodec::Flac,
+            ],
+            Self::M4a => &[AudioTargetCodec::Aac, AudioTargetCodec::Alac],
+            Self::Wav | Self::Aiff => &[AudioTargetCodec::Pcm],
+            Self::Flac => &[AudioTargetCodec::Flac],
+            Self::Opus => &[AudioTargetCodec::Opus],
+            Self::Mp3 => &[AudioTargetCodec::Mp3],
+            Self::Aac => &[AudioTargetCodec::Aac],
+            Self::Alac => &[AudioTargetCodec::Alac],
+        }
+    }
+
+    /// Human-readable list of the codecs valid for this container.
+    #[must_use]
+    pub const fn supported_codec_list(self) -> &'static str {
+        match self {
+            Self::Ogg => "vorbis, opus, or flac",
+            Self::M4a => "aac or alac",
+            _ => self.default_codec().label(),
+        }
+    }
+
+    /// Label for the resolved container/codec pair, used in diagnostics so an
+    /// explicit `--codec` is never reported under the container's default name.
+    #[must_use]
+    pub const fn resolved_label(self, codec: AudioTargetCodec) -> &'static str {
+        match (self, codec) {
+            (Self::Ogg, AudioTargetCodec::Vorbis) => "Ogg Vorbis",
+            (Self::Ogg, AudioTargetCodec::Opus) => "Ogg Opus",
+            (Self::Ogg, AudioTargetCodec::Flac) => "Ogg FLAC",
+            (Self::M4a, AudioTargetCodec::Aac) => "M4A (AAC)",
+            (Self::M4a, AudioTargetCodec::Alac) => "M4A (ALAC)",
+            (Self::Alac, _) => "ALAC (M4A)",
+            _ => self.label(),
+        }
+    }
+
+    /// Resolves `codec` against the codecs this container can carry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::UnsupportedAudioCodecForFormat`] when an explicit
+    /// codec cannot be stored in this container.
+    pub fn resolve_codec(
+        self,
+        codec: Option<AudioTargetCodec>,
+    ) -> Result<AudioTargetCodec, DomainError> {
+        match codec {
+            None => Ok(self.default_codec()),
+            Some(codec) if self.supported_codecs().contains(&codec) => Ok(codec),
+            Some(codec) => Err(DomainError::UnsupportedAudioCodecForFormat {
+                format: self,
+                codec,
+                supported: self.supported_codec_list(),
+            }),
+        }
+    }
 }
 
 impl fmt::Display for AudioOutputFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Narrow codec selector for containers that can carry more than one codec.
+///
+/// Pairing a codec with an incompatible container is rejected by
+/// [`AudioOutputFormat::resolve_codec`] before a plan can be built, so an
+/// `(AudioOutputFormat, AudioTargetCodec)` pair inside a plan is always valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum AudioTargetCodec {
+    Pcm,
+    Flac,
+    Opus,
+    Vorbis,
+    Mp3,
+    Aac,
+    Alac,
+}
+
+impl AudioTargetCodec {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pcm => "PCM",
+            Self::Flac => "FLAC",
+            Self::Opus => "Opus",
+            Self::Vorbis => "Vorbis",
+            Self::Mp3 => "MP3",
+            Self::Aac => "AAC",
+            Self::Alac => "ALAC",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_lossless(self) -> bool {
+        matches!(self, Self::Pcm | Self::Flac | Self::Alac)
+    }
+}
+
+impl fmt::Display for AudioTargetCodec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.label())
     }
@@ -307,6 +430,9 @@ impl AudioOptionSampleRate {
         88_200, 96_000,
     ];
     pub const OPUS_RATE_HZ: u32 = 48_000;
+    /// The M4A sample entry stores the rate in a 16.16 fixed-point field, so an
+    /// integer rate above 65535 would be written as zero and break reopening.
+    pub const ALAC_MAX_HZ: u32 = 0xFFFF;
     pub const MIN_HZ: u32 = 8_000;
     pub const MAX_HZ: u32 = 192_000;
 
@@ -391,7 +517,8 @@ impl AudioEncodingOptions {
     /// Highest Layer III bitrate available at MPEG-2/2.5 sample rates.
     const MP3_MPEG2_MAX_BPS: u32 = 160_000;
 
-    /// Creates options and validates every field against the output format.
+    /// Creates options and validates every field against the output format's
+    /// default codec.
     ///
     /// # Errors
     ///
@@ -404,13 +531,39 @@ impl AudioEncodingOptions {
         channels: Option<AudioOptionChannels>,
         bit_depth: Option<AudioBitDepth>,
     ) -> Result<Self, DomainError> {
+        Self::for_codec(
+            format,
+            format.default_codec(),
+            rate_control,
+            sample_rate,
+            channels,
+            bit_depth,
+        )
+    }
+
+    /// Creates options and validates every field against the resolved codec,
+    /// including that `codec` is storable in `format`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::UnsupportedAudioCodecForFormat`] for an invalid
+    /// container/codec pair and a [`DomainError`] for any option the native
+    /// encoder for that codec cannot represent.
+    pub fn for_codec(
+        format: AudioOutputFormat,
+        codec: AudioTargetCodec,
+        rate_control: AudioRateControl,
+        sample_rate: Option<AudioOptionSampleRate>,
+        channels: Option<AudioOptionChannels>,
+        bit_depth: Option<AudioBitDepth>,
+    ) -> Result<Self, DomainError> {
         let options = Self {
             rate_control,
             sample_rate,
             channels,
             bit_depth,
         };
-        options.validate(format)?;
+        options.validate(format, codec)?;
         Ok(options)
     }
 
@@ -434,21 +587,26 @@ impl AudioEncodingOptions {
         self.bit_depth
     }
 
-    fn validate(&self, format: AudioOutputFormat) -> Result<(), DomainError> {
-        Self::validate_rate_control(format, self.rate_control)?;
+    fn validate(
+        &self,
+        format: AudioOutputFormat,
+        codec: AudioTargetCodec,
+    ) -> Result<(), DomainError> {
+        format.resolve_codec(Some(codec))?;
+        Self::validate_rate_control(format, codec, self.rate_control)?;
         if let Some(depth) = self.bit_depth {
-            Self::validate_bit_depth(format, depth)?;
+            Self::validate_bit_depth(format, codec, depth)?;
         }
         if let Some(rate) = self.sample_rate {
-            Self::validate_sample_rate(format, rate)?;
+            Self::validate_sample_rate(codec, rate)?;
         }
         if let Some(channels) = self.channels {
-            Self::validate_channels(format, channels)?;
+            Self::validate_channels(codec, channels)?;
         }
         // Cross-field check: an explicit MPEG-2/2.5 rate cannot carry more than
         // 160 kbps through rusty_mp3 without a silent downgrade to 160 kbps.
         // Without an explicit rate the pipeline resolves the effective rate itself.
-        if format == AudioOutputFormat::Mp3
+        if codec == AudioTargetCodec::Mp3
             && let AudioRateControl::Bitrate(bitrate) = self.rate_control
             && let Some(rate) = self.sample_rate
             && AudioOptionSampleRate::MP3_MPEG2_RATES.contains(&rate.hz())
@@ -463,7 +621,7 @@ impl AudioEncodingOptions {
         // AAC stores at most 6144 bits per channel per 1024-sample frame. With an
         // explicit rate and channel count the limit is knowable before any I/O;
         // without either one the pipeline checks it against the effective values.
-        if matches!(format, AudioOutputFormat::Aac | AudioOutputFormat::M4a)
+        if codec == AudioTargetCodec::Aac
             && let AudioRateControl::Bitrate(bitrate) = self.rate_control
             && let Some(rate) = self.sample_rate
             && let Some(channels) = self.channels
@@ -488,36 +646,38 @@ impl AudioEncodingOptions {
     /// lossy encoders only accept normalized `f32` input.
     fn validate_bit_depth(
         format: AudioOutputFormat,
+        codec: AudioTargetCodec,
         depth: AudioBitDepth,
     ) -> Result<(), DomainError> {
-        let valid = match format {
-            AudioOutputFormat::Wav | AudioOutputFormat::Aiff => true,
-            AudioOutputFormat::Flac => matches!(
+        let valid = match codec {
+            AudioTargetCodec::Pcm => true,
+            AudioTargetCodec::Flac => matches!(
                 depth,
                 AudioBitDepth::Int8 | AudioBitDepth::Int16 | AudioBitDepth::Int24
             ),
-            AudioOutputFormat::Alac => depth == AudioBitDepth::Int16,
-            AudioOutputFormat::Mp3
-            | AudioOutputFormat::Aac
-            | AudioOutputFormat::M4a
-            | AudioOutputFormat::Opus
-            | AudioOutputFormat::Ogg => false,
+            // `alac-encoder` implements `PcmFormat` only for `i16` and hardcodes
+            // `bits_per_channel: 16`, so every other depth must be rejected.
+            AudioTargetCodec::Alac => depth == AudioBitDepth::Int16,
+            AudioTargetCodec::Mp3
+            | AudioTargetCodec::Aac
+            | AudioTargetCodec::Opus
+            | AudioTargetCodec::Vorbis => false,
         };
         if valid {
             return Ok(());
         }
-        let reason = match format {
-            AudioOutputFormat::Flac => "FLAC stores at most 24-bit integer PCM; use 8, 16 or 24",
-            AudioOutputFormat::Alac => "ALAC stores 16-bit integer PCM only; use 16",
-            AudioOutputFormat::Mp3
-            | AudioOutputFormat::Aac
-            | AudioOutputFormat::M4a
-            | AudioOutputFormat::Opus
-            | AudioOutputFormat::Ogg => "lossy codecs consume normalized f32 samples",
-            AudioOutputFormat::Wav | AudioOutputFormat::Aiff => "",
+        let reason = match codec {
+            AudioTargetCodec::Flac => "FLAC stores at most 24-bit integer PCM; use 8, 16 or 24",
+            AudioTargetCodec::Alac => "ALAC stores 16-bit integer PCM only; use 16",
+            AudioTargetCodec::Mp3
+            | AudioTargetCodec::Aac
+            | AudioTargetCodec::Opus
+            | AudioTargetCodec::Vorbis => "lossy codecs consume normalized f32 samples",
+            AudioTargetCodec::Pcm => "",
         };
         Err(DomainError::UnsupportedAudioBitDepth {
             format,
+            codec,
             bit_depth: depth,
             reason,
         })
@@ -525,34 +685,31 @@ impl AudioEncodingOptions {
 
     fn validate_rate_control(
         format: AudioOutputFormat,
+        codec: AudioTargetCodec,
         control: AudioRateControl,
     ) -> Result<(), DomainError> {
         let unsupported =
             |flag: &'static str, reason: &'static str| DomainError::UnsupportedAudioRateControl {
                 format,
+                codec,
                 control: flag,
                 reason,
             };
         match control {
             AudioRateControl::Default => {}
             AudioRateControl::Bitrate(bitrate) => {
-                if format.is_lossless() {
+                if codec.is_lossless() {
                     return Err(unsupported(
                         "--bitrate",
                         "lossless formats store the source PCM unchanged",
                     ));
                 }
-                let (min, max, expected) = match format {
-                    AudioOutputFormat::Mp3 => (32_000, 320_000, "32000..=320000 bps for MP3"),
-                    AudioOutputFormat::Aac | AudioOutputFormat::M4a => {
-                        (32_000, 512_000, "32000..=512000 bps for AAC/M4A")
-                    }
-                    AudioOutputFormat::Ogg => (32_000, 512_000, "32000..=512000 bps for Ogg"),
-                    AudioOutputFormat::Opus => (6_000, 510_000, "6000..=510000 bps for Opus"),
-                    AudioOutputFormat::Wav
-                    | AudioOutputFormat::Flac
-                    | AudioOutputFormat::Alac
-                    | AudioOutputFormat::Aiff => {
+                let (min, max, expected) = match codec {
+                    AudioTargetCodec::Mp3 => (32_000, 320_000, "32000..=320000 bps for MP3"),
+                    AudioTargetCodec::Aac => (32_000, 512_000, "32000..=512000 bps for AAC"),
+                    AudioTargetCodec::Vorbis => (32_000, 512_000, "32000..=512000 bps for Vorbis"),
+                    AudioTargetCodec::Opus => (6_000, 510_000, "6000..=510000 bps for Opus"),
+                    AudioTargetCodec::Pcm | AudioTargetCodec::Flac | AudioTargetCodec::Alac => {
                         return Err(unsupported(
                             "--bitrate",
                             "lossless formats store the source PCM unchanged",
@@ -568,13 +725,13 @@ impl AudioEncodingOptions {
                 }
             }
             AudioRateControl::Quality(quality) => {
-                if format.is_lossless() {
+                if codec.is_lossless() {
                     return Err(unsupported(
                         "--quality",
                         "lossless formats store the source PCM unchanged",
                     ));
                 }
-                if matches!(format, AudioOutputFormat::Aac | AudioOutputFormat::M4a) {
+                if codec == AudioTargetCodec::Aac {
                     return Err(unsupported(
                         "--quality",
                         "the AAC encoder exposes only bitrate_bps; use --bitrate",
@@ -588,38 +745,41 @@ impl AudioEncodingOptions {
     }
 
     fn validate_sample_rate(
-        format: AudioOutputFormat,
+        codec: AudioTargetCodec,
         rate: AudioOptionSampleRate,
     ) -> Result<(), DomainError> {
         let hz = rate.hz();
-        if format == AudioOutputFormat::Opus && hz != AudioOptionSampleRate::OPUS_RATE_HZ {
+        if codec == AudioTargetCodec::Opus && hz != AudioOptionSampleRate::OPUS_RATE_HZ {
             return Err(DomainError::InvalidAudioOptionSampleRate {
                 hz,
                 expected: "exactly 48000 Hz (Ogg Opus always encodes at 48 kHz)",
             });
         }
-        let valid = match format {
-            AudioOutputFormat::Opus => true,
-            AudioOutputFormat::Mp3 => AudioOptionSampleRate::MP3_RATES.contains(&hz),
-            AudioOutputFormat::Aac | AudioOutputFormat::M4a => {
-                AudioOptionSampleRate::AAC_RATES.contains(&hz)
-            }
-            AudioOutputFormat::Ogg
-            | AudioOutputFormat::Wav
-            | AudioOutputFormat::Flac
-            | AudioOutputFormat::Alac
-            | AudioOutputFormat::Aiff => {
+        if codec == AudioTargetCodec::Alac && hz > AudioOptionSampleRate::ALAC_MAX_HZ {
+            return Err(DomainError::InvalidAudioOptionSampleRate {
+                hz,
+                expected: "8000..=65535 Hz for ALAC (M4A stores a 16.16 fixed-point rate)",
+            });
+        }
+        let valid = match codec {
+            AudioTargetCodec::Opus => true,
+            AudioTargetCodec::Mp3 => AudioOptionSampleRate::MP3_RATES.contains(&hz),
+            AudioTargetCodec::Aac => AudioOptionSampleRate::AAC_RATES.contains(&hz),
+            AudioTargetCodec::Vorbis
+            | AudioTargetCodec::Pcm
+            | AudioTargetCodec::Flac
+            | AudioTargetCodec::Alac => {
                 (AudioOptionSampleRate::MIN_HZ..=AudioOptionSampleRate::MAX_HZ).contains(&hz)
             }
         };
         if valid {
             return Ok(());
         }
-        let expected = match format {
-            AudioOutputFormat::Mp3 => {
+        let expected = match codec {
+            AudioTargetCodec::Mp3 => {
                 "one of 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, or 48000 Hz"
             }
-            AudioOutputFormat::Aac | AudioOutputFormat::M4a => {
+            AudioTargetCodec::Aac => {
                 "one of 7350, 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, or 96000 Hz"
             }
             _ => "8000..=192000 Hz",
@@ -628,22 +788,21 @@ impl AudioEncodingOptions {
     }
 
     fn validate_channels(
-        format: AudioOutputFormat,
+        codec: AudioTargetCodec,
         channels: AudioOptionChannels,
     ) -> Result<(), DomainError> {
         let count = channels.get();
-        let (valid, expected) = match format {
-            AudioOutputFormat::Mp3 | AudioOutputFormat::Opus => {
+        let (valid, expected) = match codec {
+            AudioTargetCodec::Mp3 | AudioTargetCodec::Opus => {
                 ((1..=2).contains(&count), "1 or 2 channels")
             }
-            AudioOutputFormat::Aac | AudioOutputFormat::M4a | AudioOutputFormat::Ogg => (
+            AudioTargetCodec::Aac | AudioTargetCodec::Vorbis => (
                 (1..=6).contains(&count) && count != 4,
                 "1, 2, 3, 5, or 6 channels",
             ),
-            AudioOutputFormat::Wav
-            | AudioOutputFormat::Flac
-            | AudioOutputFormat::Alac
-            | AudioOutputFormat::Aiff => ((1..=8).contains(&count), "1..=8 channels"),
+            AudioTargetCodec::Pcm | AudioTargetCodec::Flac | AudioTargetCodec::Alac => {
+                ((1..=8).contains(&count), "1..=8 channels")
+            }
         };
         if valid {
             Ok(())
@@ -747,15 +906,18 @@ pub enum AudioExecutionMode {
     CpuFlac,
     CpuOpus,
     CpuOgg,
+    CpuOggOpus,
+    CpuOggFlac,
     CpuMp3,
     CpuAac,
     CpuM4a,
+    CpuM4aAlac,
     CpuAlac,
     CpuAiff,
 }
 
 impl AudioExecutionMode {
-    /// Resolves the CPU encoder for `format`.
+    /// Resolves the CPU encoder for `format` with its default codec.
     ///
     /// Never falls back to CPU when a GPU backend was requested: the caller receives an explicit
     /// [`DomainError::UnsupportedAudioPipeline`] instead.
@@ -767,18 +929,47 @@ impl AudioExecutionMode {
         format: AudioOutputFormat,
         backend: HardwareBackend,
     ) -> Result<Self, DomainError> {
+        Self::resolve_with_codec(format, None, backend)
+    }
+
+    /// Resolves the CPU encoder for an explicit container/codec pair. Invalid
+    /// pairs and GPU backends are rejected before any plan can be represented.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::UnsupportedAudioPipeline`] for any GPU backend and
+    /// [`DomainError::UnsupportedAudioCodecForFormat`] for an incompatible pair.
+    pub fn resolve_with_codec(
+        format: AudioOutputFormat,
+        codec: Option<AudioTargetCodec>,
+        backend: HardwareBackend,
+    ) -> Result<Self, DomainError> {
         match backend {
-            HardwareBackend::Cpu => Ok(match format {
-                AudioOutputFormat::Wav => Self::CpuWav,
-                AudioOutputFormat::Flac => Self::CpuFlac,
-                AudioOutputFormat::Opus => Self::CpuOpus,
-                AudioOutputFormat::Ogg => Self::CpuOgg,
-                AudioOutputFormat::Mp3 => Self::CpuMp3,
-                AudioOutputFormat::Aac => Self::CpuAac,
-                AudioOutputFormat::M4a => Self::CpuM4a,
-                AudioOutputFormat::Alac => Self::CpuAlac,
-                AudioOutputFormat::Aiff => Self::CpuAiff,
-            }),
+            HardwareBackend::Cpu => {
+                let codec = format.resolve_codec(codec)?;
+                Ok(match (format, codec) {
+                    (AudioOutputFormat::Wav, AudioTargetCodec::Pcm) => Self::CpuWav,
+                    (AudioOutputFormat::Flac, AudioTargetCodec::Flac) => Self::CpuFlac,
+                    (AudioOutputFormat::Opus, AudioTargetCodec::Opus) => Self::CpuOpus,
+                    (AudioOutputFormat::Ogg, AudioTargetCodec::Vorbis) => Self::CpuOgg,
+                    (AudioOutputFormat::Ogg, AudioTargetCodec::Opus) => Self::CpuOggOpus,
+                    (AudioOutputFormat::Ogg, AudioTargetCodec::Flac) => Self::CpuOggFlac,
+                    (AudioOutputFormat::Mp3, AudioTargetCodec::Mp3) => Self::CpuMp3,
+                    (AudioOutputFormat::Aac, AudioTargetCodec::Aac) => Self::CpuAac,
+                    (AudioOutputFormat::M4a, AudioTargetCodec::Aac) => Self::CpuM4a,
+                    (AudioOutputFormat::M4a, AudioTargetCodec::Alac) => Self::CpuM4aAlac,
+                    (AudioOutputFormat::Alac, AudioTargetCodec::Alac) => Self::CpuAlac,
+                    (AudioOutputFormat::Aiff, AudioTargetCodec::Pcm) => Self::CpuAiff,
+                    // `format.resolve_codec` already accepts only the pairs above.
+                    _ => {
+                        return Err(DomainError::UnsupportedAudioCodecForFormat {
+                            format,
+                            codec,
+                            supported: format.supported_codec_list(),
+                        });
+                    }
+                })
+            }
             HardwareBackend::Gpu(backend) => Err(DomainError::UnsupportedAudioPipeline {
                 format,
                 backend: HardwareBackend::Gpu(backend),
@@ -795,12 +986,25 @@ impl AudioExecutionMode {
             Self::CpuWav => AudioOutputFormat::Wav,
             Self::CpuFlac => AudioOutputFormat::Flac,
             Self::CpuOpus => AudioOutputFormat::Opus,
-            Self::CpuOgg => AudioOutputFormat::Ogg,
+            Self::CpuOgg | Self::CpuOggOpus | Self::CpuOggFlac => AudioOutputFormat::Ogg,
             Self::CpuMp3 => AudioOutputFormat::Mp3,
             Self::CpuAac => AudioOutputFormat::Aac,
-            Self::CpuM4a => AudioOutputFormat::M4a,
+            Self::CpuM4a | Self::CpuM4aAlac => AudioOutputFormat::M4a,
             Self::CpuAlac => AudioOutputFormat::Alac,
             Self::CpuAiff => AudioOutputFormat::Aiff,
+        }
+    }
+
+    #[must_use]
+    pub const fn codec(self) -> AudioTargetCodec {
+        match self {
+            Self::CpuWav | Self::CpuAiff => AudioTargetCodec::Pcm,
+            Self::CpuFlac | Self::CpuOggFlac => AudioTargetCodec::Flac,
+            Self::CpuOpus | Self::CpuOggOpus => AudioTargetCodec::Opus,
+            Self::CpuOgg => AudioTargetCodec::Vorbis,
+            Self::CpuMp3 => AudioTargetCodec::Mp3,
+            Self::CpuAac | Self::CpuM4a => AudioTargetCodec::Aac,
+            Self::CpuM4aAlac | Self::CpuAlac => AudioTargetCodec::Alac,
         }
     }
 
@@ -817,9 +1021,12 @@ impl fmt::Display for AudioExecutionMode {
             Self::CpuFlac => "flac (cpu)",
             Self::CpuOpus => "opus (cpu)",
             Self::CpuOgg => "ogg vorbis (cpu)",
+            Self::CpuOggOpus => "ogg opus (cpu)",
+            Self::CpuOggFlac => "ogg flac (cpu)",
             Self::CpuMp3 => "mp3 (cpu)",
             Self::CpuAac => "aac adts (cpu)",
             Self::CpuM4a => "m4a aac (cpu)",
+            Self::CpuM4aAlac => "m4a alac (cpu)",
             Self::CpuAlac => "alac m4a (cpu)",
             Self::CpuAiff => "aiff pcm (cpu)",
         })
@@ -940,7 +1147,7 @@ impl AudioBatchPlan {
                 ));
             }
         }
-        options.validate(mode.output_format())?;
+        options.validate(mode.output_format(), mode.codec())?;
         Ok(Self {
             items,
             mode,
@@ -962,6 +1169,11 @@ impl AudioBatchPlan {
     #[must_use]
     pub const fn output_format(&self) -> AudioOutputFormat {
         self.mode.output_format()
+    }
+
+    #[must_use]
+    pub const fn target_codec(&self) -> AudioTargetCodec {
+        self.mode.codec()
     }
 
     #[must_use]
@@ -1615,5 +1827,649 @@ mod tests {
         .unwrap_or_else(|_| unreachable!());
         assert_eq!(plan.options(), valid);
         assert_eq!(default_options(), AudioEncodingOptions::default());
+    }
+
+    fn codec_options(
+        format: AudioOutputFormat,
+        codec: AudioTargetCodec,
+        control: AudioRateControl,
+        sample_rate: Option<u32>,
+        channels: Option<u16>,
+        depth: Option<AudioBitDepth>,
+    ) -> Result<AudioEncodingOptions, DomainError> {
+        let rate = sample_rate.map(AudioOptionSampleRate::new).transpose()?;
+        let channels = channels.map(AudioOptionChannels::new).transpose()?;
+        AudioEncodingOptions::for_codec(format, codec, control, rate, channels, depth)
+    }
+
+    fn error_text(result: Result<AudioEncodingOptions, DomainError>) -> String {
+        match result {
+            Ok(_) => String::new(),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn resolves_default_and_explicit_codecs_per_container() -> Result<(), DomainError> {
+        for (format, default, supported) in [
+            (
+                AudioOutputFormat::Wav,
+                AudioTargetCodec::Pcm,
+                &[AudioTargetCodec::Pcm][..],
+            ),
+            (
+                AudioOutputFormat::Aiff,
+                AudioTargetCodec::Pcm,
+                &[AudioTargetCodec::Pcm][..],
+            ),
+            (
+                AudioOutputFormat::Flac,
+                AudioTargetCodec::Flac,
+                &[AudioTargetCodec::Flac][..],
+            ),
+            (
+                AudioOutputFormat::Opus,
+                AudioTargetCodec::Opus,
+                &[AudioTargetCodec::Opus][..],
+            ),
+            (
+                AudioOutputFormat::Mp3,
+                AudioTargetCodec::Mp3,
+                &[AudioTargetCodec::Mp3][..],
+            ),
+            (
+                AudioOutputFormat::Aac,
+                AudioTargetCodec::Aac,
+                &[AudioTargetCodec::Aac][..],
+            ),
+            (
+                AudioOutputFormat::Alac,
+                AudioTargetCodec::Alac,
+                &[AudioTargetCodec::Alac][..],
+            ),
+            (
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Vorbis,
+                &[
+                    AudioTargetCodec::Vorbis,
+                    AudioTargetCodec::Opus,
+                    AudioTargetCodec::Flac,
+                ],
+            ),
+            (
+                AudioOutputFormat::M4a,
+                AudioTargetCodec::Aac,
+                &[AudioTargetCodec::Aac, AudioTargetCodec::Alac],
+            ),
+        ] {
+            assert_eq!(format.default_codec(), default, "{format}");
+            assert_eq!(format.supported_codecs(), supported, "{format}");
+            assert_eq!(format.resolve_codec(None)?, default, "{format}");
+            for &codec in supported {
+                assert_eq!(
+                    format.resolve_codec(Some(codec))?,
+                    codec,
+                    "{format} {codec}"
+                );
+            }
+            assert!(
+                codec_options(format, default, AudioRateControl::Default, None, None, None).is_ok()
+            );
+        }
+
+        assert_eq!(AudioInputFormat::OggFlac.extension(), "ogg");
+        assert_eq!(AudioInputFormat::OggFlac.label(), "Ogg FLAC");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_container_codec_pairs() -> Result<(), DomainError> {
+        let invalid = [
+            (
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Aac,
+                "vorbis, opus, or flac",
+            ),
+            (
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Pcm,
+                "vorbis, opus, or flac",
+            ),
+            (
+                AudioOutputFormat::M4a,
+                AudioTargetCodec::Opus,
+                "aac or alac",
+            ),
+            (AudioOutputFormat::Flac, AudioTargetCodec::Alac, "FLAC"),
+            (AudioOutputFormat::Wav, AudioTargetCodec::Flac, "PCM"),
+        ];
+        for (format, codec, expected) in invalid {
+            let err = format
+                .resolve_codec(Some(codec))
+                .err()
+                .ok_or(DomainError::EmptyField("audio.codec"))?;
+            assert!(
+                matches!(err, DomainError::UnsupportedAudioCodecForFormat { .. }),
+                "{format} {codec}: {err}"
+            );
+            assert!(err.to_string().contains(expected), "{err}");
+            assert_eq!(
+                AudioExecutionMode::resolve_with_codec(format, Some(codec), HardwareBackend::Cpu),
+                Err(DomainError::UnsupportedAudioCodecForFormat {
+                    format,
+                    codec,
+                    supported: format.supported_codec_list(),
+                })
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn for_codec_validates_every_option_against_the_resolved_codec() -> Result<(), DomainError> {
+        let bitrate = |bps| {
+            AudioRateControl::Bitrate(
+                AudioOptionBitrate::new(bps).unwrap_or_else(|_| unreachable!()),
+            )
+        };
+        let quality = |value| -> Result<AudioRateControl, DomainError> {
+            AudioQuality::new(value).map(AudioRateControl::Quality)
+        };
+        let plain = |format, codec, control, rate, channels, depth| {
+            codec_options(format, codec, control, rate, channels, depth)
+        };
+
+        // Ogg + FLAC is lossless: 8/16/24-bit only; rate control is rejected and
+        // diagnostics name the resolved container/codec, not Ogg Vorbis.
+        for depth in [
+            AudioBitDepth::Int8,
+            AudioBitDepth::Int16,
+            AudioBitDepth::Int24,
+        ] {
+            assert!(
+                plain(
+                    AudioOutputFormat::Ogg,
+                    AudioTargetCodec::Flac,
+                    AudioRateControl::Default,
+                    None,
+                    None,
+                    Some(depth)
+                )
+                .is_ok()
+            );
+        }
+        for depth in [AudioBitDepth::Int32, AudioBitDepth::Float32] {
+            assert!(matches!(
+                plain(
+                    AudioOutputFormat::Ogg,
+                    AudioTargetCodec::Flac,
+                    AudioRateControl::Default,
+                    None,
+                    None,
+                    Some(depth)
+                ),
+                Err(DomainError::UnsupportedAudioBitDepth { .. })
+            ));
+        }
+        let err = error_text(plain(
+            AudioOutputFormat::Ogg,
+            AudioTargetCodec::Flac,
+            bitrate(128_000),
+            None,
+            None,
+            None,
+        ));
+        assert!(err.contains("Ogg FLAC"), "{err}");
+        assert!(err.contains("--bitrate"), "{err}");
+        let err = error_text(plain(
+            AudioOutputFormat::Ogg,
+            AudioTargetCodec::Flac,
+            quality(80)?,
+            None,
+            None,
+            None,
+        ));
+        assert!(err.contains("Ogg FLAC"), "{err}");
+        assert!(
+            plain(
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Flac,
+                AudioRateControl::Default,
+                Some(192_000),
+                Some(8),
+                None
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            plain(
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Flac,
+                AudioRateControl::Default,
+                Some(7_999),
+                None,
+                None
+            ),
+            Err(DomainError::InvalidAudioOptionSampleRate { .. })
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn ogg_opus_options_enforce_48k_and_rate_bounds() -> Result<(), DomainError> {
+        let bitrate = |bps| {
+            AudioRateControl::Bitrate(
+                AudioOptionBitrate::new(bps).unwrap_or_else(|_| unreachable!()),
+            )
+        };
+        let quality = |value| -> Result<AudioRateControl, DomainError> {
+            AudioQuality::new(value).map(AudioRateControl::Quality)
+        };
+        let plain = |format, codec, control, rate, channels, depth| {
+            codec_options(format, codec, control, rate, channels, depth)
+        };
+
+        // Ogg + Opus: 48 kHz, 1-2 channels, 6-510 kbps, no integer depth.
+        assert!(
+            plain(
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Opus,
+                AudioRateControl::Default,
+                Some(48_000),
+                Some(2),
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            plain(
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Opus,
+                bitrate(128_000),
+                None,
+                None,
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            plain(
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Opus,
+                quality(80)?,
+                None,
+                None,
+                None
+            )
+            .is_ok()
+        );
+        for (rate, channels, bps) in [
+            (Some(44_100), None, None),
+            (None, Some(3), None),
+            (None, None, Some(5_999)),
+            (None, None, Some(511_000)),
+        ] {
+            assert!(
+                plain(
+                    AudioOutputFormat::Ogg,
+                    AudioTargetCodec::Opus,
+                    bps.map_or(AudioRateControl::Default, bitrate),
+                    rate,
+                    channels,
+                    None
+                )
+                .is_err(),
+                "{rate:?} {channels:?} {bps:?}"
+            );
+        }
+        assert!(matches!(
+            plain(
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Opus,
+                AudioRateControl::Default,
+                None,
+                None,
+                Some(AudioBitDepth::Int16)
+            ),
+            Err(DomainError::UnsupportedAudioBitDepth { .. })
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn ogg_vorbis_options_enforce_rate_and_layouts() -> Result<(), DomainError> {
+        let bitrate = |bps| {
+            AudioRateControl::Bitrate(
+                AudioOptionBitrate::new(bps).unwrap_or_else(|_| unreachable!()),
+            )
+        };
+        let quality = |value| -> Result<AudioRateControl, DomainError> {
+            AudioQuality::new(value).map(AudioRateControl::Quality)
+        };
+        let plain = |format, codec, control, rate, channels, depth| {
+            codec_options(format, codec, control, rate, channels, depth)
+        };
+
+        // Ogg + Vorbis: bitrate/quality, no integer depth, no quad layout.
+        assert!(
+            plain(
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Vorbis,
+                bitrate(128_000),
+                None,
+                None,
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            plain(
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Vorbis,
+                quality(80)?,
+                None,
+                None,
+                None
+            )
+            .is_ok()
+        );
+        for bps in [31_000, 513_000] {
+            assert!(matches!(
+                plain(
+                    AudioOutputFormat::Ogg,
+                    AudioTargetCodec::Vorbis,
+                    bitrate(bps),
+                    None,
+                    None,
+                    None
+                ),
+                Err(DomainError::InvalidAudioOptionBitrate { .. })
+            ));
+        }
+        for channels in [1, 2, 3, 5, 6] {
+            assert!(
+                plain(
+                    AudioOutputFormat::Ogg,
+                    AudioTargetCodec::Vorbis,
+                    AudioRateControl::Default,
+                    None,
+                    Some(channels),
+                    None
+                )
+                .is_ok()
+            );
+        }
+        assert!(matches!(
+            plain(
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Vorbis,
+                AudioRateControl::Default,
+                None,
+                Some(4),
+                None
+            ),
+            Err(DomainError::InvalidAudioOptionChannels { .. })
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn m4a_alac_and_aac_options_enforce_codec_limits() -> Result<(), DomainError> {
+        let bitrate = |bps| {
+            AudioRateControl::Bitrate(
+                AudioOptionBitrate::new(bps).unwrap_or_else(|_| unreachable!()),
+            )
+        };
+        let quality = |value| -> Result<AudioRateControl, DomainError> {
+            AudioQuality::new(value).map(AudioRateControl::Quality)
+        };
+        let plain = |format, codec, control, rate, channels, depth| {
+            codec_options(format, codec, control, rate, channels, depth)
+        };
+
+        // M4A + ALAC: 16-bit only; rate control and wrong depths are rejected.
+        assert!(
+            plain(
+                AudioOutputFormat::M4a,
+                AudioTargetCodec::Alac,
+                AudioRateControl::Default,
+                None,
+                None,
+                Some(AudioBitDepth::Int16)
+            )
+            .is_ok()
+        );
+        for depth in [
+            AudioBitDepth::Int8,
+            AudioBitDepth::Int24,
+            AudioBitDepth::Int32,
+            AudioBitDepth::Float32,
+        ] {
+            let err = error_text(plain(
+                AudioOutputFormat::M4a,
+                AudioTargetCodec::Alac,
+                AudioRateControl::Default,
+                None,
+                None,
+                Some(depth),
+            ));
+            assert!(err.contains("M4A (ALAC)"), "{err}");
+            assert!(err.contains("16"), "{err}");
+        }
+        let err = error_text(plain(
+            AudioOutputFormat::M4a,
+            AudioTargetCodec::Alac,
+            bitrate(128_000),
+            None,
+            None,
+            None,
+        ));
+        assert!(err.contains("M4A (ALAC)"), "{err}");
+        assert!(
+            error_text(plain(
+                AudioOutputFormat::M4a,
+                AudioTargetCodec::Alac,
+                quality(80)?,
+                None,
+                None,
+                None
+            ))
+            .contains("M4A (ALAC)")
+        );
+        // 96 kHz is a valid AAC rate, but the M4A ALAC sample entry stores the
+        // rate in a 16.16 fixed-point field: it would write zero and break reopening.
+        assert!(matches!(
+            plain(
+                AudioOutputFormat::M4a,
+                AudioTargetCodec::Alac,
+                AudioRateControl::Default,
+                Some(96_000),
+                None,
+                Some(AudioBitDepth::Int16)
+            ),
+            Err(DomainError::InvalidAudioOptionSampleRate { .. })
+        ));
+        assert!(
+            plain(
+                AudioOutputFormat::M4a,
+                AudioTargetCodec::Alac,
+                AudioRateControl::Default,
+                Some(AudioOptionSampleRate::ALAC_MAX_HZ),
+                None,
+                Some(AudioBitDepth::Int16)
+            )
+            .is_ok()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn m4a_aac_options_enforce_bitrate_and_frame_capacity() -> Result<(), DomainError> {
+        let bitrate = |bps| {
+            AudioRateControl::Bitrate(
+                AudioOptionBitrate::new(bps).unwrap_or_else(|_| unreachable!()),
+            )
+        };
+        let quality = |value| -> Result<AudioRateControl, DomainError> {
+            AudioQuality::new(value).map(AudioRateControl::Quality)
+        };
+        let plain = |format, codec, control, rate, channels, depth| {
+            codec_options(format, codec, control, rate, channels, depth)
+        };
+
+        // M4A + AAC uses the bitrate path and keeps the frame-capacity check.
+        assert!(
+            plain(
+                AudioOutputFormat::M4a,
+                AudioTargetCodec::Aac,
+                bitrate(128_000),
+                Some(48_000),
+                Some(2),
+                None
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            plain(
+                AudioOutputFormat::M4a,
+                AudioTargetCodec::Aac,
+                bitrate(512_000),
+                Some(8_000),
+                Some(1),
+                None
+            ),
+            Err(DomainError::IncompatibleAacBitrateRate { .. })
+        ));
+        let err = error_text(plain(
+            AudioOutputFormat::M4a,
+            AudioTargetCodec::Aac,
+            quality(80)?,
+            None,
+            None,
+            None,
+        ));
+        assert!(err.contains("M4A (AAC)"), "{err}");
+        assert!(matches!(
+            plain(
+                AudioOutputFormat::M4a,
+                AudioTargetCodec::Aac,
+                AudioRateControl::Default,
+                None,
+                None,
+                Some(AudioBitDepth::Int16)
+            ),
+            Err(DomainError::UnsupportedAudioBitDepth { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn execution_modes_carry_their_codec_without_silent_fallback() -> Result<(), DomainError> {
+        for (format, codec, mode, label) in [
+            (
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Vorbis,
+                AudioExecutionMode::CpuOgg,
+                "ogg vorbis (cpu)",
+            ),
+            (
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Opus,
+                AudioExecutionMode::CpuOggOpus,
+                "ogg opus (cpu)",
+            ),
+            (
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Flac,
+                AudioExecutionMode::CpuOggFlac,
+                "ogg flac (cpu)",
+            ),
+            (
+                AudioOutputFormat::M4a,
+                AudioTargetCodec::Aac,
+                AudioExecutionMode::CpuM4a,
+                "m4a aac (cpu)",
+            ),
+            (
+                AudioOutputFormat::M4a,
+                AudioTargetCodec::Alac,
+                AudioExecutionMode::CpuM4aAlac,
+                "m4a alac (cpu)",
+            ),
+            (
+                AudioOutputFormat::Flac,
+                AudioTargetCodec::Flac,
+                AudioExecutionMode::CpuFlac,
+                "flac (cpu)",
+            ),
+            (
+                AudioOutputFormat::Alac,
+                AudioTargetCodec::Alac,
+                AudioExecutionMode::CpuAlac,
+                "alac m4a (cpu)",
+            ),
+        ] {
+            assert_eq!(
+                AudioExecutionMode::resolve_with_codec(format, Some(codec), HardwareBackend::Cpu)?,
+                mode
+            );
+            assert_eq!(mode.codec(), codec);
+            assert_eq!(mode.output_format(), format);
+            assert_eq!(mode.to_string(), label);
+            assert!(matches!(
+                AudioExecutionMode::resolve_with_codec(
+                    format,
+                    Some(codec),
+                    HardwareBackend::Gpu(GpuBackend::Nvenc)
+                ),
+                Err(DomainError::UnsupportedAudioPipeline { .. })
+            ));
+        }
+        assert_eq!(
+            AudioExecutionMode::resolve(AudioOutputFormat::Ogg, HardwareBackend::Cpu)?,
+            AudioExecutionMode::CpuOgg
+        );
+
+        let workers = NonZeroUsize::MIN;
+        let plan = AudioBatchPlan::with_options(
+            vec![item("a")],
+            AudioExecutionMode::CpuOggFlac,
+            workers,
+            AudioEncodingOptions::for_codec(
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Flac,
+                AudioRateControl::Default,
+                None,
+                None,
+                Some(AudioBitDepth::Int24),
+            )?,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        assert_eq!(plan.target_codec(), AudioTargetCodec::Flac);
+
+        let bad_options = AudioEncodingOptions::for_codec(
+            AudioOutputFormat::M4a,
+            AudioTargetCodec::Aac,
+            AudioRateControl::Bitrate(
+                AudioOptionBitrate::new(128_000).unwrap_or_else(|_| unreachable!()),
+            ),
+            None,
+            None,
+            None,
+        )?;
+        assert!(matches!(
+            AudioBatchPlan::with_options(
+                vec![item("a")],
+                AudioExecutionMode::CpuM4aAlac,
+                workers,
+                bad_options,
+            ),
+            Err(DomainError::UnsupportedAudioRateControl { .. })
+        ));
+        Ok(())
     }
 }

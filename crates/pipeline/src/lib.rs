@@ -13,6 +13,7 @@ mod heic;
 mod ico;
 mod m4a;
 mod mpegts;
+mod ogg_flac;
 mod pnm;
 mod qoi;
 pub mod remux;

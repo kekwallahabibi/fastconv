@@ -8,7 +8,7 @@ use fastconv_domain::{
     AudioBatchItem, AudioBatchPlan, AudioBitDepth, AudioEncodingOptions, AudioExecutionMode,
     AudioInputFormat, AudioOptionBitrate, AudioOptionChannels, AudioOptionSampleRate,
     AudioOutputFormat, AudioQuality, AudioRateControl, AudioSampleFormat, AudioStreamInfo,
-    DomainError, HardwareBackend, PathRole,
+    AudioTargetCodec, DomainError, HardwareBackend, PathRole,
 };
 use symphonia::core::audio::sample::SampleFormat as SymphoniaSampleFormat;
 use symphonia::core::codecs::audio::{
@@ -28,13 +28,15 @@ use crate::ProbeError;
 
 const MAGIC_PREFIX_BYTES: usize = 4096;
 const SUPPORTED_AUDIO_TARGETS: &str = "flac, wav, opus, ogg, mp3, aac, m4a, alac, or aiff";
+const CODEC_PARSE_EXPECTED: &str = "vorbis, opus, flac, aac, alac, pcm, or mp3";
 
 /// Raw encoder knobs collected at the CLI boundary before the output format is known.
 ///
 /// Field-level validity is established by the domain constructors; compatibility with the
-/// resolved output format is checked once in [`prepare_audio_batch`].
+/// resolved output format and codec is checked once in [`prepare_audio_batch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AudioEncodingRequest {
+    pub codec: Option<AudioTargetCodec>,
     pub rate_control: AudioRateControl,
     pub sample_rate: Option<AudioOptionSampleRate>,
     pub channels: Option<AudioOptionChannels>,
@@ -110,6 +112,29 @@ pub fn parse_audio_bit_depth(raw: &str) -> Result<AudioBitDepth, DomainError> {
     }
 }
 
+/// Parses the raw `--codec` value at the system boundary.
+///
+/// Values are case-insensitive and surrounding whitespace is ignored.
+///
+/// # Errors
+///
+/// Returns [`DomainError::InvalidAudioCodec`] for any unrecognized value.
+pub fn parse_audio_codec(raw: &str) -> Result<AudioTargetCodec, DomainError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "vorbis" => Ok(AudioTargetCodec::Vorbis),
+        "opus" => Ok(AudioTargetCodec::Opus),
+        "flac" => Ok(AudioTargetCodec::Flac),
+        "aac" => Ok(AudioTargetCodec::Aac),
+        "alac" => Ok(AudioTargetCodec::Alac),
+        "pcm" => Ok(AudioTargetCodec::Pcm),
+        "mp3" => Ok(AudioTargetCodec::Mp3),
+        _ => Err(DomainError::InvalidAudioCodec {
+            raw: raw.to_owned(),
+            expected: CODEC_PARSE_EXPECTED,
+        }),
+    }
+}
+
 /// Parses and validates the raw encoding flag values into an [`AudioEncodingRequest`].
 ///
 /// This is the single boundary where the CLI's raw `--bitrate`, `--quality`,
@@ -120,12 +145,17 @@ pub fn parse_audio_bit_depth(raw: &str) -> Result<AudioBitDepth, DomainError> {
 ///
 /// Returns a diagnostic for a bitrate/quality conflict or any malformed flag value.
 pub fn parse_audio_encoding_request(
+    codec: Option<&str>,
     bitrate: Option<&str>,
     quality: Option<&str>,
     sample_rate: Option<&str>,
     channels: Option<&str>,
     bit_depth: Option<&str>,
 ) -> Result<AudioEncodingRequest, String> {
+    let codec = codec
+        .map(parse_audio_codec)
+        .transpose()
+        .map_err(|err| err.to_string())?;
     if bitrate.is_some() && quality.is_some() {
         return Err("cannot combine --bitrate with --quality".to_owned());
     }
@@ -170,6 +200,7 @@ pub fn parse_audio_encoding_request(
         .transpose()
         .map_err(|err| err.to_string())?;
     Ok(AudioEncodingRequest {
+        codec,
         rate_control,
         sample_rate,
         channels,
@@ -258,13 +289,19 @@ pub fn detect_audio_magic(bytes: &[u8]) -> Option<AudioInputFormat> {
         }
     }
     if bytes.starts_with(b"OggS")
-        && let Some(identification) = ogg_identification_packet(bytes)
+        && let Some((identification, after_skeleton)) = ogg_identification_packet(bytes)
     {
         if identification.starts_with(b"OpusHead") {
-            return Some(AudioInputFormat::Opus);
+            // `opus-pure` reads from offset zero and requires OpusHead as the
+            // first packet; claiming a Skeleton-prefixed file would create a
+            // plan that can never be opened.
+            return (!after_skeleton).then_some(AudioInputFormat::Opus);
         }
         if identification.starts_with(b"\x01vorbis") {
             return Some(AudioInputFormat::Vorbis);
+        }
+        if identification.starts_with(b"\x7fFLAC") {
+            return Some(AudioInputFormat::OggFlac);
         }
     }
     if let Some(tag_len) = id3v2_tag_len(bytes) {
@@ -284,24 +321,50 @@ pub fn detect_audio_magic(bytes: &[u8]) -> Option<AudioInputFormat> {
     None
 }
 
-/// Extracts the first packet from the leading Ogg page. Codec must be read from this framed
-/// identification packet; scanning arbitrary bytes can mistake Vorbis comments for Opus.
-fn ogg_identification_packet(bytes: &[u8]) -> Option<&[u8]> {
-    if !bytes.starts_with(b"OggS") || bytes.len() < 28 {
-        return None;
-    }
-    let segments = usize::from(*bytes.get(26)?);
-    let table_start = 27;
-    let table = bytes.get(table_start..table_start + segments)?;
-    let mut packet_len = 0_usize;
-    for &lacing in table {
-        packet_len += usize::from(lacing);
-        if lacing < 255 {
-            break;
+/// Extracts the first packet of the first non-Skeleton Ogg page within the leading prefix.
+///
+/// Ogg Skeleton streams prefix the audio stream with `fishead`/`fisbone` pages, so reading
+/// only the first page would miss the codec identification packet. The codec must come from
+/// a framed identification packet; scanning arbitrary bytes can mistake Vorbis comments for
+/// Opus. The BOS flag is deliberately ignored so a lone identification page still works.
+/// Returns the first audio identification packet and whether a Skeleton page
+/// preceded it. The flag matters for Opus: `opus-pure` requires `OpusHead` to be
+/// the first packet of the file, so a Skeleton-prefixed Opus stream must not be
+/// detected as openable.
+fn ogg_identification_packet(bytes: &[u8]) -> Option<(&[u8], bool)> {
+    const TABLE_START: usize = 27;
+    let limit = bytes.len().min(MAGIC_PREFIX_BYTES);
+    let mut offset = 0_usize;
+    let mut after_skeleton = false;
+    while offset < limit {
+        let mut page = bytes.get(offset..limit)?;
+        if !page.starts_with(b"OggS") || page.len() < TABLE_START {
+            return None;
         }
+        let segments = usize::from(page[26]);
+        let table_end = TABLE_START.checked_add(segments)?;
+        let table = page.get(TABLE_START..table_end)?;
+        let mut body_len = 0_usize;
+        let mut first_packet_len = None;
+        for &lacing in table {
+            body_len = body_len.checked_add(usize::from(lacing))?;
+            if first_packet_len.is_none() && lacing < 255 {
+                first_packet_len = Some(body_len);
+            }
+        }
+        // The page body is the sum of *all* lacing values, not just the first packet's.
+        let page_len = table_end.checked_add(body_len)?;
+        page = page.get(..page_len)?;
+        if let Some(packet_len) = first_packet_len {
+            let packet = page.get(table_end..table_end.checked_add(packet_len)?)?;
+            if !packet.starts_with(b"fishead") && !packet.starts_with(b"fisbone") {
+                return Some((packet, after_skeleton));
+            }
+            after_skeleton = true;
+        }
+        offset = offset.checked_add(page_len)?;
     }
-    let payload_start = table_start + segments;
-    bytes.get(payload_start..payload_start + packet_len)
+    None
 }
 
 fn read_magic_prefix(file: &mut File, path: &Path) -> Result<[u8; MAGIC_PREFIX_BYTES], ProbeError> {
@@ -490,7 +553,7 @@ pub fn probe_audio(path: &Path) -> Result<ProbedAudio, ProbeError> {
     let mut format = detect_audio_magic(&prefix).ok_or_else(|| {
         invalid_audio(
             path,
-            "unrecognized audio magic bytes (expected WAV, FLAC, MP3, Ogg Vorbis, Ogg Opus, AAC, M4A, ALAC, or AIFF)",
+            "unrecognized audio magic bytes (expected WAV, FLAC, MP3, Ogg Vorbis, Ogg Opus, Ogg FLAC, AAC, M4A, ALAC, or AIFF)",
         )
     })?;
 
@@ -592,10 +655,11 @@ fn resolve_single_target(
 fn prepare_directory_batch(
     source_dir: &Path,
     target_dir: &Path,
-    format: AudioOutputFormat,
+    mode: AudioExecutionMode,
     threads: NonZeroUsize,
     options: AudioEncodingOptions,
 ) -> Result<AudioBatchPlan, ProbeError> {
+    let format = mode.output_format();
     match fs::metadata(target_dir) {
         Ok(meta) if meta.is_dir() => {}
         Ok(_) => return Err(ProbeError::TargetNotADirectory(target_dir.to_path_buf())),
@@ -671,7 +735,6 @@ fn prepare_directory_batch(
         return Err(ProbeError::EmptyAudioDirectory(source_dir.to_path_buf()));
     }
 
-    let mode = AudioExecutionMode::resolve(format, HardwareBackend::Cpu)?;
     Ok(AudioBatchPlan::with_options(items, mode, threads, options)?)
 }
 
@@ -752,24 +815,27 @@ pub fn prepare_audio_batch(
 
     if source_meta.is_dir() {
         let format = to.unwrap_or(AudioOutputFormat::Flac);
-        AudioExecutionMode::resolve(format, backend)?;
+        let mode = AudioExecutionMode::resolve_with_codec(format, request.codec, backend)?;
         // Validate encoding options before touching any input file in the batch.
-        let options = AudioEncodingOptions::new(
+        let options = AudioEncodingOptions::for_codec(
             format,
+            mode.codec(),
             request.rate_control,
             request.sample_rate,
             request.channels,
             request.bit_depth,
         )?;
-        return prepare_directory_batch(source, target, format, threads, options);
+        return prepare_directory_batch(source, target, mode, threads, options);
     }
     if !source_meta.is_file() {
         return Err(ProbeError::NotAFileOrDirectory(source.to_path_buf()));
     }
 
     let (resolved_target, format) = resolve_single_target(source, target, to)?;
-    let options = AudioEncodingOptions::new(
+    let mode = AudioExecutionMode::resolve_with_codec(format, request.codec, backend)?;
+    let options = AudioEncodingOptions::for_codec(
         format,
+        mode.codec(),
         request.rate_control,
         request.sample_rate,
         request.channels,
@@ -780,7 +846,6 @@ pub fn prepare_audio_batch(
     if canonical_source == canonical_target {
         return Err(DomainError::IdenticalSourceAndTarget(source.to_path_buf()).into());
     }
-    let mode = AudioExecutionMode::resolve(format, backend)?;
     let probed = probe_audio(source)?;
     let item = AudioBatchItem::new(
         canonical_source,
@@ -1116,6 +1181,7 @@ mod tests {
     #[test]
     fn parses_raw_encoding_request_and_rejects_conflicts() -> Result<(), String> {
         let expected = AudioEncodingRequest {
+            codec: None,
             rate_control: AudioRateControl::Bitrate(
                 AudioOptionBitrate::new(192_000).map_err(|err| err.to_string())?,
             ),
@@ -1124,20 +1190,21 @@ mod tests {
             bit_depth: None,
         };
         assert_eq!(
-            parse_audio_encoding_request(Some("192k"), None, Some("48000"), Some("2"), None)?,
+            parse_audio_encoding_request(None, Some("192k"), None, Some("48000"), Some("2"), None)?,
             expected
         );
         assert_eq!(
-            parse_audio_encoding_request(None, None, None, None, None)?,
+            parse_audio_encoding_request(None, None, None, None, None, None)?,
             AudioEncodingRequest::default()
         );
         assert_eq!(
-            parse_audio_encoding_request(None, Some("85"), None, None, None)?.rate_control,
+            parse_audio_encoding_request(None, None, Some("85"), None, None, None)?.rate_control,
             AudioRateControl::Quality(AudioQuality::new(85).map_err(|err| err.to_string())?)
         );
 
         for (bitrate, quality) in [(Some("128k"), Some("80")), (Some("128k"), Some("101"))] {
-            let Err(err) = parse_audio_encoding_request(bitrate, quality, None, None, None) else {
+            let Err(err) = parse_audio_encoding_request(None, bitrate, quality, None, None, None)
+            else {
                 return Err("bitrate/quality must be rejected".to_owned());
             };
             assert!(
@@ -1154,7 +1221,7 @@ mod tests {
             ((None, None, None, Some("9")), "invalid --channels"),
             ((Some("abc"), None, None, None), "invalid audio bitrate"),
         ] {
-            let Err(err) = parse_audio_encoding_request(args.0, args.1, args.2, args.3, None)
+            let Err(err) = parse_audio_encoding_request(None, args.0, args.1, args.2, args.3, None)
             else {
                 return Err(format!("malformed value must be rejected: {args:?}"));
             };
@@ -1300,13 +1367,13 @@ mod tests {
 
     #[test]
     fn parses_bit_depth_in_the_raw_encoding_request() -> Result<(), String> {
-        let request = parse_audio_encoding_request(None, None, None, None, Some(" f32 "))?;
+        let request = parse_audio_encoding_request(None, None, None, None, None, Some(" f32 "))?;
         assert_eq!(request.bit_depth, Some(AudioBitDepth::Float32));
         assert_eq!(
-            parse_audio_encoding_request(None, None, None, None, None)?.bit_depth,
+            parse_audio_encoding_request(None, None, None, None, None, None)?.bit_depth,
             None
         );
-        let error = parse_audio_encoding_request(None, None, None, None, Some("64"))
+        let error = parse_audio_encoding_request(None, None, None, None, None, Some("64"))
             .err()
             .ok_or_else(|| "invalid depth must be rejected".to_owned())?;
         assert!(error.contains("invalid audio bit depth"), "{error}");
@@ -1508,5 +1575,266 @@ mod tests {
                 "{format} must reject --bit-depth"
             );
         }
+    }
+
+    #[test]
+    fn parses_codec_tokens_at_the_boundary() -> Result<(), DomainError> {
+        for (raw, expected) in [
+            ("vorbis", AudioTargetCodec::Vorbis),
+            (" Opus ", AudioTargetCodec::Opus),
+            ("FLAC", AudioTargetCodec::Flac),
+            ("aac", AudioTargetCodec::Aac),
+            ("ALAC", AudioTargetCodec::Alac),
+            ("pcm", AudioTargetCodec::Pcm),
+            ("Mp3", AudioTargetCodec::Mp3),
+        ] {
+            assert_eq!(parse_audio_codec(raw), Ok(expected), "raw={raw}");
+        }
+        for raw in ["", " ", "wma", "flac1", "vorbis opus"] {
+            assert!(
+                matches!(
+                    parse_audio_codec(raw),
+                    Err(DomainError::InvalidAudioCodec { .. })
+                ),
+                "'{raw}' must be rejected"
+            );
+        }
+        let request =
+            parse_audio_encoding_request(Some(" flac "), None, None, None, None, Some("24"))
+                .map_err(|_| DomainError::EmptyField("audio.codec"))?;
+        assert_eq!(request.codec, Some(AudioTargetCodec::Flac));
+        assert_eq!(request.bit_depth, Some(AudioBitDepth::Int24));
+        assert_eq!(
+            parse_audio_encoding_request(None, None, None, None, None, None)
+                .map_err(|_| DomainError::EmptyField("audio.request"))?
+                .codec,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn detects_ogg_flac_from_identification_packet() {
+        let mut page = b"OggS".to_vec();
+        page.extend_from_slice(&[0_u8; 22]);
+        page.extend_from_slice(&[1, 51]);
+        let mut identification = b"\x7fFLAC\x01\x00\x00\x01fLaC".to_vec();
+        identification.resize(51, 0);
+        page.extend_from_slice(&identification);
+        assert_eq!(detect_audio_magic(&page), Some(AudioInputFormat::OggFlac));
+        // A Vorbis comment mentioning FLAC must not be mistaken for Ogg FLAC.
+        let mut vorbis = b"OggS".to_vec();
+        vorbis.extend_from_slice(&[0_u8; 22]);
+        vorbis.extend_from_slice(&[1, 7]);
+        vorbis.extend_from_slice(b"\x01vorbis");
+        assert_eq!(detect_audio_magic(&vorbis), Some(AudioInputFormat::Vorbis));
+    }
+
+    // Builds a single-packet Ogg page with correct lacing (packets <= 255 bytes here).
+    fn ogg_page(header_type: u8, packet: &[u8]) -> Vec<u8> {
+        let mut page = b"OggS".to_vec();
+        page.push(0); // stream version
+        page.push(header_type);
+        page.extend_from_slice(&[0_u8; 16]); // granule position, serial number, sequence
+        page.extend_from_slice(&[0_u8; 4]); // CRC (the detector does not verify it)
+        page.push(1);
+        page.push(u8::try_from(packet.len()).unwrap_or(u8::MAX));
+        page.extend_from_slice(packet);
+        page
+    }
+
+    #[test]
+    fn detects_ogg_audio_after_skeleton_pages() {
+        let mut fishead = vec![0_u8; 44];
+        fishead[..8].copy_from_slice(b"fishead\0");
+        let mut fisbone = vec![0_u8; 30];
+        fisbone[..8].copy_from_slice(b"fisbone\0");
+
+        // Skeleton alone is not an audio identification packet.
+        assert_eq!(detect_audio_magic(&ogg_page(0x02, &fishead)), None);
+
+        let mut bytes = ogg_page(0x02, &fishead);
+        bytes.extend_from_slice(&ogg_page(0x00, &fisbone));
+        bytes.extend_from_slice(&ogg_page(0x02, b"\x7fFLAC\x01\x00\x00\x01fLaC"));
+        assert_eq!(detect_audio_magic(&bytes), Some(AudioInputFormat::OggFlac));
+
+        let mut bytes = ogg_page(0x02, &fishead);
+        bytes.extend_from_slice(&ogg_page(0x02, b"\x01vorbis"));
+        assert_eq!(detect_audio_magic(&bytes), Some(AudioInputFormat::Vorbis));
+
+        // `opus-pure` needs OpusHead as the very first packet, so a Skeleton
+        // prefix must not be reported as an openable Opus stream.
+        let mut opus = ogg_page(0x02, &fishead);
+        opus.extend_from_slice(&ogg_page(0x02, b"OpusHead"));
+        assert_eq!(detect_audio_magic(&opus), None);
+        assert_eq!(
+            detect_audio_magic(&ogg_page(0x02, b"OpusHead")),
+            Some(AudioInputFormat::Opus)
+        );
+    }
+
+    #[test]
+    fn resolves_codec_specific_modes_for_batches_and_directory_targets() -> Result<(), String> {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest
+            .join("target")
+            .join(format!("fastconv-audio-codec-batch-{}", std::process::id()));
+        let source_dir = root.join("src");
+        let target_dir = root.join("dst");
+        fs::create_dir_all(&source_dir).map_err(|err| err.to_string())?;
+        fs::create_dir_all(&target_dir).map_err(|err| err.to_string())?;
+        let data: Vec<u8> = (0..2_048)
+            .map(|index| u8::try_from(index % 251).unwrap_or(0))
+            .collect();
+        for name in ["first.wav", "second.wav"] {
+            fs::write(
+                source_dir.join(name),
+                probe_pcm_bytes(1, 2, 16, &data, false),
+            )
+            .map_err(|err| err.to_string())?;
+        }
+        let threads = Some(NonZeroUsize::MIN);
+
+        let flac_request = AudioEncodingRequest {
+            codec: Some(AudioTargetCodec::Flac),
+            bit_depth: Some(AudioBitDepth::Int24),
+            ..AudioEncodingRequest::default()
+        };
+        let plan = prepare_audio_batch(
+            &source_dir,
+            &target_dir,
+            Some(AudioOutputFormat::Ogg),
+            threads,
+            HardwareBackend::Cpu,
+            flac_request,
+        )
+        .map_err(|err| err.to_string())?;
+        assert_eq!(plan.mode(), AudioExecutionMode::CpuOggFlac);
+        assert_eq!(plan.target_codec(), AudioTargetCodec::Flac);
+        assert_eq!(plan.options().bit_depth(), Some(AudioBitDepth::Int24));
+        assert_eq!(plan.items().len(), 2);
+        assert!(
+            plan.items()
+                .iter()
+                .all(|item| item.target().extension().is_some_and(|ext| ext == "ogg"))
+        );
+
+        let alac_request = AudioEncodingRequest {
+            codec: Some(AudioTargetCodec::Alac),
+            bit_depth: Some(AudioBitDepth::Int16),
+            ..AudioEncodingRequest::default()
+        };
+        let plan = prepare_audio_batch(
+            &source_dir,
+            &target_dir,
+            Some(AudioOutputFormat::M4a),
+            threads,
+            HardwareBackend::Cpu,
+            alac_request,
+        )
+        .map_err(|err| err.to_string())?;
+        assert_eq!(plan.mode(), AudioExecutionMode::CpuM4aAlac);
+        assert_eq!(plan.target_codec(), AudioTargetCodec::Alac);
+        assert_eq!(plan.options().bit_depth(), Some(AudioBitDepth::Int16));
+        assert!(
+            plan.items()
+                .iter()
+                .all(|item| item.target().extension().is_some_and(|ext| ext == "m4a"))
+        );
+
+        // An invalid codec/container pair is rejected before any item is probed.
+        let invalid = AudioEncodingRequest {
+            codec: Some(AudioTargetCodec::Aac),
+            ..AudioEncodingRequest::default()
+        };
+        let result = prepare_audio_batch(
+            &source_dir,
+            &target_dir,
+            Some(AudioOutputFormat::Ogg),
+            threads,
+            HardwareBackend::Cpu,
+            invalid,
+        );
+        assert!(matches!(
+            result,
+            Err(ProbeError::InvalidDomain(
+                DomainError::UnsupportedAudioCodecForFormat { .. }
+            ))
+        ));
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_codec_for_single_file_directory_targets_and_transforms() -> Result<(), String> {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest.join("target").join(format!(
+            "fastconv-audio-codec-single-{}",
+            std::process::id()
+        ));
+        let source_dir = root.join("src");
+        let target_dir = root.join("dst");
+        fs::create_dir_all(&source_dir).map_err(|err| err.to_string())?;
+        fs::create_dir_all(&target_dir).map_err(|err| err.to_string())?;
+        let data: Vec<u8> = (0..2_048)
+            .map(|index| u8::try_from(index % 251).unwrap_or(0))
+            .collect();
+        let single = source_dir.join("first.wav");
+        fs::write(&single, probe_pcm_bytes(1, 2, 16, &data, false))
+            .map_err(|err| err.to_string())?;
+        let threads = Some(NonZeroUsize::MIN);
+
+        // `.oga` is an alias for the Ogg container, including with --codec.
+        let (oga_target, oga_format) =
+            resolve_single_target(&single, Path::new("out.oga"), Some(AudioOutputFormat::Ogg))
+                .unwrap_or_else(|_| (PathBuf::new(), AudioOutputFormat::Wav));
+        assert_eq!(oga_target, PathBuf::from("out.oga"));
+        assert_eq!(oga_format, AudioOutputFormat::Ogg);
+
+        // Single file targeting a directory: the directory suffix selects the
+        // container and --codec decides which encoder the plan carries.
+        let nested = target_dir.join("nested/");
+        let plan = prepare_audio_batch(
+            &single,
+            &nested,
+            Some(AudioOutputFormat::Ogg),
+            threads,
+            HardwareBackend::Cpu,
+            AudioEncodingRequest {
+                codec: Some(AudioTargetCodec::Opus),
+                sample_rate: Some(
+                    AudioOptionSampleRate::new(48_000).unwrap_or_else(|_| unreachable!()),
+                ),
+                ..AudioEncodingRequest::default()
+            },
+        )
+        .map_err(|err| err.to_string())?;
+        assert_eq!(plan.mode(), AudioExecutionMode::CpuOggOpus);
+        assert_eq!(plan.target_codec(), AudioTargetCodec::Opus);
+        assert_eq!(plan.items()[0].target(), nested.join("first.ogg"));
+
+        // Resampling plus remixing stays valid for multi-codec containers.
+        let plan = prepare_audio_batch(
+            &single,
+            &target_dir.join("transformed.ogg"),
+            Some(AudioOutputFormat::Ogg),
+            threads,
+            HardwareBackend::Cpu,
+            AudioEncodingRequest {
+                codec: Some(AudioTargetCodec::Flac),
+                sample_rate: Some(
+                    AudioOptionSampleRate::new(44_100).unwrap_or_else(|_| unreachable!()),
+                ),
+                channels: Some(AudioOptionChannels::new(1).unwrap_or_else(|_| unreachable!())),
+                bit_depth: Some(AudioBitDepth::Int24),
+                ..AudioEncodingRequest::default()
+            },
+        )
+        .map_err(|err| err.to_string())?;
+        assert_eq!(plan.mode(), AudioExecutionMode::CpuOggFlac);
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 }

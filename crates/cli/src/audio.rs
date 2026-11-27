@@ -3,14 +3,15 @@ use std::path::PathBuf;
 
 use fastconv_domain::{
     AudioBitDepth, AudioOptionChannels, AudioOptionSampleRate, AudioOutputFormat, AudioRateControl,
-    HardwareBackend,
+    AudioTargetCodec, HardwareBackend,
 };
 
 pub(crate) const AUDIO_HELP: &str = r"fastconv audio - convert audio files
 
 Usage:
-  fastconv audio <source> <target> [--to <format>] [--bitrate <rate> | --quality <0..=100>]
-                 [--sample-rate <hz>] [--channels <1..=8>] [--bit-depth <8|16|24|32|f32>]
+  fastconv audio <source> <target> [--to <format>] [--codec <codec>]
+                 [--bitrate <rate> | --quality <0..=100>] [--sample-rate <hz>]
+                 [--channels <1..=8>] [--bit-depth <8|16|24|32|f32>]
                  [--threads <N>] [--backend <name>]
 
 Arguments:
@@ -21,22 +22,29 @@ Options:
   --to <format>         Output format; directory batches default to flac, single
                         files infer it from the target extension: flac, wav,
                         opus, ogg, mp3, aac, m4a, alac, aiff
+  --codec <codec>       Codec inside the container: vorbis, opus, flac, aac,
+                        alac, pcm, mp3. Defaults follow the container:
+                        ogg -> vorbis, m4a -> aac, and every other format has
+                        a single codec. Valid pairs: ogg with vorbis/opus/flac,
+                        m4a with aac/alac; all other formats accept only their
+                        default. --codec must agree with --to and the target
+                        extension; incompatible pairs are rejected.
   --bitrate <rate>      Lossy target bitrate: 128k, 192K, 320kbps, bare kbps
                         below 1000 (e.g. 192), or bare bps (e.g. 192000).
-                        Ranges: mp3 32-320k, aac/m4a/ogg 32-512k, opus 6-510k.
+                        Ranges: mp3 32-320k, vorbis/aac 32-512k, opus 6-510k.
                         Mutually exclusive with --quality; rejected by
-                        lossless outputs (wav, flac, alac, aiff).
-  --quality <0..=100>   Quality-based VBR, supported by mp3, ogg and opus.
-                        mutually exclusive with --bitrate; aac/m4a have no
-                        VBR quality mode (use --bitrate) and lossless outputs
-                        reject it.
+                        lossless codecs (pcm, flac, alac).
+  --quality <0..=100>   Quality-based VBR, supported by mp3, vorbis and opus.
+                        mutually exclusive with --bitrate; aac has no VBR quality
+                        mode (use --bitrate) and lossless codecs reject it.
   --sample-rate <hz>    Resample output to this rate. Opus accepts only 48000;
-                        mp3 and aac/m4a accept only their codec rate tables.
-  --channels <1..=8>    Output channel count (mp3/opus 1-2, aac/m4a/ogg 1-6
-                        excluding 4, lossless 1-8). Remixing is deterministic.
+                        mp3 and aac accept only their codec rate tables; alac
+                        accepts 8000..=65535 (M4A stores a 16.16 fixed-point rate).
+  --channels <1..=8>    Output channel count (mp3/opus 1-2, aac/vorbis 1-6
+                        excluding 4, pcm/flac/alac 1-8). Remixing is deterministic.
   --bit-depth <...>     Lossless PCM depth: 8, 16, 24, 32 or f32. Accepted by
-                        wav/aiff; flac accepts 8/16/24 and alac accepts 16.
-                        Rejected by all lossy targets. Default follows the source
+                        pcm; flac accepts 8/16/24 and alac accepts 16.
+                        Rejected by all lossy codecs. Default follows the source
                         where the target stores it; otherwise float to flac gives
                         24-bit integer, and float or 8-bit input to alac gives
                         16-bit.
@@ -47,9 +55,9 @@ Options:
   -h, --help            Print this help
 
 Supported input formats:
-  wav, flac, mp3, ogg (Vorbis), opus, aac (ADTS), m4a, alac, aiff
+  wav, flac, mp3, ogg (Vorbis, Opus, Ogg FLAC), opus, aac (ADTS), m4a (AAC/ALAC), alac, aiff
   Output aliases: wave -> wav, oga -> ogg, aif/aifc -> aiff
-  Lossless outputs: wav, flac, alac, aiff
+  Lossless outputs: wav, flac, ogg (--codec flac), m4a (--codec alac), alac, aiff
   ALAC writes an M4A container; use a .m4a or .alac target extension.";
 
 pub(crate) fn print_audio_help() {
@@ -61,6 +69,7 @@ pub(crate) struct AudioArgs {
     source: PathBuf,
     target: PathBuf,
     to: Option<AudioOutputFormat>,
+    codec: Option<AudioTargetCodec>,
     rate_control: AudioRateControl,
     sample_rate: Option<AudioOptionSampleRate>,
     channels: Option<AudioOptionChannels>,
@@ -99,6 +108,7 @@ fn parse_target_format(value: &str) -> Result<AudioOutputFormat, String> {
 /// presence, duplicates, and missing values.
 #[derive(Default)]
 struct AudioOptionState {
+    codec: Option<String>,
     bitrate: Option<String>,
     quality: Option<String>,
     sample_rate: Option<String>,
@@ -114,6 +124,7 @@ impl AudioOptionState {
     /// Returns a diagnostic for duplicate flags or missing values.
     fn parse(&mut self, flag: &str, args: &[&str], index: usize) -> Result<Option<usize>, String> {
         let slot = match flag {
+            "--codec" => &mut self.codec,
             "--bitrate" => &mut self.bitrate,
             "--quality" => &mut self.quality,
             "--sample-rate" => &mut self.sample_rate,
@@ -204,6 +215,7 @@ pub(crate) fn parse_audio_args(args: &[&str]) -> Result<AudioCommand, String> {
     // Hand the raw encoding values to the boundary parser once, so validation of
     // external input lives in fastconv-probe and domain only ever sees valid types.
     let request = fastconv_probe::parse_audio_encoding_request(
+        options.codec.as_deref(),
         options.bitrate.as_deref(),
         options.quality.as_deref(),
         options.sample_rate.as_deref(),
@@ -215,6 +227,7 @@ pub(crate) fn parse_audio_args(args: &[&str]) -> Result<AudioCommand, String> {
         source: PathBuf::from(*source),
         target: PathBuf::from(*target),
         to,
+        codec: request.codec,
         rate_control: request.rate_control,
         sample_rate: request.sample_rate,
         channels: request.channels,
@@ -238,6 +251,7 @@ pub(crate) fn run_audio(args: &AudioArgs) -> Result<(), String> {
         args.threads,
         args.backend,
         fastconv_probe::AudioEncodingRequest {
+            codec: args.codec,
             rate_control: args.rate_control,
             sample_rate: args.sample_rate,
             channels: args.channels,
@@ -270,6 +284,7 @@ mod tests {
         assert!(AUDIO_HELP.contains("Usage:\n  fastconv audio <source> <target>"));
         for flag in [
             "--to",
+            "--codec <codec>",
             "--bitrate <rate>",
             "--quality <0..=100>",
             "--sample-rate <hz>",
@@ -289,6 +304,12 @@ mod tests {
                 "missing {format} in audio help"
             );
         }
+        assert!(AUDIO_HELP.contains("ogg -> vorbis"));
+        assert!(AUDIO_HELP.contains("m4a -> aac"));
+        assert!(AUDIO_HELP.contains("Ogg FLAC"));
+        assert!(AUDIO_HELP.contains("vorbis/aac 32-512k"));
+        assert!(AUDIO_HELP.contains("opus 6-510k"));
+        assert!(AUDIO_HELP.contains("pcm/flac/alac 1-8"));
         assert!(AUDIO_HELP.contains("no silent CPU fallback"));
         assert!(AUDIO_HELP.contains("ALAC writes an M4A container"));
         assert!(AUDIO_HELP.contains("mutually exclusive with --bitrate"));
@@ -307,6 +328,7 @@ mod tests {
                 source: PathBuf::from("in.wav"),
                 target: PathBuf::from("out.flac"),
                 to: None,
+                codec: None,
                 rate_control: AudioRateControl::Default,
                 sample_rate: None,
                 channels: None,
@@ -380,6 +402,36 @@ mod tests {
                 return Err("expected audio run args".to_owned());
             };
             assert_eq!(parsed.to, Some(format), "wrong format for '--to {name}'");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parses_codec_values_through_the_probe_boundary() -> Result<(), String> {
+        for (raw, expected) in [
+            ("vorbis", AudioTargetCodec::Vorbis),
+            (" Opus ", AudioTargetCodec::Opus),
+            ("FLAC", AudioTargetCodec::Flac),
+            ("aac", AudioTargetCodec::Aac),
+            ("alac", AudioTargetCodec::Alac),
+            ("pcm", AudioTargetCodec::Pcm),
+            ("MP3", AudioTargetCodec::Mp3),
+        ] {
+            let AudioCommand::Run(parsed) = parse_audio_args(&["a.wav", "b.ogg", "--codec", raw])?
+            else {
+                return Err("expected audio run args".to_owned());
+            };
+            assert_eq!(parsed.codec, Some(expected), "--codec {raw}");
+        }
+        for args in [
+            vec!["a", "b", "--codec", "wma"],
+            vec!["a", "b", "--codec"],
+            vec!["a", "b", "--codec", "flac", "--codec", "opus"],
+        ] {
+            assert!(
+                parse_audio_args(&args).is_err(),
+                "{args:?} must be rejected"
+            );
         }
         Ok(())
     }

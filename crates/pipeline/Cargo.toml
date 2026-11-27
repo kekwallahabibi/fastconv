@@ -8,9 +8,6 @@ license.workspace = true
 default = []
 nvenc = ["dep:cudarc", "dep:libloading", "dep:nvidia-video-codec-sdk"]
 
-[dev-dependencies]
-ogg.workspace = true
-
 [dependencies]
 alac-encoder.workspace = true
 cudarc = { workspace = true, optional = true }
@@ -24,6 +21,7 @@ jxl.workspace = true
 jixel.workspace = true
 libloading = { workspace = true, optional = true }
 nvidia-video-codec-sdk = { workspace = true, optional = true }
+ogg.workspace = true
 opus-pure.workspace = true
 png.workspace = true
 rubato.workspace = true
