@@ -2713,7 +2713,7 @@ fn cpu_mjpeg(
     }
     let mut rgb = Vec::with_capacity(rgb_len);
     let mut units = Vec::with_capacity(frames.len());
-    for frame in frames {
+    for (index, frame) in frames.iter().enumerate() {
         let image = YuvPlanarImage {
             y_plane: frame.y.as_slice(),
             y_stride: u32::try_from(w)
@@ -2747,6 +2747,17 @@ fn cpu_mjpeg(
         encoder
             .encode(&rgb, w16, h16, JpegColorType::Rgb)
             .map_err(|err| encode_error(path, format!("MJPEG encode failed: {err}")))?;
+        // The decode side caps packets at MJPEG_PACKET_CAP; never emit a frame
+        // that fastconv itself would reject.
+        if jpeg.len() > MJPEG_PACKET_CAP {
+            return Err(encode_error(
+                path,
+                format!(
+                    "MJPEG frame {index} encoded to {} bytes, above the {MJPEG_PACKET_CAP}-byte cap",
+                    jpeg.len()
+                ),
+            ));
+        }
         // Every JPEG frame is independently decodable: keyframe = true, and
         // make_stream sets dts = pts for all packets.
         units.push((jpeg, true));
@@ -3127,6 +3138,40 @@ mod tests {
         unsupported[0].color = YuvColor::specified(YuvMatrix::Unsupported(10), YuvRange::Limited);
         assert!(matches!(
             cpu_mjpeg(path, &unsupported, VideoQuality::DEFAULT, 0, 25, 1),
+            Err(PipelineError::EncodeFailed { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn mjpeg_encode_rejects_oversized_jpeg_packet() -> Result<(), PipelineError> {
+        let path = Path::new("mjpeg-oversized-jpeg");
+        // 4096x4096 is the largest frame the pixel cap allows; high-entropy
+        // content at quality 100 encodes above the 16 MiB packet cap.
+        let mut state = 1_u32;
+        let mut noise = |len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    u8::try_from(state >> 24).unwrap_or(0)
+                })
+                .collect()
+        };
+        let side = usize::try_from(MJPEG_MAX_DIMENSION).unwrap_or(0) / 2;
+        let frame = Yuv420Frame {
+            width: u32::try_from(side).map_err(|_| encode_error(path, "side width"))?,
+            height: u32::try_from(side).map_err(|_| encode_error(path, "side height"))?,
+            y: noise(side.saturating_mul(side)),
+            u: noise(side.saturating_mul(side) / 4),
+            v: noise(side.saturating_mul(side) / 4),
+            pts_us: 0,
+            duration_us: 40_000,
+            color: YuvColor::default(),
+        };
+        let quality = VideoQuality::new(VideoQuality::MAX)
+            .map_err(|err| encode_error(path, format!("quality: {err}")))?;
+        assert!(matches!(
+            cpu_mjpeg(path, &[frame], quality, 0, 25, 1),
             Err(PipelineError::EncodeFailed { .. })
         ));
         Ok(())
