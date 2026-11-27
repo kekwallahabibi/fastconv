@@ -3,12 +3,14 @@ use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "serde")]
 use serde::Serialize;
 
 use crate::{DomainError, GpuBackend, GpuCapability, HardwareBackend, HostHardware, PathRole};
 
 /// Non-zero pixel dimensions of a decoded or probed image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct ImageDimensions {
     width: NonZeroU32,
     height: NonZeroU32,
@@ -51,7 +53,8 @@ impl fmt::Display for ImageDimensions {
 }
 
 /// Supported still-image input container formats validated at the boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum ImageInputFormat {
     Png,
     Jpeg,
@@ -94,7 +97,8 @@ impl fmt::Display for ImageInputFormat {
 }
 
 /// Supported still-image output container formats.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum ImageOutputFormat {
     Webp,
     Heic,
@@ -137,7 +141,8 @@ impl fmt::Display for ImageOutputFormat {
 }
 
 /// Validated lossy image quality factor in `0..=100`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct ImageQuality(u8);
 
 impl ImageQuality {
@@ -172,7 +177,8 @@ impl ImageQuality {
 
 /// Compression mode requested for an image conversion, making lossless + quality
 /// contradictions unrepresentable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum ImageCompression {
     Lossy { quality: ImageQuality },
     Lossless,
@@ -188,7 +194,8 @@ impl fmt::Display for ImageCompression {
 }
 
 /// Effort/speed tradeoff for image encoders that expose multiple compression levels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum CompressionLevel {
     Fast,
     Balanced,
@@ -207,7 +214,8 @@ impl fmt::Display for CompressionLevel {
 }
 
 /// User-selected TIFF compression family, before an effort level is resolved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum TiffCompressionKind {
     Deflate,
     Lzw,
@@ -229,7 +237,8 @@ impl fmt::Display for TiffCompressionKind {
 
 /// Validated TIFF compression, making `CompressionLevel` + non-Deflate combinations
 /// compile-time unrepresentable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum TiffCompression {
     Deflate { level: CompressionLevel },
     Lzw,
@@ -255,7 +264,8 @@ impl fmt::Display for TiffCompression {
 }
 
 /// Chroma subsampling for formats that expose a 4:2:0 / 4:4:4 choice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum ChromaSubsampling {
     Yuv420,
     Yuv444,
@@ -272,7 +282,8 @@ impl fmt::Display for ChromaSubsampling {
 }
 
 /// Optional encoder controls validated once at the probe boundary.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct ImageEncodeOptions {
     pub compression_level: Option<CompressionLevel>,
     pub tiff_compression: Option<TiffCompressionKind>,
@@ -286,7 +297,8 @@ pub struct ImageEncodeOptions {
 /// PNG/BMP/QOI/TIFF/ICO/PNM, or hardware-absent video encoder backends) cannot be constructed.
 /// HEIC is encodable either as pure-Rust CPU HEVC-Intra ([`Self::CpuHeic`]) or via
 /// NVIDIA NVENC ([`Self::NvencHeic`]); the latter never silently falls back to the CPU path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum ImageExecutionMode {
     CpuWebp {
         compression: ImageCompression,
@@ -972,7 +984,8 @@ impl ImageBatchPlan {
 }
 
 /// Execution summary returned after completing an [`ImageBatchPlan`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct ImageConversionReport {
     files_converted: NonZeroUsize,
     total_input_bytes: NonZeroU64,

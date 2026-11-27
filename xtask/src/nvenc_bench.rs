@@ -6,7 +6,9 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fastconv_domain::{BenchmarkMetrics, BenchmarkSample, MediaKind, PeakMemory, WorkloadUnit};
+use fastconv_domain::{
+    BenchmarkMetrics, BenchmarkSample, MediaKind, PeakMemory, WorkloadUnit, u64_to_f64,
+};
 use serde::Deserialize;
 
 use crate::bench::format_baseline_table;
@@ -869,12 +871,6 @@ fn parse_psnr_average_db(output: &str) -> Option<f64> {
         }
     }
     None
-}
-
-fn u64_to_f64(value: u64) -> f64 {
-    let hi = u32::try_from(value >> 32).unwrap_or(u32::MAX);
-    let lo = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
-    f64::from(hi) * 4_294_967_296.0 + f64::from(lo)
 }
 
 #[cfg(test)]

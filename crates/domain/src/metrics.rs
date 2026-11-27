@@ -2,28 +2,32 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
+#[cfg(feature = "serde")]
 use serde::Serialize;
 
-use crate::{DomainError, MediaKind, require_non_empty};
+use crate::{DomainError, MediaKind, require_non_empty, u64_to_f64};
 
 const BYTES_PER_MEGABYTE: f64 = 1_000_000.0;
 
 /// Peak resident memory observed during a benchmark run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum PeakMemory {
     MeasuredBytes(NonZeroU64),
     Unavailable,
 }
 
 /// Primary work unit used to compute benchmark throughput.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum WorkloadUnit {
     Bytes,
     VideoFrames(NonZeroU64),
 }
 
 /// Derived throughput metric guaranteed to match measured duration and size.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum Throughput {
     MegabytesPerSec(f64),
     FramesPerSec { fps: f64, megabytes_per_sec: f64 },
@@ -52,7 +56,8 @@ pub struct BenchmarkSample {
 }
 
 /// Validated, self-consistent performance record for a benchmark workload.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct BenchmarkMetrics {
     workload_name: String,
     media_kind: MediaKind,
@@ -151,12 +156,6 @@ impl BenchmarkMetrics {
     pub fn size_ratio(&self) -> f64 {
         u64_to_f64(self.output_bytes.get()) / u64_to_f64(self.input_bytes.get())
     }
-}
-
-fn u64_to_f64(value: u64) -> f64 {
-    let hi = u32::try_from(value >> 32).unwrap_or(u32::MAX);
-    let lo = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
-    f64::from(hi) * 4_294_967_296.0 + f64::from(lo)
 }
 
 #[cfg(test)]

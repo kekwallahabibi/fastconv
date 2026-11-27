@@ -17,6 +17,7 @@ mod ogg_flac;
 mod pnm;
 mod qoi;
 pub mod remux;
+mod staging;
 mod video_anim;
 mod video_bitstream;
 pub(crate) mod video_codecs;
@@ -185,7 +186,7 @@ mod tests {
         ChromaSubsampling, CompressionLevel, ConversionRequest, DomainError, ExecutionPlan,
         GpuBackend, HardwareBackend, ImageBatchItem, ImageBatchPlan, ImageCompression,
         ImageDimensions, ImageExecutionMode, ImageInputFormat, ImageQuality, MediaKind,
-        TiffCompression,
+        TiffCompression, u64_to_f64,
     };
     use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
     use std::env;
@@ -390,12 +391,6 @@ mod tests {
 
         fs::remove_dir_all(&root)?;
         Ok(())
-    }
-
-    fn u64_to_f64(value: u64) -> f64 {
-        let hi = u32::try_from(value >> 32).unwrap_or(u32::MAX);
-        let lo = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
-        f64::from(hi) * 4_294_967_296.0 + f64::from(lo)
     }
 
     fn mean_abs_channel_diff(a: &[u8], b: &[u8]) -> Result<f64, Box<dyn std::error::Error>> {

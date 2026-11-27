@@ -1,9 +1,10 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
+use crate::{duplicate_flag, flag_value, parse_threads};
 use fastconv_domain::{
     AudioBitDepth, AudioOptionChannels, AudioOptionSampleRate, AudioOutputFormat, AudioRateControl,
-    AudioTargetCodec, HardwareBackend,
+    AudioTargetCodec, HardwareBackend, u64_to_f64,
 };
 
 pub(crate) const AUDIO_HELP: &str = r"fastconv audio - convert audio files
@@ -133,12 +134,9 @@ impl AudioOptionState {
             _ => return Ok(None),
         };
         if slot.is_some() {
-            return Err(format!("duplicate flag '{flag}'"));
+            return Err(duplicate_flag(flag));
         }
-        let raw = args
-            .get(index + 1)
-            .copied()
-            .ok_or_else(|| format!("missing value for {flag}"))?;
+        let raw = flag_value(args, index, flag)?;
         *slot = Some(raw.to_owned());
         Ok(Some(index + 2))
     }
@@ -167,35 +165,21 @@ pub(crate) fn parse_audio_args(args: &[&str]) -> Result<AudioCommand, String> {
             "-h" | "--help" => return Ok(AudioCommand::Help),
             "--to" => {
                 if to.is_some() {
-                    return Err("duplicate flag '--to'".to_owned());
+                    return Err(duplicate_flag("--to"));
                 }
-                let raw = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --to".to_owned())?;
-                to = Some(parse_target_format(raw)?);
+                to = Some(parse_target_format(flag_value(args, index, "--to")?)?);
                 index += 2;
             }
             "--threads" => {
-                if threads.is_some() {
-                    return Err("duplicate flag '--threads'".to_owned());
-                }
-                let raw = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --threads".to_owned())?;
-                threads = Some(
-                    raw.parse::<NonZeroUsize>()
-                        .map_err(|err| format!("invalid --threads '{raw}': {err}"))?,
-                );
-                index += 2;
+                let (parsed, next) = parse_threads(args, index, threads.is_some())?;
+                threads = Some(parsed);
+                index = next;
             }
             "--backend" => {
                 if backend.is_some() {
-                    return Err("duplicate flag '--backend'".to_owned());
+                    return Err(duplicate_flag("--backend"));
                 }
-                let raw = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --backend".to_owned())?;
-                backend = Some(crate::parse_backend(raw)?);
+                backend = Some(crate::parse_backend(flag_value(args, index, "--backend")?)?);
                 index += 2;
             }
             flag if flag.starts_with('-') => return Err(format!("unknown flag '{flag}'")),
@@ -266,8 +250,8 @@ pub(crate) fn run_audio(args: &AudioArgs) -> Result<(), String> {
         report.files_converted(),
         plan.mode(),
         report.worker_threads_used(),
-        crate::u64_to_f64(report.total_input_bytes().get()) / 1_000_000.0,
-        crate::u64_to_f64(report.total_output_bytes().get()) / 1_000_000.0,
+        u64_to_f64(report.total_input_bytes().get()) / 1_000_000.0,
+        u64_to_f64(report.total_output_bytes().get()) / 1_000_000.0,
         report.duration().as_secs_f64() * 1_000.0,
         report.megabytes_per_sec(),
     );

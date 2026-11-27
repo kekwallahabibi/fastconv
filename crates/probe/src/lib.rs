@@ -180,6 +180,53 @@ pub fn validate_source_file(path: &Path) -> Result<PathBuf, ProbeError> {
     Ok(path.to_path_buf())
 }
 
+/// Resolves a path to an absolute location, using the nearest existing ancestor
+/// for outputs that do not exist yet. This makes relative/absolute aliases
+/// comparable at the boundary, so alias checks can reject in-place overwrites
+/// and missing-parent targets still resolve deterministically.
+pub(crate) fn canonical_or_parent(path: &Path) -> Result<PathBuf, ProbeError> {
+    let mut cursor = path.to_path_buf();
+    let mut missing = std::collections::VecDeque::new();
+    loop {
+        match fs::canonicalize(&cursor) {
+            Ok(mut canonical) => {
+                for component in missing {
+                    canonical = canonical.join(component);
+                }
+                return Ok(canonical);
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ProbeError::Io {
+                    path: cursor,
+                    source,
+                });
+            }
+        }
+        match cursor.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                if let Some(name) = cursor.file_name() {
+                    missing.push_front(name.to_os_string());
+                }
+                cursor = parent.to_path_buf();
+            }
+            _ => {
+                let mut canonical = fs::canonicalize(".").map_err(|source| ProbeError::Io {
+                    path: PathBuf::from("."),
+                    source,
+                })?;
+                if let Some(name) = cursor.file_name() {
+                    missing.push_front(name.to_os_string());
+                }
+                for component in missing {
+                    canonical = canonical.join(component);
+                }
+                return Ok(canonical);
+            }
+        }
+    }
+}
+
 /// Queries the host OS for the available CPU parallelism.
 ///
 /// # Errors

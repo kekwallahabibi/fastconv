@@ -34,10 +34,21 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "serde")]
 use serde::Serialize;
 
+/// Deterministic `u64` -> `f64` conversion for throughput/quality reporting.
+/// Splitting into two `u32` halves keeps every crate's rounded results identical.
+#[must_use]
+pub fn u64_to_f64(value: u64) -> f64 {
+    let hi = u32::try_from(value >> 32).unwrap_or(u32::MAX);
+    let lo = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    f64::from(hi) * 4_294_967_296.0 + f64::from(lo)
+}
+
 /// High-level media category supported by `fastconv`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum MediaKind {
     Video,
     Audio,
@@ -45,14 +56,16 @@ pub enum MediaKind {
 }
 
 /// Subset of media kinds eligible for zero-copy GPU execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum GpuMediaKind {
     Video,
     Image,
 }
 
 /// Concrete hardware acceleration backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum GpuBackend {
     Nvenc,
     Vaapi,
@@ -63,7 +76,8 @@ pub enum GpuBackend {
 }
 
 /// Execution backend explicitly selected for a conversion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum HardwareBackend {
     Cpu,
     Gpu(GpuBackend),

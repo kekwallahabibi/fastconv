@@ -3,12 +3,14 @@ use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(feature = "serde")]
 use serde::Serialize;
 
-use crate::{DomainError, GpuBackend, HardwareBackend, PathRole};
+use crate::{DomainError, GpuBackend, HardwareBackend, PathRole, u64_to_f64};
 
 /// Video container formats supported for remuxing and transcoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum VideoContainerFormat {
     Mp4,
     Mkv,
@@ -104,7 +106,8 @@ impl fmt::Display for VideoContainerFormat {
 }
 
 /// Video/audio codecs that fastconv recognises in containers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum VideoCodec {
     H264,
     Hevc,
@@ -249,7 +252,8 @@ impl fmt::Display for VideoCodec {
 }
 
 /// Video codec selected for re-encoding, distinct from probed bitstream codecs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum TargetVideoCodec {
     H264,
     Hevc,
@@ -314,7 +318,8 @@ impl fmt::Display for TargetVideoCodec {
 }
 
 /// Audio codec selected for re-encoding inside a video container.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum TargetAudioCodec {
     Aac,
     Opus,
@@ -375,7 +380,8 @@ impl fmt::Display for TargetAudioCodec {
 }
 
 /// Validated lossy video quality factor in `0..=100`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct VideoQuality(u8);
 
 impl VideoQuality {
@@ -480,7 +486,8 @@ const fn bitrate_display(bps: u32) -> (u32, &'static str) {
 }
 
 /// Validated video bitrate in bits per second.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct VideoBitrate(u32);
 
 impl VideoBitrate {
@@ -528,7 +535,8 @@ impl fmt::Display for VideoBitrate {
 
 /// Validated audio bitrate in bits per second. Codec-specific limits are
 /// applied by [`AudioEncodeConfig::new`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct AudioBitrate(u32);
 
 impl AudioBitrate {
@@ -575,7 +583,8 @@ impl fmt::Display for AudioBitrate {
 }
 
 /// Validated audio sample rate in Hz.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct AudioSampleRate(NonZeroU32);
 
 impl AudioSampleRate {
@@ -603,7 +612,8 @@ impl fmt::Display for AudioSampleRate {
 }
 
 /// Validated audio channel count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct AudioChannels(NonZeroU16);
 
 impl AudioChannels {
@@ -633,7 +643,8 @@ impl fmt::Display for AudioChannels {
 /// Optional, user-requested audio encoding settings for tracks inside a video
 /// container. Nothing here is applied until it has been checked against a
 /// concrete codec by [`AudioEncodeConfig::new`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct AudioEncodeOptions {
     bitrate: Option<AudioBitrate>,
     sample_rate: Option<AudioSampleRate>,
@@ -677,7 +688,8 @@ impl AudioEncodeOptions {
 
 /// Validated audio encoder settings for one target codec, with all unspecified
 /// fields left as `None` so the pipeline can keep its existing defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct AudioEncodeConfig {
     codec: TargetAudioCodec,
     bitrate: Option<AudioBitrate>,
@@ -908,7 +920,8 @@ pub fn validate_audio_options_for_container(
 /// `Auto` is resolved exactly once in `fastconv-probe` from the probed source
 /// codec and the selected encoder backend. Forced `Nvdec` never silently
 /// degrades to CPU decode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum HardwareDecodeBackend {
     Auto,
     Cpu,
@@ -977,7 +990,8 @@ impl fmt::Display for HardwareDecodeBackend {
 }
 
 /// Concrete, validated decode path carried from probe into the pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum VideoDecodeMode {
     Cpu,
     Nvdec,
@@ -1021,7 +1035,8 @@ impl fmt::Display for VideoDecodeMode {
 /// Decode paths actually executed by a whole batch. Under `--hwdecode auto`
 /// each item is resolved separately, so one batch may use both paths. `NoVideo`
 /// means no item dispatched a video decode (e.g. an audio-only copy batch).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum VideoDecodePaths {
     NoVideo,
     Cpu,
@@ -1084,7 +1099,8 @@ impl From<VideoDecodeMode> for VideoDecodePaths {
 }
 
 /// Explicit rate-control choice for video encoders that support it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum VideoRateControl {
     Quality(VideoQuality),
     Bitrate(VideoBitrate),
@@ -1120,7 +1136,8 @@ impl fmt::Display for VideoRateControl {
 }
 
 /// Compile-time-legal video encoder choice: a codec/backend pair and its rate control.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum VideoEncodeMode {
     CpuH264 { rate_control: VideoRateControl },
     CpuAv1 { rate_control: VideoRateControl },
@@ -1310,7 +1327,8 @@ impl fmt::Display for VideoEncodeMode {
 }
 
 /// Per-track decision for a video stream during transcoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum VideoTrackAction {
     Copy,
     Encode(VideoEncodeMode),
@@ -1336,7 +1354,8 @@ impl fmt::Display for VideoTrackAction {
 }
 
 /// Per-track decision for an audio stream during video transcoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum AudioTrackAction {
     Copy,
     Encode(AudioEncodeConfig),
@@ -1373,7 +1392,8 @@ impl fmt::Display for AudioTrackAction {
 }
 
 /// Kind of a stream inside a container.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum VideoStreamKind {
     Video,
     Audio,
@@ -1397,7 +1417,8 @@ impl fmt::Display for VideoStreamKind {
 
 /// Playback loop count signalled by an animation source. `Times(1)` plays once;
 /// there is deliberately no `Times(0)` (that bit pattern means "forever").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum AnimationLoop {
     #[default]
     Infinite,
@@ -1406,7 +1427,8 @@ pub enum AnimationLoop {
 
 /// Animation facts validated once at the probe boundary and carried unchanged
 /// into execution, so the pipeline never re-parses container metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct AnimationMeta {
     loop_count: AnimationLoop,
     has_alpha: bool,
@@ -1433,7 +1455,8 @@ impl AnimationMeta {
 }
 
 /// Probed stream metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct VideoStreamInfo {
     codec: VideoCodec,
     kind: VideoStreamKind,
@@ -1680,7 +1703,8 @@ impl VideoRemuxPlan {
 }
 
 /// Report after a remux batch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct VideoRemuxReport {
     files_remuxed: NonZeroUsize,
     total_input_bytes: NonZeroU64,
@@ -2057,7 +2081,8 @@ impl VideoTranscodePlan {
 }
 
 /// Report after a transcode batch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct VideoTranscodeReport {
     files_converted: NonZeroUsize,
     frames_processed: u64,
@@ -2168,12 +2193,6 @@ impl VideoTranscodeReport {
         }
         u64_to_f64(self.frames_processed) / secs
     }
-}
-
-fn u64_to_f64(value: u64) -> f64 {
-    let hi = u32::try_from(value >> 32).unwrap_or(u32::MAX);
-    let lo = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
-    f64::from(hi) * 4_294_967_296.0 + f64::from(lo)
 }
 
 #[cfg(test)]

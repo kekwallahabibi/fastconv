@@ -6,7 +6,9 @@
 //! file. NVENC modes are routed to the GPU backend with no silent CPU fallback.
 
 use std::borrow::Cow;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
+#[cfg(test)]
+use std::fs::{File, OpenOptions};
 use std::io::{self, Cursor, Write};
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
@@ -42,6 +44,7 @@ use symphonia::core::packet::PacketRef;
 use symphonia::core::units::{Duration, Timestamp};
 
 use crate::PipelineError;
+use crate::staging::StagingTarget;
 use crate::video_anim::{self, AnimFrameInfo};
 use crate::video_bitstream::{
     PcmFormat, default_opus_head, extract_flac_streaminfo_from_mkv_codec_private,
@@ -2981,82 +2984,6 @@ fn transcode_audio_track_streaming(
     Ok(())
 }
 
-/// A crash-safe staging file: exclusively created, written through the owned
-/// handle, then published by an atomic rename.
-struct StagingTarget {
-    temp: PathBuf,
-    target: PathBuf,
-    file: Option<File>,
-    published: bool,
-}
-
-impl StagingTarget {
-    fn new(target: &Path, tag: usize) -> Result<Self, PipelineError> {
-        if let Some(parent) = target.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent).map_err(|source| PipelineError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        // The staging name deliberately ignores the destination basename:
-        // a long user-supplied name could otherwise overflow the filesystem's
-        // component limit. Only the parent directory and create_new matter.
-        let serial = STAGING_SERIAL.fetch_add(1, Ordering::Relaxed);
-        let temp = target.with_file_name(format!(
-            ".fastconv-{}-{serial}-{tag}.tmp",
-            std::process::id()
-        ));
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(&temp).map_err(|source| PipelineError::Io {
-            path: temp.clone(),
-            source,
-        })?;
-        Ok(Self {
-            temp,
-            target: target.to_path_buf(),
-            file: Some(file),
-            published: false,
-        })
-    }
-
-    fn file(&self) -> Result<&File, PipelineError> {
-        self.file
-            .as_ref()
-            .ok_or_else(|| PipelineError::RemuxFailed {
-                path: self.target.clone(),
-                reason: "staging file is already committed".to_owned(),
-            })
-    }
-
-    fn commit(mut self) -> Result<(), PipelineError> {
-        drop(self.file.take());
-        fs::rename(&self.temp, &self.target).map_err(|source| PipelineError::Io {
-            path: self.target.clone(),
-            source,
-        })?;
-        self.published = true;
-        Ok(())
-    }
-}
-
-impl Drop for StagingTarget {
-    fn drop(&mut self) {
-        if !self.published {
-            let _ = fs::remove_file(&self.temp);
-        }
-    }
-}
-
-static STAGING_SERIAL: AtomicU64 = AtomicU64::new(0);
-
 fn input_size(path: &Path) -> u64 {
     fs::metadata(path).map_or(0, |meta| meta.len())
 }
@@ -3373,7 +3300,7 @@ fn transcode_to_animation(
         .unwrap_or_default();
     let loop_count = animation.loop_count();
 
-    let staging = StagingTarget::new(target, tag)?;
+    let staging = StagingTarget::create_with_handle(target, tag)?;
     let written = video_anim::encode_animation_stream(
         format,
         quality,
@@ -3855,7 +3782,7 @@ fn transcode_file(
                 tracks: staged_tracks,
                 packets,
             };
-            let staging = StagingTarget::new(target, tag)?;
+            let staging = StagingTarget::create_with_handle(target, tag)?;
             mux_video(staging.file()?, target, format, &out_media)?;
             staging.commit()?;
             Ok((
@@ -5259,8 +5186,8 @@ mod tests {
     fn staging_name_is_short_and_cleans_up_after_a_failed_commit() -> Result<(), PipelineError> {
         let dir = temp_dir("staging")?;
         let long_target = dir.join(format!("{}.mov", "a".repeat(255)));
-        let long_staging = StagingTarget::new(&long_target, 3)?;
-        let long_temp = long_staging.temp.clone();
+        let long_staging = StagingTarget::create_with_handle(&long_target, 3)?;
+        let long_temp = long_staging.path().to_path_buf();
         let name = long_temp.file_name().and_then(|n| n.to_str()).unwrap_or("");
         assert!(long_temp.starts_with(&dir));
         assert!(name.len() < 64);
@@ -5268,8 +5195,8 @@ mod tests {
         assert!(!long_temp.exists());
 
         let target = dir.join("out.mov");
-        let staging = StagingTarget::new(&target, 4)?;
-        let temp = staging.temp.clone();
+        let staging = StagingTarget::create_with_handle(&target, 4)?;
+        let temp = staging.path().to_path_buf();
         {
             let _file = staging.file()?;
         }
@@ -5284,7 +5211,7 @@ mod tests {
             path: target.clone(),
             source,
         })?;
-        let staging = StagingTarget::new(&target, 5)?;
+        let staging = StagingTarget::create_with_handle(&target, 5)?;
         staging.commit()?;
         assert!(target.is_file());
         fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {

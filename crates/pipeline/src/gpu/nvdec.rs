@@ -98,8 +98,8 @@ mod enabled {
     // in nvcuvid.h / cuviddec.h / cuda_runtime_api.h.
     #[allow(unsafe_code)]
     fn symbol<T: Copy>(library: &Library, name: &[u8]) -> Result<T, String> {
-        // libloading 0.9 accepts a byte slice directly and null-terminates it
-        // internally; a `&Vec<u8>` no longer implements `AsSymbolName`.
+        // libloading accepts a byte slice directly and null-terminates it
+        // internally; pass `name` rather than `&Vec<u8>`.
         unsafe {
             library.get::<T>(name).map(|symbol| *symbol).map_err(|err| {
                 format!(

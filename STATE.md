@@ -4,9 +4,9 @@
 ## Snapshot
 | Item | Value |
 | :--- | :--- |
-| Product | `fastconv` 0.1.0 · edition 2024 · AGPL-3.0-only · pre-merge / pre-review branch `perf/speedup-video-zero-loss` (rebased onto `origin/main` including Feature 12b image speedups) · 5 crates |
+| Product | `fastconv` 0.1.0 · edition 2024 · AGPL-3.0-only · pre-merge / pre-review branch `chore/shrink-binary-and-codebase` (binary/codebase shrink: fat LTO + strip + shared staging, zero behaviour change) · 5 crates |
 | Verify | `cargo xtask verify` green — **707** default tests (33 cli + 3 audio_codecs + 11 cli_help + 101 domain + 407 pipeline + 130 probe + 22 xtask), **474** `--features nvenc` tests (33 cli + 3 audio_codecs + 11 cli_help + 427 pipeline); **273** deps license-checked; fmt + clippy `-D warnings` clean (default and nvenc) |
-| Release binary | 37.5 MiB default (unstripped); ffmpeg ~38 MB incl. libs |
+| Release binary | default **39,724,568 B (37.88 MiB) → 28,503,464 B (27.18 MiB), −28.25%**; `--features nvenc` **40,410,144 B (38.54 MiB) → 29,155,880 B (27.81 MiB), −27.85%** — `strip = true`, `lto = "fat"`, `codegen-units = 1`, `opt-level = 3` |
 
 ## CLI
 | Command | Form |
@@ -30,14 +30,14 @@
 | Image | `png 0.18`, `zune-jpeg 0.5.16-rc3`, `zenwebp 0.4.6`, `tiff 0.11.3`, `jxl 0.8.0`, `jixel 0.5.13`, `zenavif 0.1.6`, `zenavif-parse 0.6.2`, `gif 0.14.2`, `ico 0.6.0`, `rav1e 0.8.1`, `avif-serialize 0.8.9`, `jpeg-encoder 0.7.1`, `heifer 0.7.3` (CPU HEIC) |
 | Audio | `flacenc 0.5.1`, `hound 3.5.1`, `opus-pure 0.2.5`, `vorbis-enc 0.1.1`, `rusty_mp3 1.2.2`, `rusty_aac 2.3.0`, `alac-encoder 0.3.0`, `symphonia 0.6.1`, `rubato 5.1.0`, `ogg 0.9.2` |
 | Video | `rusty_h264 0.17.4`, `rusty_h265 0.7.3` (+ `rusty_h265-accel 0.7.3`), `rav1d-safe 0.5.7`, `rusty_vp9 0.3.0`, `containr 0.1.1`, `yuv 0.8.21` |
-| GPU / misc | `cudarc 0.16`, `libloading 0.9`, `nvidia-video-codec-sdk 0.4` (nvenc feature only), `serde`/`serde_json 1`; no `wgpu` |
+| GPU / misc | `cudarc 0.16`, `libloading 0.8`, `nvidia-video-codec-sdk 0.4` (nvenc feature only), `serde`/`serde_json 1`; no `wgpu` |
 
 ## Workspace / module map
 | Crate | Sources |
 | :--- | :--- |
 | `domain` | `src/{lib,audio,hardware,image,metrics,video}.rs` — pure types/invariants |
 | `probe` | `src/{lib,audio,hardware,image,video}.rs` — boundary parsing/validation |
-| `pipeline` | `src/{lib,audio,aiff,avif,avi,bmp,cpu,decode,gif,heic,ico,m4a,mpegts,pnm,qoi,remux,video_anim,video_bitstream,video_codecs,video_container,video_transcode}.rs` + `src/gpu/{mod,nvdec,nvenc,heic}.rs` |
+| `pipeline` | `src/{lib,audio,aiff,avif,avi,bmp,cpu,decode,gif,heic,ico,m4a,mpegts,pnm,qoi,remux,staging,video_anim,video_bitstream,video_codecs,video_container,video_transcode}.rs` + `src/gpu/{mod,nvdec,nvenc,heic}.rs` |
 | `cli` (`fastconv`) | `src/{main,audio,video}.rs`, `tests/cli_help.rs` — thin orchestration |
 | `xtask` | `src/{main,bench,audio_bench,nvenc_bench,remux_bench,fixtures}.rs` — verify / fixtures / bench |
 
@@ -50,79 +50,77 @@
 - RAM caps (actual constants): JXL/AVIF ≤8 image workers, HEIC ≤8 image workers (RGB/RGBA scratch + HEVC tile state), AVIF inner threads ≤8, MP4 faststart ≤64 MiB in-memory (stream above), ≤8 animation workers, ≤2 CPU video file workers, 1 GiB decoded/track, 512 MiB PCM/file, 1 GiB PCM/batch.
 - Turing reality: NVENC = HEVC-intra (HEIC) only on the GPU path; CPU HEIC (`heifer`) works on any host; no HW encoders for webp/jpeg/png/bmp/qoi/tiff/jxl/avif/gif/ico/pnm; AV1 CPU-decode; image Vulkan rejected. GPU probe Linux-only (DRM sysfs + NVIDIA procfs).
 
-## Benchmarks — canonical 2026-11-27 (pre-merge / pre-review branch runs)
-Host: `Intel Core i7-6700` (4C/8T AVX2/FMA, 32 GiB) + `RTX 2060` (6 GB, driver `620.73.04`); `ffmpeg n9.1`; `rustc`/`cargo 1.100.0`; all runs serial.
+## Benchmarks — canonical 2026-11-27 (pre-merge / pre-review branch run, Feature 13 binary/codebase shrink)
+Host: `Intel Core i7-6700` (4C/8T AVX2/FMA, 32023 MiB) + `RTX 2060` (6 GB, driver `620.73.04`); `ffmpeg n9.1`; `rustc`/`cargo 1.100.0`; all runs serial.
 
-- Provenance (image — this snapshot): HEAD `f53e03d0bfd936b2422ff376b0fa866270028ff8`; code `git diff | sha256sum` = `fa7c0d7bc5f9bf8a596e23b900980d6b03da4b40f7648fbaae730849c459137c` (zero-quality-loss image speedups: `crates/pipeline/src/{avif,bmp,cpu,decode,heic,qoi}.rs`, `crates/pipeline/src/gpu/heic.rs`; `STATE.md` updated afterwards).
-- Provenance (audio rows, retained unchanged): HEAD `fbfdf2203125e8bdcfb5a1f1b3abaaf85936ec8f`; code `git diff | sha256sum` = `d9b40d3be3048e066c2a8efaf8fed5580994c11b932869dca5a36dd8b74254e0` (zero-quality-loss audio speedups: `crates/pipeline/src/{aiff,audio,m4a,ogg_flac}.rs`, `crates/probe/src/audio.rs`). These speedup changes do not touch those code paths; their numbers are kept verbatim.
-- Provenance (video — NVENC & remux, this snapshot): HEAD `e2168f49dccaace12abada09673acfa782f7fb24`; code `git diff -- crates/ | sha256sum` = `12d62454df852bbc1ee4854f83c65b1d6e6d2efaae50840d67307913d289849c` (zero-quality-loss video speedups: `crates/pipeline/src/{nvdec,nvenc,mpegts,remux,video_anim,video_bitstream,video_codecs,video_container,video_transcode}.rs` — write-combined bitstream scan (`lock_bitstream_into` + single-pass `to_sample_and_keyframe`), split NVENC input/output CUDA streams and single-read MKV→MP4 buffering (≤32 MiB); `STATE.md` updated afterwards). Pre-merge / pre-review branch `perf/speedup-video-zero-loss`; the Video — NVENC & Remux table below is authoritative for this snapshot. Hardware verified with `target/release/fastconv probe`: `Intel Core i7-6700` (4C/8T AVX2/FMA, 32023 MiB) + `NVIDIA GeForce RTX 2060` (6 GB, driver `620.73.04`), media backends `nvenc` (encode+decode) and `vaapi` (decode-only). Animation / CPU-HEIC rows retained unchanged: HEAD `c7b36320788965d66b6a465bf3c284d29fe0fe83`; code `git diff | sha256sum` = `fd5e27789ab56fc897ce9a41b637d860e86fc093dc2d32c53ec27e112b09eff6` (CPU-HEIC feature diff). After the benchmark run, a CUDA-stream teardown-order fix was applied in the same `nvenc.rs` function (both streams declared before the encoder/session so they outlive NVENC's best-effort EOS on early abort); teardown-only, with no effect on the benchmarked encode loop.
-- Commands: `cargo xtask gen-fixtures`; `cargo build --release -p fastconv-cli`; `cargo build --release -p fastconv-cli --features nvenc`; `timeout -k 10 600s cargo xtask bench`; `timeout -k 10 220s cargo xtask bench --audio`; `timeout -k 10 180s cargo xtask bench --remux`; `timeout -k 10 180s cargo xtask bench --nvenc`; `cargo xtask verify`. CPU HEIC (no `xtask` target, retained — `heifer` preset unchanged): 3 serial runs each of `target/release/fastconv convert <src> <dst> --to heic --backend cpu --quality 80` — single `fixtures/images_4k/img_01.png` and 20-image `fixtures/images_4k/` batch. Wall time + exact peak RSS captured with `wait4` rusage (VmHWM equivalent; `/usr/bin/time` is unavailable on this host); median time and max peak RSS reported. Animation via external 3-run scripts.
-- Validation: image 20/20 per batch row (21 harness rows, all 3840x2160; lossless rows `webp_to_png`/`png_to_qoi`/`webp_to_bmp`/`png_to_tiff` exact RGB vs decoder reference; fastconv lossy rows ≥ 33.80 dB min / ≥ 33.95 dB mean, no output-size inflation); NVENC HEIC 20/20 (3840x2160, explicit GPU path). Audio 34/34 ffprobe + 18/18 content checks (bit-exact PCM for FLAC/AIFF/ALAC single-file and for all 9 batch inputs 9/9; lag-aligned SNR Opus 37.1 / Ogg 35.8 / MP3 64.3 / AAC 26.4 / M4A 26.4 dB single-file, 111.9/111.0/104.3/109.7/109.0 dB batch; no output-size inflation or quality regression) — retained. CPU HEIC: single 1/1 + batch 20/20 — `ftypheic` major brand, ffmpeg tile-grid reconstruction at 3840x2160, full clean `rgb24` decode (24,883,200 B/image), PSNR 35.45 dB single / 35.17–35.53 dB batch (mean 35.39) vs source PNG; all ≥ 25 dB — retained (not re-run). Video (this snapshot): NVENC 4/4 (600 frames / 10 s, 1920x1080, B-frames 295, `dts_ok=true`, clean decode, H.264 50.72 dB / HEVC 47.62 dB, outputs 25.86 / 20.52 MB, explicit `gpu:nvdec+nvenc on NVIDIA GeForce RTX 2060` hardware line with no CPU fallback); remux 4/4 (codec-copy `aac`+`h264`, 1920x1080, 600 frames, no decoder errors).
-- Animation: 2026-11-26, `6f7f14a` (PR #21, no `xtask` target; not re-run for this image-speedup feature).
+- Provenance (this snapshot): branch `chore/shrink-binary-and-codebase`, HEAD `5b718cbf580c5c6521778a60ac7776a5458fc4d2` plus the uncommitted shrink working tree; code `git diff -- Cargo.toml Cargo.lock crates/ xtask/ | sha256sum` = `f2067361f01dc99be4d3de0cf4c43d119d88815bff454639afeb00504c7b8234`; new untracked `crates/pipeline/src/staging.rs` `sha256sum` = `86c8f266525fc425a48c91dc1f92ff631db12e431493905e24eec7ef88e7af42`. `target/release/fastconv probe` reported `Intel(R) Core(TM) i7-6700 CPU @ 3.40GHz` (4C/8T, x86:avx2+fma, 32023 MiB) and `NVIDIA GeForce RTX 2060` (driver `620.73.04`), media backends `nvenc [encode+decode]` and `vaapi [decode-only]`. `STATE.md` was updated after the runs; no code file was modified by the benchmark.
+- Commands: `cargo xtask gen-fixtures`; `cargo build --release -p fastconv-cli`; `cargo build --release -p fastconv-cli --features nvenc`; `target/release/fastconv probe`; `timeout -k 10 600s cargo xtask bench`; `timeout -k 10 240s cargo xtask bench --audio` (run twice serially to diagnose the batch row; both retained); `timeout -k 10 240s cargo xtask bench --nvenc`; `timeout -k 10 240s cargo xtask bench --remux`; `cargo xtask verify`. CPU HEIC (no `xtask` target, retained unchanged — `heifer` preset untouched): 3 serial runs each of `target/release/fastconv convert <src> <dst> --to heic --backend cpu --quality 80` — single `fixtures/images_4k/img_01.png` and 20-image `fixtures/images_4k/` batch. Wall time + exact peak RSS captured with `wait4` rusage (VmHWM equivalent; `/usr/bin/time` is unavailable on this host); median time and max peak RSS reported. Animation (no `xtask` target): retained unchanged from the prior snapshot (12/12 validated, external 3-run scripts).
+- Validation: image 20/20 per batch row (21 harness rows, all 3840x2160; lossless rows `webp_to_png`/`png_to_qoi`/`webp_to_bmp`/`png_to_tiff` exact RGB vs decoder reference; fastconv lossy min 33.80 dB / mean ≥ 33.95 dB across rows, no output-size inflation); NVENC HEIC 20/20 (3840x2160, explicit GPU path). Audio 34/34 ffprobe + 18/18 content checks (bit-exact PCM for FLAC/AIFF/ALAC single-file and for all 9 batch inputs; lag-aligned SNR Opus 37.1 / Ogg 35.8 / MP3 64.3 / AAC 26.4 / M4A 26.4 dB single-file, 111.9/111.0/104.3/109.7/109.0 dB batch; no output-size inflation or quality regression). CPU HEIC: single 1/1 + batch 20/20 — `ftypheic` major brand, ffmpeg tile-grid reconstruction at 3840x2160, clean `rgb24` decode (24,883,200 B/image), PSNR 35.45 dB single / 35.17–35.53 dB batch (mean 35.39) vs source PNG — retained, not re-run. Video: NVENC 4/4 (600 frames / 10 s, 1920x1080, B-frames 295, `dts_ok=true`, clean decode, H.264 50.72 dB / HEVC 47.62 dB, outputs 25.86 / 20.52 MB, explicit `gpu:nvdec+nvenc on NVIDIA GeForce RTX 2060`, no CPU fallback); remux 4/4 (codec-copy `aac`+`h264`, 1920x1080, 600 frames, no decoder errors).
+- Regression verdict: **no throughput or quality regression caused by this shrink change.** Every quality/size/validation constant matches the prior snapshot exactly; image/NVENC/remux timings differ only within run-to-run noise (e.g. NVENC H.264 1884.5 vs 1869.6 ms with ffmpeg 1984.0 vs 1952.8 ms; remux mkv→mp4 24.1 vs 21.9 ms with ffmpeg 85.5 vs 81.1 ms). The one material delta is `audio_batch_mixed_to_flac` 229.4 vs the stale 109.8 ms: it predates this branch and comes from the already-merged post-#34-review worker budget — the AAC ADTS input exposes no `total_samples`, so `resolve_worker_count` charges the full 512 MiB per-file allowance and caps the mixed batch to **1 worker**; omitting only that input restores 8 workers and 108.4 ms, and an isolated build of unmodified HEAD (thin LTO, no working-tree changes) reproduced 1 worker / 217–238 ms. The fresh audio table is authoritative for post-review code; no runs were discarded or cherry-picked (two serial audio runs: 228.4 / 229.4 ms batch, all quality checks 18/18 in both).
 - Single-image CPU HEIC costs ~6 s, so the 20-image batch used a 600 s guard (3 serial runs ≈ 6.1 min total). No runs were discarded or cherry-picked.
 
 ### Image — 20× 4K, Q=80 / same compression class (20/20 per batch row; CPU HEIC single 1/1 retained from prior snapshot)
 | Workload | Tool | Time (ms) | Throughput | Peak RAM | Input | Output | Quality | Speedup |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `png_to_webp` | `fastconv (cpu q=80)` | 4074.3 | 74.55 MB/s | 635.2 MiB | 303.75 MB | 5.69 MB | 33.95 dB | **3.10x** |
-| `png_to_webp` | `ffmpeg (libwebp q=80)` | 12612.6 | 24.08 MB/s | 665.2 MiB | 303.75 MB | 5.34 MB | 33.61 dB | Baseline |
-| `png_to_jpeg` | `fastconv (cpu q=80)` | 560.9 | 541.58 MB/s | 432.7 MiB | 303.75 MB | 13.39 MB | 34.30 dB | **1.50x** |
-| `png_to_jpeg` | `ffmpeg (mjpeg qv=3)` | 840.9 | 361.23 MB/s | 849.8 MiB | 303.75 MB | 8.58 MB | 33.98 dB | Baseline |
-| `jpeg_to_webp` | `fastconv (cpu q=80)` | 3833.9 | 7.01 MB/s | 428.4 MiB | 26.86 MB | 5.90 MB | 38.12 dB | **3.04x** |
-| `jpeg_to_webp` | `ffmpeg (libwebp q=80)` | 11637.3 | 2.31 MB/s | 165.8 MiB | 26.86 MB | 5.44 MB | 38.40 dB | Baseline |
-| `webp_to_png` | `fastconv (cpu png)` | 531.9 | 10.69 MB/s | 498.4 MiB | 5.69 MB | 153.64 MB | exact | **3.93x** |
-| `webp_to_png` | `ffmpeg (png)` | 2092.9 | 2.72 MB/s | 820.5 MiB | 5.69 MB | 89.97 MB | exact | Baseline |
-| `png_to_qoi` | `fastconv (cpu qoi)` | 675.0 | 449.98 MB/s | 536.6 MiB | 303.75 MB | 250.91 MB | exact | **1.45x** |
-| `png_to_qoi` | `ffmpeg (qoi)` | 978.5 | 310.41 MB/s | 948.8 MiB | 303.75 MB | 250.91 MB | exact | Baseline |
-| `webp_to_bmp` | `fastconv (cpu bmp)` | 340.9 | 16.68 MB/s | 606.0 MiB | 5.69 MB | 497.67 MB | exact | **1.28x** |
-| `webp_to_bmp` | `ffmpeg (bmp)` | 436.4 | 13.03 MB/s | 484.4 MiB | 5.69 MB | 497.67 MB | exact | Baseline |
-| `png_to_tiff` | `fastconv (cpu tiff)` | 844.3 | 359.75 MB/s | 590.6 MiB | 303.75 MB | 276.93 MB | exact (both Deflate) | **3.00x** |
-| `png_to_tiff` | `ffmpeg (tiff)` | 2532.2 | 119.96 MB/s | 1436.9 MiB | 303.75 MB | 373.65 MB | exact | Baseline |
-| `png_to_jxl` | `fastconv (cpu q=80)` | 3838.9 | 79.12 MB/s | 1387.5 MiB | 303.75 MB | 1.25 MB | 34.80 dB | **4.63x** (same distance 1.9) |
-| `png_to_jxl` | `ffmpeg (libjxl d=1.9)` | 17778.1 | 17.09 MB/s | 907.5 MiB | 303.75 MB | 6.49 MB | 34.95 dB | Baseline |
-| `png_to_avif` | `fastconv (cpu q=80)` | 2337.8 | 129.93 MB/s | 1328.9 MiB | 303.75 MB | 0.64 MB | 35.65 dB | **1.62x** (−0.10 dB, 4.5x smaller) |
-| `png_to_avif` | `ffmpeg (libsvtav1 preset 8)` | 3781.9 | 80.32 MB/s | 2581.8 MiB | 303.75 MB | 2.86 MB | 35.75 dB | Baseline |
-| `png_to_heic` | `fastconv (gpu:nvenc q=80)` | 938.6 | 323.63 MB/s | 695.1 MiB | 303.75 MB | 27.47 MB | 39.21 dB | **13.44x** vs ff(webp) / **4.34x** vs cpu(webp) |
-| `jpeg_to_heic` | `fastconv (gpu:nvenc q=80)` | 871.2 | 30.83 MB/s | 523.6 MiB | 26.86 MB | 19.24 MB | 38.16 dB | **13.36x** vs ff(webp) / **4.40x** vs cpu(webp) |
-| `webp_to_heic` | `fastconv (gpu:nvenc q=80)` | 898.4 | 6.33 MB/s | 805.3 MiB | 5.69 MB | 13.21 MB | 38.10 dB | NVENC 20× 4K (no ffmpeg HEIC opponent) |
+| `png_to_webp` | `fastconv (cpu q=80)` | 4177.0 | 72.72 MB/s | 659.1 MiB | 303.75 MB | 5.69 MB | 33.95 dB | **3.16x** |
+| `png_to_webp` | `ffmpeg (libwebp q=80)` | 13216.1 | 22.98 MB/s | 666.2 MiB | 303.75 MB | 5.34 MB | 33.61 dB | Baseline |
+| `png_to_jpeg` | `fastconv (cpu q=80)` | 566.1 | 536.56 MB/s | 431.7 MiB | 303.75 MB | 13.39 MB | 34.30 dB | **1.54x** |
+| `png_to_jpeg` | `ffmpeg (mjpeg qv=3)` | 873.9 | 347.59 MB/s | 866.3 MiB | 303.75 MB | 8.58 MB | 33.98 dB | Baseline |
+| `jpeg_to_webp` | `fastconv (cpu q=80)` | 3961.5 | 6.78 MB/s | 422.1 MiB | 26.86 MB | 5.90 MB | 38.12 dB | **3.10x** |
+| `jpeg_to_webp` | `ffmpeg (libwebp q=80)` | 12262.1 | 2.19 MB/s | 165.6 MiB | 26.86 MB | 5.44 MB | 38.40 dB | Baseline |
+| `webp_to_png` | `fastconv (cpu png)` | 582.5 | 9.76 MB/s | 473.2 MiB | 5.69 MB | 153.64 MB | exact | **3.65x** |
+| `webp_to_png` | `ffmpeg (png)` | 2124.3 | 2.68 MB/s | 820.4 MiB | 5.69 MB | 89.97 MB | exact | Baseline |
+| `png_to_qoi` | `fastconv (cpu qoi)` | 622.7 | 487.77 MB/s | 521.9 MiB | 303.75 MB | 250.91 MB | exact | **1.64x** |
+| `png_to_qoi` | `ffmpeg (qoi)` | 1020.6 | 297.60 MB/s | 1015.7 MiB | 303.75 MB | 250.91 MB | exact | Baseline |
+| `webp_to_bmp` | `fastconv (cpu bmp)` | 366.4 | 15.52 MB/s | 606.5 MiB | 5.69 MB | 497.67 MB | exact | **1.25x** |
+| `webp_to_bmp` | `ffmpeg (bmp)` | 459.4 | 12.38 MB/s | 484.6 MiB | 5.69 MB | 497.67 MB | exact | Baseline |
+| `png_to_tiff` | `fastconv (cpu tiff)` | 830.9 | 365.55 MB/s | 600.9 MiB | 303.75 MB | 276.93 MB | exact (both Deflate) | **3.08x** |
+| `png_to_tiff` | `ffmpeg (tiff)` | 2558.4 | 118.72 MB/s | 1401.4 MiB | 303.75 MB | 373.65 MB | exact | Baseline |
+| `png_to_jxl` | `fastconv (cpu q=80)` | 3794.8 | 80.04 MB/s | 1395.2 MiB | 303.75 MB | 1.25 MB | 34.80 dB | **4.83x** (same distance 1.9) |
+| `png_to_jxl` | `ffmpeg (libjxl d=1.9)` | 18315.4 | 16.58 MB/s | 897.1 MiB | 303.75 MB | 6.49 MB | 34.95 dB | Baseline |
+| `png_to_avif` | `fastconv (cpu q=80)` | 2290.3 | 132.62 MB/s | 1348.7 MiB | 303.75 MB | 0.64 MB | 35.65 dB | **1.75x** (−0.10 dB, 4.5x smaller) |
+| `png_to_avif` | `ffmpeg (libsvtav1 preset 8)` | 4004.6 | 75.85 MB/s | 2377.5 MiB | 303.75 MB | 2.86 MB | 35.75 dB | Baseline |
+| `png_to_heic` | `fastconv (gpu:nvenc q=80)` | 974.5 | 311.69 MB/s | 711.8 MiB | 303.75 MB | 27.47 MB | 39.21 dB | **13.56x** vs ff(webp) / **4.29x** vs cpu(webp) |
+| `jpeg_to_heic` | `fastconv (gpu:nvenc q=80)` | 901.0 | 29.81 MB/s | 522.4 MiB | 26.86 MB | 19.24 MB | 38.16 dB | **13.61x** vs ff(webp) / **4.40x** vs cpu(webp) |
+| `webp_to_heic` | `fastconv (gpu:nvenc q=80)` | 902.9 | 6.30 MB/s | 848.7 MiB | 5.69 MB | 13.21 MB | 38.10 dB | NVENC 20× 4K (no ffmpeg HEIC opponent) |
 | `png_to_heic` (single 4K) | `fastconv (cpu heifer q=80, 3 runs)` | 6251.9 | 2.43 MB/s | 135.8 MiB | 15.18 MB | 1.09 MB | 35.45 dB | CPU-only (no ffmpeg HEIC opponent) |
 | `png_to_heic` (20× 4K batch) | `fastconv (cpu heifer q=80, 8 workers, 3 runs)` | 122310.5 | 2.48 MB/s | 467.6 MiB | 303.75 MB | 21.92 MB | 35.39 dB mean | CPU-only (no ffmpeg HEIC opponent) |
 
-### Audio — 60 s stereo 48 kHz/16-bit, target-matched bitrate/quality (achieved size/lag-aligned SNR per row; 34/34 outputs validated: 16 single-file + 18 batch)
+### Audio — 60 s stereo 48 kHz/16-bit, target-matched bitrate/quality (achieved size/lag-aligned SNR per row; 34/34 outputs validated: 16 single-file + 18 batch; two serial runs, table = second run)
 | Workload | Tool | Time (ms) | Throughput | Peak RAM | Input | Output | Quality | Speedup |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `wav_to_flac` | `fastconv (flacenc pure rust)` | 49.0 | 235.03 MB/s | 71.3 MiB | 11.52 MB | 4.12 MB | bit-exact | **3.87x** |
-| `wav_to_flac` | `ffmpeg (-c:a flac -compression_level 5)` | 189.8 | 60.68 MB/s | 57.4 MiB | 11.52 MB | 4.11 MB | bit-exact | Baseline |
-| `wav_to_aiff` | `fastconv (native pcm_s16be)` | 11.1 | 1041.95 MB/s | 10.5 MiB | 11.52 MB | 11.52 MB | bit-exact | **8.47x** |
-| `wav_to_aiff` | `ffmpeg (-c:a pcm_s16be)` | 93.7 | 122.97 MB/s | 51.9 MiB | 11.52 MB | 11.52 MB | bit-exact | Baseline |
-| `wav_to_alac` | `fastconv (alac-encoder m4a)` | 99.8 | 115.39 MB/s | 35.8 MiB | 11.52 MB | 4.48 MB | bit-exact | **3.53x** |
-| `wav_to_alac` | `ffmpeg (-c:a alac)` | 352.3 | 32.70 MB/s | 50.7 MiB | 11.52 MB | 4.69 MB | bit-exact | Baseline |
-| `wav_to_opus` | `fastconv (opus-pure)` | 148.1 | 77.80 MB/s | 73.7 MiB | 11.52 MB | 0.98 MB | 37.1 dB | **3.90x** |
-| `wav_to_opus` | `ffmpeg (-c:a libopus -b:a 128k)` | 576.7 | 19.97 MB/s | 57.3 MiB | 11.52 MB | 1.35 MB | — | Baseline |
-| `wav_to_ogg` | `fastconv (vorbis-enc q4)` | 846.3 | 13.61 MB/s | 15.6 MiB | 11.52 MB | 0.74 MB | 35.8 dB | **1.06x** |
-| `wav_to_ogg` | `ffmpeg (-c:a libvorbis -q:a 4)` | 895.8 | 12.86 MB/s | 55.9 MiB | 11.52 MB | 0.70 MB | — | Baseline |
-| `wav_to_mp3` | `fastconv (rusty_mp3 192k)` | 648.3 | 17.77 MB/s | 17.2 MiB | 11.52 MB | 1.44 MB | 64.3 dB | **1.52x** |
-| `wav_to_mp3` | `ffmpeg (-c:a libmp3lame -b:a 192k)` | 982.5 | 11.73 MB/s | 55.4 MiB | 11.52 MB | 1.44 MB | — | Baseline |
-| `wav_to_aac` | `fastconv (rusty_aac 128k)` | 143.5 | 80.25 MB/s | 70.9 MiB | 11.52 MB | 0.98 MB | 26.4 dB | **11.02x** |
-| `wav_to_aac` | `ffmpeg (-c:a aac -b:a 128k)` | 1582.2 | 7.28 MB/s | 56.0 MiB | 11.52 MB | 0.98 MB | — | Baseline |
-| `wav_to_m4a` | `fastconv (rusty_aac 128k muxed)` | 144.5 | 79.74 MB/s | 70.7 MiB | 11.52 MB | 0.97 MB | 26.4 dB | **10.88x** |
-| `wav_to_m4a` | `ffmpeg (-c:a aac -b:a 128k)` | 1571.8 | 7.33 MB/s | 54.6 MiB | 11.52 MB | 0.97 MB | — | Baseline |
-| `audio_batch_mixed_to_flac` | `fastconv (parallel, 9 inputs)` | 109.8 | 55.06 MB/s | 152.8 MiB | 6.04 MB | 5.65 MB | 9/9 validated | **7.53x** |
-| `audio_batch_mixed_to_flac` | `ffmpeg (sequential, 9 inputs)` | 826.4 | 7.31 MB/s | 60.5 MiB | 6.04 MB | 6.83 MB | 9/9 validated | Baseline |
+| `wav_to_flac` | `fastconv (flacenc pure rust)` | 49.3 | 233.44 MB/s | 71.0 MiB | 11.52 MB | 4.12 MB | bit-exact | **3.84x** |
+| `wav_to_flac` | `ffmpeg (-c:a flac -compression_level 5)` | 189.3 | 60.86 MB/s | 57.4 MiB | 11.52 MB | 4.11 MB | bit-exact | Baseline |
+| `wav_to_aiff` | `fastconv (native pcm_s16be)` | 8.9 | 1299.26 MB/s | 7.6 MiB | 11.52 MB | 11.52 MB | bit-exact | **10.81x** |
+| `wav_to_aiff` | `ffmpeg (-c:a pcm_s16be)` | 95.9 | 120.16 MB/s | 52.0 MiB | 11.52 MB | 11.52 MB | bit-exact | Baseline |
+| `wav_to_alac` | `fastconv (alac-encoder m4a)` | 96.4 | 119.45 MB/s | 32.7 MiB | 11.52 MB | 4.48 MB | bit-exact | **3.76x** |
+| `wav_to_alac` | `ffmpeg (-c:a alac)` | 362.4 | 31.79 MB/s | 52.6 MiB | 11.52 MB | 4.69 MB | bit-exact | Baseline |
+| `wav_to_opus` | `fastconv (opus-pure)` | 148.1 | 77.80 MB/s | 72.7 MiB | 11.52 MB | 0.98 MB | 37.1 dB | **3.96x** |
+| `wav_to_opus` | `ffmpeg (-c:a libopus -b:a 128k)` | 586.9 | 19.63 MB/s | 55.2 MiB | 11.52 MB | 1.35 MB | — | Baseline |
+| `wav_to_ogg` | `fastconv (vorbis-enc q4)` | 861.2 | 13.38 MB/s | 14.1 MiB | 11.52 MB | 0.74 MB | 35.8 dB | **1.08x** |
+| `wav_to_ogg` | `ffmpeg (-c:a libvorbis -q:a 4)` | 926.9 | 12.43 MB/s | 55.7 MiB | 11.52 MB | 0.70 MB | — | Baseline |
+| `wav_to_mp3` | `fastconv (rusty_mp3 192k)` | 599.0 | 19.23 MB/s | 16.4 MiB | 11.52 MB | 1.44 MB | 64.3 dB | **1.67x** |
+| `wav_to_mp3` | `ffmpeg (-c:a libmp3lame -b:a 192k)` | 1000.2 | 11.52 MB/s | 55.2 MiB | 11.52 MB | 1.44 MB | — | Baseline |
+| `wav_to_aac` | `fastconv (rusty_aac 128k)` | 143.9 | 80.05 MB/s | 59.3 MiB | 11.52 MB | 0.98 MB | 26.4 dB | **11.23x** |
+| `wav_to_aac` | `ffmpeg (-c:a aac -b:a 128k)` | 1616.2 | 7.13 MB/s | 55.3 MiB | 11.52 MB | 0.98 MB | — | Baseline |
+| `wav_to_m4a` | `fastconv (rusty_aac 128k muxed)` | 147.7 | 77.98 MB/s | 63.8 MiB | 11.52 MB | 0.97 MB | 26.4 dB | **11.02x** |
+| `wav_to_m4a` | `ffmpeg (-c:a aac -b:a 128k)` | 1627.6 | 7.08 MB/s | 55.8 MiB | 11.52 MB | 0.97 MB | — | Baseline |
+| `audio_batch_mixed_to_flac` | `fastconv (parallel, 9 inputs, 1 worker budgeted)` | 229.4 | 26.34 MB/s | 55.7 MiB | 6.04 MB | 5.65 MB | 9/9 validated | **3.70x** |
+| `audio_batch_mixed_to_flac` | `ffmpeg (sequential, 9 inputs)` | 848.4 | 7.12 MB/s | 60.4 MiB | 6.04 MB | 6.83 MB | 9/9 validated | Baseline |
 
 ### Video — NVENC & Remux, 1080p60, 600 frames, 3 serial runs/side
 | Workload | Tool | Time (ms) | FPS | Peak RAM | Output | PSNR | Speedup |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `nvenc_h264_mp4` | `fastconv (nvdec+nvenc)` | 1869.6 | 320.9 | 482.1 MiB | 25.86 MB | 50.72 dB | **1.04x** |
-| `nvenc_h264_mp4` | `ffmpeg (h264_nvenc, hwaccel cuda)` | 1952.8 | 307.2 | 631.7 MiB | 25.90 MB | 50.73 dB | Baseline |
-| `nvenc_hevc_mp4` | `fastconv (nvdec+nvenc)` | 1988.3 | 301.8 | 592.5 MiB | 20.52 MB | 47.62 dB | **1.03x** |
-| `nvenc_hevc_mp4` | `ffmpeg (hevc_nvenc, hwaccel cuda)` | 2052.4 | 292.3 | 580.8 MiB | 20.54 MB | 47.62 dB | Baseline |
-| `remux_mp4_to_mkv` | `fastconv (pure rust)` | 13.3 | 45111.7 | 17.4 MiB | 19.16 MB | codec-copy | **6.42x** |
-| `remux_mp4_to_mkv` | `ffmpeg (-c copy)` | 85.4 | 7023.0 | 60.5 MiB | 19.14 MB | codec-copy | Baseline |
-| `remux_mkv_to_mp4` | `fastconv (pure rust)` | 21.9 | 27369.8 | 56.6 MiB | 19.15 MB | codec-copy | **3.70x** |
-| `remux_mkv_to_mp4` | `ffmpeg (-c copy)` | 81.1 | 7402.4 | 57.5 MiB | 19.15 MB | codec-copy | Baseline |
+| `nvenc_h264_mp4` | `fastconv (nvdec+nvenc)` | 1884.5 | 318.4 | 480.0 MiB | 25.86 MB | 50.72 dB | **1.05x** |
+| `nvenc_h264_mp4` | `ffmpeg (h264_nvenc, hwaccel cuda)` | 1984.0 | 302.4 | 631.6 MiB | 25.90 MB | 50.73 dB | Baseline |
+| `nvenc_hevc_mp4` | `fastconv (nvdec+nvenc)` | 2011.4 | 298.3 | 591.6 MiB | 20.52 MB | 47.62 dB | **1.03x** |
+| `nvenc_hevc_mp4` | `ffmpeg (hevc_nvenc, hwaccel cuda)` | 2062.6 | 290.9 | 580.9 MiB | 20.54 MB | 47.62 dB | Baseline |
+| `remux_mp4_to_mkv` | `fastconv (pure rust)` | 13.2 | 45462.9 | 16.6 MiB | 19.16 MB | codec-copy | **6.80x** |
+| `remux_mp4_to_mkv` | `ffmpeg (-c copy)` | 89.8 | 6683.4 | 60.4 MiB | 19.14 MB | codec-copy | Baseline |
+| `remux_mkv_to_mp4` | `fastconv (pure rust)` | 24.1 | 24944.7 | 55.8 MiB | 19.15 MB | codec-copy | **3.55x** |
+| `remux_mkv_to_mp4` | `ffmpeg (-c copy)` | 85.5 | 7017.1 | 57.4 MiB | 19.15 MB | codec-copy | Baseline |
 
-### Animation — 480×270 / 15 fps / 60 frames, 3 serial runs (median time, max VmHWM), 12/12 validated
+### Animation — 480×270 / 15 fps / 60 frames, 3 serial runs (median time, max VmHWM), 12/12 validated (retained unchanged from prior snapshot)
 | Workload | Tool | Time (ms) | FPS | MB/s (input) | Peak RAM | Output | PSNR vs. source | Speedup |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `mp4_to_gif` | `fastconv (cpu gif q80)` | 262.6 | 228.5 | 0.57 | 34.7 MiB | 1.19 MB | 35.39 dB | **2.58x** |
@@ -142,11 +140,11 @@ Host: `Intel Core i7-6700` (4C/8T AVX2/FMA, 32 GiB) + `RTX 2060` (6 GB, driver `
 - Audio lossy rows are target-matched, not result-matched: Opus uses 128 kbps on both sides but VBR complexity 9 (fastconv) vs 10 (libopus), so achieved sizes differ (0.98 vs 1.35 MB); per-row lag-aligned SNR is fastconv-only where ffmpeg shows `—`.
 - WebP animation-input PSNR lag: 29.79 vs 48.94 dB (CPU), 29.63 vs 36.56 dB (NVENC) — known `zenwebp` vs `libwebp` color-conversion delta (still-image repro 30.1 dB); not bought with lower compression (0.30 vs 0.27 MB).
 - Turing AV1 is CPU-decoded; `--hwdecode nvdec` is rejected with no fallback. CPU HEVC *video* encode is rejected; still-image HEIC is available on CPU (`heifer`) and on NVENC GPU (image output remains HEIC-only).
-- GPU probe is Linux-only (DRM sysfs / NVIDIA procfs); other OSes report no adapters/backends. Animation bench not yet in `xtask` (external 3-run scripts); not re-run for this image-speedup feature.
-- Absolute timings on short rows shift run-to-run on this snapshot for both sides; the large gains here are structural, not sampling noise: `wav_to_flac` 49.0 vs 189.8 ms (was 133.8 vs 211.8 ms), `wav_to_aiff` 11.1 vs 93.7 ms (was 32.4 vs 124.8 ms), `wav_to_alac` 99.8 vs 352.3 ms (was 149.6 vs 357.8 ms), `audio_batch_mixed_to_flac` 109.8 vs 826.4 ms (was 167.5 vs 887.8 ms). Opus/Ogg/MP3/AAC/M4A fastconv times are unchanged within noise (148.1/846.3/648.3/143.5/144.5 ms vs 152.5/844.1/650.9/150.3/154.4 ms prior). Output sizes, PSNR/SNR and every validation check are unchanged in kind; no runs were discarded. Smallest margin: `wav_to_ogg` 846.3 vs 895.8 ms (1.06x), down from 1.09x only because this ffmpeg run was faster (895.8 vs 916.9 ms) — fastconv's Ogg time did not regress.
-- Audio zero-quality-loss: FLAC/AIFF/ALAC remain bit-exact (5,760,000 samples identical single-file, 9/9 batch tracks bit-identical); lossy single-file SNR (37.1/35.8/64.3/26.4/26.4 dB) and every output size match the prior snapshot exactly. Batch peak RAM rose to 152.8 MiB (was 82.2 MiB), still far below the 1 GiB batch PCM cap. Remux is an authoritative row in this video snapshot (see Video table) with 4/4 clean ffprobe checks.
-- CPU HEIC throughput is ~2.4 MB/s on this 4C/8T host: `heifer`'s Medium HEVC-Intra preset is intentionally kept (no preset cheating), and the 20-image batch caps at 8 image workers to bound RAM (peak 467.6 MiB, far below 3 GiB). The NVENC path encodes the same 20-image batch in 938.6 ms, but that is a different quality class (27.47 MB / 39.21 dB vs 21.92 MB / 35.39 dB CPU), not a fair speedup comparison.
+- GPU probe is Linux-only (DRM sysfs / NVIDIA procfs); other OSes report no adapters/backends. Animation bench not yet in `xtask` (external 3-run scripts); retained unchanged for this binary/codebase-shrink feature.
+- `audio_batch_mixed_to_flac` no longer shows the stale 109.8 ms / 7.53x pre-review number. Merged post-#34 worker budgeting sees no `total_samples` for the AAC ADTS input, reserves the full 512 MiB per-file PCM allowance and caps the 9-file mixed batch at 1 worker (55.7 MiB peak). Removing only that input measures 108.4 ms / 8 workers; unmodified HEAD reproduces 1 worker / 217–238 ms. Quality is unchanged (9/9 bit-exact or SNR-validated tracks); this is a stale-baseline correction, not a Feature 13 regression.
+- Audio zero-quality-loss: FLAC/AIFF/ALAC remain bit-exact (5,760,000 samples identical single-file, 9/9 batch tracks decoded; wav/flac/alac/aiff batch tracks bit-identical), lossy single-file SNR (37.1/35.8/64.3/26.4/26.4 dB) and every output size match the prior snapshot exactly. Single-file timings match prior within noise (49.3/8.9/96.4/148.1/861.2/599.0/143.9/147.7 ms). Smallest margin: `wav_to_ogg` 861.2 vs 926.9 ms (1.08x). Both serial audio runs agreed (batch 228.4 / 229.4 ms); no samples were discarded.
+- CPU HEIC throughput is ~2.4 MB/s on this 4C/8T host: `heifer`'s Medium HEVC-Intra preset is intentionally kept (no preset cheating), and the 20-image batch caps at 8 image workers to bound RAM (peak 467.6 MiB, far below 3 GiB). The NVENC path encodes the same 20-image batch in 974.5 ms, but that is a different quality class (27.47 MB / 39.21 dB vs 21.92 MB / 35.39 dB CPU), not a fair speedup comparison.
 - `ffprobe` lists CPU-HEIC output as 40 × 512×512 HEVC tile items + a 320×180 thumbnail rather than one 3840×2160 stream; full resolution is confirmed via ffmpeg's `Tile Grid: ... 3840x2160` group and the clean 24,883,200-byte RGB24 decode.
-- AVIF/JXL matched PSNR and smaller outputs; TIFF both Deflate, exact; AVIF peak RAM 1328.9 vs 2581.8 MiB (fastconv lower; both under 3 GiB), JXL 1387.5 vs 907.5 MiB.
-- Image zero-quality-loss speedups (this snapshot vs retained prior numbers): `png_to_jpeg` 560.9 vs 657.9 ms (1.50x vs 1.30x), `png_to_avif` 2337.8 vs 2710.3 ms (1.62x vs 1.29x), `webp_to_bmp` 340.9 vs 360.4 ms (1.28x vs 1.24x), `png_to_tiff` 844.3 vs 880.4 ms (3.00x vs 2.83x), `png_to_webp` 4074.3 vs 4204.7 ms (3.10x vs 3.00x), `jpeg_to_webp` 3833.9 vs 3985.3 ms (3.04x vs 2.93x), `webp_to_png` 531.9 vs 543.2 ms (3.93x vs 3.74x), `png_to_qoi` 675.0 vs 737.9 ms (1.45x vs 1.54x — fastconv improved; ffmpeg also faster this run, 978.5 vs 1136.7 ms), `png_to_jxl` 3838.9 vs 3853.3 ms (4.63x vs 4.71x — within noise). NVENC HEIC 938.6/871.2/898.4 ms vs 947.4/844.6/881.6 ms (+3.2% / +1.9% on the two smaller batches, within run-to-run noise; the `gpu/heic.rs` change is I/O-only). All four lossless rows remain exact RGB; lossy rows keep PSNR in the same band (e.g. `png_to_jpeg` 34.30 vs 34.29 dB, `png_to_avif` 35.65 vs 35.63 dB) with no output-size inflation. No runs were discarded or cherry-picked.
-- Video zero-quality-loss (this snapshot, pre-merge `perf/speedup-video-zero-loss`): serial re-run after the write-combined bitstream scan (`lock_bitstream_into` + single-pass `to_sample_and_keyframe`), split NVENC input/output CUDA streams and single-read MKV→MP4 buffering (≤32 MiB). NVENC fastconv H.264 1869.6 ms / 320.9 FPS / 1.04x vs prior canonical `origin/main` baseline 1846.9 ms / 324.9 FPS / 1.06x (ffmpeg 1952.8 vs ~1959.8 ms baseline — fastconv is ~23 ms slower but ffmpeg also ~7 ms faster, so this is run-to-run noise, not a regression); HEVC 1988.3 ms / 301.8 FPS / 1.03x vs baseline 1996.5 ms / 300.5 FPS / 1.03x (small improvement). Remux fastconv 13.3 ms / 6.42x (mp4→mkv) and 21.9 ms / 3.70x (mkv→mp4) vs baseline 15.3 ms / 5.58x and 24.0 ms / 3.48x (ffmpeg 85.4/81.1 vs baseline 85.4/83.4 ms — ~2 ms faster per side, with part of the mkv→mp4 margin from a faster opponent). Output sizes (~25.86/~20.52 MB NVENC, ~19.15 MB remux), PSNR (50.72/47.62 dB), 600-frame/10 s validation, B-frames 295, `dts_ok=true`, clean decode, 4/4 validation counts and the explicit `gpu:nvdec+nvenc on NVIDIA GeForce RTX 2060` hardware proof (no CPU fallback) are unchanged in kind; quality and compression class were not traded for speed, and no runs were discarded.
+- AVIF/JXL matched PSNR and smaller outputs; TIFF both Deflate, exact; AVIF peak RAM 1348.7 vs 2377.5 MiB (fastconv lower; both under 3 GiB), JXL 1395.2 vs 897.1 MiB.
+- Absolute timings on short rows shift run-to-run on this snapshot for both sides; the large gains are structural, not sampling noise. Image speedups vs ffmpeg: 3.16x webp, 1.54x jpeg, 3.10x jpeg→webp, 3.65x webp→png, 1.64x qoi, 1.25x bmp, 3.08x tiff, 4.83x JXL, 1.75x AVIF; NVENC HEIC 13.56x/13.61x vs ffmpeg(webp) with 20/20 decoded 4K outputs. FFmpeg opponent timings also shifted (e.g. png_to_webp 13216.1 vs 12612.6 ms), so fastconv's 4177.0 vs 4074.3 ms is run-to-run noise, not a fat-LTO regression. All four lossless image rows remain exact RGB; lossy rows keep PSNR in the same band (e.g. png_to_jpeg 34.30 vs 34.30 dB, png_to_avif 35.65 vs 35.65 dB) with no output-size inflation.
+- Video timings are within noise of the prior snapshot: NVENC H.264 1884.5 vs 1869.6 ms (1.05x vs 1.04x), HEVC 2011.4 vs 1988.3 ms (1.03x both); remux mp4→mkv 13.2 vs 13.3 ms (6.80x vs 6.42x) and mkv→mp4 24.1 vs 21.9 ms (3.55x vs 3.70x, ffmpeg also faster then at 81.1 vs 85.5 ms). Output sizes, 50.72/47.62 dB PSNR, 600-frame validation, B-frames 295, `dts_ok=true`, clean decode and the explicit `gpu:nvdec+nvenc on NVIDIA GeForce RTX 2060` proof are unchanged in kind; no runs were discarded or cherry-picked.

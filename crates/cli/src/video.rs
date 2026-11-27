@@ -1,10 +1,11 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
+use crate::{duplicate_flag, flag_value, parse_threads};
 use fastconv_domain::{
     AudioBitrate, AudioChannels, AudioEncodeOptions, AudioSampleRate, HardwareBackend,
     HardwareDecodeBackend, TargetVideoCodec, VideoBitrate, VideoContainerFormat, VideoQuality,
-    VideoRateControl,
+    VideoRateControl, u64_to_f64,
 };
 use fastconv_probe::{
     RequestedVideoCodec, VideoTranscodeOptions, parse_requested_audio_codec,
@@ -71,11 +72,9 @@ pub(crate) fn parse_remux_args(args: &[&str]) -> Result<RemuxCommand, String> {
             "-h" | "--help" => return Ok(RemuxCommand::Help),
             "--to" => {
                 if to.is_some() {
-                    return Err("duplicate flag '--to'".to_owned());
+                    return Err(duplicate_flag("--to"));
                 }
-                let raw = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --to".to_owned())?;
+                let raw = flag_value(args, index, "--to")?;
                 let parsed = parse_target_format(raw)?;
                 if !parsed.supports_remux() {
                     return Err(format!(
@@ -86,17 +85,9 @@ pub(crate) fn parse_remux_args(args: &[&str]) -> Result<RemuxCommand, String> {
                 index += 2;
             }
             "--threads" => {
-                if threads.is_some() {
-                    return Err("duplicate flag '--threads'".to_owned());
-                }
-                let raw = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --threads".to_owned())?;
-                threads = Some(
-                    raw.parse::<NonZeroUsize>()
-                        .map_err(|err| format!("invalid --threads '{raw}': {err}"))?,
-                );
-                index += 2;
+                let (parsed, next) = parse_threads(args, index, threads.is_some())?;
+                threads = Some(parsed);
+                index = next;
             }
             flag if flag.starts_with('-') => return Err(format!("unknown flag '{flag}'")),
             value => {
@@ -144,8 +135,8 @@ pub(crate) fn run_remux(args: &RemuxArgs) -> Result<(), String> {
             .map_or("?", |i| i.input_format().extension()),
         plan.output_format().extension(),
         report.worker_threads_used(),
-        crate::u64_to_f64(report.total_input_bytes().get()) / 1_000_000.0,
-        crate::u64_to_f64(report.total_output_bytes().get()) / 1_000_000.0,
+        u64_to_f64(report.total_input_bytes().get()) / 1_000_000.0,
+        u64_to_f64(report.total_output_bytes().get()) / 1_000_000.0,
         report.duration().as_secs_f64() * 1_000.0,
         report.megabytes_per_sec(),
     );
@@ -232,12 +223,6 @@ pub(crate) fn print_video_help() {
     println!("{VIDEO_HELP}");
 }
 
-fn flag_value<'a>(args: &'a [&str], index: usize, flag: &str) -> Result<&'a str, String> {
-    args.get(index + 1)
-        .copied()
-        .ok_or_else(|| format!("missing value for {flag}"))
-}
-
 fn parse_video_codec(raw: &str) -> Result<RequestedVideoCodec, String> {
     if raw == "copy" {
         return Ok(RequestedVideoCodec::Copy);
@@ -279,7 +264,7 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
             "-h" | "--help" => return Ok(VideoCommand::Help),
             "--to" => {
                 if to.is_some() {
-                    return Err("duplicate flag '--to'".to_owned());
+                    return Err(duplicate_flag("--to"));
                 }
                 to = Some(parse_target_format(flag_value(args, index, "--to")?)?);
                 index += 2;
@@ -368,19 +353,13 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
                 index += 2;
             }
             "--threads" => {
-                if threads.is_some() {
-                    return Err("duplicate flag '--threads'".to_owned());
-                }
-                let raw = flag_value(args, index, "--threads")?;
-                threads = Some(
-                    raw.parse::<NonZeroUsize>()
-                        .map_err(|err| format!("invalid --threads '{raw}': {err}"))?,
-                );
-                index += 2;
+                let (parsed, next) = parse_threads(args, index, threads.is_some())?;
+                threads = Some(parsed);
+                index = next;
             }
             "--backend" => {
                 if backend.is_some() {
-                    return Err("duplicate flag '--backend'".to_owned());
+                    return Err(duplicate_flag("--backend"));
                 }
                 backend = Some(crate::parse_backend(flag_value(args, index, "--backend")?)?);
                 index += 2;
@@ -489,7 +468,7 @@ pub(crate) fn run_video(args: &VideoArgs) -> Result<(), String> {
     let mb_per_sec = if secs == 0.0 {
         0.0
     } else {
-        crate::u64_to_f64(report.total_input_bytes().get()) / 1_000_000.0 / secs
+        u64_to_f64(report.total_input_bytes().get()) / 1_000_000.0 / secs
     };
 
     println!(
@@ -499,8 +478,8 @@ pub(crate) fn run_video(args: &VideoArgs) -> Result<(), String> {
         report.frames_processed(),
         report.fps(),
         report.worker_threads_used(),
-        crate::u64_to_f64(report.total_input_bytes().get()) / 1_000_000.0,
-        crate::u64_to_f64(report.total_output_bytes().get()) / 1_000_000.0,
+        u64_to_f64(report.total_input_bytes().get()) / 1_000_000.0,
+        u64_to_f64(report.total_output_bytes().get()) / 1_000_000.0,
         report.duration().as_secs_f64() * 1_000.0,
         mb_per_sec,
     );
