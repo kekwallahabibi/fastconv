@@ -1456,6 +1456,302 @@ pub(crate) fn build_vp09_sample_entry(width: u16, height: u16, vpcc_body: &[u8])
     entry
 }
 
+/// Exact PCM sample representation carried by a container. Endianness and
+/// depth are parsed from the source sample entry, never guessed at decode time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PcmFormat {
+    U8,
+    S16Le,
+    S16Be,
+    S24Le,
+    S24Be,
+    S32Le,
+    S32Be,
+    F32Le,
+    F32Be,
+    F64Le,
+}
+
+impl PcmFormat {
+    pub(crate) const fn bytes_per_sample(self) -> u16 {
+        match self {
+            Self::U8 => 1,
+            Self::S16Le | Self::S16Be => 2,
+            Self::S24Le | Self::S24Be => 3,
+            Self::S32Le | Self::S32Be | Self::F32Le | Self::F32Be => 4,
+            Self::F64Le => 8,
+        }
+    }
+
+    pub(crate) const fn is_big_endian(self) -> bool {
+        matches!(self, Self::S16Be | Self::S24Be | Self::S32Be | Self::F32Be)
+    }
+
+    pub(crate) const fn is_float(self) -> bool {
+        matches!(self, Self::F32Le | Self::F32Be | Self::F64Le)
+    }
+
+    pub(crate) const fn bit_depth(self) -> u16 {
+        self.bytes_per_sample().saturating_mul(8)
+    }
+}
+
+/// Upper bound on a FLAC configuration blob held in memory during remuxing.
+const FLAC_CONFIG_CAP: usize = 1_048_576;
+
+/// Validates a raw 34-byte FLAC STREAMINFO and returns
+/// `(channels, sample_rate, bits_per_sample)`.
+pub(crate) fn parse_flac_streaminfo(data: &[u8]) -> Result<(u16, u32, u8), String> {
+    let si: [u8; 34] = data
+        .try_into()
+        .map_err(|_| "FLAC STREAMINFO must be exactly 34 bytes".to_owned())?;
+    let min_block = u16::from_be_bytes([si[0], si[1]]);
+    let max_block = u16::from_be_bytes([si[2], si[3]]);
+    if min_block < 16 {
+        return Err("FLAC STREAMINFO min_block_size is below 16".to_owned());
+    }
+    if max_block < min_block {
+        return Err("FLAC STREAMINFO max_block_size is below min_block_size".to_owned());
+    }
+    let packed = u64::from_be_bytes([
+        si[10], si[11], si[12], si[13], si[14], si[15], si[16], si[17],
+    ]);
+    let rate = u32::try_from((packed >> 44) & 0xF_FFFF)
+        .map_err(|_| "FLAC sample rate exceeds 32 bits".to_owned())?;
+    let channels = u16::try_from(((packed >> 41) & 0x7).saturating_add(1))
+        .map_err(|_| "FLAC channel count overflow".to_owned())?;
+    let bits = u8::try_from(((packed >> 36) & 0x1F).saturating_add(1))
+        .map_err(|_| "FLAC bit depth overflow".to_owned())?;
+    if !(1..=655_350).contains(&rate) {
+        return Err(format!("FLAC STREAMINFO rate {rate} is out of range"));
+    }
+    if !(1..=8).contains(&channels) {
+        return Err(format!(
+            "FLAC STREAMINFO channel count {channels} is out of range"
+        ));
+    }
+    if !(4..=32).contains(&bits) {
+        return Err(format!("FLAC STREAMINFO bit depth {bits} is out of range"));
+    }
+    Ok((channels, rate, bits))
+}
+
+/// Walks a bounded FLAC metadata block chain and returns its STREAMINFO body.
+/// `data` starts at the first metadata block header.
+fn flac_metadata_chain(data: &[u8]) -> Result<[u8; 34], String> {
+    if data.len() > FLAC_CONFIG_CAP {
+        return Err(format!("FLAC metadata exceeds {FLAC_CONFIG_CAP} bytes"));
+    }
+    let mut idx = 0_usize;
+    let mut streaminfo = None;
+    loop {
+        let header = *data
+            .get(idx)
+            .ok_or("truncated FLAC metadata block header")?;
+        idx = idx.checked_add(1).ok_or("FLAC metadata offset overflow")?;
+        let last = header & 0x80 != 0;
+        let kind = header & 0x7F;
+        let len_bytes = data
+            .get(idx..idx.saturating_add(3))
+            .ok_or("truncated FLAC metadata block length")?;
+        let len = usize::try_from(u32::from_be_bytes([
+            0,
+            len_bytes[0],
+            len_bytes[1],
+            len_bytes[2],
+        ]))
+        .map_err(|_| "FLAC metadata block length overflow")?;
+        idx = idx.checked_add(3).ok_or("FLAC metadata offset overflow")?;
+        let end = idx.checked_add(len).ok_or("FLAC metadata block overflow")?;
+        let body = data.get(idx..end).ok_or("truncated FLAC metadata block")?;
+        idx = end;
+        if streaminfo.is_none() {
+            if kind != 0 || len != 34 {
+                return Err("first FLAC metadata block must be a 34-byte STREAMINFO".to_owned());
+            }
+            let si: [u8; 34] = body
+                .try_into()
+                .map_err(|_| "invalid FLAC STREAMINFO length".to_owned())?;
+            parse_flac_streaminfo(&si)?;
+            streaminfo = Some(si);
+        }
+        if last {
+            break;
+        }
+    }
+    streaminfo.ok_or_else(|| "FLAC metadata has no STREAMINFO".to_owned())
+}
+
+/// Extracts the canonical 34-byte STREAMINFO from a Matroska `CodecPrivate`.
+pub(crate) fn extract_flac_streaminfo_from_mkv_codec_private(
+    data: &[u8],
+) -> Result<[u8; 34], String> {
+    if !data.starts_with(b"fLaC") {
+        return Err("A_FLAC CodecPrivate must start with 'fLaC'".to_owned());
+    }
+    flac_metadata_chain(&data[4..])
+}
+
+/// Finds a child ISOBMFF box body inside a raw sample entry (or its `wave`).
+pub(crate) fn find_child_box(raw: &[u8], start: usize, fourcc: [u8; 4]) -> Option<&[u8]> {
+    let mut idx = start;
+    while idx.checked_add(8)? <= raw.len() {
+        let size = u32::from_be_bytes(raw.get(idx..idx.checked_add(4)?)?.try_into().ok()?);
+        let kind = raw.get(idx + 4..idx + 8)?;
+        let header = if size == 1 { 16 } else { 8 };
+        let body_start = idx.checked_add(header)?;
+        let body_len = if size == 0 {
+            raw.len().saturating_sub(body_start)
+        } else {
+            usize::try_from(size).ok()?.checked_sub(header)?
+        };
+        let body_end = body_start.checked_add(body_len)?;
+        if body_end > raw.len() {
+            return None;
+        }
+        if kind == fourcc {
+            return Some(&raw[body_start..body_end]);
+        }
+        if size == 0 {
+            return None;
+        }
+        idx = body_end;
+    }
+    None
+}
+
+/// Extracts the `dfLa` box body from a raw FLAC audio sample entry.
+pub(crate) fn extract_dfla_from_sample_entry(raw: &[u8]) -> Result<Vec<u8>, String> {
+    let version = u16::from_be_bytes(
+        raw.get(16..18)
+            .ok_or("truncated FLAC sample entry")?
+            .try_into()
+            .map_err(|_| "invalid FLAC sample entry version".to_owned())?,
+    );
+    let start = 8 + match version {
+        0 => 28,
+        1 => 44,
+        2 => 64,
+        other => return Err(format!("unsupported FLAC sample entry version {other}")),
+    };
+    if let Some(dfla) = find_child_box(raw, start, *b"dfLa") {
+        return Ok(dfla.to_vec());
+    }
+    let wave = find_child_box(raw, start, *b"wave").ok_or("FLAC sample entry is missing dfLa")?;
+    find_child_box(wave, 0, *b"dfLa")
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| "FLAC sample entry is missing dfLa".to_owned())
+}
+
+/// Extracts the canonical STREAMINFO from a `dfLa` full box body.
+pub(crate) fn extract_flac_streaminfo_from_dfla(data: &[u8]) -> Result<[u8; 34], String> {
+    if data.len() < 4 || data[..4] != [0, 0, 0, 0] {
+        return Err("dfLa must be version 0 with zero flags".to_owned());
+    }
+    flac_metadata_chain(&data[4..])
+}
+
+/// Builds the canonical Matroska `A_FLAC` `CodecPrivate` from STREAMINFO.
+pub(crate) fn build_mkv_flac_codec_private(streaminfo: &[u8; 34]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 4 + 34);
+    out.extend_from_slice(b"fLaC");
+    // Last metadata block, type STREAMINFO (0), 34-byte payload.
+    out.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]);
+    out.extend_from_slice(streaminfo);
+    out
+}
+
+/// Builds an ISOBMFF `fLaC` audio sample entry with a compliant `dfLa` box.
+pub(crate) fn build_flac_mp4_sample_entry(
+    channels: u16,
+    sample_rate: u32,
+    streaminfo: &[u8; 34],
+) -> Vec<u8> {
+    let mut entry = Vec::with_capacity(8 + 28 + 8 + 42);
+    entry.extend_from_slice(&[0; 4]);
+    entry.extend_from_slice(b"fLaC");
+    entry.extend_from_slice(&[0; 6]);
+    entry.extend_from_slice(&1_u16.to_be_bytes());
+    entry.extend_from_slice(&[0; 8]);
+    entry.extend_from_slice(&channels.to_be_bytes());
+    entry.extend_from_slice(&16_u16.to_be_bytes());
+    entry.extend_from_slice(&[0; 4]);
+    let rate = if sample_rate <= 0xFFFF {
+        sample_rate << 16
+    } else {
+        0
+    };
+    entry.extend_from_slice(&rate.to_be_bytes());
+    let mut dfla = Vec::with_capacity(4 + 4 + 34);
+    dfla.extend_from_slice(&[0, 0, 0, 0]);
+    dfla.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]);
+    dfla.extend_from_slice(streaminfo);
+    entry.extend_from_slice(&full_box(*b"dfLa", &dfla));
+    let size = u32::try_from(entry.len()).unwrap_or(u32::MAX);
+    entry[..4].copy_from_slice(&size.to_be_bytes());
+    entry
+}
+
+/// Builds a v0 `sowt` or v2 `lpcm` `QuickTime` PCM audio sample entry.
+pub(crate) fn build_pcm_mp4_sample_entry(
+    format: PcmFormat,
+    channels: u16,
+    sample_rate: u32,
+) -> Vec<u8> {
+    let v2 = sample_rate > 65_535 || format != PcmFormat::S16Le;
+    if !v2 {
+        let mut entry = Vec::with_capacity(8 + 28);
+        entry.extend_from_slice(&[0; 4]);
+        entry.extend_from_slice(b"sowt");
+        entry.extend_from_slice(&[0; 6]);
+        entry.extend_from_slice(&1_u16.to_be_bytes());
+        entry.extend_from_slice(&[0; 8]);
+        entry.extend_from_slice(&channels.to_be_bytes());
+        entry.extend_from_slice(&16_u16.to_be_bytes());
+        entry.extend_from_slice(&[0; 4]);
+        entry.extend_from_slice(&(sample_rate << 16).to_be_bytes());
+        let size = u32::try_from(entry.len()).unwrap_or(u32::MAX);
+        entry[..4].copy_from_slice(&size.to_be_bytes());
+        return entry;
+    }
+    let frame_bytes = u32::from(channels).saturating_mul(u32::from(format.bytes_per_sample()));
+    let mut entry = Vec::with_capacity(8 + 64);
+    entry.extend_from_slice(&[0; 4]);
+    entry.extend_from_slice(b"lpcm");
+    entry.extend_from_slice(&[0; 6]);
+    entry.extend_from_slice(&1_u16.to_be_bytes());
+    entry.extend_from_slice(&2_u16.to_be_bytes()); // version
+    entry.extend_from_slice(&[0; 6]); // revision and vendor
+    // QuickTime Sound Sample Description v2 fixed placeholder fields.
+    entry.extend_from_slice(&3_u16.to_be_bytes()); // always3
+    entry.extend_from_slice(&16_u16.to_be_bytes()); // always16
+    entry.extend_from_slice(&0xFFFE_u16.to_be_bytes()); // alwaysMinus2
+    entry.extend_from_slice(&0_u16.to_be_bytes()); // always0
+    entry.extend_from_slice(&0x0001_0000_u32.to_be_bytes()); // always65536
+    entry.extend_from_slice(&72_u32.to_be_bytes()); // sizeOfStructOnly
+    entry.extend_from_slice(&f64::from(sample_rate).to_be_bytes());
+    entry.extend_from_slice(&u32::from(channels).to_be_bytes());
+    entry.extend_from_slice(&0x7F00_0000_u32.to_be_bytes());
+    entry.extend_from_slice(&u32::from(format.bit_depth()).to_be_bytes());
+    // CoreAudio/QuickTime LPCM formatSpecificFlags:
+    // bit 0 = isFloat, bit 1 = isBigEndian, bit 2 = isSignedInteger, bit 3 = isPacked.
+    let mut flags = 0x08_u32;
+    if format.is_float() {
+        flags |= 0x01;
+    } else if format != PcmFormat::U8 {
+        flags |= 0x04;
+    }
+    if format.is_big_endian() {
+        flags |= 0x02;
+    }
+    entry.extend_from_slice(&flags.to_be_bytes());
+    entry.extend_from_slice(&frame_bytes.to_be_bytes()); // constBytesPerAudioPacket
+    entry.extend_from_slice(&1_u32.to_be_bytes()); // constLPCMFramesPerAudioPacket
+    let size = u32::try_from(entry.len()).unwrap_or(u32::MAX);
+    entry[..4].copy_from_slice(&size.to_be_bytes());
+    entry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2315,5 +2611,66 @@ mod tests {
         let mut bad = ident.clone();
         bad[29] = 0;
         assert!(vorbis_ident_info(&bad).is_err());
+    }
+
+    fn flac_streaminfo(rate: u32, channels: u16, bits: u8) -> [u8; 34] {
+        let mut si = [0_u8; 34];
+        si[0..2].copy_from_slice(&4096_u16.to_be_bytes());
+        si[2..4].copy_from_slice(&4096_u16.to_be_bytes());
+        let packed =
+            (u64::from(rate) << 44) | (u64::from(channels - 1) << 41) | (u64::from(bits - 1) << 36);
+        si[10..18].copy_from_slice(&packed.to_be_bytes());
+        si
+    }
+
+    #[test]
+    fn flac_streaminfo_roundtrips_through_container_helpers() -> Result<(), String> {
+        let si = flac_streaminfo(48_000, 2, 16);
+        assert_eq!(parse_flac_streaminfo(&si)?, (2, 48_000, 16));
+        let mkv = build_mkv_flac_codec_private(&si);
+        assert_eq!(&mkv[..4], b"fLaC");
+        assert_eq!(&mkv[4..8], &[0x80, 0x00, 0x00, 0x22]);
+        assert_eq!(extract_flac_streaminfo_from_mkv_codec_private(&mkv)?, si);
+
+        let entry = build_flac_mp4_sample_entry(2, 48_000, &si);
+        assert_eq!(&entry[4..8], b"fLaC");
+        let dfla = extract_dfla_from_sample_entry(&entry)?;
+        assert_eq!(dfla[..4], [0, 0, 0, 0]);
+        assert_eq!(extract_flac_streaminfo_from_dfla(&dfla)?, si);
+        Ok(())
+    }
+
+    #[test]
+    fn flac_helpers_reject_malformed_config() {
+        let mut si = flac_streaminfo(48_000, 2, 16);
+        si[0..2].copy_from_slice(&8_u16.to_be_bytes());
+        assert!(parse_flac_streaminfo(&si).is_err());
+        si[0..2].copy_from_slice(&4096_u16.to_be_bytes());
+        si[2..4].copy_from_slice(&16_u16.to_be_bytes());
+        assert!(parse_flac_streaminfo(&si).is_err());
+        let mut bad = build_mkv_flac_codec_private(&flac_streaminfo(48_000, 2, 16));
+        bad[4] = 0x01;
+        assert!(extract_flac_streaminfo_from_mkv_codec_private(&bad).is_err());
+        bad[4] = 0x80;
+        bad[7] = 0x21;
+        assert!(extract_flac_streaminfo_from_mkv_codec_private(&bad).is_err());
+        assert!(extract_dfla_from_sample_entry(&[0; 8]).is_err());
+        assert!(extract_flac_streaminfo_from_dfla(&[1, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn pcm_format_sizes_are_exact() {
+        assert_eq!(PcmFormat::U8.bytes_per_sample(), 1);
+        assert_eq!(PcmFormat::S24Be.bytes_per_sample(), 3);
+        assert_eq!(PcmFormat::F64Le.bytes_per_sample(), 8);
+        assert!(PcmFormat::S16Be.is_big_endian());
+        assert!(!PcmFormat::S16Le.is_big_endian());
+        assert!(PcmFormat::F32Le.is_float());
+        assert!(!PcmFormat::S32Le.is_float());
+        let entry = build_pcm_mp4_sample_entry(PcmFormat::S16Le, 2, 44_100);
+        assert_eq!(&entry[4..8], b"sowt");
+        let entry = build_pcm_mp4_sample_entry(PcmFormat::F32Le, 2, 96_000);
+        assert_eq!(&entry[4..8], b"lpcm");
+        assert_eq!(entry.len(), 8 + 64);
     }
 }

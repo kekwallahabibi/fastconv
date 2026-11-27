@@ -615,6 +615,7 @@ pub(crate) fn demux_gif_metadata(path: &Path) -> Result<ContainerMedia, Pipeline
             config: Vec::new(),
             timescale: US_TIMESCALE,
             presentation_edit: None,
+            pcm_format: None,
         }],
         packets,
     })
@@ -871,6 +872,7 @@ pub(crate) fn demux_webp_metadata(path: &Path) -> Result<ContainerMedia, Pipelin
             config: Vec::new(),
             timescale: US_TIMESCALE,
             presentation_edit: None,
+            pcm_format: None,
         }],
         packets,
     })

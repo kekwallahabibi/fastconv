@@ -3,11 +3,11 @@ use std::path::PathBuf;
 
 use fastconv_domain::{
     AudioBitrate, AudioChannels, AudioEncodeOptions, AudioSampleRate, HardwareBackend,
-    HardwareDecodeBackend, TargetAudioCodec, TargetVideoCodec, VideoBitrate, VideoContainerFormat,
-    VideoQuality, VideoRateControl,
+    HardwareDecodeBackend, TargetVideoCodec, VideoBitrate, VideoContainerFormat, VideoQuality,
+    VideoRateControl,
 };
 use fastconv_probe::{
-    RequestedAudioCodec, RequestedVideoCodec, VideoTranscodeOptions,
+    RequestedVideoCodec, VideoTranscodeOptions, parse_requested_audio_codec,
     prepare_video_transcode_batch_with_options,
 };
 
@@ -158,7 +158,9 @@ pub(crate) struct VideoArgs {
     target: PathBuf,
     to: Option<VideoContainerFormat>,
     video_codec: Option<RequestedVideoCodec>,
-    audio_codec: Option<RequestedAudioCodec>,
+    /// Raw `--acodec` value. Codec parsing and combination validation belong
+    /// to `fastconv-probe`, not this argument collector.
+    audio_codec: Option<String>,
     quality: Option<VideoQuality>,
     vbitrate: Option<VideoBitrate>,
     abitrate: Option<AudioBitrate>,
@@ -194,7 +196,8 @@ Options:
   --to <format>         Output container (required for directory batches): mp4,
                         mkv, webm, mov, avi, ts, gif, webp
   --vcodec <codec>      Video codec: h264, hevc (h265), av1, vp9, gif, webp, copy
-  --acodec <codec>      Audio codec: aac, opus, mp3, vorbis, none (drop), copy
+  --acodec <codec>      Audio codec: aac, opus, mp3, vorbis, flac, pcm, none
+                        (drop), copy. FLAC/PCM are lossless and reject --abitrate
   --quality <0..=100>   Encoding quality (default 80; mutually exclusive with
                         --vbitrate and --vcodec copy)
   --vbitrate <rate>     Target video bitrate, e.g. 500k, 2M, 2.5M or 2000000
@@ -242,31 +245,6 @@ fn parse_video_codec(raw: &str) -> Result<RequestedVideoCodec, String> {
         )
     })?;
     Ok(RequestedVideoCodec::Encode(codec))
-}
-
-fn parse_audio_codec(raw: &str) -> Result<RequestedAudioCodec, String> {
-    match raw {
-        "copy" => Ok(RequestedAudioCodec::Copy),
-        "none" => Ok(RequestedAudioCodec::Drop),
-        _ => {
-            let codec = TargetAudioCodec::from_name(raw).ok_or_else(|| {
-                format!(
-                    "unknown audio codec '{raw}' (expected aac, opus, mp3, vorbis, none, or copy)"
-                )
-            })?;
-            Ok(RequestedAudioCodec::Encode(codec))
-        }
-    }
-}
-
-fn reject_audio_overrides(audio_codec: Option<RequestedAudioCodec>) -> Result<(), String> {
-    if matches!(
-        audio_codec,
-        Some(RequestedAudioCodec::Copy | RequestedAudioCodec::Drop)
-    ) {
-        return Err("audio bitrate, sample rate and channels require audio re-encoding".to_owned());
-    }
-    Ok(())
 }
 
 /// Parses `fastconv video` arguments without touching the file system.
@@ -320,17 +298,9 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
                 if audio_codec.is_some() {
                     return Err("duplicate flag '--acodec'".to_owned());
                 }
-                let raw = flag_value(args, index, "--acodec")?;
-                let codec = parse_audio_codec(raw)?;
-                if matches!(codec, RequestedAudioCodec::Copy | RequestedAudioCodec::Drop)
-                    && (abitrate.is_some() || asample_rate.is_some() || achannels.is_some())
-                {
-                    return Err(
-                        "audio bitrate, sample rate and channels require audio re-encoding"
-                            .to_owned(),
-                    );
-                }
-                audio_codec = Some(codec);
+                // Parsing and codec/option compatibility are validated once at
+                // the probe boundary; the CLI only collects the raw value.
+                audio_codec = Some(flag_value(args, index, "--acodec")?.to_owned());
                 index += 2;
             }
             "--quality" => {
@@ -368,7 +338,6 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
                 if abitrate.is_some() {
                     return Err("duplicate flag '--abitrate'".to_owned());
                 }
-                reject_audio_overrides(audio_codec)?;
                 let raw = flag_value(args, index, "--abitrate")?;
                 abitrate = Some(AudioBitrate::parse(raw).map_err(|err| err.to_string())?);
                 index += 2;
@@ -377,7 +346,6 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
                 if asample_rate.is_some() {
                     return Err("duplicate flag '--asample-rate'".to_owned());
                 }
-                reject_audio_overrides(audio_codec)?;
                 let raw = flag_value(args, index, "--asample-rate")?;
                 let hz = raw
                     .parse::<u32>()
@@ -389,7 +357,6 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
                 if achannels.is_some() {
                     return Err("duplicate flag '--achannels'".to_owned());
                 }
-                reject_audio_overrides(audio_codec)?;
                 let raw = flag_value(args, index, "--achannels")?;
                 let count = raw
                     .parse::<u16>()
@@ -470,12 +437,20 @@ pub(crate) fn run_video(args: &VideoArgs) -> Result<(), String> {
         (None, None) => None,
     };
     let audio_options = AudioEncodeOptions::new(args.abitrate, args.asample_rate, args.achannels);
+    // `--acodec` is parsed once at the probe boundary, together with the
+    // codec/option compatibility checks, never in this argument collector.
+    let audio_codec = args
+        .audio_codec
+        .as_deref()
+        .map(parse_requested_audio_codec)
+        .transpose()
+        .map_err(|err| err.to_string())?;
     let plan = prepare_video_transcode_batch_with_options(
         &args.source,
         &args.target,
         args.to,
         args.video_codec,
-        args.audio_codec,
+        audio_codec,
         VideoTranscodeOptions::new(rate_control, audio_options),
         args.backend,
         args.decode_backend,
@@ -699,10 +674,7 @@ mod tests {
             flagged.video_codec,
             Some(RequestedVideoCodec::Encode(TargetVideoCodec::Av1))
         );
-        assert_eq!(
-            flagged.audio_codec,
-            Some(RequestedAudioCodec::Encode(TargetAudioCodec::Opus))
-        );
+        assert_eq!(flagged.audio_codec, Some("opus".to_owned()));
         assert_eq!(flagged.quality, VideoQuality::new(75).ok());
         assert_eq!(flagged.threads, NonZeroUsize::new(4));
         assert_eq!(flagged.backend, HardwareBackend::Gpu(GpuBackend::Nvenc));
@@ -793,11 +765,9 @@ mod tests {
         };
         assert_eq!(copied.video_codec, Some(RequestedVideoCodec::Copy));
 
-        for (raw, expected) in [
-            ("aac", TargetAudioCodec::Aac),
-            ("opus", TargetAudioCodec::Opus),
-            ("mp3", TargetAudioCodec::Mp3),
-            ("vorbis", TargetAudioCodec::Vorbis),
+        // The CLI collects raw values; codec meaning is resolved by probe.
+        for raw in [
+            "aac", "opus", "mp3", "vorbis", "flac", "pcm", "copy", "none",
         ] {
             let VideoCommand::Run(parsed) =
                 parse_video_args(&["in.mp4", "out.x", "--acodec", raw])?
@@ -806,15 +776,10 @@ mod tests {
             };
             assert_eq!(
                 parsed.audio_codec,
-                Some(RequestedAudioCodec::Encode(expected)),
+                Some(raw.to_owned()),
                 "video --acodec {raw}"
             );
         }
-        let VideoCommand::Run(copied) = parse_video_args(&["in.mp4", "out.x", "--acodec", "copy"])?
-        else {
-            return Err("expected video run args".to_owned());
-        };
-        assert_eq!(copied.audio_codec, Some(RequestedAudioCodec::Copy));
         Ok(())
     }
 
@@ -849,7 +814,9 @@ mod tests {
         assert!(parse_video_args(&["a", "b", "c"]).is_err());
         assert!(parse_video_args(&["a", "b", "--to", "flv"]).is_err());
         assert!(parse_video_args(&["a", "b", "--vcodec", "vp8"]).is_err());
-        assert!(parse_video_args(&["a", "b", "--acodec", "flac"]).is_err());
+        // Codec-name validity is checked by probe, not by the CLI collector.
+        assert!(parse_video_args(&["a", "b", "--acodec", "flac"]).is_ok());
+        assert!(parse_video_args(&["a", "b", "--acodec", "pcm"]).is_ok());
         assert!(parse_video_args(&["a", "b", "--backend", "magic"]).is_err());
         assert!(parse_video_args(&["a", "b", "--quality", "101"]).is_err());
         assert!(parse_video_args(&["a", "b", "--quality", "abc"]).is_err());
@@ -931,7 +898,7 @@ mod tests {
                 Some(RequestedVideoCodec::Encode(vcodec)),
                 "video --vcodec {to}"
             );
-            assert_eq!(parsed.audio_codec, Some(RequestedAudioCodec::Drop));
+            assert_eq!(parsed.audio_codec, Some("none".to_owned()));
         }
         Ok(())
     }
@@ -944,7 +911,7 @@ mod tests {
             return Err("expected video run args".to_owned());
         };
         assert_eq!(parsed.video_codec, Some(RequestedVideoCodec::Copy));
-        assert_eq!(parsed.audio_codec, Some(RequestedAudioCodec::Copy));
+        assert_eq!(parsed.audio_codec, Some("copy".to_owned()));
         assert_eq!(parsed.quality, None);
         Ok(())
     }
@@ -981,20 +948,18 @@ mod tests {
         assert!(parse_video_args(&["a", "b", "--vcodec", "copy", "--vbitrate", "1M"]).is_err());
         assert!(parse_video_args(&["a", "b", "--vbitrate", "1M", "--vcodec", "copy"]).is_err());
 
+        // Compatibility between --acodec and rate/format flags is decided by
+        // the probe boundary, so the CLI must accept the combination here.
         for flag in ["--abitrate", "--asample-rate", "--achannels"] {
             let value = match flag {
                 "--abitrate" => "128k",
                 "--asample-rate" => "48000",
                 _ => "2",
             };
-            for codec in ["copy", "none"] {
+            for codec in ["copy", "none", "flac", "pcm"] {
                 assert!(
-                    parse_video_args(&["a", "b", "--acodec", codec, flag, value]).is_err(),
+                    parse_video_args(&["a", "b", "--acodec", codec, flag, value]).is_ok(),
                     "{flag} with --acodec {codec}"
-                );
-                assert!(
-                    parse_video_args(&["a", "b", flag, value, "--acodec", codec]).is_err(),
-                    "{flag} before --acodec {codec}"
                 );
             }
         }

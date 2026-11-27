@@ -9,7 +9,7 @@ use fastconv_domain::VideoCodec;
 
 use crate::PipelineError;
 use crate::video_bitstream::{
-    default_opus_head, extract_av1c_from_obu, is_av1_keyframe, unwrap_adts, wrap_adts,
+    PcmFormat, default_opus_head, extract_av1c_from_obu, is_av1_keyframe, unwrap_adts, wrap_adts,
 };
 use crate::video_container::{
     ContainerMedia, ContainerPacket, ContainerTrack, DemuxedMedia, US_TIMESCALE,
@@ -109,15 +109,29 @@ fn video_codec(compression: [u8; 4], handler: Option<[u8; 4]>) -> Option<VideoCo
     None
 }
 
-fn audio_codec(format_tag: u16, handler: Option<[u8; 4]>) -> Option<VideoCodec> {
+fn audio_codec(
+    format_tag: u16,
+    bits: Option<u16>,
+    handler: Option<[u8; 4]>,
+) -> Result<Option<VideoCodec>, String> {
     if handler == Some(*b"OPUS") {
-        return Some(VideoCodec::Opus);
+        return Ok(Some(VideoCodec::Opus));
     }
     match format_tag {
-        0x00FF | 0x1600 | 0x1601 | 0x1602 | 0x706D => Some(VideoCodec::Aac),
-        0x704F | 0x7361 => Some(VideoCodec::Opus),
-        0x0055 => Some(VideoCodec::Mp3),
-        _ => None,
+        0x00FF | 0x1600 | 0x1601 | 0x1602 | 0x706D => Ok(Some(VideoCodec::Aac)),
+        0x704F | 0x7361 => Ok(Some(VideoCodec::Opus)),
+        0x0055 => Ok(Some(VideoCodec::Mp3)),
+        0x0001 => match bits {
+            Some(8 | 16 | 24 | 32) => Ok(Some(VideoCodec::Pcm)),
+            Some(bits) => Err(format!("unsupported AVI PCM bit depth {bits}")),
+            None => Err("AVI PCM stream is missing wBitsPerSample".to_owned()),
+        },
+        0x0003 => match bits {
+            Some(32 | 64) => Ok(Some(VideoCodec::Pcm)),
+            Some(bits) => Err(format!("unsupported AVI IEEE-float bit depth {bits}")),
+            None => Err("AVI IEEE-float stream is missing wBitsPerSample".to_owned()),
+        },
+        _ => Ok(None),
     }
 }
 
@@ -144,6 +158,8 @@ struct AvStream {
     /// `dwSampleSize`: zero means one sample per chunk, otherwise the fixed
     /// byte size of a sample and a chunk may carry several of them.
     sample_size: u32,
+    /// Exact PCM representation for `VideoCodec::Pcm`, `None` otherwise.
+    pcm_format: Option<PcmFormat>,
     samples_emitted: u64,
     packets: usize,
 }
@@ -275,16 +291,36 @@ fn parse_header(
                 scale,
                 rate,
                 sample_size: 0,
+                pcm_format: None,
                 samples_emitted: 0,
                 packets: 0,
             });
         } else {
             let tag = le_u16(format.get(..2).unwrap_or(&[])).unwrap_or(0);
-            let Some(codec) = audio_codec(tag, handler) else {
+            let bits = le_u16(format.get(14..16).unwrap_or(&[]));
+            let codec =
+                audio_codec(tag, bits, handler).map_err(|reason| avi_error(path, reason))?;
+            let Some(codec) = codec else {
                 continue;
             };
             let channels = le_u16(format.get(2..4).unwrap_or(&[])).filter(|&v| v > 0);
             let sample_rate = le_u32(format.get(4..8).unwrap_or(&[])).filter(|&v| v > 0);
+            let pcm_format = if codec == VideoCodec::Pcm {
+                if channels.is_none() || sample_rate.is_none() {
+                    return Err(avi_error(path, "AVI PCM stream has zero channels or rate"));
+                }
+                Some(match (tag, bits) {
+                    (0x0001, Some(8)) => PcmFormat::U8,
+                    (0x0001, Some(16)) => PcmFormat::S16Le,
+                    (0x0001, Some(24)) => PcmFormat::S24Le,
+                    (0x0001, Some(32)) => PcmFormat::S32Le,
+                    (0x0003, Some(32)) => PcmFormat::F32Le,
+                    (0x0003, Some(64)) => PcmFormat::F64Le,
+                    _ => return Err(avi_error(path, "unsupported AVI PCM format")),
+                })
+            } else {
+                None
+            };
             let extra = format.get(18..).unwrap_or(&[]);
             let config = match codec {
                 VideoCodec::Opus if extra.len() >= 19 && &extra[..8] == b"OpusHead" => {
@@ -312,6 +348,7 @@ fn parse_header(
                 scale,
                 rate,
                 sample_size,
+                pcm_format,
                 samples_emitted: 0,
                 packets: 0,
             });
@@ -390,6 +427,7 @@ pub(crate) fn demux_avi(path: &Path) -> Result<DemuxedMedia, PipelineError> {
                 config: s.config.clone(),
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: s.pcm_format,
             })
             .collect(),
         ..ContainerMedia::default()
@@ -462,6 +500,7 @@ pub(crate) fn demux_avi(path: &Path) -> Result<DemuxedMedia, PipelineError> {
                         config: streams[number].config.clone(),
                         timescale: US_TIMESCALE,
                         presentation_edit: None,
+                        pcm_format: None,
                     };
                     let (canonical, sync) = crate::video_container::video_packet_from_annex_b(
                         &mut proxy, data, keyframe,
@@ -497,7 +536,7 @@ pub(crate) fn demux_avi(path: &Path) -> Result<DemuxedMedia, PipelineError> {
                     sync,
                 );
             }
-            VideoCodec::Vp9 | VideoCodec::Opus | VideoCodec::Mp3 => {
+            VideoCodec::Vp9 | VideoCodec::Opus | VideoCodec::Mp3 | VideoCodec::Pcm => {
                 push_packet(
                     &mut media,
                     &mut streams,
@@ -602,19 +641,19 @@ fn build_waveformatex(
     track: &ContainerTrack,
     path: &Path,
 ) -> Result<Vec<u8>, PipelineError> {
-    let (tag, extra) = match codec {
+    let (tag, extra, pcm): (u16, Vec<u8>, Option<PcmFormat>) = match codec {
         VideoCodec::Aac => {
             let asc = track
                 .config
                 .get(..2)
                 .ok_or_else(|| avi_error(path, "missing AAC AudioSpecificConfig"))?;
-            (0x00FF_u16, asc.to_vec())
+            (0x00FF_u16, asc.to_vec(), None)
         }
         VideoCodec::Opus => {
             if track.config.len() < 19 || &track.config[..8] != b"OpusHead" {
                 return Err(avi_error(path, "invalid OpusHead"));
             }
-            (0x704F_u16, track.config.clone())
+            (0x704F_u16, track.config.clone(), None)
         }
         VideoCodec::Mp3 => {
             let mut extra = Vec::with_capacity(12);
@@ -623,23 +662,44 @@ fn build_waveformatex(
             extra.extend_from_slice(&576_u16.to_le_bytes());
             extra.extend_from_slice(&1_u16.to_le_bytes());
             extra.extend_from_slice(&0_u16.to_le_bytes());
-            (0x0055_u16, extra)
+            (0x0055_u16, extra, None)
         }
-        _ => (0_u16, Vec::new()),
+        VideoCodec::Pcm => {
+            let format = track
+                .pcm_format
+                .ok_or_else(|| avi_error(path, "PCM track has no sample format"))?;
+            if format.is_big_endian() {
+                return Err(avi_error(path, "big-endian PCM cannot be stored in AVI"));
+            }
+            let tag = if format.is_float() {
+                0x0003_u16
+            } else {
+                0x0001
+            };
+            (tag, Vec::new(), Some(format))
+        }
+        _ => (0_u16, Vec::new(), None),
     };
     let rate = track.sample_rate.unwrap_or(48_000);
     let channels = track.channels.unwrap_or(2);
     let block_align = match codec {
         VideoCodec::Mp3 => u16::try_from((rate / 8).max(1)).unwrap_or(1),
-        _ => channels.saturating_mul(2),
+        _ => match pcm {
+            Some(format) => u16::try_from(
+                usize::from(channels).saturating_mul(usize::from(format.bytes_per_sample())),
+            )
+            .unwrap_or(u16::MAX),
+            None => channels.saturating_mul(2),
+        },
     };
+    let bits = pcm.map_or(16, PcmFormat::bit_depth);
     let mut out = Vec::with_capacity(18 + extra.len());
     out.extend_from_slice(&tag.to_le_bytes());
     out.extend_from_slice(&channels.to_le_bytes());
     out.extend_from_slice(&rate.to_le_bytes());
     out.extend_from_slice(&rate.saturating_mul(u32::from(block_align)).to_le_bytes());
     out.extend_from_slice(&block_align.to_le_bytes());
-    out.extend_from_slice(&16_u16.to_le_bytes());
+    out.extend_from_slice(&bits.to_le_bytes());
     out.extend_from_slice(&u16::try_from(extra.len()).unwrap_or(u16::MAX).to_le_bytes());
     out.extend_from_slice(&extra);
     Ok(out)
@@ -675,8 +735,9 @@ pub(crate) fn mux_avi(
 
     let mut strl_chunks = Vec::new();
     for (index, track) in media.tracks.iter().enumerate() {
-        let length = u32::try_from(media.packets.iter().filter(|p| p.track == index).count())
+        let mut length = u32::try_from(media.packets.iter().filter(|p| p.track == index).count())
             .unwrap_or(u32::MAX);
+        let mut sample_size = 0_u32;
         let (scale, rate, handler, strf) = if track.codec.is_video() {
             let scale = track_duration_us(media, track).max(1);
             // `movi` carries Annex-B for H.264/HEVC and raw frames for VP9/AV1,
@@ -697,25 +758,58 @@ pub(crate) fn mux_avi(
                 [0; 4]
             };
             let sr = track.sample_rate.unwrap_or(48_000);
-            // One coded frame per chunk: dwScale counts the samples in that
-            // frame and dwSampleSize stays zero, the standard AVI VBR layout.
-            let samples_per_packet: u32 = match track.codec {
-                VideoCodec::Opus => opus_samples_per_packet(media, index, target_path)?,
-                VideoCodec::Mp3 => {
-                    if sr >= 32_000 {
-                        1152
-                    } else {
-                        576
-                    }
+            if track.codec == VideoCodec::Pcm {
+                // Uncompressed PCM uses dwScale=1 / dwRate=sample_rate with a
+                // fixed dwSampleSize, so `movi` chunks may hold many frames.
+                let format = track
+                    .pcm_format
+                    .ok_or_else(|| avi_error(target_path, "PCM track has no sample format"))?;
+                if format.is_big_endian() {
+                    return Err(avi_error(
+                        target_path,
+                        "big-endian PCM cannot be stored in AVI",
+                    ));
                 }
-                _ => 1024,
-            };
-            (
-                samples_per_packet,
-                sr,
-                handler,
-                build_waveformatex(track.codec, track, target_path)?,
-            )
+                let block_align = usize::from(track.channels.unwrap_or(2).max(1))
+                    .saturating_mul(usize::from(format.bytes_per_sample()));
+                if block_align == 0 {
+                    return Err(avi_error(target_path, "PCM block alignment is zero"));
+                }
+                sample_size = u32::try_from(block_align).unwrap_or(u32::MAX);
+                let bytes: usize = media
+                    .packets
+                    .iter()
+                    .filter(|packet| packet.track == index)
+                    .map(|packet| packet.data.len())
+                    .sum();
+                length = u32::try_from(bytes / block_align).unwrap_or(u32::MAX);
+                (
+                    1_u32,
+                    sr,
+                    handler,
+                    build_waveformatex(track.codec, track, target_path)?,
+                )
+            } else {
+                // One coded frame per chunk: dwScale counts the samples in that
+                // frame and dwSampleSize stays zero, the standard AVI VBR layout.
+                let samples_per_packet: u32 = match track.codec {
+                    VideoCodec::Opus => opus_samples_per_packet(media, index, target_path)?,
+                    VideoCodec::Mp3 => {
+                        if sr >= 32_000 {
+                            1152
+                        } else {
+                            576
+                        }
+                    }
+                    _ => 1024,
+                };
+                (
+                    samples_per_packet,
+                    sr,
+                    handler,
+                    build_waveformatex(track.codec, track, target_path)?,
+                )
+            }
         };
         let mut strh_body = vec![0_u8; 56];
         strh_body[0..4].copy_from_slice(if track.codec.is_video() {
@@ -727,8 +821,9 @@ pub(crate) fn mux_avi(
         strh_body[20..24].copy_from_slice(&scale.to_le_bytes());
         strh_body[24..28].copy_from_slice(&rate.to_le_bytes());
         strh_body[32..36].copy_from_slice(&length.to_le_bytes());
-        // dwSampleSize = 0 marks one coded frame per chunk for every codec we write.
-        strh_body[44..48].copy_from_slice(&0_u32.to_le_bytes());
+        // dwSampleSize = 0 marks one coded frame per chunk; PCM is the sole
+        // fixed-size layout and stores its frame byte count here.
+        strh_body[44..48].copy_from_slice(&sample_size.to_le_bytes());
         strl_chunks.push(riff_list(
             *b"strl",
             &[
@@ -921,6 +1016,7 @@ mod tests {
                     config: h264_config(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Aac,
@@ -931,6 +1027,7 @@ mod tests {
                     config: asc.to_vec(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
             ],
             packets: vec![
@@ -996,6 +1093,7 @@ mod tests {
                     config: hevc_config(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Mp3,
@@ -1006,6 +1104,7 @@ mod tests {
                     config: Vec::new(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
             ],
             packets: vec![
@@ -1049,6 +1148,7 @@ mod tests {
                     config: Vec::new(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Opus,
@@ -1059,6 +1159,7 @@ mod tests {
                     config: default_opus_head(2, 0),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
             ],
             packets: vec![
@@ -1097,6 +1198,7 @@ mod tests {
                     config: Vec::new(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Aac,
@@ -1107,6 +1209,7 @@ mod tests {
                     config: vec![0x12, 0x10],
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
             ],
             packets: vec![
@@ -1148,6 +1251,7 @@ mod tests {
                 config: Vec::new(),
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: [true, false, true]
                 .into_iter()
@@ -1265,6 +1369,7 @@ mod tests {
                 config: vec![0x12, 0x10],
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: (0..47)
                 .map(|index| ContainerPacket {
@@ -1323,6 +1428,7 @@ mod tests {
                 config: Vec::new(),
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: (0..2)
                 .map(|index| ContainerPacket {
@@ -1382,6 +1488,7 @@ mod tests {
                 config: Vec::new(),
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: sizes
                 .into_iter()
@@ -1460,6 +1567,7 @@ mod tests {
                 config: default_opus_head(2, 0),
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: (0..3)
                 .map(|index| ContainerPacket {
@@ -1619,6 +1727,7 @@ mod tests {
                 config: default_opus_head(2, 0),
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: vec![ContainerPacket {
                 track: 0,

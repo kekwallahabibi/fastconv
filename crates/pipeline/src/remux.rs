@@ -191,8 +191,12 @@ fn stream_copy_supports(item: &VideoRemuxItem) -> bool {
     if !direct {
         return false;
     }
+    // FLAC needs a rebuilt `dfLa` entry and PCM a rebuilt QuickTime sample
+    // entry; containr's StreamCopy cannot express either across families.
     item.streams().iter().all(|stream| {
-        stream.codec() != VideoCodec::Mp3 && !(stream.codec() == VideoCodec::Vp9 && family(output))
+        stream.codec() != VideoCodec::Mp3
+            && !matches!(stream.codec(), VideoCodec::Flac | VideoCodec::Pcm)
+            && !(stream.codec() == VideoCodec::Vp9 && family(output))
     })
 }
 
@@ -210,6 +214,8 @@ fn canonical_remux_supports(codec: VideoCodec) -> bool {
             | VideoCodec::Opus
             | VideoCodec::Vorbis
             | VideoCodec::Mp3
+            | VideoCodec::Flac
+            | VideoCodec::Pcm
     )
 }
 
@@ -1041,6 +1047,7 @@ mod container_tests {
                     config: avc_config(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Aac,
@@ -1051,6 +1058,7 @@ mod container_tests {
                     config: vec![0x11, 0x90],
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
             ],
             packets: vec![
@@ -1102,6 +1110,7 @@ mod container_tests {
                     config: Vec::new(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Opus,
@@ -1112,6 +1121,7 @@ mod container_tests {
                     config: crate::video_bitstream::default_opus_head(2, 0),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
             ],
             packets: vec![
@@ -1159,6 +1169,7 @@ mod container_tests {
                     config: Vec::new(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Vorbis,
@@ -1169,6 +1180,7 @@ mod container_tests {
                     config,
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
             ],
             packets: vec![
@@ -1486,6 +1498,7 @@ mod container_tests {
                     config: avc_config(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Aac,
@@ -1496,6 +1509,7 @@ mod container_tests {
                     config: vec![0x11, 0x90],
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
             ],
             packets,
@@ -1537,6 +1551,7 @@ mod container_tests {
                     config: Vec::new(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::Opus,
@@ -1547,6 +1562,7 @@ mod container_tests {
                     config: crate::video_bitstream::default_opus_head(2, 0),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
             ],
             packets,

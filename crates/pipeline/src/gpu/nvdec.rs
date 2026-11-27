@@ -1179,6 +1179,7 @@ mod tests {
                 config: Vec::new(),
                 timescale: crate::video_container::US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             },
             &[],
             VideoCodec::Av1,

@@ -1814,6 +1814,7 @@ fn make_stream(
         config,
         timescale: US_TIMESCALE,
         presentation_edit: None,
+        pcm_format: None,
     };
     let mut packets = Vec::with_capacity(units.len());
     let base_pts = frames
@@ -2569,6 +2570,7 @@ mod tests {
             config: Vec::new(),
             timescale: US_TIMESCALE,
             presentation_edit: None,
+            pcm_format: None,
         };
         for mode in [
             VideoEncodeMode::NvencH264 {
@@ -3198,6 +3200,7 @@ mod tests {
             config,
             timescale: US_TIMESCALE,
             presentation_edit: None,
+            pcm_format: None,
         };
 
         // Full range without colour_description keeps BT.601 default matrix + Full range.

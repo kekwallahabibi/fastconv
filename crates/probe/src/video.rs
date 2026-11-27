@@ -424,6 +424,15 @@ fn stream_codec(track: &Track) -> VideoCodec {
         if codec_id == "A_VORBIS" {
             return VideoCodec::Vorbis;
         }
+        if codec_id == "A_FLAC" {
+            return VideoCodec::Flac;
+        }
+        if matches!(
+            codec_id,
+            "A_PCM/INT/LIT" | "A_PCM/INT/BIG" | "A_PCM/FLOAT/IEEE"
+        ) {
+            return VideoCodec::Pcm;
+        }
         if codec_id == "S_TEXT/UTF8" {
             return VideoCodec::TimedText;
         }
@@ -452,6 +461,13 @@ fn stream_codec(track: &Track) -> VideoCodec {
             }
         }
         Some([b'O', b'p', b'u', b's']) => VideoCodec::Opus,
+        Some([b'f', b'L', b'a', b'C']) => VideoCodec::Flac,
+        Some(
+            [b's', b'o', b'w', b't']
+            | [b't', b'w', b'o', b's']
+            | [b'l', b'p', b'c', b'm']
+            | [b'f', b'l', b'3', b'2'],
+        ) => VideoCodec::Pcm,
         Some([b't', b'x', b'3', b'g']) => VideoCodec::TimedText,
         _ => VideoCodec::Unknown,
     }
@@ -491,6 +507,17 @@ fn audio_facts(track: &Track) -> (Option<u16>, Option<u32>) {
         return (u16::try_from(audio.channels).ok(), rate);
     }
     (None, None)
+}
+
+/// Narrows a validated Matroska `f64` sample rate to `u32`.
+// The range check makes the narrowing lossless for canonical integral rates.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn matroska_rate(rate: f64) -> Option<u32> {
+    if rate.is_finite() && rate > 0.0 && rate <= f64::from(u32::MAX) {
+        Some(rate as u32)
+    } else {
+        None
+    }
 }
 
 fn stream_info(track: &Track, ident_facts: Option<(u16, u32)>) -> VideoStreamInfo {
@@ -609,6 +636,202 @@ fn validate_vorbis_codec_private(data: &[u8]) -> Result<(u16, u32), String> {
     Ok((channels, rate))
 }
 
+/// Upper bound on a FLAC configuration blob held in memory while probing.
+const FLAC_CONFIG_CAP: usize = 1_048_576;
+
+/// Reads the authoritative channel/rate facts from a 34-byte FLAC STREAMINFO.
+fn flac_streaminfo_facts(streaminfo: &[u8]) -> Result<(u16, u32), String> {
+    let si: [u8; 34] = streaminfo
+        .try_into()
+        .map_err(|_| "FLAC STREAMINFO must be exactly 34 bytes".to_owned())?;
+    let min_block = u16::from_be_bytes([si[0], si[1]]);
+    let max_block = u16::from_be_bytes([si[2], si[3]]);
+    if min_block < 16 {
+        return Err("FLAC STREAMINFO declares min_block_size below 16".to_owned());
+    }
+    if max_block < min_block {
+        return Err("FLAC STREAMINFO max_block_size is below min_block_size".to_owned());
+    }
+    let packed = u64::from_be_bytes([
+        si[10], si[11], si[12], si[13], si[14], si[15], si[16], si[17],
+    ]);
+    let rate = u32::try_from((packed >> 44) & 0xF_FFFF)
+        .map_err(|_| "FLAC sample rate exceeds 32 bits".to_owned())?;
+    let channels = u16::try_from(((packed >> 41) & 0x7).saturating_add(1))
+        .map_err(|_| "FLAC channel count overflow".to_owned())?;
+    let bits = ((packed >> 36) & 0x1F).saturating_add(1);
+    if !(1..=655_350).contains(&rate) {
+        return Err(format!("FLAC STREAMINFO rate {rate} is out of range"));
+    }
+    if !(1..=8).contains(&channels) {
+        return Err(format!(
+            "FLAC STREAMINFO channel count {channels} is out of range"
+        ));
+    }
+    if !(4..=32).contains(&bits) {
+        return Err(format!("FLAC STREAMINFO bit depth {bits} is out of range"));
+    }
+    Ok((channels, rate))
+}
+
+/// Walks a bounded FLAC metadata block chain and returns its STREAMINFO body.
+/// `data` starts at the first metadata block header (after `fLaC` or `dfLa`'s
+/// version/flags).
+fn flac_streaminfo_from_metadata(data: &[u8]) -> Result<[u8; 34], String> {
+    if data.len() > FLAC_CONFIG_CAP {
+        return Err(format!("FLAC metadata exceeds {FLAC_CONFIG_CAP} bytes"));
+    }
+    let mut idx = 0_usize;
+    let mut streaminfo = None;
+    loop {
+        let header = *data
+            .get(idx)
+            .ok_or("truncated FLAC metadata block header")?;
+        idx = idx.checked_add(1).ok_or("FLAC metadata offset overflow")?;
+        let last = header & 0x80 != 0;
+        let kind = header & 0x7F;
+        let len_bytes = data
+            .get(idx..idx.saturating_add(3))
+            .ok_or("truncated FLAC metadata block length")?;
+        let len = usize::try_from(u32::from_be_bytes([
+            0,
+            len_bytes[0],
+            len_bytes[1],
+            len_bytes[2],
+        ]))
+        .map_err(|_| "FLAC metadata block length overflow")?;
+        idx = idx.checked_add(3).ok_or("FLAC metadata offset overflow")?;
+        let end = idx.checked_add(len).ok_or("FLAC metadata block overflow")?;
+        let body = data.get(idx..end).ok_or("truncated FLAC metadata block")?;
+        idx = end;
+        if streaminfo.is_none() {
+            if kind != 0 || len != 34 {
+                return Err("first FLAC metadata block must be a 34-byte STREAMINFO".to_owned());
+            }
+            let si: [u8; 34] = body
+                .try_into()
+                .map_err(|_| "invalid FLAC STREAMINFO length".to_owned())?;
+            flac_streaminfo_facts(&si)?;
+            streaminfo = Some(si);
+        }
+        if last {
+            break;
+        }
+    }
+    streaminfo.ok_or_else(|| "FLAC metadata has no STREAMINFO".to_owned())
+}
+
+/// Validates a Matroska `CodecPrivate` carrying FLAC headers.
+fn validate_flac_codec_private(data: &[u8]) -> Result<(u16, u32), String> {
+    if !data.starts_with(b"fLaC") {
+        return Err("A_FLAC CodecPrivate must start with 'fLaC'".to_owned());
+    }
+    flac_streaminfo_facts(&flac_streaminfo_from_metadata(&data[4..])?)
+}
+
+/// Finds a child ISOBMFF box body inside a raw sample entry.
+fn child_box(raw: &[u8], start: usize, fourcc: [u8; 4]) -> Option<&[u8]> {
+    let mut idx = start;
+    while idx.checked_add(8)? <= raw.len() {
+        let size = u32::from_be_bytes(raw.get(idx..idx.checked_add(4)?)?.try_into().ok()?);
+        let kind = raw.get(idx + 4..idx + 8)?;
+        let header = if size == 1 { 16 } else { 8 };
+        let body_start = idx.checked_add(header)?;
+        if body_start > raw.len() {
+            return None;
+        }
+        let body_len = if size == 0 {
+            raw.len().saturating_sub(body_start)
+        } else {
+            usize::try_from(size).ok()?.checked_sub(header)?
+        };
+        let body_end = body_start.checked_add(body_len)?;
+        if body_end > raw.len() {
+            return None;
+        }
+        if kind == fourcc {
+            return Some(&raw[body_start..body_end]);
+        }
+        if size == 0 {
+            return None;
+        }
+        idx = body_end;
+    }
+    None
+}
+
+/// Validates an MP4/MOV `dfLa` box body (full box + FLAC metadata chain).
+fn validate_dfla(data: &[u8]) -> Result<(u16, u32), String> {
+    if data.len() < 4 || data[..4] != [0, 0, 0, 0] {
+        return Err("dfLa must be version 0 with zero flags".to_owned());
+    }
+    flac_streaminfo_facts(&flac_streaminfo_from_metadata(&data[4..])?)
+}
+
+/// Finds an audio configuration box in an MP4/MOV sample entry, including
+/// inside a `QuickTime` `wave` wrapper.
+fn mp4_audio_config_box(entry: &containr::SampleEntry, fourcc: [u8; 4]) -> Option<&[u8]> {
+    let raw = &entry.raw;
+    let version = be_u16(raw.get(16..18)?)?;
+    let children_at = 8 + match version {
+        0 => 28,
+        1 => 44,
+        2 => 64,
+        _ => return None,
+    };
+    if let Some(body) = child_box(raw, children_at, fourcc) {
+        return Some(body);
+    }
+    child_box(child_box(raw, children_at, *b"wave")?, 0, fourcc)
+}
+
+/// Validates the fixed fields of an MP4/MOV PCM sample entry.
+fn validate_mp4_pcm_entry(entry: &containr::SampleEntry) -> Result<(), String> {
+    let audio = entry
+        .audio
+        .ok_or("PCM sample entry has no audio fields".to_owned())?;
+    if audio.channels == 0 {
+        return Err("PCM sample entry declares zero channels".to_owned());
+    }
+    if audio.sample_rate == 0 {
+        return Err("PCM sample entry declares zero sample rate".to_owned());
+    }
+    let raw = &entry.raw;
+    let version = be_u16(raw.get(16..18).ok_or("truncated PCM sample entry")?)
+        .ok_or("truncated PCM sample entry version")?;
+    let bits = match version {
+        0 | 1 => u32::from(
+            be_u16(raw.get(26..28).ok_or("truncated PCM sample entry")?)
+                .ok_or("truncated PCM sample size")?,
+        ),
+        2 => u32::from_be_bytes(
+            raw.get(56..60)
+                .ok_or("truncated PCM v2 sample entry")?
+                .try_into()
+                .map_err(|_| "invalid PCM v2 bits per channel".to_owned())?,
+        ),
+        other => return Err(format!("unsupported PCM sample entry version {other}")),
+    };
+    let is_float = entry.fourcc.0 == *b"fl32"
+        || (version == 2
+            && u32::from_be_bytes(
+                raw.get(60..64)
+                    .ok_or("truncated PCM v2 flags")?
+                    .try_into()
+                    .map_err(|_| "invalid PCM v2 flags".to_owned())?,
+            ) & 0x01
+                != 0);
+    let allowed: &[u32] = if is_float {
+        &[32, 64]
+    } else {
+        &[8, 16, 24, 32]
+    };
+    if !allowed.contains(&bits) {
+        return Err(format!("unsupported PCM bit depth {bits}"));
+    }
+    Ok(())
+}
+
 fn le_u16(bytes: &[u8]) -> Option<u16> {
     Some(u16::from_le_bytes(bytes.get(..2)?.try_into().ok()?))
 }
@@ -680,15 +903,29 @@ fn avi_video_codec(compression: [u8; 4], handler: Option<[u8; 4]>) -> VideoCodec
     VideoCodec::Unknown
 }
 
-fn avi_audio_codec(format_tag: u16, handler: Option<[u8; 4]>) -> VideoCodec {
+fn avi_audio_codec(
+    format_tag: u16,
+    bits: Option<u16>,
+    handler: Option<[u8; 4]>,
+) -> Result<VideoCodec, String> {
     if handler == Some(*b"OPUS") {
-        return VideoCodec::Opus;
+        return Ok(VideoCodec::Opus);
     }
     match format_tag {
-        0x00FF | 0x1600 | 0x1601 | 0x1602 | 0x706D => VideoCodec::Aac,
-        0x704F | 0x7361 => VideoCodec::Opus,
-        0x0055 => VideoCodec::Mp3,
-        _ => VideoCodec::Unknown,
+        0x00FF | 0x1600 | 0x1601 | 0x1602 | 0x706D => Ok(VideoCodec::Aac),
+        0x704F | 0x7361 => Ok(VideoCodec::Opus),
+        0x0055 => Ok(VideoCodec::Mp3),
+        0x0001 => match bits {
+            Some(8 | 16 | 24 | 32) => Ok(VideoCodec::Pcm),
+            Some(bits) => Err(format!("unsupported AVI PCM bit depth {bits}")),
+            None => Err("AVI PCM stream is missing wBitsPerSample".to_owned()),
+        },
+        0x0003 => match bits {
+            Some(32 | 64) => Ok(VideoCodec::Pcm),
+            Some(bits) => Err(format!("unsupported AVI IEEE-float bit depth {bits}")),
+            None => Err("AVI IEEE-float stream is missing wBitsPerSample".to_owned()),
+        },
+        _ => Ok(VideoCodec::Unknown),
     }
 }
 
@@ -736,8 +973,10 @@ fn probe_avi(
 
     let mut streams = Vec::with_capacity(strl_chunks.len());
     for chunk in strl_chunks {
-        if let Some(info) = avi_stream_info(chunk, &avih) {
-            streams.push(info);
+        match avi_stream_info(chunk, &avih) {
+            Ok(Some(info)) => streams.push(info),
+            Ok(None) => {}
+            Err(reason) => return Err(invalid_video(path, reason)),
         }
     }
     if streams.is_empty() {
@@ -747,7 +986,7 @@ fn probe_avi(
 }
 
 /// Converts one AVI `strl` list into a validated stream, ignoring unknown stream types.
-fn avi_stream_info(chunk: &[u8], avih: &AvihInfo) -> Option<VideoStreamInfo> {
+fn avi_stream_info(chunk: &[u8], avih: &AvihInfo) -> Result<Option<VideoStreamInfo>, String> {
     let mut fcc_type = [0_u8; 4];
     let mut handler = None;
     let mut scale = 1_u32;
@@ -769,7 +1008,7 @@ fn avi_stream_info(chunk: &[u8], avih: &AvihInfo) -> Option<VideoStreamInfo> {
     let is_video = fcc_type == *b"vids";
     let is_audio = fcc_type == *b"auds";
     if !is_video && !is_audio {
-        return None;
+        return Ok(None);
     }
     let (codec, width, height, channels, sample_rate) = if is_video {
         let mut width = None;
@@ -793,15 +1032,21 @@ fn avi_stream_info(chunk: &[u8], avih: &AvihInfo) -> Option<VideoStreamInfo> {
             .or((avih.height > 0).then_some(avih.height));
         (codec, width, height, None, None)
     } else {
-        let mut codec = avi_audio_codec(0, handler);
+        let bits = strf.and_then(|body| le_u16(body.get(14..16).unwrap_or(&[])));
+        let mut codec = avi_audio_codec(0, bits, handler)?;
         let mut channels = None;
         let mut sample_rate = None;
         if let Some(body) = strf
             && body.len() >= 16
         {
-            codec = avi_audio_codec(le_u16(&body[..2]).unwrap_or(0), handler);
+            codec = avi_audio_codec(le_u16(&body[..2]).unwrap_or(0), bits, handler)?;
             channels = le_u16(&body[2..4]);
             sample_rate = le_u32(&body[4..8]);
+        }
+        if codec == VideoCodec::Pcm
+            && (channels.is_none_or(|v| v == 0) || sample_rate.is_none_or(|v| v == 0))
+        {
+            return Err("AVI PCM stream declares zero channels or sample rate".to_owned());
         }
         (codec, None, None, channels, sample_rate)
     };
@@ -821,7 +1066,7 @@ fn avi_stream_info(chunk: &[u8], avih: &AvihInfo) -> Option<VideoStreamInfo> {
     } else {
         (1, 1)
     };
-    Some(VideoStreamInfo::new(
+    Ok(Some(VideoStreamInfo::new(
         codec,
         if is_video {
             VideoStreamKind::Video
@@ -836,7 +1081,7 @@ fn avi_stream_info(chunk: &[u8], avih: &AvihInfo) -> Option<VideoStreamInfo> {
         u32::try_from(timebase_den).unwrap_or(u32::MAX),
         duration,
         None,
-    ))
+    )))
 }
 
 fn le_i32_unsigned(bytes: &[u8]) -> Option<u32> {
@@ -1611,6 +1856,8 @@ fn probe_webp_video(
     ])
 }
 
+// Each container family validates its codec-specific headers in one pass.
+#[allow(clippy::too_many_lines)]
 fn probe_containr(
     path: &Path,
     format: VideoContainerFormat,
@@ -1623,11 +1870,33 @@ fn probe_containr(
             let reader = WindowedFileReader::from_file(file, file_len);
             let demuxer = containr::mp4::Demuxer::open(reader)
                 .map_err(|err| invalid_video(path, format!("container parse failed: {err}")))?;
-            demuxer
-                .tracks()
-                .iter()
-                .map(|track| stream_info(track, None))
-                .collect::<Vec<_>>()
+            let mut streams = Vec::new();
+            for track in demuxer.tracks() {
+                // `containr` has no `dfLa`/PCM codec-config variant, so validate
+                // the raw sample entry here at the single system boundary.
+                let facts = match stream_codec(track) {
+                    VideoCodec::Flac => {
+                        let entry = track
+                            .sample_entry()
+                            .ok_or_else(|| invalid_video(path, "FLAC track has no sample entry"))?;
+                        let dfla = mp4_audio_config_box(entry, *b"dfLa").ok_or_else(|| {
+                            invalid_video(path, "FLAC sample entry is missing dfLa")
+                        })?;
+                        Some(validate_dfla(dfla).map_err(|reason| invalid_video(path, reason))?)
+                    }
+                    VideoCodec::Pcm => {
+                        let entry = track
+                            .sample_entry()
+                            .ok_or_else(|| invalid_video(path, "PCM track has no sample entry"))?;
+                        validate_mp4_pcm_entry(entry)
+                            .map_err(|reason| invalid_video(path, reason))?;
+                        None
+                    }
+                    _ => None,
+                };
+                streams.push(stream_info(track, facts));
+            }
+            streams
         }
         VideoContainerFormat::Mkv | VideoContainerFormat::Webm => {
             let reader = WindowedFileReader::from_file(file, file_len);
@@ -1638,20 +1907,61 @@ fn probe_containr(
             }
             let mut streams = Vec::new();
             for track in demuxer.tracks() {
-                let ident_facts = if track.codec_id() == Some("A_VORBIS") {
-                    let private = track
-                        .matroska
-                        .as_ref()
-                        .and_then(|mkv| mkv.codec_private.as_deref())
-                        .ok_or_else(|| {
-                            invalid_video(path, "A_VORBIS track is missing CodecPrivate")
+                let codec_id = track.codec_id();
+                let ident_facts = match codec_id {
+                    Some("A_VORBIS") => {
+                        let private = track
+                            .matroska
+                            .as_ref()
+                            .and_then(|mkv| mkv.codec_private.as_deref())
+                            .ok_or_else(|| {
+                                invalid_video(path, "A_VORBIS track is missing CodecPrivate")
+                            })?;
+                        Some(
+                            validate_vorbis_codec_private(private)
+                                .map_err(|reason| invalid_video(path, reason))?,
+                        )
+                    }
+                    Some("A_FLAC") => {
+                        let private = track
+                            .matroska
+                            .as_ref()
+                            .and_then(|mkv| mkv.codec_private.as_deref())
+                            .ok_or_else(|| {
+                                invalid_video(path, "A_FLAC track is missing CodecPrivate")
+                            })?;
+                        Some(
+                            validate_flac_codec_private(private)
+                                .map_err(|reason| invalid_video(path, reason))?,
+                        )
+                    }
+                    Some(id) if id.starts_with("A_PCM/") => {
+                        let audio = track
+                            .matroska
+                            .as_ref()
+                            .and_then(|mkv| mkv.audio.as_ref())
+                            .ok_or_else(|| invalid_video(path, "A_PCM track is missing Audio"))?;
+                        let bits = audio.bit_depth.unwrap_or(0);
+                        let float = id == "A_PCM/FLOAT/IEEE";
+                        let allowed: &[u64] = if float { &[32, 64] } else { &[8, 16, 24, 32] };
+                        if !allowed.contains(&bits) {
+                            return Err(invalid_video(
+                                path,
+                                format!("unsupported A_PCM bit depth {bits}"),
+                            ));
+                        }
+                        if audio.channels == 0 {
+                            return Err(invalid_video(path, "A_PCM track declares zero channels"));
+                        }
+                        let rate = matroska_rate(audio.sampling_frequency).ok_or_else(|| {
+                            invalid_video(path, "A_PCM track has invalid sample rate")
                         })?;
-                    Some(
-                        validate_vorbis_codec_private(private)
-                            .map_err(|reason| invalid_video(path, reason))?,
-                    )
-                } else {
-                    None
+                        let channels = u16::try_from(audio.channels).map_err(|_| {
+                            invalid_video(path, "A_PCM channel count exceeds 65535")
+                        })?;
+                        Some((channels, rate))
+                    }
+                    _ => None,
                 };
                 streams.push(stream_info(track, ident_facts));
             }
@@ -1986,6 +2296,29 @@ pub enum RequestedAudioCodec {
     Copy,
     Encode(TargetAudioCodec),
     Drop,
+}
+
+/// Parses the raw `--acodec` value at the system boundary. Codec names and the
+/// copy/drop aliases are recognised here so no other layer re-parses CLI text.
+///
+/// # Errors
+///
+/// Returns [`ProbeError::InvalidVideo`] with an empty path when `raw` names no
+/// known audio codec.
+pub fn parse_requested_audio_codec(raw: &str) -> Result<RequestedAudioCodec, ProbeError> {
+    match raw.to_ascii_lowercase().as_str() {
+        "copy" => Ok(RequestedAudioCodec::Copy),
+        "none" => Ok(RequestedAudioCodec::Drop),
+        _ => match TargetAudioCodec::from_name(raw) {
+            Some(codec) => Ok(RequestedAudioCodec::Encode(codec)),
+            None => Err(ProbeError::InvalidVideo {
+                path: PathBuf::new(),
+                reason: format!(
+                    "unknown audio codec '{raw}' (expected aac, opus, mp3, vorbis, flac, pcm, none, or copy)"
+                ),
+            }),
+        },
+    }
 }
 
 /// Rate-control and audio overrides for a transcode batch. `None` rate control
@@ -2438,6 +2771,7 @@ mod tests {
     struct AudioFacts {
         channels: Option<u64>,
         sampling_frequency: Option<f64>,
+        bit_depth: Option<u64>,
     }
 
     fn mkv_with_vorbis(private: &[u8], audio: Option<AudioFacts>) -> Vec<u8> {
@@ -2505,6 +2839,7 @@ mod tests {
                 AudioFacts {
                     channels: Some(2),
                     sampling_frequency: None,
+                    bit_depth: None,
                 },
                 2,
                 44_100,
@@ -2514,6 +2849,7 @@ mod tests {
                 AudioFacts {
                     channels: None,
                     sampling_frequency: Some(44_100.0),
+                    bit_depth: None,
                 },
                 2,
                 44_100,
@@ -2523,6 +2859,7 @@ mod tests {
                 AudioFacts {
                     channels: Some(6),
                     sampling_frequency: Some(48_000.0),
+                    bit_depth: None,
                 },
                 6,
                 48_000,
@@ -4217,6 +4554,254 @@ mod tests {
             err_contains(&opus, "not supported by Opus"),
             "unexpected codec-limit error: {opus:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_requested_audio_codec_covers_every_alias() {
+        assert!(matches!(
+            parse_requested_audio_codec("copy"),
+            Ok(RequestedAudioCodec::Copy)
+        ));
+        assert!(matches!(
+            parse_requested_audio_codec("NONE"),
+            Ok(RequestedAudioCodec::Drop)
+        ));
+        assert!(matches!(
+            parse_requested_audio_codec("Flac"),
+            Ok(RequestedAudioCodec::Encode(TargetAudioCodec::Flac))
+        ));
+        assert!(matches!(
+            parse_requested_audio_codec("pcm"),
+            Ok(RequestedAudioCodec::Encode(TargetAudioCodec::Pcm))
+        ));
+        assert!(parse_requested_audio_codec("vp8").is_err());
+    }
+
+    fn flac_streaminfo(rate: u32, channels: u16, bits: u8) -> [u8; 34] {
+        let mut si = [0_u8; 34];
+        si[0..2].copy_from_slice(&4096_u16.to_be_bytes());
+        si[2..4].copy_from_slice(&4096_u16.to_be_bytes());
+        let packed =
+            (u64::from(rate) << 44) | (u64::from(channels - 1) << 41) | (u64::from(bits - 1) << 36);
+        si[10..18].copy_from_slice(&packed.to_be_bytes());
+        si
+    }
+
+    fn flac_codec_private(si: &[u8; 34]) -> Vec<u8> {
+        let mut private = b"fLaC".to_vec();
+        private.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]);
+        private.extend_from_slice(si);
+        private
+    }
+
+    fn mkv_with_audio_codec(codec_id: &[u8], private: &[u8], audio: Option<AudioFacts>) -> Vec<u8> {
+        let mut header = Vec::new();
+        header.extend(ebml_uint(0x4286, 1));
+        header.extend(ebml_uint(0x42F2, 4));
+        header.extend(ebml_uint(0x42F3, 8));
+        header.extend(ebml_el(0x4282, b"matroska"));
+        header.extend(ebml_uint(0x4287, 4));
+        header.extend(ebml_uint(0x4285, 2));
+        let mut segment = Vec::new();
+        segment.extend(ebml_el_vint(
+            0x1549_A966,
+            &ebml_uint(0x002A_D7B1, 1_000_000),
+        ));
+        let mut entry = Vec::new();
+        entry.extend(ebml_uint(0xD7, 1));
+        entry.extend(ebml_uint(0x73C5, 1));
+        entry.extend(ebml_uint(0x83, 2));
+        entry.extend(ebml_el(0x86, codec_id));
+        if !private.is_empty() {
+            entry.extend(ebml_el_vint(0x63A2, private));
+        }
+        if let Some(audio) = audio {
+            let mut audio_body = Vec::new();
+            if let Some(channels) = audio.channels {
+                audio_body.extend(ebml_uint(0x9F, channels));
+            }
+            if let Some(rate) = audio.sampling_frequency {
+                audio_body.extend(ebml_el(0xB5, &rate.to_be_bytes()));
+            }
+            if let Some(depth) = audio.bit_depth {
+                audio_body.extend(ebml_uint(0x6264, depth));
+            }
+            entry.extend(ebml_el_vint(0xE1, &audio_body));
+        }
+        segment.extend(ebml_el_vint(0x1654_AE6B, &ebml_el_vint(0xAE, &entry)));
+        let mut bytes = ebml_el_vint(0x1A45_DFA3, &header);
+        bytes.extend(ebml_el_vint(0x1853_8067, &segment));
+        bytes
+    }
+
+    #[test]
+    fn probe_accepts_flac_and_uses_streaminfo_facts() -> Result<(), Box<dyn std::error::Error>> {
+        let si = flac_streaminfo(44_100, 2, 16);
+        let bytes = mkv_with_audio_codec(b"A_FLAC", &flac_codec_private(&si), None);
+        let path = temp_file("flac-ok", &bytes)?;
+        let probed = probe_video(&path)?;
+        let audio = probed
+            .streams
+            .iter()
+            .find(|stream| stream.codec() == VideoCodec::Flac)
+            .ok_or("no FLAC stream was probed")?;
+        assert_eq!(audio.channels().map(NonZeroU16::get), Some(2));
+        assert_eq!(
+            audio.sample_rate().map(std::num::NonZeroU32::get),
+            Some(44_100)
+        );
+        fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn probe_rejects_malformed_flac_codec_private() -> Result<(), Box<dyn std::error::Error>> {
+        let si = flac_streaminfo(0, 2, 16);
+        let mut bad_rate = flac_codec_private(&si);
+        let path = temp_file(
+            "flac-bad-rate",
+            &mkv_with_audio_codec(b"A_FLAC", &bad_rate, None),
+        )?;
+        assert!(err_contains(&probe_video(&path), "rate"));
+        fs::remove_file(&path)?;
+
+        bad_rate[4] = 0x01; // not a STREAMINFO block
+        let path = temp_file(
+            "flac-bad-block",
+            &mkv_with_audio_codec(b"A_FLAC", &bad_rate, None),
+        )?;
+        assert!(err_contains(&probe_video(&path), "STREAMINFO"));
+        fs::remove_file(&path)?;
+
+        let path = temp_file("flac-missing", &mkv_with_audio_codec(b"A_FLAC", &[], None))?;
+        assert!(err_contains(&probe_video(&path), "CodecPrivate"));
+        fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mp4_dfla_and_pcm_entry_helpers_validate_headers() -> Result<(), Box<dyn std::error::Error>> {
+        let si = flac_streaminfo(48_000, 2, 16);
+        let mut dfla = vec![0_u8; 4];
+        dfla.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]);
+        dfla.extend_from_slice(&si);
+        assert_eq!(validate_dfla(&dfla).ok(), Some((2_u16, 48_000_u32)));
+        let mut bad = dfla.clone();
+        bad[0] = 1;
+        assert!(validate_dfla(&bad).is_err());
+        bad[0] = 0;
+        bad[4] = 0x01;
+        assert!(validate_dfla(&bad).is_err());
+
+        // A version 0 audio sample entry with a dfLa child box.
+        let mut child = u32::try_from(dfla.len() + 8)
+            .map_err(|_| "test box too large")?
+            .to_be_bytes()
+            .to_vec();
+        child.extend_from_slice(b"dfLa");
+        child.extend_from_slice(&dfla);
+        let mut body = vec![0_u8; 28];
+        body[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        body[16..18].copy_from_slice(&2_u16.to_be_bytes());
+        body[18..20].copy_from_slice(&16_u16.to_be_bytes());
+        body[24..28].copy_from_slice(&(48_000_u32 << 16).to_be_bytes());
+        let mut raw = u32::try_from(8 + body.len() + child.len())
+            .map_err(|_| "test entry too large")?
+            .to_be_bytes()
+            .to_vec();
+        raw.extend_from_slice(b"fLaC");
+        raw.extend_from_slice(&body);
+        raw.extend_from_slice(&child);
+        let entry = containr::SampleEntry {
+            fourcc: containr::FourCc(*b"fLaC"),
+            raw,
+            data_reference_index: 1,
+            codec_config: None,
+            video: None,
+            audio: Some(containr::AudioInfo {
+                channels: 2,
+                sample_size: 16,
+                sample_rate: 48_000,
+            }),
+        };
+        let found = mp4_audio_config_box(&entry, *b"dfLa").ok_or("missing dfLa");
+        assert!(found.is_ok(), "dfLa must be found in the sample entry");
+        assert_eq!(validate_dfla(found?).ok(), Some((2_u16, 48_000_u32)));
+        assert!(validate_mp4_pcm_entry(&entry).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn avi_probe_accepts_only_supported_pcm_bit_depths() {
+        let strl = |tag: u16, channels: u16, rate: u32, bits: u16| -> Vec<u8> {
+            let mut out = b"strh".to_vec();
+            out.extend_from_slice(&36_u32.to_le_bytes());
+            out.extend_from_slice(b"auds");
+            out.extend_from_slice(&[0; 32]);
+            out.extend_from_slice(b"strf");
+            out.extend_from_slice(&16_u32.to_le_bytes());
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&channels.to_le_bytes());
+            out.extend_from_slice(&rate.to_le_bytes());
+            out.extend_from_slice(&[0; 6]);
+            out.extend_from_slice(&bits.to_le_bytes());
+            out
+        };
+        for (tag, bits, accepted) in [
+            (0x0001, 8, true),
+            (0x0001, 16, true),
+            (0x0001, 24, true),
+            (0x0001, 32, true),
+            (0x0001, 20, false),
+            (0x0003, 32, true),
+            (0x0003, 64, true),
+            (0x0003, 16, false),
+        ] {
+            let result = avi_stream_info(&strl(tag, 2, 48_000, bits), &AvihInfo::default());
+            assert_eq!(
+                result.as_ref().is_ok_and(|info| info
+                    .as_ref()
+                    .is_some_and(|info| info.codec() == VideoCodec::Pcm)),
+                accepted,
+                "AVI tag {tag:#06x} at {bits} bits"
+            );
+        }
+        assert!(avi_stream_info(&strl(0x0001, 0, 48_000, 16), &AvihInfo::default()).is_err());
+        assert!(avi_stream_info(&strl(0x0001, 2, 0, 16), &AvihInfo::default()).is_err());
+    }
+
+    #[test]
+    fn probe_accepts_and_rejects_matroska_pcm_bit_depths() -> Result<(), Box<dyn std::error::Error>>
+    {
+        for (codec_id, bits, accepted) in [
+            ("A_PCM/INT/LIT", 8, true),
+            ("A_PCM/INT/LIT", 16, true),
+            ("A_PCM/INT/LIT", 24, true),
+            ("A_PCM/INT/LIT", 32, true),
+            ("A_PCM/INT/LIT", 20, false),
+            ("A_PCM/FLOAT/IEEE", 32, true),
+            ("A_PCM/FLOAT/IEEE", 64, true),
+            ("A_PCM/FLOAT/IEEE", 16, false),
+        ] {
+            let audio = AudioFacts {
+                channels: Some(2),
+                sampling_frequency: Some(48_000.0),
+                bit_depth: Some(bits),
+            };
+            let bytes = mkv_with_audio_codec(codec_id.as_bytes(), &[], Some(audio));
+            let path = temp_file("mkv-pcm", &bytes)?;
+            let result = probe_video(&path);
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "{codec_id} at {bits} bits: {result:?}"
+            );
+            if let Ok(probed) = result {
+                assert!(probed.streams.iter().any(|s| s.codec() == VideoCodec::Pcm));
+            }
+            fs::remove_file(&path)?;
+        }
         Ok(())
     }
 }

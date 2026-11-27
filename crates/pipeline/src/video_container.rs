@@ -19,11 +19,14 @@ use fastconv_domain::{VideoCodec, VideoContainerFormat};
 
 use crate::PipelineError;
 use crate::video_bitstream::{
-    annex_b_to_avcc, annex_b_to_hvcc, avcc_to_annex_b, build_aac_esds, build_mp3_mp4a_sample_entry,
-    build_vp09_sample_entry, dops_to_opus_head, extract_av1c_from_obu, extract_avcc_from_annex_b,
-    extract_hvcc_from_annex_b, hvcc_to_annex_b, is_av1_keyframe, is_h264_keyframe_annex_b,
-    is_hevc_keyframe_annex_b, opus_head_to_dops, unpack_xiph_laced_vorbis_headers,
-    vorbis_ident_info, vp9_color_from_keyframe,
+    PcmFormat, annex_b_to_avcc, annex_b_to_hvcc, avcc_to_annex_b, build_aac_esds,
+    build_flac_mp4_sample_entry, build_mkv_flac_codec_private, build_mp3_mp4a_sample_entry,
+    build_pcm_mp4_sample_entry, build_vp09_sample_entry, dops_to_opus_head, extract_av1c_from_obu,
+    extract_avcc_from_annex_b, extract_dfla_from_sample_entry, extract_flac_streaminfo_from_dfla,
+    extract_flac_streaminfo_from_mkv_codec_private, extract_hvcc_from_annex_b, find_child_box,
+    hvcc_to_annex_b, is_av1_keyframe, is_h264_keyframe_annex_b, is_hevc_keyframe_annex_b,
+    opus_head_to_dops, parse_flac_streaminfo, unpack_xiph_laced_vorbis_headers, vorbis_ident_info,
+    vp9_color_from_keyframe,
 };
 
 /// Canonical timestamp unit: exact microseconds, i.e. one tick is 1 µs and
@@ -76,6 +79,8 @@ pub(crate) struct ContainerTrack {
     pub(crate) timescale: u32,
     /// Optional explicit presentation window from a source edit list.
     pub(crate) presentation_edit: Option<TrackPresentation>,
+    /// Exact PCM sample representation. `None` for every compressed codec.
+    pub(crate) pcm_format: Option<crate::video_bitstream::PcmFormat>,
 }
 
 /// One coded frame with microsecond timestamps.
@@ -332,6 +337,8 @@ fn mp4_codec(track: &Track) -> Option<VideoCodec> {
             b"av01" => Some(VideoCodec::Av1),
             b"vp09" => Some(VideoCodec::Vp9),
             b"Opus" => Some(VideoCodec::Opus),
+            b"fLaC" => Some(VideoCodec::Flac),
+            b"sowt" | b"twos" | b"lpcm" | b"fl32" => Some(VideoCodec::Pcm),
             b".mp3" => Some(VideoCodec::Mp3),
             b"mp4a" => {
                 let object = track
@@ -357,6 +364,8 @@ fn mp4_codec(track: &Track) -> Option<VideoCodec> {
         "A_AAC" => Some(VideoCodec::Aac),
         "A_OPUS" => Some(VideoCodec::Opus),
         "A_VORBIS" => Some(VideoCodec::Vorbis),
+        "A_FLAC" => Some(VideoCodec::Flac),
+        "A_PCM/INT/LIT" | "A_PCM/INT/BIG" | "A_PCM/FLOAT/IEEE" => Some(VideoCodec::Pcm),
         "A_MPEG/L3" => Some(VideoCodec::Mp3),
         _ => None,
     }
@@ -382,6 +391,8 @@ fn mkv_codec(codec_id: &str) -> Option<VideoCodec> {
         "A_AAC" => Some(VideoCodec::Aac),
         "A_OPUS" => Some(VideoCodec::Opus),
         "A_VORBIS" => Some(VideoCodec::Vorbis),
+        "A_FLAC" => Some(VideoCodec::Flac),
+        "A_PCM/INT/LIT" | "A_PCM/INT/BIG" | "A_PCM/FLOAT/IEEE" => Some(VideoCodec::Pcm),
         "A_MPEG/L3" => Some(VideoCodec::Mp3),
         _ => None,
     }
@@ -574,8 +585,146 @@ fn canonical_config(
         VideoCodec::Vorbis => unpack_xiph_laced_vorbis_headers(raw)
             .map(|_| raw.to_vec())
             .map_err(|reason| container_error(path, reason)),
-        VideoCodec::Mp3 => Ok(Vec::new()),
+        VideoCodec::Flac => {
+            let entry = track
+                .sample_entry()
+                .ok_or_else(|| container_error(path, "FLAC track has no sample entry"))?;
+            let dfla = extract_dfla_from_sample_entry(&entry.raw)
+                .map_err(|reason| container_error(path, reason))?;
+            let streaminfo = extract_flac_streaminfo_from_dfla(&dfla)
+                .map_err(|reason| container_error(path, reason))?;
+            parse_flac_streaminfo(&streaminfo).map_err(|reason| container_error(path, reason))?;
+            Ok(streaminfo.to_vec())
+        }
+        // The exact PCM/MP3 representation is stored in the track facts, not config.
+        VideoCodec::Pcm | VideoCodec::Mp3 => Ok(Vec::new()),
         _ => Err(container_error(path, format!("unsupported codec {codec}"))),
+    }
+}
+
+/// Reads the exact PCM representation from an MP4/MOV audio sample entry.
+fn mp4_pcm_format(track: &Track, path: &Path) -> Result<PcmFormat, PipelineError> {
+    let error = |reason: &str| container_error(path, reason);
+    let entry = track
+        .sample_entry()
+        .ok_or_else(|| error("PCM track has no sample entry"))?;
+    let raw = &entry.raw;
+    let version_bytes = raw
+        .get(16..18)
+        .ok_or_else(|| error("truncated PCM sample entry"))?;
+    let version = u16::from_be_bytes([version_bytes[0], version_bytes[1]]);
+    let fourcc = entry.fourcc.0;
+    let signed = |bits: u16, big: bool| match (bits, big) {
+        (8, _) => Some(PcmFormat::U8),
+        (16, false) => Some(PcmFormat::S16Le),
+        (16, true) => Some(PcmFormat::S16Be),
+        (24, false) => Some(PcmFormat::S24Le),
+        (24, true) => Some(PcmFormat::S24Be),
+        (32, false) => Some(PcmFormat::S32Le),
+        (32, true) => Some(PcmFormat::S32Be),
+        _ => None,
+    };
+    match &fourcc {
+        b"sowt" => Ok(PcmFormat::S16Le),
+        b"twos" => Ok(PcmFormat::S16Be),
+        b"fl32" => {
+            let start = 8 + match version {
+                0 => 28,
+                1 => 44,
+                2 => 64,
+                other => return Err(error(&format!("unsupported PCM version {other}"))),
+            };
+            // QuickTime `enda` carries a 2-byte big-endian `littleEndian` flag:
+            // non-zero means little-endian, zero or absent means big-endian.
+            let enda = find_child_box(raw, start, *b"enda").or_else(|| {
+                find_child_box(raw, start, *b"wave")
+                    .and_then(|wave| find_child_box(wave, 0, *b"enda"))
+            });
+            let little = match enda {
+                Some(body) if body.len() >= 2 => u16::from_be_bytes([body[0], body[1]]) != 0,
+                _ => false,
+            };
+            if little {
+                Ok(PcmFormat::F32Le)
+            } else {
+                Ok(PcmFormat::F32Be)
+            }
+        }
+        b"lpcm" => {
+            let (bits, flags) = match version {
+                0 | 1 => {
+                    let bytes = raw
+                        .get(26..28)
+                        .ok_or_else(|| error("truncated PCM sample size"))?;
+                    (u16::from_be_bytes([bytes[0], bytes[1]]), 0_u32)
+                }
+                2 => {
+                    let bytes = raw
+                        .get(56..64)
+                        .ok_or_else(|| error("truncated PCM v2 fields"))?;
+                    (
+                        u16::try_from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                            .map_err(|_| error("PCM v2 bit depth exceeds 65535"))?,
+                        u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+                    )
+                }
+                other => return Err(error(&format!("unsupported PCM version {other}"))),
+            };
+            let big = flags & 0x02 != 0;
+            if flags & 0x01 != 0 {
+                match (bits, big) {
+                    (32, false) => Ok(PcmFormat::F32Le),
+                    (32, true) => Ok(PcmFormat::F32Be),
+                    (64, false) => Ok(PcmFormat::F64Le),
+                    _ => Err(error(&format!(
+                        "unsupported IEEE-float PCM bit depth {bits}"
+                    ))),
+                }
+            } else {
+                signed(bits, big).ok_or_else(|| error(&format!("unsupported PCM bit depth {bits}")))
+            }
+        }
+        _ => Err(error(&format!(
+            "unrecognised PCM sample entry {}",
+            String::from_utf8_lossy(&fourcc)
+        ))),
+    }
+}
+
+/// Reads the exact PCM representation from a Matroska `A_PCM` track.
+fn mkv_pcm_format(
+    codec_id: &str,
+    bit_depth: Option<u64>,
+    path: &Path,
+) -> Result<PcmFormat, PipelineError> {
+    let error = |reason: &str| container_error(path, reason);
+    let bits = u16::try_from(bit_depth.unwrap_or(0))
+        .map_err(|_| error("Matroska PCM bit depth exceeds 65535"))?;
+    match codec_id {
+        "A_PCM/INT/LIT" => match bits {
+            8 => Ok(PcmFormat::U8),
+            16 => Ok(PcmFormat::S16Le),
+            24 => Ok(PcmFormat::S24Le),
+            32 => Ok(PcmFormat::S32Le),
+            _ => Err(error(&format!("unsupported Matroska PCM bit depth {bits}"))),
+        },
+        "A_PCM/INT/BIG" => match bits {
+            8 => Ok(PcmFormat::U8),
+            16 => Ok(PcmFormat::S16Be),
+            24 => Ok(PcmFormat::S24Be),
+            32 => Ok(PcmFormat::S32Be),
+            _ => Err(error(&format!("unsupported Matroska PCM bit depth {bits}"))),
+        },
+        "A_PCM/FLOAT/IEEE" => match bits {
+            32 => Ok(PcmFormat::F32Le),
+            64 => Ok(PcmFormat::F64Le),
+            _ => Err(error(&format!(
+                "unsupported Matroska float bit depth {bits}"
+            ))),
+        },
+        _ => Err(error(&format!(
+            "unrecognised Matroska PCM codec {codec_id}"
+        ))),
     }
 }
 
@@ -627,6 +776,13 @@ fn mp4_track_edit(track: &Track) -> Option<(i64, TrackPresentation)> {
 }
 
 fn demux_mp4(path: &Path) -> Result<ContainerMedia, PipelineError> {
+    demux_mp4_with_format(path, VideoContainerFormat::Mp4)
+}
+
+fn demux_mp4_with_format(
+    path: &Path,
+    format: VideoContainerFormat,
+) -> Result<ContainerMedia, PipelineError> {
     let reader = WindowedFileReader::open(path).map_err(|source| PipelineError::Io {
         path: path.to_path_buf(),
         source,
@@ -641,6 +797,11 @@ fn demux_mp4(path: &Path) -> Result<ContainerMedia, PipelineError> {
             continue;
         };
         let config = canonical_config(track, codec, path)?;
+        let pcm_format = if codec == VideoCodec::Pcm {
+            Some(mp4_pcm_format(track, path)?)
+        } else {
+            None
+        };
         let (width, height) = track
             .video()
             .map_or((None, None), |v| (Some(v.width), Some(v.height)));
@@ -665,6 +826,7 @@ fn demux_mp4(path: &Path) -> Result<ContainerMedia, PipelineError> {
             config,
             timescale: US_TIMESCALE,
             presentation_edit,
+            pcm_format,
         });
     }
     if media.tracks.is_empty() {
@@ -697,7 +859,78 @@ fn demux_mp4(path: &Path) -> Result<ContainerMedia, PipelineError> {
             data: buf.clone(),
         });
     }
+    if format == VideoContainerFormat::Mov {
+        coalesce_mov_pcm(&mut media, path)?;
+    }
     Ok(media)
+}
+
+/// MOV PCM stores one decoded frame per MP4 sample. Coalesce contiguous frames
+/// into bounded packets so a 48 kHz track does not allocate 48k packets/sec.
+fn coalesce_mov_pcm(media: &mut ContainerMedia, path: &Path) -> Result<(), PipelineError> {
+    const MAX_FRAMES_PER_PACKET: usize = 1_024;
+    let pcm_tracks: Vec<usize> = media
+        .tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, track)| track.codec == VideoCodec::Pcm)
+        .map(|(index, _)| index)
+        .collect();
+    if pcm_tracks.is_empty() {
+        return Ok(());
+    }
+    let frame_bytes: Vec<usize> = media
+        .tracks
+        .iter()
+        .map(|track| {
+            usize::from(track.pcm_format.map_or(2, PcmFormat::bytes_per_sample))
+                .saturating_mul(usize::from(track.channels.unwrap_or(2).max(1)))
+        })
+        .collect();
+    let mut pending: Vec<Option<ContainerPacket>> = vec![None; media.tracks.len()];
+    let mut frames: Vec<usize> = vec![0; media.tracks.len()];
+    let mut out = Vec::with_capacity(media.packets.len());
+    for packet in std::mem::take(&mut media.packets) {
+        let index = packet.track;
+        if !pcm_tracks.contains(&index) {
+            if let Some(previous) = pending[index].take() {
+                out.push(previous);
+                frames[index] = 0;
+            }
+            out.push(packet);
+            continue;
+        }
+        let bytes = frame_bytes[index].max(1);
+        if packet.data.is_empty() || packet.data.len() % bytes != 0 {
+            return Err(container_error(
+                path,
+                format!("MOV PCM packet is not a whole number of frames ({bytes} bytes)"),
+            ));
+        }
+        let count = packet.data.len() / bytes;
+        let flush = pending[index].as_ref().is_some_and(|previous| {
+            previous
+                .pts
+                .saturating_add(i64::try_from(previous.duration).unwrap_or(i64::MAX))
+                != packet.pts
+                || frames[index].saturating_add(count) > MAX_FRAMES_PER_PACKET
+        });
+        if flush && let Some(previous) = pending[index].take() {
+            out.push(previous);
+            frames[index] = 0;
+        }
+        match pending[index].as_mut() {
+            Some(previous) => {
+                previous.data.extend_from_slice(&packet.data);
+                previous.duration = previous.duration.saturating_add(packet.duration);
+            }
+            None => pending[index] = Some(packet),
+        }
+        frames[index] = frames[index].saturating_add(count);
+    }
+    out.extend(pending.into_iter().flatten());
+    media.packets = out;
+    Ok(())
 }
 
 // Track facts and packet timestamps come from one demuxer walk; extracting
@@ -735,7 +968,24 @@ fn demux_mkv(path: &Path) -> Result<ContainerMedia, PipelineError> {
                 })?;
                 config
             }
+            VideoCodec::Flac => {
+                let si =
+                    extract_flac_streaminfo_from_mkv_codec_private(&config).map_err(|reason| {
+                        container_error(path, format!("invalid A_FLAC CodecPrivate: {reason}"))
+                    })?;
+                si.to_vec()
+            }
             _ => config,
+        };
+        let pcm_format = if codec == VideoCodec::Pcm {
+            let bits = track
+                .matroska
+                .as_ref()
+                .and_then(|mkv| mkv.audio.as_ref())
+                .and_then(|audio| audio.bit_depth);
+            Some(mkv_pcm_format(codec_id, bits, path)?)
+        } else {
+            None
         };
         let (width, height) = track
             .matroska
@@ -765,6 +1015,18 @@ fn demux_mkv(path: &Path) -> Result<ContainerMedia, PipelineError> {
             channels = channels.or(Some(ident_channels));
             sample_rate = sample_rate.or(Some(ident_rate));
         }
+        // Matroska's default Audio children (1 channel, 8000 Hz) must not mask
+        // the authoritative STREAMINFO values.
+        if codec == VideoCodec::Flac
+            && let Ok((flac_channels, flac_rate, _)) = parse_flac_streaminfo(&config)
+        {
+            if channels.is_none_or(|value| value == 1) {
+                channels = Some(flac_channels);
+            }
+            if sample_rate.is_none_or(|value| value == 8_000) {
+                sample_rate = Some(flac_rate);
+            }
+        }
         id_to_index.insert(track.id, media.tracks.len());
         media.tracks.push(ContainerTrack {
             codec,
@@ -775,6 +1037,7 @@ fn demux_mkv(path: &Path) -> Result<ContainerMedia, PipelineError> {
             config,
             timescale: US_TIMESCALE,
             presentation_edit: None,
+            pcm_format,
         });
     }
     if media.tracks.is_empty() {
@@ -899,7 +1162,8 @@ pub(crate) fn demux_video(
     format: VideoContainerFormat,
 ) -> Result<ContainerMedia, PipelineError> {
     match format {
-        VideoContainerFormat::Mp4 | VideoContainerFormat::Mov => demux_mp4(path),
+        VideoContainerFormat::Mp4 => demux_mp4(path),
+        VideoContainerFormat::Mov => demux_mp4_with_format(path, VideoContainerFormat::Mov),
         VideoContainerFormat::Mkv | VideoContainerFormat::Webm => demux_mkv(path),
         VideoContainerFormat::Avi => crate::avi::demux_avi(path),
         VideoContainerFormat::Ts => crate::mpegts::demux_ts(path),
@@ -1157,6 +1421,45 @@ fn mux_mp4_into<W: Read + Write + Seek>(
                     sample_rate,
                 )
             }
+            VideoCodec::Flac => {
+                let streaminfo: [u8; 34] = track
+                    .config
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| container_error(target_path, "invalid FLAC STREAMINFO"))?;
+                let (channels, sample_rate, _) = parse_flac_streaminfo(&streaminfo)
+                    .map_err(|reason| container_error(target_path, reason))?;
+                (
+                    SampleEntrySpec::Raw(build_flac_mp4_sample_entry(
+                        channels,
+                        sample_rate,
+                        &streaminfo,
+                    )),
+                    sample_rate,
+                )
+            }
+            VideoCodec::Pcm => {
+                // `containr`'s cross-family StreamCopy cannot rebuild PCM
+                // sample entries; canonical muxing must use QuickTime MOV.
+                if options.brand != Brand::QuickTime {
+                    return Err(container_error(
+                        target_path,
+                        "PCM requires QuickTime MOV output; ISO MP4 has no PCM sample entry",
+                    ));
+                }
+                let sample_rate = track.sample_rate.unwrap_or(48_000).max(1);
+                let format = track.pcm_format.ok_or_else(|| {
+                    container_error(target_path, "PCM track has no sample format")
+                })?;
+                (
+                    SampleEntrySpec::Raw(build_pcm_mp4_sample_entry(
+                        format,
+                        track.channels.unwrap_or(2),
+                        sample_rate,
+                    )),
+                    sample_rate,
+                )
+            }
             _ => {
                 return Err(container_error(
                     target_path,
@@ -1208,6 +1511,22 @@ fn mux_mp4_into<W: Read + Write + Seek>(
     }
     let mut media_end: Vec<u64> = vec![0; media.tracks.len()];
     let mut prev_dts_ticks: Vec<Option<i64>> = vec![None; media.tracks.len()];
+    // Uncompressed PCM samples must be one AVI/QuickTime sample per frame with
+    // `stts.delta == 1` and `sample_size == frame_bytes`, not one sample per
+    // canonical packet. Every other codec writes one sample per packet.
+    let pcm_frame_bytes: Vec<usize> = media
+        .tracks
+        .iter()
+        .map(|track| {
+            if track.codec == VideoCodec::Pcm {
+                usize::from(track.pcm_format.map_or(2, PcmFormat::bytes_per_sample))
+                    .saturating_mul(usize::from(track.channels.unwrap_or(2).max(1)))
+                    .max(1)
+            } else {
+                0
+            }
+        })
+        .collect();
     for (packet_index, (packet, &(dts, pts))) in media.packets.iter().zip(&timestamps).enumerate() {
         let track_timescale = track_timescales[packet.track];
         // pts already includes the composition offset derived from the
@@ -1221,29 +1540,69 @@ fn mux_mp4_into<W: Read + Write + Seek>(
         let dts_ticks = monotonic_dts_ticks(raw_dts_ticks, prev_dts_ticks[packet.track]);
         prev_dts_ticks[packet.track] = Some(dts_ticks);
         let pts_ticks = us_to_ticks(pts, track_timescale);
-        let final_duration_ticks = (last_packet_for_track[packet.track] == Some(packet_index))
-            .then(|| {
-                u64::try_from(
-                    us_to_ticks(
-                        i64::try_from(packet.duration).unwrap_or(i64::MAX),
-                        track_timescale,
-                    )
-                    .max(1),
+        let last_packet = last_packet_for_track[packet.track] == Some(packet_index);
+        let final_duration_ticks = last_packet.then(|| {
+            u64::try_from(
+                us_to_ticks(
+                    i64::try_from(packet.duration).unwrap_or(i64::MAX),
+                    track_timescale,
                 )
-                .unwrap_or(1)
-            });
-        let input = containr::mp4::PacketIn {
-            data: &packet.data,
-            pts: pts_ticks,
-            dts: dts_ticks,
-            // Only the final packet needs an explicit duration; intermediate
-            // stts deltas come from the next DTS without 1 µs rounding.
-            duration: final_duration_ticks,
-            sync: packet.keyframe,
+                .max(1),
+            )
+            .unwrap_or(1)
+        });
+        let frame_bytes = pcm_frame_bytes[packet.track];
+        let frames = if frame_bytes == 0 {
+            1
+        } else {
+            if packet.data.is_empty() || packet.data.len() % frame_bytes != 0 {
+                return Err(container_error(
+                    target_path,
+                    "PCM packet is not a whole number of frames",
+                ));
+            }
+            packet.data.len() / frame_bytes
         };
-        output
-            .write_packet(ids[packet.track], &input)
-            .map_err(|err| containr_error(target_path, &err))?;
+        if frame_bytes > 0 {
+            let last_dts = dts_ticks
+                .saturating_add(i64::try_from(frames.saturating_sub(1)).unwrap_or(i64::MAX));
+            prev_dts_ticks[packet.track] = Some(last_dts);
+        }
+        for frame in 0..frames {
+            let (data, pts, dts, duration, sync) = if frame_bytes == 0 {
+                (
+                    packet.data.as_slice(),
+                    pts_ticks,
+                    dts_ticks,
+                    final_duration_ticks,
+                    packet.keyframe,
+                )
+            } else {
+                let from = frame.saturating_mul(frame_bytes);
+                let to = from.saturating_add(frame_bytes).min(packet.data.len());
+                let is_last = last_packet && frame.saturating_add(1) == frames;
+                let frame_tick = dts_ticks.saturating_add(i64::try_from(frame).unwrap_or(i64::MAX));
+                (
+                    &packet.data[from..to],
+                    frame_tick,
+                    frame_tick,
+                    if is_last { Some(1) } else { None },
+                    true,
+                )
+            };
+            let input = containr::mp4::PacketIn {
+                data,
+                pts,
+                dts,
+                // Only the final sample needs an explicit duration; intermediate
+                // stts deltas come from the next DTS without 1 µs rounding.
+                duration,
+                sync,
+            };
+            output
+                .write_packet(ids[packet.track], &input)
+                .map_err(|err| containr_error(target_path, &err))?;
+        }
     }
     for (index, id) in ids.iter().enumerate() {
         let (Some(track_visible_start), Some(pts_base)) = (visible_starts[index], pts_bases[index])
@@ -1365,10 +1724,22 @@ fn mkv_codec_private(
             })?;
             Ok(Some(track.config.clone()))
         }
+        VideoCodec::Flac => {
+            let streaminfo: [u8; 34] = track
+                .config
+                .as_slice()
+                .try_into()
+                .map_err(|_| container_error(target_path, "invalid FLAC STREAMINFO"))?;
+            parse_flac_streaminfo(&streaminfo)
+                .map_err(|reason| container_error(target_path, reason))?;
+            Ok(Some(build_mkv_flac_codec_private(&streaminfo)))
+        }
         _ => Ok((!track.config.is_empty()).then(|| track.config.clone())),
     }
 }
 
+// Codec-id selection, track specs and packet writes share one linear pass.
+#[allow(clippy::too_many_lines)]
 fn mux_mkv(
     target: &File,
     target_path: &Path,
@@ -1394,6 +1765,15 @@ fn mux_mkv(
             VideoCodec::Aac => "A_AAC",
             VideoCodec::Opus => "A_OPUS",
             VideoCodec::Vorbis => "A_VORBIS",
+            VideoCodec::Flac => "A_FLAC",
+            VideoCodec::Pcm => match track
+                .pcm_format
+                .ok_or_else(|| container_error(target_path, "PCM track has no sample format"))?
+            {
+                PcmFormat::S16Be | PcmFormat::S24Be | PcmFormat::S32Be => "A_PCM/INT/BIG",
+                PcmFormat::F32Le | PcmFormat::F32Be | PcmFormat::F64Le => "A_PCM/FLOAT/IEEE",
+                _ => "A_PCM/INT/LIT",
+            },
             VideoCodec::Mp3 => "A_MPEG/L3",
             _ => {
                 return Err(container_error(
@@ -1420,7 +1800,7 @@ fn mux_mkv(
         if kind == TrackKind::Video {
             spec.matroska.video = Some(video_element(track));
         } else {
-            spec.matroska.audio = Some(audio_element(track));
+            spec.matroska.audio = Some(audio_element(track, target_path)?);
         }
         // Matroska's DefaultDuration is in nanoseconds, not in ticks.
         spec.matroska.default_duration =
@@ -1488,14 +1868,29 @@ fn video_element(track: &ContainerTrack) -> MatroskaVideo {
     }
 }
 
-fn audio_element(track: &ContainerTrack) -> MatroskaAudio {
-    MatroskaAudio {
+fn audio_element(
+    track: &ContainerTrack,
+    target_path: &Path,
+) -> Result<MatroskaAudio, PipelineError> {
+    let bit_depth = if track.codec == VideoCodec::Flac {
+        let streaminfo: [u8; 34] = track
+            .config
+            .as_slice()
+            .try_into()
+            .map_err(|_| container_error(target_path, "invalid FLAC STREAMINFO"))?;
+        let (_, _, bits) = parse_flac_streaminfo(&streaminfo)
+            .map_err(|reason| container_error(target_path, reason))?;
+        Some(u64::from(bits))
+    } else {
+        track.pcm_format.map(|format| u64::from(format.bit_depth()))
+    };
+    Ok(MatroskaAudio {
         sampling_frequency: f64::from(track.sample_rate.unwrap_or(48_000)),
         output_sampling_frequency: None,
         channels: u64::from(track.channels.unwrap_or(2)),
-        bit_depth: None,
+        bit_depth,
         extra: Vec::new(),
-    }
+    })
 }
 
 /// Muxes the canonical representation into any supported output container.
@@ -1646,6 +2041,7 @@ mod tests {
                 config,
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: vec![ContainerPacket {
                 track: 0,
@@ -1743,6 +2139,7 @@ mod tests {
                 config: Vec::new(),
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: vec![packet(100_000), packet(200_000), packet(50_000)],
         };
@@ -1806,6 +2203,7 @@ mod tests {
                     config: vec![0x11, 0x90],
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::H264,
@@ -1819,6 +2217,7 @@ mod tests {
                     .unwrap_or_default(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
             ],
             packets: vec![
@@ -1911,6 +2310,7 @@ mod tests {
                     config: vec![0x11, 0x90],
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
                 ContainerTrack {
                     codec: VideoCodec::H264,
@@ -1924,6 +2324,7 @@ mod tests {
                     .unwrap_or_default(),
                     timescale: US_TIMESCALE,
                     presentation_edit: None,
+                    pcm_format: None,
                 },
             ],
             packets: vec![
@@ -2074,6 +2475,7 @@ mod tests {
                 .unwrap_or_default(),
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             // Decode order I0, P3, B1, B2.
             packets: vec![
@@ -2149,6 +2551,7 @@ mod tests {
                 .unwrap_or_default(),
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: stamps
                 .into_iter()
@@ -2594,6 +2997,7 @@ mod tests {
                 config,
                 timescale: US_TIMESCALE,
                 presentation_edit: None,
+                pcm_format: None,
             }],
             packets: vec![ContainerPacket {
                 track: 0,
@@ -2653,6 +3057,73 @@ mod tests {
         assert!(
             matches!(result, Err(PipelineError::RemuxFailed { .. })),
             "malformed Vorbis CodecPrivate must be rejected at mux time"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pcm_requires_quicktime_brand_and_uses_fixed_sample_size() -> Result<(), String> {
+        let media = ContainerMedia {
+            tracks: vec![ContainerTrack {
+                codec: VideoCodec::Pcm,
+                width: None,
+                height: None,
+                channels: Some(2),
+                sample_rate: Some(48_000),
+                config: Vec::new(),
+                timescale: US_TIMESCALE,
+                presentation_edit: None,
+                pcm_format: Some(crate::video_bitstream::PcmFormat::S16Le),
+            }],
+            packets: vec![ContainerPacket {
+                track: 0,
+                pts: 0,
+                dts: 0,
+                duration: 1_000,
+                keyframe: true,
+                data: vec![0_u8; 4 * 1024],
+            }],
+        };
+        let mp4 = MuxOptions {
+            brand: Brand::Isom,
+            ..MuxOptions::default()
+        };
+        let mut output = Cursor::new(Vec::new());
+        assert!(mux_mp4_into(&mut output, Path::new("pcm.mp4"), &media, mp4).is_err());
+
+        let mov = MuxOptions {
+            brand: Brand::QuickTime,
+            ..MuxOptions::default()
+        };
+        let mut output = Cursor::new(Vec::new());
+        mux_mp4_into(&mut output, Path::new("pcm.mov"), &media, mov)
+            .map_err(|err| err.to_string())?;
+        let bytes = output.into_inner();
+        let stsz = bytes.windows(4).position(|w| w == b"stsz").ok_or("stsz")?;
+        // `stsz` full box: version/flags (4), sample_size (4), count (4).
+        let size = u32::from_be_bytes(
+            bytes
+                .get(stsz + 8..stsz + 12)
+                .ok_or("sample_size")?
+                .try_into()
+                .map_err(|_| "sample_size")?,
+        );
+        assert_eq!(size, 4, "one stereo S16 frame is four bytes");
+
+        let mut bad = media;
+        bad.packets[0].data.push(0);
+        let mut output = Cursor::new(Vec::new());
+        assert!(
+            mux_mp4_into(
+                &mut output,
+                Path::new("pcm.mov"),
+                &bad,
+                MuxOptions {
+                    brand: Brand::QuickTime,
+                    ..MuxOptions::default()
+                }
+            )
+            .is_err()
         );
         Ok(())
     }
