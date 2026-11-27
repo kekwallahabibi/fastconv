@@ -159,10 +159,10 @@ impl fmt::Display for AudioOutputFormat {
 pub struct AudioBitrate(NonZeroU32);
 
 impl AudioBitrate {
-    const PARSE_EXPECTED: &'static str =
-        "a positive rate such as 128k, 192k, 320k, 128kbps, 128, or 128000";
-
     /// Creates a bitrate from an exact bits-per-second value.
+    ///
+    /// CLI syntax parsing belongs at the system boundary in `fastconv-probe`; this
+    /// constructor only accepts an already-resolved exact rate.
     ///
     /// # Errors
     ///
@@ -172,47 +172,8 @@ impl AudioBitrate {
             .map(Self)
             .ok_or_else(|| DomainError::InvalidAudioOptionBitrate {
                 raw: bps.to_string(),
-                expected: Self::PARSE_EXPECTED,
+                expected: "a positive bits-per-second value",
             })
-    }
-
-    /// Parses CLI syntax: a `k`/`kbps` suffix (case-insensitive) means kbps,
-    /// a bare value below `1_000` is kbps, and a bare value of at least `1_000` is bps.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DomainError::InvalidAudioOptionBitrate`] for empty, zero, non-digit,
-    /// overflowing, or otherwise malformed input.
-    pub fn parse(raw: &str) -> Result<Self, DomainError> {
-        let invalid = || DomainError::InvalidAudioOptionBitrate {
-            raw: raw.to_owned(),
-            expected: Self::PARSE_EXPECTED,
-        };
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Err(invalid());
-        }
-        let lowered = trimmed.to_ascii_lowercase();
-        let (digits, suffix_kbps) = if let Some(rest) = lowered.strip_suffix("kbps") {
-            (rest, true)
-        } else if let Some(rest) = lowered.strip_suffix('k') {
-            (rest, true)
-        } else {
-            (trimmed, false)
-        };
-        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(invalid());
-        }
-        let value = digits.parse::<u32>().map_err(|_| invalid())?;
-        if value == 0 {
-            return Err(invalid());
-        }
-        let bps = if suffix_kbps || value < 1_000 {
-            value.checked_mul(1_000).ok_or_else(invalid)?
-        } else {
-            value
-        };
-        Self::new(bps)
     }
 
     #[must_use]
@@ -272,6 +233,9 @@ impl AudioSampleRate {
     pub const MP3_RATES: [u32; 9] = [
         8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000,
     ];
+    /// MPEG-2/2.5 Layer III rates. `rusty_mp3` caps Layer III at 160 kbps here and
+    /// silently snaps a higher bitrate down, so the domain rejects that combination.
+    pub const MP3_MPEG2_RATES: [u32; 6] = [8_000, 11_025, 12_000, 16_000, 22_050, 24_000];
     /// The AAC sample-rate table (`rusty_aac::SAMPLE_RATES`), including 7.35 kHz.
     pub const AAC_RATES: [u32; 13] = [
         7_350, 8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 64_000,
@@ -357,6 +321,9 @@ impl Default for AudioEncodingOptions {
 }
 
 impl AudioEncodingOptions {
+    /// Highest Layer III bitrate available at MPEG-2/2.5 sample rates.
+    const MP3_MPEG2_MAX_BPS: u32 = 160_000;
+
     /// Creates options and validates every field against the output format.
     ///
     /// # Errors
@@ -400,6 +367,21 @@ impl AudioEncodingOptions {
         }
         if let Some(channels) = self.channels {
             Self::validate_channels(format, channels)?;
+        }
+        // Cross-field check: an explicit MPEG-2/2.5 rate cannot carry more than
+        // 160 kbps through rusty_mp3 without a silent downgrade to 160 kbps.
+        // Without an explicit rate the pipeline resolves the effective rate itself.
+        if format == AudioOutputFormat::Mp3
+            && let AudioRateControl::Bitrate(bitrate) = self.rate_control
+            && let Some(rate) = self.sample_rate
+            && AudioSampleRate::MP3_MPEG2_RATES.contains(&rate.hz())
+            && bitrate.bps() > Self::MP3_MPEG2_MAX_BPS
+        {
+            return Err(DomainError::IncompatibleAudioBitrateRate {
+                bps: bitrate.bps(),
+                hz: rate.hz(),
+                max_bps: Self::MP3_MPEG2_MAX_BPS,
+            });
         }
         Ok(())
     }
@@ -1029,43 +1011,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_bitrate_syntax() -> Result<(), DomainError> {
-        for (raw, bps) in [
-            ("128k", 128_000),
-            ("192K", 192_000),
-            ("320kbps", 320_000),
-            ("128KBPS", 128_000),
-            (" 6 ", 6_000),
-            ("510", 510_000),
-            ("999", 999_000),
-            ("128000", 128_000),
-            ("6000", 6_000),
-        ] {
-            assert_eq!(AudioBitrate::parse(raw)?.bps(), bps, "raw={raw}");
-        }
+    fn bitrate_constructor_accepts_only_exact_nonzero_bps() -> Result<(), DomainError> {
+        assert_eq!(AudioBitrate::new(191_500)?.bps(), 191_500);
         assert_eq!(AudioBitrate::new(191_500)?.kbps_rounded(), 192);
         assert_eq!(AudioBitrate::new(1)?.kbps_rounded(), 1);
-        for raw in [
-            "",
-            " ",
-            "0",
-            "0k",
-            "k",
-            "kbps",
-            "-128k",
-            "128kb",
-            "12x8k",
-            "4294967296k",
-            "4294967296",
-        ] {
-            assert!(
-                matches!(
-                    AudioBitrate::parse(raw),
-                    Err(DomainError::InvalidAudioOptionBitrate { .. })
-                ),
-                "'{raw}' must be rejected"
-            );
-        }
         assert!(matches!(
             AudioBitrate::new(0),
             Err(DomainError::InvalidAudioOptionBitrate { .. })
@@ -1170,6 +1119,58 @@ mod tests {
             assert!(AudioEncodingOptions::new(format, quality(0)?, None, None).is_ok());
             assert!(AudioEncodingOptions::new(format, quality(100)?, None, None).is_ok());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mp3_high_bitrate_at_mpeg2_sample_rates() -> Result<(), DomainError> {
+        let bitrate = |bps| AudioBitrate::new(bps).map(AudioRateControl::Bitrate);
+        let rate = |hz| AudioSampleRate::new(hz).map(Some);
+
+        for hz in AudioSampleRate::MP3_MPEG2_RATES {
+            assert!(
+                matches!(
+                    AudioEncodingOptions::new(
+                        AudioOutputFormat::Mp3,
+                        bitrate(320_000)?,
+                        rate(hz)?,
+                        None
+                    ),
+                    Err(DomainError::IncompatibleAudioBitrateRate {
+                        bps: 320_000,
+                        max_bps: 160_000,
+                        ..
+                    })
+                ),
+                "MP3 at {hz} Hz must reject 320000 bps"
+            );
+            assert!(
+                AudioEncodingOptions::new(
+                    AudioOutputFormat::Mp3,
+                    bitrate(160_000)?,
+                    rate(hz)?,
+                    None
+                )
+                .is_ok(),
+                "MP3 at {hz} Hz must accept 160000 bps"
+            );
+        }
+        for hz in [32_000, 44_100, 48_000] {
+            assert!(
+                AudioEncodingOptions::new(
+                    AudioOutputFormat::Mp3,
+                    bitrate(320_000)?,
+                    rate(hz)?,
+                    None
+                )
+                .is_ok(),
+                "MP3 at {hz} Hz (MPEG-1) must accept 320000 bps"
+            );
+        }
+        assert!(
+            AudioEncodingOptions::new(AudioOutputFormat::Mp3, bitrate(320_000)?, None, None)
+                .is_ok()
+        );
         Ok(())
     }
 
@@ -1290,6 +1291,28 @@ mod tests {
             .is_ok()
         );
         Ok(())
+    }
+
+    #[test]
+    fn plan_rejects_mp3_high_bitrate_at_low_rate_before_io() {
+        let workers = NonZeroUsize::MIN;
+        let options = AudioEncodingOptions {
+            rate_control: AudioRateControl::Bitrate(
+                AudioBitrate::new(320_000).unwrap_or_else(|_| unreachable!()),
+            ),
+            sample_rate: Some(AudioSampleRate::new(24_000).unwrap_or_else(|_| unreachable!())),
+            channels: None,
+        };
+        let result = AudioBatchPlan::with_options(
+            vec![item("a")],
+            AudioExecutionMode::CpuMp3,
+            workers,
+            options,
+        );
+        assert!(matches!(
+            result,
+            Err(DomainError::IncompatibleAudioBitrateRate { .. })
+        ));
     }
 
     #[test]

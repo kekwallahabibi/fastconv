@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use fastconv_domain::{
-    AudioBatchItem, AudioBatchPlan, AudioChannels, AudioEncodingOptions, AudioExecutionMode,
-    AudioInputFormat, AudioOutputFormat, AudioRateControl, AudioSampleRate, AudioStreamInfo,
-    DomainError, HardwareBackend, PathRole,
+    AudioBatchItem, AudioBatchPlan, AudioBitrate, AudioChannels, AudioEncodingOptions,
+    AudioExecutionMode, AudioInputFormat, AudioOutputFormat, AudioQuality, AudioRateControl,
+    AudioSampleRate, AudioStreamInfo, DomainError, HardwareBackend, PathRole,
 };
 use symphonia::core::codecs::audio::{AudioDecoderOptions, well_known::CODEC_ID_ALAC};
 use symphonia::core::formats::FormatOptions;
@@ -30,6 +30,111 @@ pub struct AudioEncodingRequest {
     pub rate_control: AudioRateControl,
     pub sample_rate: Option<AudioSampleRate>,
     pub channels: Option<AudioChannels>,
+}
+
+const BITRATE_PARSE_EXPECTED: &str =
+    "a positive rate such as 128k, 192k, 320k, 128kbps, 128, or 128000";
+
+/// Parses the raw `--bitrate` value at the system boundary into a validated domain rate.
+///
+/// A `k`/`kbps` suffix (case-insensitive) means kbps, a bare value below `1_000` is kbps,
+/// and a bare value of at least `1_000` is bps.
+///
+/// # Errors
+///
+/// Returns [`DomainError::InvalidAudioBitrate`] for empty, zero, non-digit, overflowing,
+/// or otherwise malformed input.
+pub fn parse_audio_bitrate(raw: &str) -> Result<AudioBitrate, DomainError> {
+    let invalid = || DomainError::InvalidAudioBitrate {
+        raw: raw.to_owned(),
+        expected: BITRATE_PARSE_EXPECTED,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(invalid());
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    let (digits, suffix_kbps) = if let Some(rest) = lowered.strip_suffix("kbps") {
+        (rest, true)
+    } else if let Some(rest) = lowered.strip_suffix('k') {
+        (rest, true)
+    } else {
+        (trimmed, false)
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let value = digits.parse::<u32>().map_err(|_| invalid())?;
+    if value == 0 {
+        return Err(invalid());
+    }
+    let bps = if suffix_kbps || value < 1_000 {
+        value.checked_mul(1_000).ok_or_else(invalid)?
+    } else {
+        value
+    };
+    AudioBitrate::new(bps)
+}
+
+/// Parses and validates the four raw encoding flag values into an [`AudioEncodingRequest`].
+///
+/// This is the single boundary where the CLI's raw `--bitrate`, `--quality`,
+/// `--sample-rate`, and `--channels` strings become domain types; the CLI only collects
+/// raw values and flag presence.
+///
+/// # Errors
+///
+/// Returns a diagnostic for a bitrate/quality conflict or any malformed flag value.
+pub fn parse_audio_encoding_request(
+    bitrate: Option<&str>,
+    quality: Option<&str>,
+    sample_rate: Option<&str>,
+    channels: Option<&str>,
+) -> Result<AudioEncodingRequest, String> {
+    if bitrate.is_some() && quality.is_some() {
+        return Err("cannot combine --bitrate with --quality".to_owned());
+    }
+    let rate_control = if let Some(raw) = bitrate {
+        AudioRateControl::Bitrate(parse_audio_bitrate(raw).map_err(|err| err.to_string())?)
+    } else if let Some(raw) = quality {
+        let value = raw
+            .parse::<u8>()
+            .map_err(|err| format!("invalid --quality '{raw}': {err}"))?;
+        AudioRateControl::Quality(
+            AudioQuality::new(value).map_err(|err| format!("invalid --quality '{raw}': {err}"))?,
+        )
+    } else {
+        AudioRateControl::Default
+    };
+    let sample_rate = match sample_rate {
+        Some(raw) => {
+            let hz = raw
+                .parse::<u32>()
+                .map_err(|err| format!("invalid --sample-rate '{raw}': {err}"))?;
+            Some(
+                AudioSampleRate::new(hz)
+                    .map_err(|err| format!("invalid --sample-rate '{raw}': {err}"))?,
+            )
+        }
+        None => None,
+    };
+    let channels = match channels {
+        Some(raw) => {
+            let count = raw
+                .parse::<u16>()
+                .map_err(|err| format!("invalid --channels '{raw}': {err}"))?;
+            Some(
+                AudioChannels::new(count)
+                    .map_err(|err| format!("invalid --channels '{raw}': {err}"))?,
+            )
+        }
+        None => None,
+    };
+    Ok(AudioEncodingRequest {
+        rate_control,
+        sample_rate,
+        channels,
+    })
 }
 
 /// Validated input metadata produced at the file-system boundary.
@@ -890,6 +995,93 @@ mod tests {
             assert_eq!(probed.format, AudioInputFormat::Aac, "tag_len={tag_len}");
         }
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_bitrate_syntax_at_the_boundary() -> Result<(), DomainError> {
+        for (raw, bps) in [
+            ("128k", 128_000),
+            ("192K", 192_000),
+            ("320kbps", 320_000),
+            ("128KBPS", 128_000),
+            (" 6 ", 6_000),
+            ("510", 510_000),
+            ("999", 999_000),
+            ("128000", 128_000),
+            ("6000", 6_000),
+        ] {
+            assert_eq!(parse_audio_bitrate(raw)?.bps(), bps, "raw={raw}");
+        }
+        for raw in [
+            "",
+            " ",
+            "0",
+            "0k",
+            "k",
+            "kbps",
+            "-128k",
+            "128kb",
+            "12x8k",
+            "4294967296k",
+            "4294967296",
+        ] {
+            assert!(
+                matches!(
+                    parse_audio_bitrate(raw),
+                    Err(DomainError::InvalidAudioBitrate { .. })
+                ),
+                "'{raw}' must be rejected"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parses_raw_encoding_request_and_rejects_conflicts() -> Result<(), String> {
+        let expected = AudioEncodingRequest {
+            rate_control: AudioRateControl::Bitrate(
+                AudioBitrate::new(192_000).map_err(|err| err.to_string())?,
+            ),
+            sample_rate: Some(AudioSampleRate::new(48_000).map_err(|err| err.to_string())?),
+            channels: Some(AudioChannels::new(2).map_err(|err| err.to_string())?),
+        };
+        assert_eq!(
+            parse_audio_encoding_request(Some("192k"), None, Some("48000"), Some("2"))?,
+            expected
+        );
+        assert_eq!(
+            parse_audio_encoding_request(None, None, None, None)?,
+            AudioEncodingRequest::default()
+        );
+        assert_eq!(
+            parse_audio_encoding_request(None, Some("85"), None, None)?.rate_control,
+            AudioRateControl::Quality(AudioQuality::new(85).map_err(|err| err.to_string())?)
+        );
+
+        for (bitrate, quality) in [(Some("128k"), Some("80")), (Some("128k"), Some("101"))] {
+            let Err(err) = parse_audio_encoding_request(bitrate, quality, None, None) else {
+                return Err("bitrate/quality must be rejected".to_owned());
+            };
+            assert!(
+                err.contains("cannot combine --bitrate with --quality"),
+                "unexpected diagnostic: {err}"
+            );
+        }
+        for (args, needle) in [
+            ((None, Some("101"), None, None), "invalid --quality"),
+            ((None, Some("abc"), None, None), "invalid --quality"),
+            ((None, None, Some("0"), None), "invalid --sample-rate"),
+            ((None, None, Some("abc"), None), "invalid --sample-rate"),
+            ((None, None, None, Some("0")), "invalid --channels"),
+            ((None, None, None, Some("9")), "invalid --channels"),
+            ((Some("abc"), None, None, None), "invalid audio bitrate"),
+        ] {
+            let Err(err) = parse_audio_encoding_request(args.0, args.1, args.2, args.3) else {
+                return Err(format!("malformed value must be rejected: {args:?}"));
+            };
+            assert!(err.contains(needle), "expected '{needle}' in '{err}'");
+        }
         Ok(())
     }
 

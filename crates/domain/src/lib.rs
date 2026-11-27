@@ -169,6 +169,11 @@ pub enum DomainError {
         channels: u16,
         expected: &'static str,
     },
+    IncompatibleAudioBitrateRate {
+        bps: u32,
+        hz: u32,
+        max_bps: u32,
+    },
     UnsupportedAudioRateControl {
         format: AudioOutputFormat,
         control: &'static str,
@@ -233,13 +238,11 @@ impl fmt::Display for DomainError {
         match self {
             Self::EmptyPath(role) => write!(f, "{role} path must not be empty"),
             Self::EmptyField(field) => write!(f, "field '{field}' must not be blank"),
-            Self::IdenticalSourceAndTarget(path) => {
-                write!(
-                    f,
-                    "source and target path must differ to avoid in-place corruption: {}",
-                    path.display()
-                )
-            }
+            Self::IdenticalSourceAndTarget(path) => write!(
+                f,
+                "source and target path must differ to avoid in-place corruption: {}",
+                path.display()
+            ),
             Self::InvalidCpuTopology {
                 physical_cores,
                 logical_threads,
@@ -272,20 +275,16 @@ impl fmt::Display for DomainError {
             Self::EmptyBatch => {
                 f.write_str("image conversion batch must contain at least one file")
             }
-            Self::DuplicateTargetPath(path) => {
-                write!(
-                    f,
-                    "multiple batch items target the same output path: {}",
-                    path.display()
-                )
-            }
-            Self::TargetOverwritesSource(path) => {
-                write!(
-                    f,
-                    "batch output path would overwrite a source file: {}",
-                    path.display()
-                )
-            }
+            Self::DuplicateTargetPath(path) => write!(
+                f,
+                "multiple batch items target the same output path: {}",
+                path.display()
+            ),
+            Self::TargetOverwritesSource(path) => write!(
+                f,
+                "batch output path would overwrite a source file: {}",
+                path.display()
+            ),
             Self::UnsupportedBackend {
                 media_kind,
                 backend,
@@ -324,6 +323,10 @@ impl fmt::Display for DomainError {
                     "invalid audio channel count {channels} (expected {expected})"
                 )
             }
+            Self::IncompatibleAudioBitrateRate { bps, hz, max_bps } => write!(
+                f,
+                "audio bitrate {bps} bps at {hz} Hz is incompatible with MP3 (MPEG-2/2.5 Layer III caps at {max_bps} bps)"
+            ),
             Self::UnsupportedAudioRateControl {
                 format,
                 control,

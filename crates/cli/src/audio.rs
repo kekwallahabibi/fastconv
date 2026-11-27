@@ -2,8 +2,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use fastconv_domain::{
-    AudioBitrate, AudioChannels, AudioOutputFormat, AudioQuality, AudioRateControl,
-    AudioSampleRate, HardwareBackend,
+    AudioChannels, AudioOutputFormat, AudioRateControl, AudioSampleRate, HardwareBackend,
 };
 
 pub(crate) const AUDIO_HELP: &str = r"fastconv audio - convert audio files
@@ -84,14 +83,17 @@ fn parse_target_format(value: &str) -> Result<AudioOutputFormat, String> {
     }
 }
 
-/// State for the four encoding flags, grouped so mutual exclusion is checked once.
+/// Raw encoding flag values collected at the CLI boundary.
+///
+/// Values are stored verbatim: parsing and validation happen exactly once, in
+/// `fastconv-probe`'s `parse_audio_encoding_request`. This state only tracks flag
+/// presence, duplicates, and missing values.
 #[derive(Default)]
 struct AudioOptionState {
-    rate_control: Option<AudioRateControl>,
-    seen_bitrate: bool,
-    seen_quality: bool,
-    sample_rate: Option<AudioSampleRate>,
-    channels: Option<AudioChannels>,
+    bitrate: Option<String>,
+    quality: Option<String>,
+    sample_rate: Option<String>,
+    channels: Option<String>,
 }
 
 impl AudioOptionState {
@@ -99,66 +101,23 @@ impl AudioOptionState {
     ///
     /// # Errors
     ///
-    /// Returns a diagnostic for duplicate flags, missing or invalid values, or combining
-    /// `--bitrate` with `--quality`.
+    /// Returns a diagnostic for duplicate flags or missing values.
     fn parse(&mut self, flag: &str, args: &[&str], index: usize) -> Result<Option<usize>, String> {
-        let value = || {
-            args.get(index + 1)
-                .copied()
-                .ok_or_else(|| format!("missing value for {flag}"))
-        };
-        match flag {
-            "--bitrate" => {
-                if self.seen_bitrate {
-                    return Err("duplicate flag '--bitrate'".to_owned());
-                }
-                if self.seen_quality {
-                    return Err("cannot combine --bitrate with --quality".to_owned());
-                }
-                let raw = value()?;
-                let bitrate = AudioBitrate::parse(raw).map_err(|err| err.to_string())?;
-                self.rate_control = Some(AudioRateControl::Bitrate(bitrate));
-                self.seen_bitrate = true;
-            }
-            "--quality" => {
-                if self.seen_quality {
-                    return Err("duplicate flag '--quality'".to_owned());
-                }
-                if self.seen_bitrate {
-                    return Err("cannot combine --quality with --bitrate".to_owned());
-                }
-                let raw = value()?;
-                let parsed = raw
-                    .parse::<u8>()
-                    .map_err(|err| format!("invalid --quality '{raw}': {err}"))?;
-                let quality = AudioQuality::new(parsed).map_err(|err| err.to_string())?;
-                self.rate_control = Some(AudioRateControl::Quality(quality));
-                self.seen_quality = true;
-            }
-            "--sample-rate" => {
-                if self.sample_rate.is_some() {
-                    return Err("duplicate flag '--sample-rate'".to_owned());
-                }
-                let raw = value()?;
-                let hz = raw
-                    .parse::<u32>()
-                    .map_err(|err| format!("invalid --sample-rate '{raw}': {err}"))?;
-                let rate = AudioSampleRate::new(hz).map_err(|err| err.to_string())?;
-                self.sample_rate = Some(rate);
-            }
-            "--channels" => {
-                if self.channels.is_some() {
-                    return Err("duplicate flag '--channels'".to_owned());
-                }
-                let raw = value()?;
-                let parsed = raw
-                    .parse::<u16>()
-                    .map_err(|err| format!("invalid --channels '{raw}': {err}"))?;
-                let count = AudioChannels::new(parsed).map_err(|err| err.to_string())?;
-                self.channels = Some(count);
-            }
+        let slot = match flag {
+            "--bitrate" => &mut self.bitrate,
+            "--quality" => &mut self.quality,
+            "--sample-rate" => &mut self.sample_rate,
+            "--channels" => &mut self.channels,
             _ => return Ok(None),
+        };
+        if slot.is_some() {
+            return Err(format!("duplicate flag '{flag}'"));
         }
+        let raw = args
+            .get(index + 1)
+            .copied()
+            .ok_or_else(|| format!("missing value for {flag}"))?;
+        *slot = Some(raw.to_owned());
         Ok(Some(index + 2))
     }
 }
@@ -231,13 +190,22 @@ pub(crate) fn parse_audio_args(args: &[&str]) -> Result<AudioCommand, String> {
         );
     };
 
+    // Hand the raw encoding values to the boundary parser once, so validation of
+    // external input lives in fastconv-probe and domain only ever sees valid types.
+    let request = fastconv_probe::parse_audio_encoding_request(
+        options.bitrate.as_deref(),
+        options.quality.as_deref(),
+        options.sample_rate.as_deref(),
+        options.channels.as_deref(),
+    )?;
+
     Ok(AudioCommand::Run(AudioArgs {
         source: PathBuf::from(*source),
         target: PathBuf::from(*target),
         to,
-        rate_control: options.rate_control.unwrap_or(AudioRateControl::Default),
-        sample_rate: options.sample_rate,
-        channels: options.channels,
+        rate_control: request.rate_control,
+        sample_rate: request.sample_rate,
+        channels: request.channels,
         threads,
         backend: backend.unwrap_or(HardwareBackend::Cpu),
     }))
@@ -281,7 +249,7 @@ pub(crate) fn run_audio(args: &AudioArgs) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastconv_domain::GpuBackend;
+    use fastconv_domain::{AudioBitrate, AudioQuality, GpuBackend};
 
     #[test]
     fn help_documents_only_implemented_flags() {

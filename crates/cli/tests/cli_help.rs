@@ -316,62 +316,98 @@ fn invalid_probe_arguments_fail() -> Result<(), String> {
 
 #[test]
 fn invalid_audio_encoding_flags_fail_before_io() -> Result<(), String> {
-    let cases: [&[&str]; 11] = [
-        &[
-            "audio",
-            "in.wav",
-            "out.flac",
-            "--bitrate",
-            "128k",
-            "--quality",
-            "80",
-        ],
-        &[
-            "audio",
-            "in.wav",
-            "out.mp3",
-            "--bitrate",
-            "128k",
-            "--bitrate",
-            "192k",
-        ],
-        &[
-            "audio",
-            "in.wav",
-            "out.mp3",
-            "--quality",
-            "40",
-            "--quality",
-            "60",
-        ],
-        &["audio", "in.wav", "out.mp3", "--bitrate"],
-        &["audio", "in.wav", "out.mp3", "--bitrate", "abc"],
-        &["audio", "in.wav", "out.mp3", "--quality", "101"],
-        &["audio", "in.wav", "out.mp3", "--sample-rate", "0"],
-        &[
-            "audio",
-            "in.wav",
-            "out.mp3",
-            "--sample-rate",
-            "44100",
-            "--sample-rate",
-            "48000",
-        ],
-        &["audio", "in.wav", "out.mp3", "--channels", "0"],
-        &["audio", "in.wav", "out.mp3", "--channels", "9"],
-        &[
-            "audio",
-            "in.wav",
-            "out.mp3",
-            "--channels",
-            "2",
-            "--channels",
-            "1",
-        ],
+    let cases: [(&[&str], &str); 11] = [
+        (
+            &[
+                "audio",
+                "in.wav",
+                "out.flac",
+                "--bitrate",
+                "128k",
+                "--quality",
+                "80",
+            ],
+            "cannot combine --bitrate with --quality",
+        ),
+        (
+            &[
+                "audio",
+                "in.wav",
+                "out.mp3",
+                "--bitrate",
+                "128k",
+                "--bitrate",
+                "192k",
+            ],
+            "duplicate flag",
+        ),
+        (
+            &[
+                "audio",
+                "in.wav",
+                "out.mp3",
+                "--quality",
+                "40",
+                "--quality",
+                "60",
+            ],
+            "duplicate flag",
+        ),
+        (
+            &["audio", "in.wav", "out.mp3", "--bitrate"],
+            "missing value",
+        ),
+        (
+            &["audio", "in.wav", "out.mp3", "--bitrate", "abc"],
+            "invalid audio bitrate",
+        ),
+        (
+            &["audio", "in.wav", "out.mp3", "--quality", "101"],
+            "invalid --quality",
+        ),
+        (
+            &["audio", "in.wav", "out.mp3", "--sample-rate", "0"],
+            "invalid --sample-rate",
+        ),
+        (
+            &[
+                "audio",
+                "in.wav",
+                "out.mp3",
+                "--sample-rate",
+                "44100",
+                "--sample-rate",
+                "48000",
+            ],
+            "duplicate flag",
+        ),
+        (
+            &["audio", "in.wav", "out.mp3", "--channels", "0"],
+            "invalid --channels",
+        ),
+        (
+            &["audio", "in.wav", "out.mp3", "--channels", "9"],
+            "invalid --channels",
+        ),
+        (
+            &[
+                "audio",
+                "in.wav",
+                "out.mp3",
+                "--channels",
+                "2",
+                "--channels",
+                "1",
+            ],
+            "duplicate flag",
+        ),
     ];
-    for args in cases {
+    for (args, expected) in cases {
         let stderr = failure(args)?;
-        assert!(stderr.contains("error:"), "no error for {args:?}");
+        assert!(
+            stderr.contains(expected),
+            "expected '{expected}' for {args:?}, got: {stderr}"
+        );
     }
     Ok(())
 }
