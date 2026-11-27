@@ -17,9 +17,12 @@ const GLOBAL_HELP: &str = r"Usage:
   fastconv convert <source> <target> [--to <format>] [--quality <0..=100> | --lossless]
                  [--compression-level <fast|balanced|best>] [--tiff-compression <deflate|lzw|packbits|none>]
                  [--chroma <420|444>] [--threads <N>] [--backend <name>]
-  fastconv audio <source> <target> [--to <format>] [--bitrate <rate> | --quality <0..=100>]
-                 [--sample-rate <hz>] [--channels <1..=8>] [--bit-depth <8|16|24|32|f32>]
+  fastconv audio <source> <target> [--to <format>] [--codec <codec>]
+                 [--bitrate <rate> | --quality <0..=100>] [--sample-rate <hz>]
+                 [--channels <1..=8>] [--bit-depth <8|16|24|32|f32>]
                  [--threads <N>] [--backend <name>]
+  --codec: vorbis, opus, flac, aac, alac, pcm, mp3; ogg defaults to vorbis
+           (also accepts opus/flac), m4a defaults to aac (also accepts alac).
   fastconv remux <source> <target> [--to <mp4|mkv|webm|mov|avi|ts>] [--threads <N>]
   fastconv video <source> <target> [--to <format>] [--vcodec <codec>]
                  [--acodec <codec>] [--quality <0..=100> | --vbitrate <rate>]

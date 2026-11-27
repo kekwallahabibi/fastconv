@@ -193,12 +193,17 @@ fn convert_help_documents_accepted_flags_and_rules() -> Result<(), String> {
 fn audio_help_documents_all_encoding_flags_and_rules() -> Result<(), String> {
     let text = stdout(&["audio", "--help"])?;
     for needle in [
-        "fastconv audio <source> <target> [--to <format>] [--bitrate <rate> | --quality <0..=100>]",
-        "[--sample-rate <hz>] [--channels <1..=8>] [--bit-depth <8|16|24|32|f32>]",
+        "fastconv audio <source> <target> [--to <format>] [--codec <codec>]",
+        "[--bitrate <rate> | --quality <0..=100>] [--sample-rate <hz>]",
+        "[--channels <1..=8>] [--bit-depth <8|16|24|32|f32>]",
         "[--threads <N>] [--backend <name>]",
         "<source>",
         "<target>",
         "--to <format>",
+        "--codec <codec>",
+        "ogg -> vorbis",
+        "m4a -> aac",
+        "Ogg FLAC",
         "--bitrate <rate>",
         "--quality <0..=100>",
         "--sample-rate <hz>",
@@ -219,7 +224,7 @@ fn audio_help_documents_all_encoding_flags_and_rules() -> Result<(), String> {
         "wave -> wav",
         "oga -> ogg",
         "aif/aifc -> aiff",
-        "Lossless outputs: wav, flac, alac, aiff",
+        "Lossless outputs: wav, flac",
         "ALAC writes an M4A container",
         ".m4a",
         ".alac",

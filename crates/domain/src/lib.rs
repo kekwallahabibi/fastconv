@@ -8,7 +8,7 @@ pub use audio::{
     AudioBatchItem, AudioBatchPlan, AudioBitDepth, AudioConversionReport, AudioEncodingOptions,
     AudioExecutionMode, AudioInputFormat, AudioOptionBitrate, AudioOptionChannels,
     AudioOptionSampleRate, AudioOutputFormat, AudioQuality, AudioRateControl, AudioSampleFormat,
-    AudioStreamInfo, aac_frame_capacity_bps,
+    AudioStreamInfo, AudioTargetCodec, aac_frame_capacity_bps,
 };
 pub use hardware::{
     CpuInfo, DetectedGpuBackend, GpuAdapterInfo, GpuCapability, GpuVendor, HostHardware, SimdLevel,
@@ -183,8 +183,18 @@ pub enum DomainError {
     },
     UnsupportedAudioRateControl {
         format: AudioOutputFormat,
+        codec: AudioTargetCodec,
         control: &'static str,
         reason: &'static str,
+    },
+    InvalidAudioCodec {
+        raw: String,
+        expected: &'static str,
+    },
+    UnsupportedAudioCodecForFormat {
+        format: AudioOutputFormat,
+        codec: AudioTargetCodec,
+        supported: &'static str,
     },
     InvalidAudioBitDepth {
         raw: String,
@@ -192,6 +202,7 @@ pub enum DomainError {
     },
     UnsupportedAudioBitDepth {
         format: AudioOutputFormat,
+        codec: AudioTargetCodec,
         bit_depth: AudioBitDepth,
         reason: &'static str,
     },
@@ -330,24 +341,16 @@ impl fmt::Display for DomainError {
             Self::InvalidAudioQuality { value, max } => {
                 write!(f, "audio quality must be in 0..={max}, got {value}")
             }
-            Self::InvalidAudioOptionSampleRate { hz, expected } => {
-                write!(f, "invalid audio sample rate {hz} Hz (expected {expected})")
-            }
-            Self::InvalidAudioOptionChannels { channels, expected } => {
-                write!(
-                    f,
-                    "invalid audio channel count {channels} (expected {expected})"
-                )
-            }
-            Self::IncompatibleAudioBitrateRate { bps, hz, max_bps } => write!(
-                f,
-                "audio bitrate {bps} bps at {hz} Hz is incompatible with MP3 (MPEG-2/2.5 Layer III caps at {max_bps} bps)"
-            ),
             Self::UnsupportedAudioRateControl {
                 format,
+                codec,
                 control,
                 reason,
-            } => write!(f, "{control} is not supported for {format} audio: {reason}"),
+            } => write!(
+                f,
+                "{control} is not supported for {} audio: {reason}",
+                format.resolved_label(*codec)
+            ),
             _ => fmt_encoding_error(self, f),
         }
     }
@@ -395,16 +398,42 @@ fn fmt_encoding_error(err: &DomainError, f: &mut fmt::Formatter<'_>) -> fmt::Res
             f,
             "audio bitrate {bps} bps at {hz} Hz with {channels} channels exceeds the AAC frame capacity of {max_bps} bps"
         ),
+        DomainError::InvalidAudioOptionSampleRate { hz, expected } => {
+            write!(f, "invalid audio sample rate {hz} Hz (expected {expected})")
+        }
+        DomainError::InvalidAudioOptionChannels { channels, expected } => {
+            write!(
+                f,
+                "invalid audio channel count {channels} (expected {expected})"
+            )
+        }
+        DomainError::IncompatibleAudioBitrateRate { bps, hz, max_bps } => write!(
+            f,
+            "audio bitrate {bps} bps at {hz} Hz is incompatible with MP3 (MPEG-2/2.5 Layer III caps at {max_bps} bps)"
+        ),
+        DomainError::InvalidAudioCodec { raw, expected } => {
+            write!(f, "invalid audio codec '{raw}' (expected {expected})")
+        }
+        DomainError::UnsupportedAudioCodecForFormat {
+            format,
+            codec,
+            supported,
+        } => write!(
+            f,
+            "codec '{codec}' cannot be stored in {format} (expected {supported})"
+        ),
         DomainError::InvalidAudioBitDepth { raw, expected } => {
             write!(f, "invalid audio bit depth '{raw}' (expected {expected})")
         }
         DomainError::UnsupportedAudioBitDepth {
             format,
+            codec,
             bit_depth,
             reason,
         } => write!(
             f,
-            "--bit-depth {bit_depth} is not supported for {format} audio: {reason}"
+            "--bit-depth {bit_depth} is not supported for {} audio: {reason}",
+            format.resolved_label(*codec)
         ),
         _ => Err(fmt::Error),
     }

@@ -15,11 +15,11 @@ use std::time::Instant;
 
 use fastconv_domain::{
     AudioBatchItem, AudioBatchPlan, AudioBitDepth, AudioConversionReport, AudioEncodingOptions,
-    AudioInputFormat, AudioOptionChannels, AudioOptionSampleRate, AudioOutputFormat,
-    AudioRateControl, AudioSampleFormat, HardwareBackend, aac_frame_capacity_bps,
+    AudioExecutionMode, AudioInputFormat, AudioOptionChannels, AudioOptionSampleRate,
+    AudioRateControl, AudioSampleFormat, AudioTargetCodec, HardwareBackend, aac_frame_capacity_bps,
 };
 use flacenc::bitsink::ByteSink;
-use flacenc::component::BitRepr;
+use flacenc::component::{BitRepr, Stream};
 use flacenc::error::{SourceError, Verify};
 use flacenc::source::{Fill, Source};
 use hound::{SampleFormat, WavSpec, WavWriter};
@@ -518,7 +518,7 @@ fn decode_adts_aac(
 fn decode_symphonia(
     path: &Path,
     format: AudioInputFormat,
-    target: AudioOutputFormat,
+    codec: AudioTargetCodec,
     options: &AudioEncodingOptions,
     buf: &mut AudioWorkerBuffer,
 ) -> Result<(u32, usize, usize, AudioSampleFormat), PipelineError> {
@@ -604,11 +604,8 @@ fn decode_symphonia(
     // Symphonia left-aligns 16-bit integer samples when converting to i32 (i16 << 16),
     // so a direct i16 copy is both faster and bit-exact for lossless targets.
     let direct_i16 = matches!(
-        target,
-        AudioOutputFormat::Wav
-            | AudioOutputFormat::Flac
-            | AudioOutputFormat::Aiff
-            | AudioOutputFormat::Alac
+        codec,
+        AudioTargetCodec::Pcm | AudioTargetCodec::Flac | AudioTargetCodec::Alac
     ) && bits == 16
         && !is_float
         && !rate_channel_change
@@ -617,7 +614,7 @@ fn decode_symphonia(
             .is_none_or(|depth| depth == AudioBitDepth::Int16);
     // Going from i32 through f32 truncates the low eight bits, so 32-bit integer
     // WAV/AIFF conversions copy the decoded i32 samples straight through.
-    let direct_i32 = matches!(target, AudioOutputFormat::Wav | AudioOutputFormat::Aiff)
+    let direct_i32 = codec == AudioTargetCodec::Pcm
         && bits == 32
         && !is_float
         && !rate_channel_change
@@ -713,7 +710,7 @@ fn decode_symphonia(
 
 fn decode_audio(
     item: &AudioBatchItem,
-    target: AudioOutputFormat,
+    codec: AudioTargetCodec,
     options: &AudioEncodingOptions,
     buf: &mut AudioWorkerBuffer,
 ) -> Result<(u32, usize, usize, AudioSampleFormat), PipelineError> {
@@ -727,7 +724,7 @@ fn decode_audio(
             let (rate, channels) = decode_adts_aac(item.source(), buf)?;
             (rate, channels, 16, AudioSampleFormat::Int)
         }
-        _ => decode_symphonia(item.source(), item.input_format(), target, options, buf)?,
+        _ => decode_symphonia(item.source(), item.input_format(), codec, options, buf)?,
     };
 
     if channels == 0 {
@@ -749,7 +746,7 @@ fn decode_audio(
 /// ALAC or 24-bit FLAC on request.
 fn resolve_target_depth(
     path: &Path,
-    output: AudioOutputFormat,
+    codec: AudioTargetCodec,
     source_bits: usize,
     source_format: AudioSampleFormat,
     options: &AudioEncodingOptions,
@@ -757,14 +754,7 @@ fn resolve_target_depth(
     if let Some(depth) = options.bit_depth() {
         return Ok(depth);
     }
-    if matches!(
-        output,
-        AudioOutputFormat::Opus
-            | AudioOutputFormat::Ogg
-            | AudioOutputFormat::Mp3
-            | AudioOutputFormat::Aac
-            | AudioOutputFormat::M4a
-    ) {
+    if !codec.is_lossless() {
         return Ok(AudioBitDepth::Float32);
     }
     let unsupported = |bits| PipelineError::UnsupportedSampleDepth {
@@ -775,46 +765,32 @@ fn resolve_target_depth(
         path: path.to_path_buf(),
         reason,
     };
-    match (output, source_format, source_bits) {
+    match (codec, source_format, source_bits) {
         // Narrowing f64 to f32 or 24-bit integer must be an explicit request.
-        (AudioOutputFormat::Wav | AudioOutputFormat::Aiff, AudioSampleFormat::Float, 64) => {
-            Err(encode_err(
-                "64-bit float source would be narrowed to 32-bit; use --bit-depth f32".to_owned(),
-            ))
-        }
-        (AudioOutputFormat::Flac, AudioSampleFormat::Float, 64) => Err(encode_err(
+        (AudioTargetCodec::Pcm, AudioSampleFormat::Float, 64) => Err(encode_err(
+            "64-bit float source would be narrowed to 32-bit; use --bit-depth f32".to_owned(),
+        )),
+        (AudioTargetCodec::Flac, AudioSampleFormat::Float, 64) => Err(encode_err(
             "64-bit float source would be narrowed to 24-bit; use --bit-depth 24".to_owned(),
         )),
-        (AudioOutputFormat::Wav | AudioOutputFormat::Aiff, AudioSampleFormat::Float, _) => {
-            Ok(AudioBitDepth::Float32)
-        }
-        (AudioOutputFormat::Wav | AudioOutputFormat::Aiff, AudioSampleFormat::Int, 8) => {
+        (AudioTargetCodec::Pcm, AudioSampleFormat::Float, _) => Ok(AudioBitDepth::Float32),
+        (AudioTargetCodec::Pcm | AudioTargetCodec::Flac, AudioSampleFormat::Int, 8) => {
             Ok(AudioBitDepth::Int8)
         }
         // ALAC is 16-bit: keep its pre-existing default for integer widths it can
         // store and for IEEE-float input (whose width may be unset or inferred as 32).
-        (
-            AudioOutputFormat::Wav | AudioOutputFormat::Aiff | AudioOutputFormat::Flac,
-            AudioSampleFormat::Int,
-            0 | 16,
-        )
-        | (AudioOutputFormat::Alac, AudioSampleFormat::Int, 0 | 8 | 16)
-        | (AudioOutputFormat::Alac, AudioSampleFormat::Float, 0 | 32) => Ok(AudioBitDepth::Int16),
-        (AudioOutputFormat::Wav | AudioOutputFormat::Aiff, AudioSampleFormat::Int, 24) => {
-            Ok(AudioBitDepth::Int24)
-        }
-        (AudioOutputFormat::Wav | AudioOutputFormat::Aiff, AudioSampleFormat::Int, 32) => {
-            Ok(AudioBitDepth::Int32)
-        }
+        (AudioTargetCodec::Pcm | AudioTargetCodec::Flac, AudioSampleFormat::Int, 0 | 16)
+        | (AudioTargetCodec::Alac, AudioSampleFormat::Int, 0 | 8 | 16)
+        | (AudioTargetCodec::Alac, AudioSampleFormat::Float, 0 | 32) => Ok(AudioBitDepth::Int16),
         // Float input to FLAC is quantized to Int24. That keeps full precision
         // only near full scale; quieter samples lose relative precision.
-        (AudioOutputFormat::Flac, AudioSampleFormat::Float, _)
-        | (AudioOutputFormat::Flac, AudioSampleFormat::Int, 24) => Ok(AudioBitDepth::Int24),
-        (AudioOutputFormat::Flac, AudioSampleFormat::Int, 8) => Ok(AudioBitDepth::Int8),
-        (AudioOutputFormat::Flac, AudioSampleFormat::Int, 32) => Err(encode_err(
+        (AudioTargetCodec::Pcm | AudioTargetCodec::Flac, AudioSampleFormat::Int, 24)
+        | (AudioTargetCodec::Flac, AudioSampleFormat::Float, _) => Ok(AudioBitDepth::Int24),
+        (AudioTargetCodec::Pcm, AudioSampleFormat::Int, 32) => Ok(AudioBitDepth::Int32),
+        (AudioTargetCodec::Flac, AudioSampleFormat::Int, 32) => Err(encode_err(
             "FLAC stores at most 24-bit integer PCM; use --bit-depth 24".to_owned(),
         )),
-        (AudioOutputFormat::Alac, _, _) => Err(encode_err(
+        (AudioTargetCodec::Alac, _, _) => Err(encode_err(
             "ALAC stores 16-bit integer PCM only; use --bit-depth 16".to_owned(),
         )),
         (_, _, bits) => Err(unsupported(bits)),
@@ -823,45 +799,38 @@ fn resolve_target_depth(
 
 /// Quantizes the decoded `f32` samples into the integer representation the target
 /// encoder consumes. A `Float32` target keeps the original float buffer untouched.
-fn quantize_for(output: AudioOutputFormat, depth: AudioBitDepth, buf: &mut AudioWorkerBuffer) {
+fn quantize_for(codec: AudioTargetCodec, depth: AudioBitDepth, buf: &mut AudioWorkerBuffer) {
     buf.samples_i16.clear();
     buf.samples_i32.clear();
-    match (output, depth) {
+    match (codec, depth) {
         (_, AudioBitDepth::Float32) => return,
-        (AudioOutputFormat::Flac, AudioBitDepth::Int8) => buf.samples_i32.extend(
+        (AudioTargetCodec::Flac, AudioBitDepth::Int8) => buf.samples_i32.extend(
             buf.samples_f32
                 .iter()
                 .copied()
                 .map(|sample| i32::from(quantize_i8(sample))),
         ),
-        (AudioOutputFormat::Flac, AudioBitDepth::Int16) => buf.samples_i32.extend(
+        (AudioTargetCodec::Flac, AudioBitDepth::Int16) => buf.samples_i32.extend(
             buf.samples_f32
                 .iter()
                 .copied()
                 .map(|sample| i32::from(quantize_i16(sample))),
         ),
-        (
-            AudioOutputFormat::Flac | AudioOutputFormat::Wav | AudioOutputFormat::Aiff,
-            AudioBitDepth::Int24,
-        ) => buf
+        (AudioTargetCodec::Flac | AudioTargetCodec::Pcm, AudioBitDepth::Int24) => buf
             .samples_i32
             .extend(buf.samples_f32.iter().copied().map(quantize_i24)),
-        (
-            AudioOutputFormat::Wav | AudioOutputFormat::Aiff | AudioOutputFormat::Alac,
-            AudioBitDepth::Int8,
-        ) => buf.samples_i16.extend(
-            buf.samples_f32
-                .iter()
-                .copied()
-                .map(|sample| i16::from(quantize_i8(sample))),
-        ),
-        (
-            AudioOutputFormat::Wav | AudioOutputFormat::Aiff | AudioOutputFormat::Alac,
-            AudioBitDepth::Int16,
-        ) => buf
+        (AudioTargetCodec::Pcm | AudioTargetCodec::Alac, AudioBitDepth::Int8) => {
+            buf.samples_i16.extend(
+                buf.samples_f32
+                    .iter()
+                    .copied()
+                    .map(|s| i16::from(quantize_i8(s))),
+            );
+        }
+        (AudioTargetCodec::Pcm | AudioTargetCodec::Alac, AudioBitDepth::Int16) => buf
             .samples_i16
             .extend(buf.samples_f32.iter().copied().map(quantize_i16)),
-        (AudioOutputFormat::Wav | AudioOutputFormat::Aiff, AudioBitDepth::Int32) => buf
+        (AudioTargetCodec::Pcm, AudioBitDepth::Int32) => buf
             .samples_i32
             .extend(buf.samples_f32.iter().copied().map(quantize_i32)),
         // Unsupported combinations are rejected before this point.
@@ -1176,17 +1145,13 @@ impl<S: Source> Source for EofTolerantFlacSource<S> {
     }
 }
 
-fn encode_flac_from_source<S: Source>(
+/// Encodes a validated FLAC `Source` into native FLAC component frames shared
+/// by the native `.flac` writer and the Xiph Ogg-FLAC mapper.
+fn build_flac_stream<S: Source>(
     path: &Path,
     source: S,
     batch_workers: usize,
-    source_failed: Option<&AtomicBool>,
-) -> Result<(), PipelineError> {
-    let pcm_bytes = source
-        .len_hint()
-        .unwrap_or(0)
-        .saturating_mul(source.channels())
-        .saturating_mul(source.bits_per_sample() / 8);
+) -> Result<Stream, PipelineError> {
     let mut config = flacenc::config::Encoder::default();
     config.block_size = FLAC_BLOCK_SIZE;
     // The quantized LPC search dominates runtime for only a small compression gain.
@@ -1220,6 +1185,26 @@ fn encode_flac_from_source<S: Source>(
             path: path.to_path_buf(),
             reason: format!("FLAC stream-info update failed: {err}"),
         })?;
+    Ok(stream)
+}
+
+/// Writes the shared FLAC frames to a native `.flac` bitstream.
+fn write_native_flac(
+    path: &Path,
+    stream: &Stream,
+    source_failed: Option<&AtomicBool>,
+) -> Result<(), PipelineError> {
+    if source_failed.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err(PipelineError::DecodeFailed {
+            path: path.to_path_buf(),
+            reason: "WAV source ended before all declared PCM samples were read".to_owned(),
+        });
+    }
+    let info = stream.stream_info();
+    let pcm_bytes = info
+        .total_samples()
+        .saturating_mul(info.channels())
+        .saturating_mul(info.bits_per_sample() / 8);
     let max_sink_bytes = usize::try_from(MAX_PCM_BYTES_PER_FILE).unwrap_or(usize::MAX);
     let estimated_bytes =
         ((pcm_bytes / 10).saturating_mul(6).saturating_add(65_536)).min(max_sink_bytes);
@@ -1230,16 +1215,54 @@ fn encode_flac_from_source<S: Source>(
             path: path.to_path_buf(),
             reason: format!("FLAC bitstream write failed: {err}"),
         })?;
+    fs::write(path, sink.as_slice()).map_err(|source| PipelineError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn encode_flac_from_source<S: Source>(
+    path: &Path,
+    source: S,
+    batch_workers: usize,
+    source_failed: Option<&AtomicBool>,
+) -> Result<(), PipelineError> {
+    let stream = build_flac_stream(path, source, batch_workers)?;
+    write_native_flac(path, &stream, source_failed)
+}
+
+fn encode_ogg_flac_from_source<S: Source>(
+    path: &Path,
+    source: S,
+    batch_workers: usize,
+    source_failed: Option<&AtomicBool>,
+) -> Result<(), PipelineError> {
+    let stream = build_flac_stream(path, source, batch_workers)?;
     if source_failed.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
         return Err(PipelineError::DecodeFailed {
             path: path.to_path_buf(),
             reason: "WAV source ended before all declared PCM samples were read".to_owned(),
         });
     }
-    fs::write(path, sink.as_slice()).map_err(|source| PipelineError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    crate::ogg_flac::write_ogg_flac(path, &stream)
+}
+
+fn encode_ogg_flac(
+    path: &Path,
+    rate: u32,
+    channels: usize,
+    bits: usize,
+    buf: &AudioWorkerBuffer,
+    batch_workers: usize,
+) -> Result<(), PipelineError> {
+    let source = BorrowedI32FlacSource {
+        samples: &buf.samples_i32,
+        read_head: 0,
+        channels,
+        bits,
+        rate: usize_from(rate),
+    };
+    encode_ogg_flac_from_source(path, source, batch_workers, None)
 }
 
 fn encode_flac(
@@ -1749,31 +1772,28 @@ fn aac_rate(rate: u32) -> u32 {
 /// Single source of truth for the rate fed to the encoder. Explicit options win;
 /// otherwise every format keeps the codec default it used before these options existed.
 fn effective_sample_rate(
-    output: AudioOutputFormat,
+    codec: AudioTargetCodec,
     rate: u32,
     options: &AudioEncodingOptions,
 ) -> u32 {
-    let codec_default = match output {
-        AudioOutputFormat::Opus => OPUS_RATE,
-        AudioOutputFormat::Aac | AudioOutputFormat::M4a => aac_rate(rate),
-        AudioOutputFormat::Mp3 => {
+    let codec_default = match codec {
+        AudioTargetCodec::Opus => OPUS_RATE,
+        AudioTargetCodec::Aac => aac_rate(rate),
+        AudioTargetCodec::Mp3 => {
             if MP3_RATES.contains(&rate) {
                 rate
             } else {
                 OPUS_RATE
             }
         }
-        AudioOutputFormat::Ogg => {
+        AudioTargetCodec::Vorbis => {
             if rate <= OGG_MAX_RATE {
                 rate
             } else {
                 OPUS_RATE
             }
         }
-        AudioOutputFormat::Wav
-        | AudioOutputFormat::Flac
-        | AudioOutputFormat::Alac
-        | AudioOutputFormat::Aiff => rate,
+        AudioTargetCodec::Pcm | AudioTargetCodec::Flac | AudioTargetCodec::Alac => rate,
     };
     options
         .sample_rate()
@@ -1822,7 +1842,7 @@ fn encode_aac(
     options: &AudioEncodingOptions,
 ) -> Result<(), PipelineError> {
     check_aac_channels(path, channels, "AAC")?;
-    let target_rate = effective_sample_rate(AudioOutputFormat::Aac, rate, options);
+    let target_rate = effective_sample_rate(AudioTargetCodec::Aac, rate, options);
     check_aac_bitrate(path, target_rate, channels, options)?;
     resample_f32(rate, target_rate, channels, buf, "aac-resampler")?;
     if buf.samples_f32.is_empty() {
@@ -1891,7 +1911,7 @@ fn encode_m4a(
     options: &AudioEncodingOptions,
 ) -> Result<(), PipelineError> {
     check_aac_channels(path, channels, "M4A/AAC")?;
-    let target_rate = effective_sample_rate(AudioOutputFormat::M4a, rate, options);
+    let target_rate = effective_sample_rate(AudioTargetCodec::Aac, rate, options);
     check_aac_bitrate(path, target_rate, channels, options)?;
     resample_f32(rate, target_rate, channels, buf, "m4a-resampler")?;
     if buf.samples_f32.is_empty() {
@@ -1944,7 +1964,7 @@ fn encode_mp3(
     options: &AudioEncodingOptions,
 ) -> Result<(), PipelineError> {
     check_channels(path, channels, 1, 2, "MP3")?;
-    let target_rate = effective_sample_rate(AudioOutputFormat::Mp3, rate, options);
+    let target_rate = effective_sample_rate(AudioTargetCodec::Mp3, rate, options);
     if target_rate < 32_000
         && matches!(
             options.rate_control(),
@@ -2041,7 +2061,7 @@ fn encode_ogg(
             reason: "Ogg Vorbis requires a positive sample rate".to_owned(),
         });
     }
-    let target_rate = effective_sample_rate(AudioOutputFormat::Ogg, rate, options);
+    let target_rate = effective_sample_rate(AudioTargetCodec::Vorbis, rate, options);
     resample_f32(rate, target_rate, channels, buf, "ogg-resampler")?;
     if buf.samples_f32.is_empty() {
         return Err(PipelineError::EmptyOutput(path.to_path_buf()));
@@ -2232,10 +2252,10 @@ fn encode_audio(
 ) -> Result<u64, PipelineError> {
     let options = settings.options;
     let batch_workers = settings.batch_workers;
-    let output = mode.output_format();
+    let codec = mode.codec();
     let depth = resolve_target_depth(
         item.source(),
-        output,
+        codec,
         source.bits,
         source.sample_format,
         options,
@@ -2245,31 +2265,41 @@ fn encode_audio(
     let direct_i16 =
         !buf.samples_i16.is_empty() && buf.samples_f32.is_empty() && buf.samples_i32.is_empty();
     let direct_i32 = !buf.samples_i32.is_empty() && buf.samples_f32.is_empty();
-    if !direct_i16 && !direct_i32 && output.is_lossless() {
-        quantize_for(output, depth, buf);
+    if !direct_i16 && !direct_i32 && codec.is_lossless() {
+        quantize_for(codec, depth, buf);
     }
-    if direct_i16 && output == AudioOutputFormat::Flac {
+    if direct_i16 && codec == AudioTargetCodec::Flac {
         buf.samples_i32.clear();
         buf.samples_i32
             .extend(buf.samples_i16.iter().copied().map(i32::from));
     }
     let flac_bits = usize::from(depth.bits());
-    encode_staged(item, |temp| match output {
-        AudioOutputFormat::Wav => encode_wav(temp, rate, channels, depth, buf),
-        AudioOutputFormat::Flac => encode_flac(temp, rate, channels, flac_bits, buf, batch_workers),
-        AudioOutputFormat::Opus => encode_opus(temp, rate, channels, buf, batch_workers, options),
-        AudioOutputFormat::Ogg => encode_ogg(temp, rate, channels, buf, options),
-        AudioOutputFormat::Mp3 => encode_mp3(temp, rate, channels, buf, options),
-        AudioOutputFormat::Aac => encode_aac(temp, rate, channels, buf, options),
-        AudioOutputFormat::M4a => encode_m4a(temp, rate, channels, buf, options),
-        AudioOutputFormat::Alac => encode_alac(temp, rate, channels, buf, batch_workers),
-        AudioOutputFormat::Aiff => encode_aiff(temp, rate, channels, depth, buf),
+    encode_staged(item, |temp| match mode {
+        AudioExecutionMode::CpuWav => encode_wav(temp, rate, channels, depth, buf),
+        AudioExecutionMode::CpuFlac => {
+            encode_flac(temp, rate, channels, flac_bits, buf, batch_workers)
+        }
+        AudioExecutionMode::CpuOggFlac => {
+            encode_ogg_flac(temp, rate, channels, flac_bits, buf, batch_workers)
+        }
+        AudioExecutionMode::CpuOpus | AudioExecutionMode::CpuOggOpus => {
+            encode_opus(temp, rate, channels, buf, batch_workers, options)
+        }
+        AudioExecutionMode::CpuOgg => encode_ogg(temp, rate, channels, buf, options),
+        AudioExecutionMode::CpuMp3 => encode_mp3(temp, rate, channels, buf, options),
+        AudioExecutionMode::CpuAac => encode_aac(temp, rate, channels, buf, options),
+        AudioExecutionMode::CpuM4a => encode_m4a(temp, rate, channels, buf, options),
+        AudioExecutionMode::CpuAlac | AudioExecutionMode::CpuM4aAlac => {
+            encode_alac(temp, rate, channels, buf, batch_workers)
+        }
+        AudioExecutionMode::CpuAiff => encode_aiff(temp, rate, channels, depth, buf),
     })
 }
 
 fn convert_pcm_wav_to_flac(
     item: &AudioBatchItem,
     stream: PcmWavStream,
+    mode: AudioExecutionMode,
     buf: &mut AudioWorkerBuffer,
     batch_workers: usize,
 ) -> Result<u64, PipelineError> {
@@ -2296,7 +2326,11 @@ fn convert_pcm_wav_to_flac(
         };
         let failed = Arc::new(AtomicBool::new(false));
         let source = EofTolerantFlacSource::new(source, Arc::clone(&failed));
-        encode_flac_from_source(temp, source, batch_workers, Some(&failed))
+        if mode == AudioExecutionMode::CpuOggFlac {
+            encode_ogg_flac_from_source(temp, source, batch_workers, Some(&failed))
+        } else {
+            encode_flac_from_source(temp, source, batch_workers, Some(&failed))
+        }
     })
 }
 
@@ -2313,9 +2347,12 @@ fn convert_item(
             source,
         })?
         .len();
-    let output = mode.output_format();
+    let codec = mode.codec();
     if item.input_format() == AudioInputFormat::Wav
-        && output == AudioOutputFormat::Flac
+        && matches!(
+            mode,
+            AudioExecutionMode::CpuFlac | AudioExecutionMode::CpuOggFlac
+        )
         && let Some(stream) = try_open_pcm_wav(item.source())?
     {
         // The streaming fast path preserves the source rate/channels exactly; any
@@ -2330,11 +2367,11 @@ fn convert_item(
                 .bit_depth()
                 .is_some_and(|depth| usize::from(depth.bits()) != stream.bits);
         if !transforming {
-            let output_bytes = convert_pcm_wav_to_flac(item, stream, buf, batch_workers)?;
+            let output_bytes = convert_pcm_wav_to_flac(item, stream, mode, buf, batch_workers)?;
             return Ok((input_bytes, output_bytes));
         }
     }
-    let (rate, channels, bits, sample_format) = decode_audio(item, output, options, buf)?;
+    let (rate, channels, bits, sample_format) = decode_audio(item, codec, options, buf)?;
     let wanted_channels = options
         .channels()
         .map_or(channels, |channels| usize::from(channels.get()));
@@ -2346,18 +2383,21 @@ fn convert_item(
         remix_channels_f32(current_channels, wanted_channels, buf, item.source())?;
         current_channels = wanted_channels;
     }
-    let target_rate = effective_sample_rate(output, rate, options);
+    let target_rate = effective_sample_rate(codec, rate, options);
     if target_rate != rate {
-        let label = match output {
-            AudioOutputFormat::Wav => "wav-resampler",
-            AudioOutputFormat::Flac => "flac-resampler",
-            AudioOutputFormat::Alac => "alac-resampler",
-            AudioOutputFormat::Aiff => "aiff-resampler",
-            AudioOutputFormat::Opus => "opus-resampler",
-            AudioOutputFormat::Ogg => "ogg-resampler",
-            AudioOutputFormat::Mp3 => "mp3-resampler",
-            AudioOutputFormat::Aac => "aac-resampler",
-            AudioOutputFormat::M4a => "m4a-resampler",
+        let label = match mode {
+            AudioExecutionMode::CpuWav => "wav-resampler",
+            AudioExecutionMode::CpuFlac => "flac-resampler",
+            AudioExecutionMode::CpuOggFlac => "ogg-flac-resampler",
+            AudioExecutionMode::CpuAlac => "alac-resampler",
+            AudioExecutionMode::CpuM4aAlac => "m4a-alac-resampler",
+            AudioExecutionMode::CpuAiff => "aiff-resampler",
+            AudioExecutionMode::CpuOpus => "opus-resampler",
+            AudioExecutionMode::CpuOggOpus => "ogg-opus-resampler",
+            AudioExecutionMode::CpuOgg => "ogg-resampler",
+            AudioExecutionMode::CpuMp3 => "mp3-resampler",
+            AudioExecutionMode::CpuAac => "aac-resampler",
+            AudioExecutionMode::CpuM4a => "m4a-resampler",
         };
         resample_f32(rate, target_rate, current_channels, buf, label)?;
         if buf.samples_f32.is_empty() {
@@ -2402,18 +2442,17 @@ struct PcmEstimate {
 /// only when a quantizing path is actually taken.
 fn quantizes_to_second_array(
     item: &AudioBatchItem,
-    output: AudioOutputFormat,
+    codec: AudioTargetCodec,
     options: &AudioEncodingOptions,
 ) -> bool {
-    if !output.is_lossless() || options.bit_depth().is_some_and(AudioBitDepth::is_float) {
+    if !codec.is_lossless() || options.bit_depth().is_some_and(AudioBitDepth::is_float) {
         return false;
     }
     let stream = item.stream();
     if stream.sample_format() != AudioSampleFormat::Int {
-        // WAV/AIFF keep float streams as Float32 unless an integer depth is forced;
-        // `quantize_for` then leaves the float buffer untouched.
-        return !(matches!(output, AudioOutputFormat::Wav | AudioOutputFormat::Aiff)
-            && options.bit_depth().is_none());
+        // PCM containers keep float streams as Float32 unless an integer depth is
+        // forced; `quantize_for` then leaves the float buffer untouched.
+        return !(codec == AudioTargetCodec::Pcm && options.bit_depth().is_none());
     }
     let bits = usize::from(stream.bits_per_sample().map_or(0, NonZeroU16::get));
     let no_transform = options
@@ -2426,7 +2465,7 @@ fn quantizes_to_second_array(
     let direct_i16 =
         no_transform && bits == 16 && explicit.is_none_or(|depth| depth == AudioBitDepth::Int16);
     let direct_i32 = no_transform
-        && matches!(output, AudioOutputFormat::Wav | AudioOutputFormat::Aiff)
+        && codec == AudioTargetCodec::Pcm
         && bits == 32
         && explicit.is_none_or(|depth| depth == AudioBitDepth::Int32);
     !direct_i16 && !direct_i32
@@ -2434,7 +2473,7 @@ fn quantizes_to_second_array(
 
 fn estimate_pcm_bytes(
     item: &AudioBatchItem,
-    output: AudioOutputFormat,
+    codec: AudioTargetCodec,
     options: &AudioEncodingOptions,
 ) -> PcmEstimate {
     let stream = item.stream();
@@ -2451,7 +2490,7 @@ fn estimate_pcm_bytes(
         return unknown;
     };
     let source_rate = stream.sample_rate().get();
-    let target_rate = effective_sample_rate(output, source_rate, options);
+    let target_rate = effective_sample_rate(codec, source_rate, options);
     let source_channels = u64::from(stream.channels().get()).max(1);
     let target_channels = u64::from(
         options
@@ -2496,7 +2535,7 @@ fn estimate_pcm_bytes(
         };
         peak_bytes = peak_bytes.max(source_bytes.saturating_add(remix_output_bytes));
     }
-    if quantizes_to_second_array(item, output, options) {
+    if quantizes_to_second_array(item, codec, options) {
         // The decoded f32 samples and the quantized i16/i32 array are both live
         // across the extend loop, and the integer array keeps its capacity for
         // later items. Charge a second full-file array at the wider 4-byte size.
@@ -2511,12 +2550,12 @@ fn estimate_pcm_bytes(
 fn resolve_worker_count(
     items: &[AudioBatchItem],
     requested: usize,
-    output: AudioOutputFormat,
+    codec: AudioTargetCodec,
     options: &AudioEncodingOptions,
 ) -> Result<usize, PipelineError> {
     let estimates: Vec<PcmEstimate> = items
         .iter()
-        .map(|item| estimate_pcm_bytes(item, output, options))
+        .map(|item| estimate_pcm_bytes(item, codec, options))
         .collect();
     let largest_buffer = estimates
         .iter()
@@ -2611,7 +2650,7 @@ pub fn execute_audio_batch(plan: &AudioBatchPlan) -> Result<AudioConversionRepor
     let worker_count = resolve_worker_count(
         items,
         plan.effective_workers().get(),
-        plan.mode().output_format(),
+        plan.mode().codec(),
         &options,
     )?;
     // Idle workers must not shrink the inner-encoder budget of the active files.
@@ -2686,7 +2725,7 @@ pub fn execute_audio_batch(plan: &AudioBatchPlan) -> Result<AudioConversionRepor
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastconv_domain::{AudioOptionBitrate, AudioQuality};
+    use fastconv_domain::{AudioOptionBitrate, AudioOutputFormat, AudioQuality};
     use std::num::{NonZeroU16, NonZeroU32};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2966,14 +3005,14 @@ mod tests {
             })
             .collect();
         let defaults = AudioEncodingOptions::default();
-        let estimate = estimate_pcm_bytes(&items[0], AudioOutputFormat::Wav, &defaults);
+        let estimate = estimate_pcm_bytes(&items[0], AudioTargetCodec::Pcm, &defaults);
         assert_eq!(estimate.largest_buffer_bytes, MAX_PCM_BYTES_PER_FILE);
         assert_eq!(
             estimate.peak_bytes,
             MAX_PCM_BYTES_PER_FILE.saturating_mul(2)
         );
         let workers =
-            resolve_worker_count(&items, 8, AudioOutputFormat::Wav, &defaults).unwrap_or(0);
+            resolve_worker_count(&items, 8, AudioTargetCodec::Pcm, &defaults).unwrap_or(0);
         assert_eq!(
             workers, 1,
             "unknown decoded lengths must reserve two coexisting buffers"
@@ -3660,7 +3699,7 @@ mod tests {
         let (rate, channels, _, _) = decode_symphonia(
             &ogg,
             AudioInputFormat::Vorbis,
-            AudioOutputFormat::Wav,
+            AudioTargetCodec::Pcm,
             &AudioEncodingOptions::default(),
             &mut decoded_buf,
         )?;
@@ -3717,7 +3756,7 @@ mod tests {
         let (rate, channels, _, _) = decode_symphonia(
             &mono,
             AudioInputFormat::Vorbis,
-            AudioOutputFormat::Wav,
+            AudioTargetCodec::Pcm,
             &AudioEncodingOptions::default(),
             &mut decoded,
         )?;
@@ -3740,7 +3779,7 @@ mod tests {
         let (rate, channels, _, _) = decode_symphonia(
             &short,
             AudioInputFormat::Vorbis,
-            AudioOutputFormat::Wav,
+            AudioTargetCodec::Pcm,
             &AudioEncodingOptions::default(),
             &mut decoded_short,
         )?;
@@ -4042,12 +4081,12 @@ mod tests {
             AudioRateControl::Default,
         );
         assert_eq!(
-            effective_sample_rate(AudioOutputFormat::Wav, 48_000, &explicit),
+            effective_sample_rate(AudioTargetCodec::Pcm, 48_000, &explicit),
             44_100
         );
         assert_eq!(
             effective_sample_rate(
-                AudioOutputFormat::Opus,
+                AudioTargetCodec::Opus,
                 44_100,
                 &AudioEncodingOptions::default()
             ),
@@ -4055,7 +4094,7 @@ mod tests {
         );
         assert_eq!(
             effective_sample_rate(
-                AudioOutputFormat::Mp3,
+                AudioTargetCodec::Mp3,
                 44_100,
                 &AudioEncodingOptions::default()
             ),
@@ -4071,7 +4110,7 @@ mod tests {
             1_000,
         );
         let defaults = AudioEncodingOptions::default();
-        let plain = estimate_pcm_bytes(&item, AudioOutputFormat::Wav, &defaults);
+        let plain = estimate_pcm_bytes(&item, AudioTargetCodec::Pcm, &defaults);
         assert_eq!(
             (plain.peak_bytes, plain.largest_buffer_bytes),
             (8_000, 8_000)
@@ -4082,7 +4121,7 @@ mod tests {
             Some(6),
             AudioRateControl::Default,
         );
-        let grown = estimate_pcm_bytes(&item, AudioOutputFormat::Wav, &upsampled);
+        let grown = estimate_pcm_bytes(&item, AudioTargetCodec::Pcm, &upsampled);
         assert_eq!(grown.largest_buffer_bytes, 2_000 * 6 * 4);
         // The remixed f32 samples and their quantized i32 copy are both live,
         // which peaks higher than the decoded/resample coexistence (64_000).
@@ -4095,9 +4134,9 @@ mod tests {
             8_000,
             MAX_PCM_BYTES_PER_FILE / 8,
         );
-        let huge_estimate = estimate_pcm_bytes(&huge, AudioOutputFormat::Wav, &upsampled);
+        let huge_estimate = estimate_pcm_bytes(&huge, AudioTargetCodec::Pcm, &upsampled);
         assert!(huge_estimate.largest_buffer_bytes > MAX_PCM_BYTES_PER_FILE);
-        assert!(resolve_worker_count(&[huge], 4, AudioOutputFormat::Wav, &upsampled).is_err());
+        assert!(resolve_worker_count(&[huge], 4, AudioTargetCodec::Pcm, &upsampled).is_err());
     }
 
     fn plan_with_options(
@@ -4933,24 +4972,20 @@ mod tests {
     fn rejects_implicit_64bit_float_narrowing() -> Result<(), PipelineError> {
         let path = Path::new("in.wav");
         let defaults = AudioEncodingOptions::default();
-        for output in [
-            AudioOutputFormat::Wav,
-            AudioOutputFormat::Aiff,
-            AudioOutputFormat::Flac,
-        ] {
+        for codec in [AudioTargetCodec::Pcm, AudioTargetCodec::Flac] {
             assert!(
                 matches!(
-                    resolve_target_depth(path, output, 64, AudioSampleFormat::Float, &defaults),
+                    resolve_target_depth(path, codec, 64, AudioSampleFormat::Float, &defaults),
                     Err(PipelineError::EncodeFailed { .. })
                 ),
-                "{output} must reject implicit f64 narrowing"
+                "{codec} must reject implicit f64 narrowing"
             );
         }
         let explicit = options_depth(AudioOutputFormat::Wav, AudioBitDepth::Float32);
         assert_eq!(
             resolve_target_depth(
                 path,
-                AudioOutputFormat::Wav,
+                AudioTargetCodec::Pcm,
                 64,
                 AudioSampleFormat::Float,
                 &explicit
@@ -4960,7 +4995,7 @@ mod tests {
         assert_eq!(
             resolve_target_depth(
                 path,
-                AudioOutputFormat::Wav,
+                AudioTargetCodec::Pcm,
                 32,
                 AudioSampleFormat::Float,
                 &defaults
@@ -4978,7 +5013,7 @@ mod tests {
             assert_eq!(
                 resolve_target_depth(
                     path,
-                    AudioOutputFormat::Alac,
+                    AudioTargetCodec::Alac,
                     bits,
                     AudioSampleFormat::Float,
                     &defaults
@@ -4990,7 +5025,7 @@ mod tests {
         assert!(matches!(
             resolve_target_depth(
                 path,
-                AudioOutputFormat::Alac,
+                AudioTargetCodec::Alac,
                 24,
                 AudioSampleFormat::Int,
                 &defaults
@@ -5089,10 +5124,10 @@ mod tests {
             1_000,
         );
         let defaults = AudioEncodingOptions::default();
-        let direct = estimate_pcm_bytes(&item, AudioOutputFormat::Wav, &defaults);
+        let direct = estimate_pcm_bytes(&item, AudioTargetCodec::Pcm, &defaults);
         let quantized = estimate_pcm_bytes(
             &item,
-            AudioOutputFormat::Wav,
+            AudioTargetCodec::Pcm,
             &options_depth(AudioOutputFormat::Wav, AudioBitDepth::Int32),
         );
         assert_eq!(direct.peak_bytes, 8_000);
@@ -5116,20 +5151,349 @@ mod tests {
         )
         .unwrap_or_else(|_| unreachable!());
         let defaults = AudioEncodingOptions::default();
-        for output in [AudioOutputFormat::Wav, AudioOutputFormat::Aiff] {
-            let estimate = estimate_pcm_bytes(&item, output, &defaults);
-            assert_eq!(estimate.peak_bytes, 8_000, "{output} implicit Float32");
-            assert_eq!(
-                estimate.largest_buffer_bytes, 8_000,
-                "{output} implicit Float32"
-            );
-        }
+        let estimate = estimate_pcm_bytes(&item, AudioTargetCodec::Pcm, &defaults);
+        assert_eq!(estimate.peak_bytes, 8_000, "implicit Float32");
+        assert_eq!(estimate.largest_buffer_bytes, 8_000, "implicit Float32");
         // A forced integer depth still quantizes and needs the second array.
         let forced = estimate_pcm_bytes(
             &item,
-            AudioOutputFormat::Wav,
+            AudioTargetCodec::Pcm,
             &options_depth(AudioOutputFormat::Wav, AudioBitDepth::Int32),
         );
         assert_eq!(forced.peak_bytes, 16_000);
+    }
+
+    #[test]
+    fn roundtrips_wav_ogg_flac_wav_bit_identically() -> Result<(), PipelineError> {
+        let dir = temp_dir("ogg-flac-roundtrip");
+        let src = dir.join("in.wav");
+        let ogg = dir.join("out.ogg");
+        let back = dir.join("back.wav");
+        let samples = tone(8_000, 2);
+        write_wav(&src, &samples, 48_000, 2);
+
+        execute_audio_batch(&plan(
+            vec![item(
+                src.clone(),
+                ogg.clone(),
+                AudioInputFormat::Wav,
+                2,
+                48_000,
+            )],
+            AudioExecutionMode::CpuOggFlac,
+        ))?;
+
+        let packets = ogg_packets(&ogg)?;
+        assert!(
+            packets.len() >= 3,
+            "expected identification, comment and frames"
+        );
+        assert!(packets[0].data.starts_with(b"\x7fFLAC"));
+        assert_eq!(packets[0].data.len(), 51);
+        assert_eq!(&packets[0].data[9..13], b"fLaC");
+        assert_eq!(packets[1].data.len(), 20);
+        assert_eq!(&packets[1].data[4..8], &8_u32.to_le_bytes());
+        assert!(packets[2..].iter().all(|p| p.data.starts_with(&[0xFF])));
+        let mut granule = 0_u64;
+        for packet in packets.iter().skip(2) {
+            granule = granule.max(packet.absgp_page());
+        }
+        assert_eq!(granule, 8_000);
+        assert!(packets.last().is_some_and(ogg::Packet::last_in_stream));
+
+        execute_audio_batch(&plan(
+            vec![item(
+                ogg,
+                back.clone(),
+                AudioInputFormat::OggFlac,
+                2,
+                48_000,
+            )],
+            AudioExecutionMode::CpuWav,
+        ))?;
+        assert_eq!(read_wav(&back), samples);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    fn codec_options(
+        format: AudioOutputFormat,
+        codec: AudioTargetCodec,
+        control: AudioRateControl,
+        rate: Option<u32>,
+        channels: Option<u16>,
+        depth: Option<AudioBitDepth>,
+    ) -> AudioEncodingOptions {
+        let rate = rate.map(|hz| AudioOptionSampleRate::new(hz).unwrap_or_else(|_| unreachable!()));
+        let channels = channels
+            .map(|count| AudioOptionChannels::new(count).unwrap_or_else(|_| unreachable!()));
+        AudioEncodingOptions::for_codec(format, codec, control, rate, channels, depth)
+            .unwrap_or_else(|_| unreachable!())
+    }
+
+    #[test]
+    fn roundtrips_24bit_wav_ogg_flac_wav_bit_identically() -> Result<(), PipelineError> {
+        let dir = temp_dir("ogg-flac-24bit");
+        let src = dir.join("in.wav");
+        let ogg = dir.join("out.ogg");
+        let back = dir.join("back.wav");
+        let samples = deep_tone(4_000, 2);
+        write_wav24(&src, &samples, 48_000, 2)?;
+
+        let encode_options = codec_options(
+            AudioOutputFormat::Ogg,
+            AudioTargetCodec::Flac,
+            AudioRateControl::Default,
+            None,
+            None,
+            Some(AudioBitDepth::Int24),
+        );
+        execute_audio_batch(&plan_with_options(
+            vec![item_bits(
+                src,
+                ogg.clone(),
+                AudioInputFormat::Wav,
+                2,
+                48_000,
+                24,
+            )],
+            AudioExecutionMode::CpuOggFlac,
+            encode_options,
+        ))?;
+
+        let packets = ogg_packets(&ogg)?;
+        assert!(packets[0].data.starts_with(b"\x7fFLAC"));
+        assert_eq!(packets[0].data.len(), 51);
+        // STREAMINFO payload: bits-per-sample is stored in the low five bits of
+        // byte 12 after the 34-byte block begins at byte 17.
+        let info = &packets[0].data[17..51];
+        assert_eq!(info.len(), 34);
+        assert_eq!(info[10], 0x0B, "sample rate high byte must be 48 kHz");
+        assert_eq!(info[11], 0xB8, "sample rate low byte must be 48 kHz");
+        let bits_minus_one = (u32::from(info[12] & 0x01) << 4) | u32::from(info[13] >> 4);
+        assert_eq!(bits_minus_one, 23, "bits per sample must be 24");
+
+        let decode_options = codec_options(
+            AudioOutputFormat::Wav,
+            AudioTargetCodec::Pcm,
+            AudioRateControl::Default,
+            None,
+            None,
+            Some(AudioBitDepth::Int24),
+        );
+        execute_audio_batch(&plan_with_options(
+            vec![item_bits(
+                ogg,
+                back.clone(),
+                AudioInputFormat::OggFlac,
+                2,
+                48_000,
+                24,
+            )],
+            AudioExecutionMode::CpuWav,
+            decode_options,
+        ))?;
+        assert_eq!(read_wav_i32(&back), samples);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrips_wav_m4a_alac_wav_bit_identically_with_explicit_depth() -> Result<(), PipelineError>
+    {
+        let dir = temp_dir("m4a-alac-16bit");
+        let src = dir.join("in.wav");
+        let m4a = dir.join("out.m4a");
+        let back = dir.join("back.wav");
+        let samples = tone(8_000, 2);
+        write_wav(&src, &samples, 48_000, 2);
+
+        let options = codec_options(
+            AudioOutputFormat::M4a,
+            AudioTargetCodec::Alac,
+            AudioRateControl::Default,
+            None,
+            None,
+            Some(AudioBitDepth::Int16),
+        );
+        execute_audio_batch(&plan_with_options(
+            vec![item(src, m4a.clone(), AudioInputFormat::Wav, 2, 48_000)],
+            AudioExecutionMode::CpuM4aAlac,
+            options,
+        ))?;
+        assert!(
+            fs::metadata(&m4a)
+                .map_err(|source| PipelineError::Io {
+                    path: m4a.clone(),
+                    source,
+                })?
+                .len()
+                > 8
+        );
+
+        execute_audio_batch(&plan(
+            vec![item(m4a, back.clone(), AudioInputFormat::Alac, 2, 48_000)],
+            AudioExecutionMode::CpuWav,
+        ))?;
+        assert_eq!(read_wav(&back), samples);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn ogg_opus_and_m4a_aac_honor_128k_bitrate() -> Result<(), PipelineError> {
+        let dir = temp_dir("container-bitrates");
+        let src = dir.join("in.wav");
+
+        for (name, format, codec, mode, input_format) in [
+            (
+                "out.ogg",
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Opus,
+                AudioExecutionMode::CpuOggOpus,
+                AudioInputFormat::Opus,
+            ),
+            (
+                "out.m4a",
+                AudioOutputFormat::M4a,
+                AudioTargetCodec::Aac,
+                AudioExecutionMode::CpuM4a,
+                AudioInputFormat::M4a,
+            ),
+        ] {
+            let encoded = dir.join(name);
+            let back = dir.join(format!("back-{name}.wav"));
+            write_wav(&src, &tone(16_000, 2), 48_000, 2);
+            let options = codec_options(
+                format,
+                codec,
+                AudioRateControl::Bitrate(AudioOptionBitrate::new(128_000).map_err(|err| {
+                    PipelineError::EncodeFailed {
+                        path: encoded.clone(),
+                        reason: err.to_string(),
+                    }
+                })?),
+                Some(48_000),
+                Some(2),
+                None,
+            );
+            execute_audio_batch(&plan_with_options(
+                vec![item(
+                    src.clone(),
+                    encoded.clone(),
+                    AudioInputFormat::Wav,
+                    2,
+                    48_000,
+                )],
+                mode,
+                options,
+            ))?;
+            execute_audio_batch(&plan(
+                vec![item(encoded, back.clone(), input_format, 2, 48_000)],
+                AudioExecutionMode::CpuWav,
+            ))?;
+            let spec = wav_spec(&back)?;
+            assert_eq!((spec.channels, spec.sample_rate), (2, 48_000));
+            assert_ne!(read_wav(&back).len(), 0);
+        }
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn codec_batch_and_resampling_remixing_reach_lossless_containers() -> Result<(), PipelineError>
+    {
+        let dir = temp_dir("codec-batch-transform");
+        let first = dir.join("first.wav");
+        let second = dir.join("second.wav");
+        let flac_ogg = dir.join("first.ogg");
+        let alac_m4a = dir.join("second.m4a");
+        let samples = tone(8_000, 2);
+        write_wav(&first, &samples, 48_000, 2);
+        write_wav(&second, &samples, 48_000, 2);
+
+        // Two container/codec pairs in one batch each preserve their payload.
+        execute_audio_batch(&plan(
+            vec![item(
+                first.clone(),
+                flac_ogg.clone(),
+                AudioInputFormat::Wav,
+                2,
+                48_000,
+            )],
+            AudioExecutionMode::CpuOggFlac,
+        ))?;
+        execute_audio_batch(&plan(
+            vec![item(
+                second.clone(),
+                alac_m4a.clone(),
+                AudioInputFormat::Wav,
+                2,
+                48_000,
+            )],
+            AudioExecutionMode::CpuM4aAlac,
+        ))?;
+        let back_ogg = dir.join("back-ogg.wav");
+        let back_m4a = dir.join("back-m4a.wav");
+        execute_audio_batch(&plan(
+            vec![item(
+                flac_ogg,
+                back_ogg.clone(),
+                AudioInputFormat::OggFlac,
+                2,
+                48_000,
+            )],
+            AudioExecutionMode::CpuWav,
+        ))?;
+        execute_audio_batch(&plan(
+            vec![item(
+                alac_m4a,
+                back_m4a.clone(),
+                AudioInputFormat::Alac,
+                2,
+                48_000,
+            )],
+            AudioExecutionMode::CpuWav,
+        ))?;
+        assert_eq!(read_wav(&back_ogg), samples);
+        assert_eq!(read_wav(&back_m4a), samples);
+
+        // Resampling and remixing are applied before the codec encoder runs.
+        let transformed = dir.join("transformed.ogg");
+        let options = codec_options(
+            AudioOutputFormat::Ogg,
+            AudioTargetCodec::Flac,
+            AudioRateControl::Default,
+            Some(44_100),
+            Some(1),
+            None,
+        );
+        execute_audio_batch(&plan_with_options(
+            vec![item(
+                first,
+                transformed.clone(),
+                AudioInputFormat::Wav,
+                2,
+                48_000,
+            )],
+            AudioExecutionMode::CpuOggFlac,
+            options,
+        ))?;
+        let back_transformed = dir.join("back-transformed.wav");
+        execute_audio_batch(&plan(
+            vec![item(
+                transformed,
+                back_transformed.clone(),
+                AudioInputFormat::OggFlac,
+                1,
+                44_100,
+            )],
+            AudioExecutionMode::CpuWav,
+        ))?;
+        let spec = wav_spec(&back_transformed)?;
+        assert_eq!((spec.channels, spec.sample_rate), (1, 44_100));
+        assert_ne!(read_wav(&back_transformed).len(), 0);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 }
