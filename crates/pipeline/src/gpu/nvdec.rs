@@ -301,43 +301,65 @@ mod enabled {
             Ok(())
         }
 
-        /// Synchronises the oldest copy, releases its NVDEC surface and recycles
-        /// the event. Both failures are returned after all cleanup is done.
+        /// Waits for one queued copy, then releases its surface only once the
+        /// wait confirms completion. The event is recycled on every path. A
+        /// failed wait leaves the surface owned by the decoder (which destroys
+        /// it at teardown) rather than unmapping memory the device may still read.
         #[allow(unsafe_code)]
+        fn finish_one(
+            &mut self,
+            ptr: sys::CUdeviceptr,
+            event: CudaEvent,
+        ) -> Result<(), PipelineError> {
+            let sync = event
+                .synchronize()
+                .map_err(|err| nvdec_error(format!("cuEventSynchronize failed: {err}")));
+            self.free_events.push(event);
+            sync?;
+            // SAFETY: the event proves the queued copy finished, and the decoder
+            // outlives this tracker, so the mapping is still valid here.
+            cu_result(
+                unsafe { (self.api.unmap_frame)(self.decoder.get(), ptr) },
+                "cuvidUnmapVideoFrame64 failed",
+            )
+        }
+
+        /// Synchronises the oldest copy and releases its surface.
         fn release_oldest(&mut self) -> Result<(), PipelineError> {
             let Some((ptr, event)) = self.pending.pop_front() else {
                 return Ok(());
             };
-            let sync = event
-                .synchronize()
-                .map_err(|err| nvdec_error(format!("cuEventSynchronize failed: {err}")));
-            // SAFETY: the decoder outlives this tracker, and `ptr` came from
-            // `cuvidMapVideoFrame64`. The event above proves the copy finished.
-            let unmap = cu_result(
-                unsafe { (self.api.unmap_frame)(self.decoder.get(), ptr) },
-                "cuvidUnmapVideoFrame64 failed",
-            );
-            self.free_events.push(event);
-            sync?;
-            unmap
+            self.finish_one(ptr, event)
+        }
+
+        /// Drains every deferred copy, returning the first failure only after
+        /// all confirmed surfaces are released. Kept separate from `Drop` so a
+        /// completion error can still reach the caller on the success path.
+        fn drain_all(&mut self) -> Result<(), PipelineError> {
+            let mut first_error = None;
+            while let Some((ptr, event)) = self.pending.pop_front() {
+                if let Err(err) = self.finish_one(ptr, event)
+                    && first_error.is_none()
+                {
+                    first_error = Some(err);
+                }
+            }
+            match first_error {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
         }
     }
 
     impl Drop for UnmapTracker {
-        #[allow(unsafe_code)]
         fn drop(&mut self) {
-            let decoder = self.decoder.get();
-            if decoder.is_null() {
+            if self.decoder.get().is_null() {
                 return;
             }
             // Every remaining surface must be released before the decoder is
             // destroyed (field order in `CallbackState` guarantees this).
             // Errors cannot be propagated from `Drop`; never panic here.
-            while let Some((ptr, event)) = self.pending.pop_front() {
-                let _sync = event.synchronize();
-                // SAFETY: see `release_oldest`; teardown has no error channel.
-                unsafe { (self.api.unmap_frame)(decoder, ptr) };
-            }
+            let _drained = self.drain_all();
         }
     }
 
@@ -1167,11 +1189,16 @@ mod enabled {
         cu_result(status, "cuvidParseVideoData EOS failed")?;
 
         let frames = state.displayed_frames;
+        // A copy can queue successfully and fail only when its event is awaited;
+        // `Drop` has no error channel, so drain explicitly before reporting
+        // success. Remaining surfaces are still released by `Drop` afterwards.
+        let drained = state.unmap_tracker.borrow_mut().drain_all();
         // Explicit drop order: parser -> state/decoder -> ctx lock (while caller's
         // shared CUDA context remains alive).
         drop(parser);
         drop(state);
         drop(ctx_lock);
+        drained?;
         Ok(frames)
     }
 }

@@ -3468,9 +3468,25 @@ fn transcode_file(
         .iter()
         .map(|packets| packets.iter().map(|packet| packet.pts).min().unwrap_or(0))
         .collect::<Vec<_>>();
-    // Copied tracks emit one packet per source packet; reserve that many slots
-    // so common copy-only transcodes never grow the output vector mid-loop.
-    let source_packet_count = per_track.iter().map(Vec::len).sum();
+    // Copied tracks emit one packet per source packet; reserve only the slots
+    // that survive into the output. Dropped PCM tracks can hold millions of
+    // small packets and encoded tracks emit far fewer, so counting them here
+    // would reserve hundreds of MiB for packets never written.
+    let source_packet_count: usize = media
+        .tracks
+        .iter()
+        .enumerate()
+        .map(|(index, track)| {
+            let copied = if track.codec.is_video() {
+                matches!(item.video_action(), VideoTrackAction::Copy)
+            } else if track.codec.is_audio() {
+                matches!(item.audio_action(), AudioTrackAction::Copy)
+            } else {
+                true // timed text is copy-only
+            };
+            if copied { per_track[index].len() } else { 0 }
+        })
+        .sum();
 
     // Fail before any worker starts if a target codec cannot be carried.
     for track in &media.tracks {

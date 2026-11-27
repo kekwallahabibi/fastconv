@@ -2423,6 +2423,10 @@ mod enabled {
             std::mem::forget(reg_resources);
             std::mem::forget(vram_slab);
             std::mem::forget(session);
+            // The quarantined session still holds the bound I/O stream handles;
+            // keep their owners alive too, or NVENC may use destroyed streams.
+            std::mem::forget(cuda_stream);
+            std::mem::forget(output_cuda_stream);
         }
         stage_result?;
 

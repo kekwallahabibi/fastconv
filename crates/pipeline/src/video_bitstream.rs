@@ -222,9 +222,10 @@ impl LengthPrefixedConfig {
 
 /// Writes one AVCC/HVCC sample as Annex-B into reusable `out` and records the
 /// `(payload_start, payload_end)` range of every emitted NAL unit in reusable
-/// `ranges`. Callers clear both buffers between packets, so no per-packet
-/// allocation is needed and the byte ranges let access-unit detection skip a
-/// second byte-by-byte scan for `00 00 01` start codes.
+/// `ranges`. Callers clear both buffers between packets so the output storage
+/// is reused (`length_prefixed_nalus` and the HEVC parameter-set check still
+/// allocate small per-sample vectors); the byte ranges let access-unit detection
+/// skip a second byte-by-byte scan for `00 00 01` start codes.
 #[cfg(feature = "nvenc")]
 pub(crate) fn length_prefixed_to_annex_b_into(
     config: &LengthPrefixedConfig,
