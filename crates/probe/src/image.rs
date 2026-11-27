@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 
 use fastconv_domain::{
     DomainError, HardwareBackend, HostHardware, ImageBatchItem, ImageBatchPlan, ImageCompression,
-    ImageDimensions, ImageExecutionMode, ImageInputFormat, ImageOutputFormat, PathRole,
+    ImageDimensions, ImageEncodeOptions, ImageExecutionMode, ImageInputFormat, ImageOutputFormat,
+    PathRole,
 };
 use jxl::api::JxlBitstreamInput;
 use zune_jpeg::JpegDecoder;
@@ -1511,26 +1512,69 @@ pub fn prepare_image_batch(
     worker_threads: Option<NonZeroUsize>,
     backend: HardwareBackend,
 ) -> Result<ImageBatchPlan, ProbeError> {
-    prepare_image_batch_inner(
+    prepare_image_batch_with_options(
         source,
         target,
         compression,
+        ImageEncodeOptions::default(),
         output_format,
         worker_threads,
         backend,
-        None,
     )
 }
 
-fn prepare_image_batch_inner(
+/// Validates a single image file or mixed image folder with explicit encoder options.
+///
+/// # Errors
+///
+/// Returns [`ProbeError`] on invalid inputs, unsupported option/format combinations, or
+/// unavailable backends. Never performs silent CPU fallbacks.
+pub fn prepare_image_batch_with_options(
     source: &Path,
     target: &Path,
     compression: Option<ImageCompression>,
+    options: ImageEncodeOptions,
     output_format: Option<ImageOutputFormat>,
     worker_threads: Option<NonZeroUsize>,
     backend: HardwareBackend,
-    hardware: Option<&HostHardware>,
 ) -> Result<ImageBatchPlan, ProbeError> {
+    prepare_image_batch_inner(&ImageBatchRequest {
+        source,
+        target,
+        compression,
+        options,
+        output_format,
+        worker_threads,
+        backend,
+        hardware: None,
+    })
+}
+
+/// Single bundle of validated-at-the-boundary inputs for batch planning.
+struct ImageBatchRequest<'a> {
+    source: &'a Path,
+    target: &'a Path,
+    compression: Option<ImageCompression>,
+    options: ImageEncodeOptions,
+    output_format: Option<ImageOutputFormat>,
+    worker_threads: Option<NonZeroUsize>,
+    backend: HardwareBackend,
+    hardware: Option<&'a HostHardware>,
+}
+
+fn prepare_image_batch_inner(
+    request: &ImageBatchRequest<'_>,
+) -> Result<ImageBatchPlan, ProbeError> {
+    let ImageBatchRequest {
+        source,
+        target,
+        compression,
+        options,
+        output_format,
+        worker_threads,
+        backend,
+        hardware,
+    } = *request;
     if source.as_os_str().is_empty() {
         return Err(ProbeError::InvalidDomain(DomainError::EmptyPath(
             PathRole::Source,
@@ -1555,7 +1599,8 @@ fn prepare_image_batch_inner(
     if source_meta.is_file() {
         let (resolved_target, resolved_format) =
             resolve_single_target(source, target, output_format)?;
-        let mode = resolve_execution_mode(resolved_format, compression, backend, hardware)?;
+        let mode =
+            resolve_execution_mode(resolved_format, compression, options, backend, hardware)?;
         let probed = probe_image(source)?;
         reject_canonical_same_path(source, &resolved_target)?;
         let item = ImageBatchItem::new(
@@ -1569,7 +1614,8 @@ fn prepare_image_batch_inner(
 
     if source_meta.is_dir() {
         let resolved_format = output_format.unwrap_or(ImageOutputFormat::Webp);
-        let mode = resolve_execution_mode(resolved_format, compression, backend, hardware)?;
+        let mode =
+            resolve_execution_mode(resolved_format, compression, options, backend, hardware)?;
         return prepare_directory_batch(source, target, mode, threads);
     }
 
@@ -1579,22 +1625,29 @@ fn prepare_image_batch_inner(
 fn resolve_execution_mode(
     format: ImageOutputFormat,
     compression: Option<ImageCompression>,
+    options: ImageEncodeOptions,
     backend: HardwareBackend,
     hardware: Option<&HostHardware>,
 ) -> Result<ImageExecutionMode, ProbeError> {
     match (backend, hardware) {
-        (HardwareBackend::Cpu, _) => Ok(ImageExecutionMode::resolve_cpu(format, compression)?),
-        (HardwareBackend::Gpu(_), Some(hw)) => Ok(ImageExecutionMode::resolve(
+        (HardwareBackend::Cpu, _) => Ok(ImageExecutionMode::resolve_cpu_with_options(
             format,
             compression,
+            options,
+        )?),
+        (HardwareBackend::Gpu(_), Some(hw)) => Ok(ImageExecutionMode::resolve_with_options(
+            format,
+            compression,
+            options,
             backend,
             hw,
         )?),
         (HardwareBackend::Gpu(_), None) => {
             let detected = detect_host_hardware()?;
-            Ok(ImageExecutionMode::resolve(
+            Ok(ImageExecutionMode::resolve_with_options(
                 format,
                 compression,
+                options,
                 backend,
                 &detected,
             )?)
@@ -1829,12 +1882,17 @@ fn reject_canonical_same_path(source: &Path, target: &Path) -> Result<(), ProbeE
 
 #[cfg(test)]
 mod tests {
-    use super::{ProbedImage, prepare_image_batch, prepare_image_batch_inner, probe_image};
+    use super::{
+        ImageBatchRequest, ProbedImage, prepare_image_batch, prepare_image_batch_inner,
+        prepare_image_batch_with_options, probe_image,
+    };
     use crate::ProbeError;
     use fastconv_domain::{
-        CpuInfo, DetectedGpuBackend, DomainError, GpuAdapterInfo, GpuBackend, GpuCapability,
-        GpuVendor, HardwareBackend, HostHardware, ImageCompression, ImageDimensions,
-        ImageExecutionMode, ImageInputFormat, ImageOutputFormat, ImageQuality, PathRole, SimdLevel,
+        ChromaSubsampling, CompressionLevel, CpuInfo, DetectedGpuBackend, DomainError,
+        GpuAdapterInfo, GpuBackend, GpuCapability, GpuVendor, HardwareBackend, HostHardware,
+        ImageCompression, ImageDimensions, ImageEncodeOptions, ImageExecutionMode,
+        ImageInputFormat, ImageOutputFormat, ImageQuality, PathRole, SimdLevel, TiffCompression,
+        TiffCompressionKind,
     };
     use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
     use std::env;
@@ -2227,7 +2285,8 @@ mod tests {
         assert_eq!(
             single_jpeg.mode(),
             ImageExecutionMode::CpuJpeg {
-                quality: ImageQuality::DEFAULT
+                quality: ImageQuality::DEFAULT,
+                chroma: ChromaSubsampling::Yuv420,
             }
         );
 
@@ -2239,7 +2298,12 @@ mod tests {
             None,
             HardwareBackend::Cpu,
         )?;
-        assert_eq!(single_png.mode(), ImageExecutionMode::CpuPng);
+        assert_eq!(
+            single_png.mode(),
+            ImageExecutionMode::CpuPng {
+                level: CompressionLevel::Fast,
+            }
+        );
 
         let single_bmp = prepare_image_batch(
             &png_path,
@@ -2261,15 +2325,16 @@ mod tests {
         )?;
         assert_eq!(single_qoi.mode(), ImageExecutionMode::CpuQoi);
 
-        let heic_single = prepare_image_batch_inner(
-            &jpg_path,
-            &root.join("nvenc.heic"),
-            lossy,
-            None,
-            None,
-            HardwareBackend::Gpu(GpuBackend::Nvenc),
-            Some(&rtx),
-        )?;
+        let heic_single = prepare_image_batch_inner(&ImageBatchRequest {
+            source: &jpg_path,
+            target: &root.join("nvenc.heic"),
+            compression: lossy,
+            options: ImageEncodeOptions::default(),
+            output_format: None,
+            worker_threads: None,
+            backend: HardwareBackend::Gpu(GpuBackend::Nvenc),
+            hardware: Some(&rtx),
+        })?;
         assert_eq!(
             heic_single.items()[0].input_format(),
             ImageInputFormat::Jpeg
@@ -2331,15 +2396,16 @@ mod tests {
         let lossy = Some(ImageCompression::Lossy {
             quality: ImageQuality::DEFAULT,
         });
-        let heic_batch = prepare_image_batch_inner(
-            &src_dir,
-            &out_dir,
-            lossy,
-            Some(ImageOutputFormat::Heic),
-            None,
-            HardwareBackend::Gpu(GpuBackend::Nvenc),
-            Some(&rtx),
-        )?;
+        let heic_batch = prepare_image_batch_inner(&ImageBatchRequest {
+            source: &src_dir,
+            target: &out_dir,
+            compression: lossy,
+            options: ImageEncodeOptions::default(),
+            output_format: Some(ImageOutputFormat::Heic),
+            worker_threads: None,
+            backend: HardwareBackend::Gpu(GpuBackend::Nvenc),
+            hardware: Some(&rtx),
+        })?;
         assert_eq!(heic_batch.items().len(), 5);
         assert_eq!(heic_batch.items()[0].input_format(), ImageInputFormat::Png);
         assert_eq!(heic_batch.items()[1].input_format(), ImageInputFormat::Jpeg);
@@ -2363,7 +2429,12 @@ mod tests {
             None,
             HardwareBackend::Cpu,
         )?;
-        assert_eq!(png_batch.mode(), ImageExecutionMode::CpuPng);
+        assert_eq!(
+            png_batch.mode(),
+            ImageExecutionMode::CpuPng {
+                level: CompressionLevel::Fast,
+            }
+        );
         assert_eq!(png_batch.items().len(), 5);
         assert_eq!(png_batch.items()[2].target(), out_dir.join("03_gamma.png"));
 
@@ -2561,15 +2632,16 @@ mod tests {
             quality: ImageQuality::DEFAULT,
         });
 
-        let nvenc_webp = prepare_image_batch_inner(
-            &valid,
-            &root.join("out.webp"),
-            lossy,
-            None,
-            None,
-            HardwareBackend::Gpu(GpuBackend::Nvenc),
-            Some(&rtx),
-        );
+        let nvenc_webp = prepare_image_batch_inner(&ImageBatchRequest {
+            source: &valid,
+            target: &root.join("out.webp"),
+            compression: lossy,
+            options: ImageEncodeOptions::default(),
+            output_format: None,
+            worker_threads: None,
+            backend: HardwareBackend::Gpu(GpuBackend::Nvenc),
+            hardware: Some(&rtx),
+        });
         assert!(matches!(
             nvenc_webp,
             Err(ProbeError::InvalidDomain(
@@ -2581,15 +2653,16 @@ mod tests {
             ))
         ));
 
-        let vulkan_jpeg = prepare_image_batch_inner(
-            &valid,
-            &root.join("out.jpg"),
-            lossy,
-            None,
-            None,
-            HardwareBackend::Gpu(GpuBackend::Vulkan),
-            Some(&rtx),
-        );
+        let vulkan_jpeg = prepare_image_batch_inner(&ImageBatchRequest {
+            source: &valid,
+            target: &root.join("out.jpg"),
+            compression: lossy,
+            options: ImageEncodeOptions::default(),
+            output_format: None,
+            worker_threads: None,
+            backend: HardwareBackend::Gpu(GpuBackend::Vulkan),
+            hardware: Some(&rtx),
+        });
         assert!(matches!(
             vulkan_jpeg,
             Err(ProbeError::InvalidDomain(
@@ -2601,15 +2674,16 @@ mod tests {
             ))
         ));
 
-        let vaapi_err = prepare_image_batch_inner(
-            &valid,
-            &root.join("out.webp"),
-            lossy,
-            None,
-            None,
-            HardwareBackend::Gpu(GpuBackend::Vaapi),
-            Some(&rtx),
-        );
+        let vaapi_err = prepare_image_batch_inner(&ImageBatchRequest {
+            source: &valid,
+            target: &root.join("out.webp"),
+            compression: lossy,
+            options: ImageEncodeOptions::default(),
+            output_format: None,
+            worker_threads: None,
+            backend: HardwareBackend::Gpu(GpuBackend::Vaapi),
+            hardware: Some(&rtx),
+        });
         assert!(matches!(
             vaapi_err,
             Err(ProbeError::InvalidDomain(
@@ -2620,15 +2694,30 @@ mod tests {
             ))
         ));
 
-        let format_mismatch = prepare_image_batch_inner(
-            &valid,
-            &root.join("out.webp"),
-            lossy,
-            Some(ImageOutputFormat::Jpeg),
-            None,
-            HardwareBackend::Cpu,
-            Some(&rtx),
-        );
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_format_mismatches_and_quality_on_lossless_formats() -> Result<(), ProbeError> {
+        let root = create_temp_dir("cpu-errors")?;
+        let valid = root.join("good.png");
+        write_tiny_png(&valid, 8, 8)?;
+        let rtx = synthetic_rtx_hardware()?;
+        let lossy = Some(ImageCompression::Lossy {
+            quality: ImageQuality::DEFAULT,
+        });
+
+        let format_mismatch = prepare_image_batch_inner(&ImageBatchRequest {
+            source: &valid,
+            target: &root.join("out.webp"),
+            compression: lossy,
+            options: ImageEncodeOptions::default(),
+            output_format: Some(ImageOutputFormat::Jpeg),
+            worker_threads: None,
+            backend: HardwareBackend::Cpu,
+            hardware: Some(&rtx),
+        });
         assert!(matches!(
             format_mismatch,
             Err(ProbeError::UnsupportedTargetFormat {
@@ -2637,15 +2726,16 @@ mod tests {
             })
         ));
 
-        let png_quality_err = prepare_image_batch_inner(
-            &valid,
-            &root.join("out.png"),
-            lossy,
-            None,
-            None,
-            HardwareBackend::Cpu,
-            Some(&rtx),
-        );
+        let png_quality_err = prepare_image_batch_inner(&ImageBatchRequest {
+            source: &valid,
+            target: &root.join("out.png"),
+            compression: lossy,
+            options: ImageEncodeOptions::default(),
+            output_format: None,
+            worker_threads: None,
+            backend: HardwareBackend::Cpu,
+            hardware: Some(&rtx),
+        });
         assert!(matches!(
             png_quality_err,
             Err(ProbeError::InvalidDomain(
@@ -3375,7 +3465,12 @@ mod tests {
             None,
             HardwareBackend::Cpu,
         )?;
-        assert_eq!(plan.mode(), ImageExecutionMode::CpuPng);
+        assert_eq!(
+            plan.mode(),
+            ImageExecutionMode::CpuPng {
+                level: CompressionLevel::Fast,
+            }
+        );
         assert_eq!(plan.items().len(), 4);
         assert_eq!(plan.items()[0].input_format(), ImageInputFormat::Avif);
         assert_eq!(plan.items()[1].input_format(), ImageInputFormat::Gif);
@@ -3393,6 +3488,93 @@ mod tests {
             HardwareBackend::Cpu,
         );
         assert!(matches!(video_err, Err(ProbeError::InvalidImage { .. })));
+
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
+        Ok(())
+    }
+
+    #[test]
+    fn threads_encoder_options_through_the_probe_boundary() -> Result<(), ProbeError> {
+        let root = create_temp_dir("encode-options")?;
+        let png = root.join("in.png");
+        write_tiny_png(&png, 16, 12)?;
+
+        let best_png = prepare_image_batch_with_options(
+            &png,
+            &root.join("out.png"),
+            None,
+            ImageEncodeOptions {
+                compression_level: Some(CompressionLevel::Best),
+                ..ImageEncodeOptions::default()
+            },
+            None,
+            None,
+            HardwareBackend::Cpu,
+        )?;
+        assert_eq!(
+            best_png.mode(),
+            ImageExecutionMode::CpuPng {
+                level: CompressionLevel::Best,
+            }
+        );
+
+        let lzw_tiff = prepare_image_batch_with_options(
+            &png,
+            &root.join("out.tiff"),
+            None,
+            ImageEncodeOptions {
+                tiff_compression: Some(TiffCompressionKind::Lzw),
+                ..ImageEncodeOptions::default()
+            },
+            None,
+            None,
+            HardwareBackend::Cpu,
+        )?;
+        assert_eq!(
+            lzw_tiff.mode(),
+            ImageExecutionMode::CpuTiff {
+                compression: TiffCompression::Lzw,
+            }
+        );
+
+        let chroma_jpeg = prepare_image_batch_with_options(
+            &png,
+            &root.join("out.jpg"),
+            None,
+            ImageEncodeOptions {
+                chroma: Some(ChromaSubsampling::Yuv444),
+                ..ImageEncodeOptions::default()
+            },
+            None,
+            None,
+            HardwareBackend::Cpu,
+        )?;
+        assert_eq!(
+            chroma_jpeg.mode(),
+            ImageExecutionMode::CpuJpeg {
+                quality: ImageQuality::DEFAULT,
+                chroma: ChromaSubsampling::Yuv444,
+            }
+        );
+
+        let rejected = prepare_image_batch_with_options(
+            &png,
+            &root.join("out.bmp"),
+            None,
+            ImageEncodeOptions {
+                compression_level: Some(CompressionLevel::Fast),
+                ..ImageEncodeOptions::default()
+            },
+            None,
+            None,
+            HardwareBackend::Cpu,
+        );
+        assert!(matches!(
+            rejected,
+            Err(ProbeError::InvalidDomain(
+                DomainError::UnsupportedImagePipeline { .. }
+            ))
+        ));
 
         fs::remove_dir_all(&root).map_err(|source| ProbeError::Io { path: root, source })?;
         Ok(())

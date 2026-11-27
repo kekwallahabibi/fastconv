@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use avif_serialize::Aviffy;
-use fastconv_domain::ImageQuality;
+use fastconv_domain::{ChromaSubsampling, CompressionLevel, ImageQuality};
 use rav1e::color::{
     ColorDescription, ColorPrimaries, MatrixCoefficients, PixelRange, TransferCharacteristics,
 };
@@ -45,10 +45,19 @@ fn encode_av1_frame(
     chroma: ChromaSampling,
     monochrome: bool,
     quantizer: usize,
+    level: CompressionLevel,
     threads: usize,
     fill_planes: impl FnOnce(&mut Frame<u8>),
 ) -> Result<Vec<u8>, PipelineError> {
-    let mut enc = EncoderConfig::with_speed_preset(10);
+    // Presets 10/8/6 keep the still-frame invariants below while trading encode
+    // effort for compression. Preset 10 additionally disables tools that only
+    // matter for the fastest path and pins 64x64 partitions on large images.
+    let preset = match level {
+        CompressionLevel::Fast => 10,
+        CompressionLevel::Balanced => 8,
+        CompressionLevel::Best => 6,
+    };
+    let mut enc = EncoderConfig::with_speed_preset(preset);
     enc.width = width;
     enc.height = height;
     enc.bit_depth = 8;
@@ -76,24 +85,26 @@ fn encode_av1_frame(
     // avoids pixel-domain psy distortion passes on every intra candidate.
     enc.tune = Tune::Psnr;
 
-    // Preset 10 fixes partitions to 32x32 and skips CDEF/fine directional intra
-    // on still frames, keeping comparable PSNR/size to SVT-AV1 preset 8 while
-    // eliminating the 8x8/16x16 partition search bottleneck on 4K inputs.
-    enc.speed_settings = SpeedSettings::from_preset(10);
+    // Multi-reference, lookahead and scene detection cannot help a still frame.
+    enc.speed_settings = SpeedSettings::from_preset(preset);
     enc.speed_settings.multiref = false;
     enc.speed_settings.rdo_lookahead_frames = 1;
     enc.speed_settings.scene_detection_mode = SceneDetectionSpeed::None;
-    enc.speed_settings.lrf = false;
-    enc.speed_settings.cdef = false;
-    enc.speed_settings.segmentation = SegmentationLevel::Disabled;
-    enc.speed_settings.transform.rdo_tx_decision = false;
-    enc.speed_settings.transform.reduced_tx_set = true;
-    enc.speed_settings.transform.tx_domain_distortion = true;
-    enc.speed_settings.transform.tx_domain_rate = true;
-    enc.speed_settings.prediction.fine_directional_intra = false;
-    if width >= 1024 && height >= 1024 {
-        enc.speed_settings.partition.partition_range =
-            PartitionRange::new(BlockSize::BLOCK_64X64, BlockSize::BLOCK_64X64);
+    if level == CompressionLevel::Fast {
+        // Preset 10 fixes partitions to 32x32 and skips CDEF/fine directional
+        // intra, eliminating the 8x8/16x16 partition search bottleneck on 4K.
+        enc.speed_settings.lrf = false;
+        enc.speed_settings.cdef = false;
+        enc.speed_settings.segmentation = SegmentationLevel::Disabled;
+        enc.speed_settings.transform.rdo_tx_decision = false;
+        enc.speed_settings.transform.reduced_tx_set = true;
+        enc.speed_settings.transform.tx_domain_distortion = true;
+        enc.speed_settings.transform.tx_domain_rate = true;
+        enc.speed_settings.prediction.fine_directional_intra = false;
+        if width >= 1024 && height >= 1024 {
+            enc.speed_settings.partition.partition_range =
+                PartitionRange::new(BlockSize::BLOCK_64X64, BlockSize::BLOCK_64X64);
+        }
     }
     enc.tiles = if threads > 1 && width >= 256 && height >= 256 {
         threads.next_power_of_two().clamp(4, 16)
@@ -372,6 +383,65 @@ fn fill_yuv420(
     }
 }
 
+/// Full-resolution luma/chroma planes for 4:4:4. Transparent RGB samples keep
+/// their luma but contribute neutral chroma so hidden colours cannot bleed into
+/// neighbouring visible pixels.
+#[allow(clippy::many_single_char_names)] // r/g/b/a are canonical colour components.
+fn fill_yuv444(
+    frame: &mut Frame<u8>,
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    format: DecodedPixelFormat,
+) {
+    let [y_plane, u_plane, v_plane] = &mut frame.planes;
+    let mut y_rows = y_plane.rows_iter_mut();
+    let mut u_rows = u_plane.rows_iter_mut();
+    let mut v_rows = v_plane.rows_iter_mut();
+    let bpp = match format {
+        DecodedPixelFormat::L8 => 1_usize,
+        DecodedPixelFormat::La8 => 2_usize,
+        DecodedPixelFormat::Rgb8 => 3_usize,
+        DecodedPixelFormat::Rgba8 => 4_usize,
+    };
+
+    for row_index in 0..height {
+        let (Some(y_dst), Some(u_dst), Some(v_dst)) = (y_rows.next(), u_rows.next(), v_rows.next())
+        else {
+            break;
+        };
+        let row_start = row_index * width * bpp;
+        for x in 0..width {
+            let i = row_start + x * bpp;
+            let (r, g, b, alpha) = match format {
+                DecodedPixelFormat::L8 | DecodedPixelFormat::La8 => {
+                    let value = i32::from(pixels[i]);
+                    (value, value, value, None)
+                }
+                DecodedPixelFormat::Rgb8 => (
+                    i32::from(pixels[i]),
+                    i32::from(pixels[i + 1]),
+                    i32::from(pixels[i + 2]),
+                    None,
+                ),
+                DecodedPixelFormat::Rgba8 => (
+                    i32::from(pixels[i]),
+                    i32::from(pixels[i + 1]),
+                    i32::from(pixels[i + 2]),
+                    Some(pixels[i + 3]),
+                ),
+            };
+            y_dst[x] = luma_bt601(r, g, b);
+            if alpha == Some(0) {
+                (u_dst[x], v_dst[x]) = (128, 128);
+            } else {
+                let (cb, cr) = chroma_bt601(r, g, b);
+                (u_dst[x], v_dst[x]) = (cb, cr);
+            }
+        }
+    }
+}
+
 fn fill_alpha(
     frame: &mut Frame<u8>,
     pixels: &[u8],
@@ -388,14 +458,65 @@ fn fill_alpha(
     }
 }
 
-pub(crate) fn encode_avif_into(
-    target: &Path,
-    quality: ImageQuality,
+type FillYuv = fn(&mut Frame<u8>, &[u8], usize, usize, DecodedPixelFormat);
+
+struct AvifColorPlan {
+    sampling: ChromaSampling,
+    fill: FillYuv,
+    seq_profile: u8,
+    subsampled_xy: (bool, bool),
+}
+
+impl AvifColorPlan {
+    fn new(chroma: ChromaSubsampling) -> Self {
+        // Color frames always carry three planes: avif-serialize 0.8.9 hardcodes a
+        // 3-channel PixiBox even when monochrome is signalled, so grayscale sources
+        // use neutral chroma rather than a single-plane AV1 frame.
+        let (sampling, fill, seq_profile, subsampled_xy) = match chroma {
+            ChromaSubsampling::Yuv420 => (
+                ChromaSampling::Cs420,
+                fill_yuv420 as FillYuv,
+                0_u8,
+                (true, true),
+            ),
+            ChromaSubsampling::Yuv444 => (
+                ChromaSampling::Cs444,
+                fill_yuv444 as FillYuv,
+                1_u8,
+                (false, false),
+            ),
+        };
+        Self {
+            sampling,
+            fill,
+            seq_profile,
+            subsampled_xy,
+        }
+    }
+}
+
+struct AvifFrameSettings {
+    quantizer: usize,
+    level: CompressionLevel,
     threads: usize,
-    pixels: &[u8],
+}
+
+pub(crate) struct AvifEncodeRequest<'a> {
+    pub(crate) target: &'a Path,
+    pub(crate) quality: ImageQuality,
+    pub(crate) level: CompressionLevel,
+    pub(crate) chroma: ChromaSubsampling,
+    pub(crate) threads: usize,
+    pub(crate) pixels: &'a [u8],
+    pub(crate) decoded: DecodedFrameMeta,
+    pub(crate) encoded_buf: &'a mut Vec<u8>,
+}
+
+fn validated_avif_layout(
+    target: &Path,
     decoded: DecodedFrameMeta,
-    encoded_buf: &mut Vec<u8>,
-) -> Result<(), PipelineError> {
+    pixels: &[u8],
+) -> Result<(usize, usize, usize), PipelineError> {
     let width = usize::try_from(decoded.width).map_err(|_| PipelineError::EncodeFailed {
         path: target.to_path_buf(),
         reason: format!("AVIF width {} is too large", decoded.width),
@@ -432,52 +553,53 @@ pub(crate) fn encode_avif_into(
             ),
         });
     }
+    Ok((width, height, bpp))
+}
 
-    let quantizer = quality_to_quantizer(quality.get());
-    // L8/La8 use Cs420 with neutral chroma because avif-serialize 0.8.9
-    // hardcodes a 3-channel PixiBox even when monochrome is signalled.
-    let color = encode_av1_frame(
+fn encode_avif_alpha(
+    target: &Path,
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    bpp: usize,
+    settings: &AvifFrameSettings,
+) -> Result<Option<Vec<u8>>, PipelineError> {
+    let alpha_offset = bpp - 1;
+    let opaque = pixels
+        .iter()
+        .skip(alpha_offset)
+        .step_by(bpp)
+        .all(|&a| a == u8::MAX);
+    if opaque {
+        return Ok(None);
+    }
+    encode_av1_frame(
         target,
         width,
         height,
-        ChromaSampling::Cs420,
-        false,
-        quantizer,
-        threads,
-        |frame| fill_yuv420(frame, pixels, width, height, decoded.format),
-    )?;
+        ChromaSampling::Cs400,
+        true,
+        settings.quantizer,
+        settings.level,
+        settings.threads,
+        |frame| fill_alpha(frame, pixels, width, height, bpp, alpha_offset),
+    )
+    .map(Some)
+}
 
-    let alpha = match decoded.format {
-        DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8 => {
-            let alpha_offset = bpp - 1;
-            let opaque = pixels
-                .iter()
-                .skip(alpha_offset)
-                .step_by(bpp)
-                .all(|&a| a == u8::MAX);
-            if opaque {
-                None
-            } else {
-                Some(encode_av1_frame(
-                    target,
-                    width,
-                    height,
-                    ChromaSampling::Cs400,
-                    true,
-                    quantizer,
-                    threads,
-                    |frame| fill_alpha(frame, pixels, width, height, bpp, alpha_offset),
-                )?)
-            }
-        }
-        _ => None,
-    };
-
+fn serialize_avif(
+    target: &Path,
+    encoded_buf: &mut Vec<u8>,
+    color: &[u8],
+    alpha: Option<&[u8]>,
+    decoded: DecodedFrameMeta,
+    plan: &AvifColorPlan,
+) -> Result<(), PipelineError> {
     encoded_buf.clear();
     let mut aviffy = Aviffy::new();
     aviffy
-        .set_seq_profile(0)
-        .set_chroma_subsampling((true, true))
+        .set_seq_profile(plan.seq_profile)
+        .set_chroma_subsampling(plan.subsampled_xy)
         .set_monochrome(false)
         .set_full_color_range(true)
         .set_color_primaries(avif_serialize::constants::ColorPrimaries::Bt709)
@@ -486,8 +608,8 @@ pub(crate) fn encode_avif_into(
     aviffy
         .write(
             &mut *encoded_buf,
-            &color,
-            alpha.as_deref(),
+            color,
+            alpha,
             decoded.width,
             decoded.height,
             8,
@@ -500,6 +622,51 @@ pub(crate) fn encode_avif_into(
         return Err(PipelineError::EmptyOutput(target.to_path_buf()));
     }
     Ok(())
+}
+
+pub(crate) fn encode_avif_into(request: AvifEncodeRequest<'_>) -> Result<(), PipelineError> {
+    let AvifEncodeRequest {
+        target,
+        quality,
+        level,
+        chroma,
+        threads,
+        pixels,
+        decoded,
+        encoded_buf,
+    } = request;
+    let (width, height, bpp) = validated_avif_layout(target, decoded, pixels)?;
+    let settings = AvifFrameSettings {
+        quantizer: quality_to_quantizer(quality.get()),
+        level,
+        threads,
+    };
+    let plan = AvifColorPlan::new(chroma);
+    let color = encode_av1_frame(
+        target,
+        width,
+        height,
+        plan.sampling,
+        false,
+        settings.quantizer,
+        settings.level,
+        settings.threads,
+        |frame| (plan.fill)(frame, pixels, width, height, decoded.format),
+    )?;
+    let alpha = match decoded.format {
+        DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8 => {
+            encode_avif_alpha(target, pixels, width, height, bpp, &settings)?
+        }
+        _ => None,
+    };
+    serialize_avif(
+        target,
+        encoded_buf,
+        &color,
+        alpha.as_deref(),
+        decoded,
+        &plan,
+    )
 }
 
 /// Decodes a still AVIF into `pixel_buf`, reusing its allocation when large enough.
@@ -614,11 +781,13 @@ mod tests {
         }
     }
 
-    fn encode_test_avif(
+    fn encode_test_avif_with(
         format: DecodedPixelFormat,
         width: u32,
         height: u32,
         transparent: bool,
+        level: CompressionLevel,
+        chroma: ChromaSubsampling,
     ) -> Result<Vec<u8>, PipelineError> {
         let bpp = match format {
             DecodedPixelFormat::L8 => 1,
@@ -639,17 +808,35 @@ mod tests {
         }
         let quality = ImageQuality::new(80).unwrap_or(ImageQuality::DEFAULT);
         let mut out = Vec::new();
-        encode_avif_into(
-            Path::new("test.avif"),
+        encode_avif_into(AvifEncodeRequest {
+            target: Path::new("test.avif"),
             quality,
-            1,
-            &pixels,
-            meta(format, width, height),
-            &mut out,
-        )?;
+            level,
+            chroma,
+            threads: 1,
+            pixels: &pixels,
+            decoded: meta(format, width, height),
+            encoded_buf: &mut out,
+        })?;
         assert!(out.len() > 8);
         assert_eq!(&out[4..8], b"ftyp", "AVIF must start with an ftyp box");
         Ok(out)
+    }
+
+    fn encode_test_avif(
+        format: DecodedPixelFormat,
+        width: u32,
+        height: u32,
+        transparent: bool,
+    ) -> Result<Vec<u8>, PipelineError> {
+        encode_test_avif_with(
+            format,
+            width,
+            height,
+            transparent,
+            CompressionLevel::Fast,
+            ChromaSubsampling::Yuv420,
+        )
     }
 
     fn has_alpha_aux_box(avif: &[u8]) -> bool {
@@ -811,5 +998,135 @@ mod tests {
         assert_decode_roundtrip(DecodedPixelFormat::L8, 1, 1, false)?;
         assert_decode_roundtrip(DecodedPixelFormat::Rgba8, 53, 37, true)?;
         Ok(())
+    }
+
+    fn assert_level_chroma_roundtrip(
+        level: CompressionLevel,
+        chroma: ChromaSubsampling,
+        format: DecodedPixelFormat,
+        transparent: bool,
+        width: u32,
+        height: u32,
+    ) -> Result<(), PipelineError> {
+        let encoded = encode_test_avif_with(format, width, height, transparent, level, chroma)?;
+        assert!(encoded.len() > 8, "{level:?} {chroma:?} produced no AVIF");
+        let mut pixels = Vec::new();
+        let (decoded_w, decoded_h, decoded_format, byte_len) =
+            decode_avif_slice_into(Path::new("test.avif"), &encoded, &mut pixels)?;
+        assert_eq!((decoded_w, decoded_h), (width, height));
+        let bpp = match decoded_format {
+            DecodedPixelFormat::L8 => 1_usize,
+            DecodedPixelFormat::La8 => 2_usize,
+            DecodedPixelFormat::Rgb8 => 3_usize,
+            DecodedPixelFormat::Rgba8 => 4_usize,
+        };
+        let usize_w = usize::try_from(width).unwrap_or(0);
+        let usize_h = usize::try_from(height).unwrap_or(0);
+        assert_eq!(byte_len, usize_w * usize_h * bpp);
+        assert!(pixels.len() >= byte_len);
+        if transparent {
+            assert!(
+                matches!(
+                    decoded_format,
+                    DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8
+                ),
+                "transparent AVIF must keep alpha"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn encodes_and_decodes_every_level_and_chroma_mode() -> Result<(), PipelineError> {
+        for level in [
+            CompressionLevel::Fast,
+            CompressionLevel::Balanced,
+            CompressionLevel::Best,
+        ] {
+            for chroma in [ChromaSubsampling::Yuv420, ChromaSubsampling::Yuv444] {
+                for format in [
+                    DecodedPixelFormat::Rgb8,
+                    DecodedPixelFormat::Rgba8,
+                    DecodedPixelFormat::L8,
+                    DecodedPixelFormat::La8,
+                ] {
+                    assert_level_chroma_roundtrip(level, chroma, format, false, 37, 27)?;
+                }
+                assert_level_chroma_roundtrip(
+                    level,
+                    chroma,
+                    DecodedPixelFormat::Rgba8,
+                    true,
+                    37,
+                    27,
+                )?;
+                assert_level_chroma_roundtrip(
+                    level,
+                    chroma,
+                    DecodedPixelFormat::La8,
+                    true,
+                    19,
+                    17,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn yuv444_keeps_full_resolution_chroma_and_neutralizes_transparent_samples()
+    -> Result<(), PipelineError> {
+        const SIDE: usize = 16;
+        let cfg = EncoderConfig {
+            width: SIDE,
+            height: SIDE,
+            bit_depth: 8,
+            chroma_sampling: ChromaSampling::Cs444,
+            ..Default::default()
+        };
+        let ctx = Config::new()
+            .with_encoder_config(cfg)
+            .with_threads(1)
+            .new_context::<u8>()
+            .map_err(|err| PipelineError::EncodeFailed {
+                path: Path::new("test.avif").to_path_buf(),
+                reason: format!("failed to create AV1 encoder context: {err}"),
+            })?;
+        let mut frame = ctx.new_frame();
+        let mut pixels = vec![0_u8; SIDE * SIDE * 4];
+        pixels[..4].copy_from_slice(&[255, 0, 0, 255]);
+        pixels[4..8].copy_from_slice(&[0, 255, 0, 0]);
+        fill_yuv444(&mut frame, &pixels, SIDE, SIDE, DecodedPixelFormat::Rgba8);
+
+        assert_eq!(first_luma(&frame, 0), luma_bt601(255, 0, 0));
+        assert_eq!(
+            (
+                first_chroma(&frame, 1).ok_or_else(missing_chroma)?,
+                first_chroma(&frame, 2).ok_or_else(missing_chroma)?
+            ),
+            chroma_bt601(255, 0, 0)
+        );
+        let u_plane = frame
+            .planes
+            .get(1)
+            .and_then(|plane| plane.rows_iter().next())
+            .ok_or_else(missing_chroma)?;
+        let v_plane = frame
+            .planes
+            .get(2)
+            .and_then(|plane| plane.rows_iter().next())
+            .ok_or_else(missing_chroma)?;
+        assert_eq!((u_plane[1], v_plane[1]), (128, 128));
+        assert!(u_plane.len() >= SIDE, "4:4:4 chroma must be full width");
+        Ok(())
+    }
+
+    fn first_luma(frame: &Frame<u8>, plane: usize) -> u8 {
+        frame
+            .planes
+            .get(plane)
+            .and_then(|p| p.rows_iter().next())
+            .and_then(|row| row.first().copied())
+            .unwrap_or_default()
     }
 }
