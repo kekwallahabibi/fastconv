@@ -44,8 +44,9 @@ use symphonia::core::units::{Duration, Timestamp};
 use crate::PipelineError;
 use crate::video_anim::{self, AnimFrameInfo};
 use crate::video_bitstream::{
-    PcmFormat, default_opus_head, pack_xiph_laced_vorbis_headers, parse_flac_streaminfo,
-    unpack_xiph_laced_vorbis_headers, vorbis_ident_info, wrap_adts,
+    PcmFormat, default_opus_head, extract_flac_streaminfo_from_mkv_codec_private,
+    pack_xiph_laced_vorbis_headers, parse_flac_streaminfo, unpack_xiph_laced_vorbis_headers,
+    vorbis_ident_info, wrap_adts,
 };
 use crate::video_codecs::{
     DecodedFrameInfo, Yuv420Frame, decode_video_track, decode_video_track_streaming,
@@ -745,17 +746,28 @@ where
             }
         }
         VideoCodec::Flac => {
-            let streaminfo: [u8; 34] = track
-                .config
-                .as_slice()
-                .try_into()
-                .map_err(|_| decode_error(path, "FLAC track has no 34-byte STREAMINFO"))?;
+            // A remuxed track may carry the full `fLaC` metadata chain (e.g. a
+            // VORBIS_COMMENT block). Walk it to the validated STREAMINFO body
+            // instead of demanding a bare 34-byte config; `track.config` itself
+            // stays untouched so a later mux preserves every native block.
+            let streaminfo: [u8; 34] = if track.config.starts_with(b"fLaC") {
+                extract_flac_streaminfo_from_mkv_codec_private(&track.config).map_err(|reason| {
+                    decode_error(path, format!("invalid FLAC metadata: {reason}"))
+                })?
+            } else {
+                track
+                    .config
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| decode_error(path, "FLAC track has no 34-byte STREAMINFO"))?
+            };
             let (flac_channels, flac_rate, _) =
                 parse_flac_streaminfo(&streaminfo).map_err(|reason| decode_error(path, reason))?;
             let mut params = AudioCodecParameters::new();
             params.for_codec(CODEC_ID_FLAC).with_sample_rate(flac_rate);
             // The decoder amends channels/bit depth from STREAMINFO itself.
-            // `symphonia-bundle-flac` reads the raw 34-byte STREAMINFO directly.
+            // `symphonia-bundle-flac` reads the raw 34-byte STREAMINFO directly,
+            // so pass only the validated body, never the whole metadata chain.
             params.with_extra_data(streaminfo.to_vec().into_boxed_slice());
             let mut decoder = symphonia::default::get_codecs()
                 .make_audio_decoder(&params, &AudioDecoderOptions::default())
@@ -818,7 +830,6 @@ where
                 .max(1)
                 .saturating_mul(frame_bytes)
                 .max(1);
-            let mut decoded_bytes = 0_u64;
             for packet in ordered {
                 if cancelled.load(Ordering::Acquire) {
                     return Ok(());
@@ -839,8 +850,10 @@ where
                     let samples = u64::try_from(slice.len() / frame_bytes)
                         .unwrap_or(u64::MAX)
                         .saturating_mul(u64::from(channels));
-                    decoded_bytes = decoded_bytes.saturating_add(samples.saturating_mul(4));
-                    enforce_decoded_budget(path, decoded_bytes)?;
+                    // `emit_ready` hands off and compacts after every slice, so
+                    // budget the live f32 working set, not a cumulative counter
+                    // that would eventually reject a long, healthy stream.
+                    enforce_live_pcm_budget(path, &chunk, samples)?;
                     chunk.extend_from_slice(&pcm_bytes_to_f32(slice, format));
                     emit_ready(
                         &mut chunk,
@@ -1369,7 +1382,12 @@ fn encode_flac_track(
 ) -> Result<(ContainerTrack, Vec<ContainerPacket>), PipelineError> {
     let rate = configured_audio_rate(TargetAudioCodec::Flac, sample_rate, config);
     let target_channels = configured_audio_channels(channels, config);
-    let pcm = mix_to_channels(samples, usize::from(channels), usize::from(target_channels))?;
+    let resampled = resample_interleaved(samples, usize::from(channels), sample_rate, rate)?;
+    let pcm = mix_to_channels(
+        &resampled,
+        usize::from(channels),
+        usize::from(target_channels),
+    )?;
     if pcm.is_empty() {
         return Err(encode_error(path, "no samples to encode as FLAC"));
     }
@@ -1414,7 +1432,12 @@ fn encode_pcm_track(
 ) -> Result<(ContainerTrack, Vec<ContainerPacket>), PipelineError> {
     let rate = configured_audio_rate(TargetAudioCodec::Pcm, sample_rate, config);
     let target_channels = configured_audio_channels(channels, config);
-    let pcm = mix_to_channels(samples, usize::from(channels), usize::from(target_channels))?;
+    let resampled = resample_interleaved(samples, usize::from(channels), sample_rate, rate)?;
+    let pcm = mix_to_channels(
+        &resampled,
+        usize::from(channels),
+        usize::from(target_channels),
+    )?;
     if pcm.is_empty() {
         return Err(encode_error(path, "no samples to encode as PCM"));
     }
@@ -3048,6 +3071,22 @@ fn enforce_decoded_budget(path: &Path, bytes: u64) -> Result<(), PipelineError> 
         ));
     }
     Ok(())
+}
+
+/// Checks the live PCM working set before a decoded slice is appended: the
+/// `f32` samples still retained in `chunk` plus the incoming slice's samples.
+/// Samples already handed to the caller were drained from `chunk`, so source
+/// duration never contributes to the cap.
+fn enforce_live_pcm_budget(
+    path: &Path,
+    chunk: &[f32],
+    incoming_samples: u64,
+) -> Result<(), PipelineError> {
+    let retained = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+    enforce_decoded_budget(
+        path,
+        retained.saturating_add(incoming_samples).saturating_mul(4),
+    )
 }
 
 fn estimated_decoded_bytes(track: &ContainerTrack, packet_count: usize) -> u64 {
@@ -4922,6 +4961,30 @@ mod tests {
         assert!(StreamingResampler::new(0, 44_100, 48_000).is_err());
         assert!(StreamingResampler::new(2, 0, 48_000).is_err());
         assert!(StreamingResampler::new(2, 44_100, 0).is_err());
+    }
+
+    #[test]
+    fn pcm_decode_budget_tracks_live_samples_not_cumulative_throughput() -> Result<(), PipelineError>
+    {
+        let path = Path::new("pcm-budget");
+        // Just before `emit_ready` drains, `chunk` holds one block and the
+        // incoming slice holds another. Repeat for longer than a 48 kHz stereo
+        // stream needs to cross 1 GiB cumulatively (~46 minutes); the cap must
+        // stay bounded because every handed-off block left `chunk`.
+        let live: Vec<f32> = vec![0.0; AUDIO_PCM_CHUNK_FRAMES * 2];
+        let incoming = u64::try_from(live.len()).unwrap_or(u64::MAX);
+        let slices = 46_u64
+            .saturating_mul(60)
+            .saturating_mul(48_000)
+            .div_ceil(u64::try_from(AUDIO_PCM_CHUNK_FRAMES).unwrap_or(1));
+        for _ in 0..slices {
+            enforce_live_pcm_budget(path, &live, incoming)?;
+        }
+        assert!(
+            enforce_live_pcm_budget(path, &[], u64::MAX).is_err(),
+            "a genuinely oversized live slice must still be rejected"
+        );
+        Ok(())
     }
 
     // Non-empty PCM assertion documents the successful decode roundtrip.
@@ -7096,6 +7159,106 @@ mod tests {
             (FLAC_CHUNK_FRAMES, FLAC_CHUNK_FRAMES),
             "fixed-block FLAC must declare equal min/max block sizes"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn flac_decode_accepts_full_metadata_chain_config() -> Result<(), PipelineError> {
+        let dir = temp_dir("flac-full-metadata")?;
+        let path = dir.join("x");
+        let samples = sine(4_800, 48_000, 2);
+        let (mut track, packets) = encode_audio_track(
+            &path,
+            &samples,
+            48_000,
+            2,
+            TargetAudioCodec::Flac,
+            default_config(TargetAudioCodec::Flac),
+        )?;
+        let si: [u8; 34] = track
+            .config
+            .as_slice()
+            .try_into()
+            .map_err(|_| decode_error(&path, "encode helper emitted no bare STREAMINFO"))?;
+        parse_flac_streaminfo(&si).map_err(|reason| decode_error(&path, reason))?;
+
+        // Canonical MKV/MOV configs keep every native block. Put a minimal
+        // VORBIS_COMMENT after STREAMINFO: the decoder must still find the
+        // validated STREAMINFO body, while remuxing must keep the whole chain.
+        let mut config = Vec::new();
+        config.extend_from_slice(b"fLaC");
+        config.push(0x00); // STREAMINFO, more blocks follow
+        config.extend_from_slice(&[0, 0, 34]);
+        config.extend_from_slice(&si);
+        config.push(0x84); // VORBIS_COMMENT, last block
+        config.extend_from_slice(&[0, 0, 8]);
+        config.extend_from_slice(&[0_u8; 8]); // empty vendor, zero comments
+        track.config = config.clone();
+
+        let (decoded, rate, channels) = decode_audio_track_pcm(&path, &track, &packets)?;
+        assert_ne!(decoded, [] as [f32; 0]);
+        assert_eq!((rate, channels), (48_000, 2));
+        assert_eq!(
+            track.config, config,
+            "remux must keep the full metadata chain"
+        );
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn lossless_whole_track_encoders_resample_rate_overrides() -> Result<(), PipelineError> {
+        let dir = temp_dir("lossless-resample")?;
+        let path = dir.join("x");
+        let input_frames = 4_800_usize;
+        let expected = expected_resampled_frames(input_frames, 48_000, 44_100);
+        assert_eq!(expected, 4_410);
+        let samples = sine(input_frames, 48_000, 2);
+        let options = || -> Result<AudioEncodeOptions, PipelineError> {
+            Ok(AudioEncodeOptions::new(
+                None,
+                Some(
+                    AudioSampleRate::new(44_100)
+                        .map_err(|err| encode_error(&path, err.to_string()))?,
+                ),
+                None,
+            ))
+        };
+
+        let flac_config = AudioEncodeConfig::new(TargetAudioCodec::Flac, options()?)
+            .map_err(|err| encode_error(&path, err.to_string()))?;
+        let (flac, _) = encode_flac_track(&path, &samples, 48_000, 2, flac_config)?;
+        assert_eq!(flac.sample_rate, Some(44_100));
+        let packed = u64::from_be_bytes(
+            flac.config
+                .get(10..18)
+                .ok_or_else(|| encode_error(&path, "short FLAC STREAMINFO"))?
+                .try_into()
+                .map_err(|_| encode_error(&path, "invalid FLAC STREAMINFO bounds"))?,
+        );
+        assert_eq!(
+            packed & 0xF_FFFF_FFFF,
+            u64::try_from(expected).unwrap_or(u64::MAX),
+            "FLAC STREAMINFO must declare the resampled frame count"
+        );
+
+        let pcm_config = AudioEncodeConfig::new(TargetAudioCodec::Pcm, options()?)
+            .map_err(|err| encode_error(&path, err.to_string()))?;
+        let (pcm, packets) = encode_pcm_track(&path, &samples, 48_000, 2, pcm_config)?;
+        assert_eq!(pcm.sample_rate, Some(44_100));
+        let frames: usize = packets
+            .iter()
+            .map(|packet| packet.data.len())
+            .sum::<usize>()
+            / 4;
+        assert_eq!(frames, expected, "PCM packets must hold resampled frames");
+        fs::remove_dir_all(&dir).map_err(|source| PipelineError::Io {
+            path: dir.clone(),
+            source,
+        })?;
         Ok(())
     }
 

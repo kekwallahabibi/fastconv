@@ -956,9 +956,24 @@ fn demux_mp4_with_format(
             let raw_duration = i64::try_from(packet.duration.unwrap_or(1))
                 .unwrap_or(i64::MAX)
                 .max(1);
+            // One MOV PCM sample holds one frame. A longer declared duration
+            // encodes a timeline gap that coalescing would silently erase, so
+            // reject it here instead of overlapping the next frame.
+            let frame_ticks = i64::from(
+                timescale
+                    .max(1)
+                    .div_ceil(media.tracks[track].sample_rate.unwrap_or(48_000).max(1)),
+            )
+            .max(1);
+            if raw_duration > frame_ticks {
+                return Err(container_error(
+                    path,
+                    "MOV PCM sample duration exceeds one frame of source ticks",
+                ));
+            }
             let source_end = packet.pts.saturating_add(raw_duration);
             if let Some(completed) =
-                coalescer.push(track, converted, packet.pts, source_end, path)?
+                coalescer.push(track, converted, packet.pts, source_end, timescale, path)?
             {
                 media.packets.push(completed);
             }
@@ -982,6 +997,8 @@ struct MovPcmCoalescer {
     pending: Vec<Option<ContainerPacket>>,
     frames: Vec<usize>,
     next_source_tick: Vec<Option<i64>>,
+    first_source_pts: Vec<Option<i64>>,
+    source_timescale: Vec<u32>,
 }
 
 impl MovPcmCoalescer {
@@ -1008,6 +1025,8 @@ impl MovPcmCoalescer {
             pending: vec![None; count],
             frames: vec![0; count],
             next_source_tick: vec![None; count],
+            first_source_pts: vec![None; count],
+            source_timescale: vec![US_TIMESCALE; count],
         }
     }
 
@@ -1023,6 +1042,7 @@ impl MovPcmCoalescer {
         packet: ContainerPacket,
         source_pts: i64,
         source_end: i64,
+        timescale: u32,
         path: &Path,
     ) -> Result<Option<ContainerPacket>, PipelineError> {
         let bytes = self.frame_bytes[index].max(1);
@@ -1036,22 +1056,34 @@ impl MovPcmCoalescer {
         let flush = self.next_source_tick[index].is_some_and(|next| next != source_pts)
             || self.frames[index].saturating_add(count) > Self::MAX_FRAMES_PER_PACKET;
         let completed = if flush { self.flush(index) } else { None };
-        match self.pending[index].as_mut() {
-            Some(previous) => {
-                previous.data.extend_from_slice(&packet.data);
-                previous.duration = previous.duration.saturating_add(packet.duration);
-            }
-            None => self.pending[index] = Some(packet),
+        if let Some(previous) = self.pending[index].as_mut() {
+            previous.data.extend_from_slice(&packet.data);
+        } else {
+            self.first_source_pts[index] = Some(source_pts);
+            self.pending[index] = Some(packet);
         }
         self.frames[index] = self.frames[index].saturating_add(count);
         self.next_source_tick[index] = Some(source_end);
+        self.source_timescale[index] = timescale;
         Ok(completed)
     }
 
     fn flush(&mut self, index: usize) -> Option<ContainerPacket> {
+        let end = self.next_source_tick[index].take();
         self.frames[index] = 0;
-        self.next_source_tick[index] = None;
-        self.pending[index].take()
+        let first = self.first_source_pts[index].take();
+        let mut packet = self.pending[index].take()?;
+        // `pts` is already the rescaled first source PTS (plus any edit
+        // shift). Derive the duration once from the two source endpoints:
+        // summing per-frame rounded microseconds makes adjacent runs overlap.
+        if let (Some(first), Some(end)) = (first, end) {
+            let duration =
+                rescale_ticks(end.saturating_sub(first), 1, self.source_timescale[index]);
+            if duration >= 0 {
+                packet.duration = u64::try_from(duration).unwrap_or(packet.duration);
+            }
+        }
+        Some(packet)
     }
 
     fn finish(mut self) -> impl Iterator<Item = ContainerPacket> {
@@ -3481,12 +3513,13 @@ mod tests {
     }
 
     #[test]
-    fn mov_pcm_coalesces_across_rounded_microsecond_gaps() -> Result<(), String> {
+    fn mov_pcm_coalesces_contiguous_frames_with_exact_duration() -> Result<(), String> {
         let dir =
             std::env::temp_dir().join(format!("fastconv-mov-coalesce-{}", std::process::id()));
         std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
         let contiguous = dir.join("contiguous.mov");
         let gapped = dir.join("gapped.mov");
+        let long = dir.join("long.mov");
         let frame: &[u8] = &[0x11, 0x22, 0x33, 0x44];
         let frames: Vec<(i64, &[u8])> = (0_i64..6).map(|tick| (tick, frame)).collect();
         write_raw_mov(
@@ -3508,26 +3541,44 @@ mod tests {
             "contiguous frames must coalesce into one packet"
         );
         assert_eq!(pcm[0].data.len(), 24, "six stereo S16 frames are 24 bytes");
+        assert_eq!(
+            pcm[0].duration, 125,
+            "six 48 kHz frames span 125 µs, not six rounded 21 µs durations"
+        );
 
+        let long_frames: Vec<(i64, &[u8])> = (0_i64..1_024).map(|tick| (tick, frame)).collect();
+        write_raw_mov(
+            &long,
+            build_pcm_mp4_sample_entry(PcmFormat::S16Le, 2, 48_000),
+            48_000,
+            &long_frames,
+        )?;
+        let media = demux_video(&long, VideoContainerFormat::Mov).map_err(|err| err.to_string())?;
+        let pcm: Vec<&ContainerPacket> = media
+            .packets
+            .iter()
+            .filter(|packet| media.tracks[packet.track].codec == VideoCodec::Pcm)
+            .collect();
+        assert_eq!(pcm.len(), 1, "1024 frames fit one coalesced packet");
+        assert_eq!(
+            pcm[0].duration, 21_333,
+            "a 1024-frame run must be rescaled once, not summed from rounded durations"
+        );
+
+        // A gap encoded as one long sample must be rejected: coalescing would
+        // otherwise overlap the following frame.
         write_raw_mov(
             &gapped,
             build_pcm_mp4_sample_entry(PcmFormat::S16Le, 2, 48_000),
             48_000,
             &[(0, frame), (1, frame), (2, frame), (10, frame)],
         )?;
-        let media =
-            demux_video(&gapped, VideoContainerFormat::Mov).map_err(|err| err.to_string())?;
-        let runs = media
-            .packets
-            .iter()
-            .filter(|packet| media.tracks[packet.track].codec == VideoCodec::Pcm)
-            .count();
-        // MP4 encodes a gap as the preceding frame's longer duration, so the
-        // source timeline is still adjacent and must coalesce; true tick gaps
-        // are covered by the direct coalescer test below.
-        assert_eq!(
-            runs, 1,
-            "source-adjacent frames coalesce despite a rounded gap"
+        let err = demux_video(&gapped, VideoContainerFormat::Mov)
+            .err()
+            .ok_or("MOV PCM sample with an 8-tick duration was accepted")?;
+        assert!(
+            format!("{err:?}").contains("duration"),
+            "unexpected rejection reason: {err:?}"
         );
         std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
         Ok(())
@@ -3559,16 +3610,20 @@ mod tests {
             data: vec![0_u8; 4],
         };
         let path = Path::new("gap.mov");
-        assert!(coalescer.push(0, frame(0), 0, 1, path)?.is_none());
-        assert!(coalescer.push(0, frame(1), 1, 2, path)?.is_none());
+        assert!(coalescer.push(0, frame(0), 0, 1, 48_000, path)?.is_none());
+        assert!(coalescer.push(0, frame(1), 1, 2, 48_000, path)?.is_none());
         // Previous frame ended at tick 2; starting at 10 is a real gap.
-        let flushed = coalescer.push(0, frame(10), 10, 11, path)?.ok_or_else(|| {
-            container_error(path, "source-tick gap did not flush the pending run")
-        })?;
+        let flushed = coalescer
+            .push(0, frame(10), 10, 11, 48_000, path)?
+            .ok_or_else(|| {
+                container_error(path, "source-tick gap did not flush the pending run")
+            })?;
         assert_eq!(flushed.data.len(), 8);
+        assert_eq!(flushed.duration, 42, "two 48 kHz ticks are 42 µs");
         let tail: Vec<_> = coalescer.finish().collect();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].data.len(), 4);
+        assert_eq!(tail[0].duration, 21);
         Ok(())
     }
 

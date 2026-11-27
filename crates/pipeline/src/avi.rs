@@ -705,6 +705,16 @@ fn build_waveformatex(
     Ok(out)
 }
 
+/// Position of AVI sample `n` in microseconds, using the same half-up rational
+/// rounding as the demuxer's `AvStream::timestamp_us` with `dwScale == 1`.
+fn avi_pcm_pts(samples: u64, rate: u32) -> i64 {
+    let rate = u128::from(rate.max(1));
+    let numerator = u128::from(samples)
+        .saturating_mul(1_000_000)
+        .saturating_add(rate / 2);
+    i64::try_from(numerator / rate).unwrap_or(i64::MAX)
+}
+
 /// Writes a compliant RIFF/AVI 1.0 file with an `idx1` index.
 // Header, chunk conversion and index construction form one linear write pass;
 // splitting them would only move mutable buffers between helpers.
@@ -791,6 +801,22 @@ pub(crate) fn mux_avi(
                     ));
                 }
                 length = u32::try_from(bytes / block_align).unwrap_or(u32::MAX);
+                // AVI readers derive PCM timestamps from the cumulative sample
+                // count, so a source gap would silently disappear. Reject it
+                // before writing the header or any payload instead.
+                let mut samples = 0_u64;
+                for pcm in media.packets.iter().filter(|packet| packet.track == index) {
+                    let expected = avi_pcm_pts(samples, sr);
+                    if pcm.pts != expected || pcm.dts != expected {
+                        return Err(avi_error(
+                            target_path,
+                            "AVI PCM packet timestamps are not contiguous sample positions",
+                        ));
+                    }
+                    samples = samples.saturating_add(
+                        u64::try_from(pcm.data.len() / block_align).unwrap_or(u64::MAX),
+                    );
+                }
                 (
                     1_u32,
                     sr,
@@ -1060,6 +1086,54 @@ mod tests {
             result.is_err(),
             "each PCM chunk must contain a whole number of frames"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn avi_rejects_pcm_timestamp_gaps() -> Result<(), Box<dyn std::error::Error>> {
+        // 480 stereo S16 frames are 10 ms at 48 kHz; the AVI timeline comes
+        // from the cumulative sample count, not from the source PTS.
+        let media = |second_pts: i64| ContainerMedia {
+            tracks: vec![ContainerTrack {
+                codec: VideoCodec::Pcm,
+                width: None,
+                height: None,
+                channels: Some(2),
+                sample_rate: Some(48_000),
+                config: Vec::new(),
+                timescale: US_TIMESCALE,
+                presentation_edit: None,
+                pcm_format: Some(PcmFormat::S16Le),
+            }],
+            packets: [0_i64, second_pts]
+                .into_iter()
+                .enumerate()
+                .map(|(index, pts)| ContainerPacket {
+                    track: 0,
+                    pts,
+                    dts: pts,
+                    duration: 10_000,
+                    keyframe: true,
+                    data: vec![u8::try_from(index).unwrap_or(1); 480 * 4],
+                })
+                .collect(),
+        };
+        let path = temp_path("pcm-pts-gap");
+        let file = File::create(&path)?;
+        let result = mux_avi(&file, &path, &media(1_000_000));
+        drop(file);
+        std::fs::remove_file(&path)?;
+        assert!(result.is_err(), "a 990 ms PCM gap must not be dropped");
+
+        let out = round_trip("pcm-pts-contiguous", &media(10_000))?;
+        let pcm: Vec<_> = out
+            .packets
+            .iter()
+            .filter(|packet| out.tracks[packet.track].codec == VideoCodec::Pcm)
+            .collect();
+        assert_eq!(pcm.len(), 2);
+        assert_eq!(pcm[0].pts, 0);
+        assert_eq!(pcm[1].pts, 10_000, "contiguous PCM must be unchanged");
         Ok(())
     }
 
