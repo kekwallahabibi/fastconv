@@ -1023,6 +1023,36 @@ mod tests {
     }
 
     #[test]
+    fn reserves_full_input_length_for_compressible_frames() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let p = Path::new("reserve.qoi");
+        let (width, height) = (1024_u32, 1_u32);
+        // All-black RGB encodes to ~39 bytes. With a fresh buffer, later growth
+        // cannot mask an undersized initial reservation (unlike the noisy
+        // fixture above, which emits ~4 KB).
+        let rgb = vec![0_u8; width as usize * height as usize * 3];
+        let mut encoded = Vec::new();
+        encode_qoi_into(
+            p,
+            &rgb,
+            DecodedFrameMeta {
+                width,
+                height,
+                format: super::DecodedPixelFormat::Rgb8,
+                byte_len: rgb.len(),
+                input_file_bytes: 1,
+                has_non_opaque_native_alpha: false,
+            },
+            &mut encoded,
+        )?;
+        assert!(
+            encoded.capacity() >= rgb.len() + super::QOI_HEADER_LEN,
+            "RGB8 encoder did not reserve the full input length up front"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn roundtrips_rgb_rgba_luma_and_la_losslessly() -> Result<(), Box<dyn std::error::Error>> {
         let p = Path::new("test.qoi");
 

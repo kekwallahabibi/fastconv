@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Seek, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -44,6 +44,11 @@ use crate::qoi::encode_qoi_into;
 
 const STREAM_IO_BUF_BYTES: usize = 512 * 1024;
 const PNG_IDAT_CHUNK_BYTES: usize = 256 * 1024;
+// The worker's reusable TIFF sink is capped so a batch of large uncompressed
+// images cannot pin one full encoded copy per worker. 2x the decoded bytes is
+// a conservative worst case for PackBits/LZW expansion.
+const MAX_TIFF_BUFFERED_BYTES: usize = 128 * 1024 * 1024;
+const TIFF_ENCODE_OVERHEAD_BOUND: usize = 1024 * 1024;
 
 /// Concrete CPU execution backend entry point.
 ///
@@ -1109,6 +1114,79 @@ fn tiff_encoder_settings(compression: TiffCompression) -> (TiffEncoderCompressio
     }
 }
 
+const fn tiff_use_buffered_sink(pixels_len: usize) -> bool {
+    pixels_len
+        .saturating_mul(2)
+        .saturating_add(TIFF_ENCODE_OVERHEAD_BOUND)
+        <= MAX_TIFF_BUFFERED_BYTES
+}
+
+fn write_tiff_image<W: Write + Seek>(
+    target: &Path,
+    compression: TiffCompression,
+    pixels: &[u8],
+    decoded: DecodedFrameMeta,
+    aux_buf: &mut Vec<u8>,
+    writer: &mut W,
+) -> Result<(), PipelineError> {
+    let mut encoder = TiffEncoder::new(writer).map_err(|err| PipelineError::EncodeFailed {
+        path: target.to_path_buf(),
+        reason: format!("failed to create TIFF encoder: {err}"),
+    })?;
+    let (encoder_compression, predictor) = tiff_encoder_settings(compression);
+    encoder = encoder
+        .with_compression(encoder_compression)
+        .with_predictor(predictor);
+
+    match decoded.format {
+        DecodedPixelFormat::L8 => encoder
+            .write_image::<colortype::Gray8>(decoded.width, decoded.height, pixels)
+            .map_err(|err| PipelineError::EncodeFailed {
+                path: target.to_path_buf(),
+                reason: format!("failed to encode TIFF grayscale image: {err}"),
+            })?,
+        DecodedPixelFormat::Rgb8 => encoder
+            .write_image::<colortype::RGB8>(decoded.width, decoded.height, pixels)
+            .map_err(|err| PipelineError::EncodeFailed {
+                path: target.to_path_buf(),
+                reason: format!("failed to encode TIFF RGB image: {err}"),
+            })?,
+        DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8 => {
+            let rgba = if decoded.format == DecodedPixelFormat::La8 {
+                let needed = expand_la8_to_rgba(target, pixels, aux_buf)?;
+                &aux_buf[..needed]
+            } else {
+                pixels
+            };
+            // Use RGBA8 (not RGB8 + extra_samples) so tiff's horizontal predictor
+            // steps by 4 samples instead of 3, while still tagging unassociated alpha.
+            let mut image = encoder
+                .new_image::<colortype::RGBA8>(decoded.width, decoded.height)
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: target.to_path_buf(),
+                    reason: format!("failed to create TIFF RGBA image: {err}"),
+                })?;
+            image
+                .encoder()
+                .write_tag(
+                    Tag::ExtraSamples,
+                    &[ExtraSamples::UnassociatedAlpha.to_u16()][..],
+                )
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: target.to_path_buf(),
+                    reason: format!("failed to declare TIFF alpha sample: {err}"),
+                })?;
+            image
+                .write_data(rgba)
+                .map_err(|err| PipelineError::EncodeFailed {
+                    path: target.to_path_buf(),
+                    reason: format!("failed to encode TIFF RGBA image: {err}"),
+                })?;
+        }
+    }
+    Ok(())
+}
+
 fn encode_tiff_streaming(
     target: &Path,
     compression: TiffCompression,
@@ -1117,85 +1195,58 @@ fn encode_tiff_streaming(
     aux_buf: &mut Vec<u8>,
     encoded_buf: &mut Vec<u8>,
 ) -> Result<u64, PipelineError> {
-    // The TIFF encoder needs a seekable sink; a `Cursor` over the worker's
-    // reusable buffer avoids a 512 KiB BufWriter allocation and lets us issue a
-    // single contiguous write to the staging file afterwards.
-    encoded_buf.clear();
-    {
-        let mut writer = io::Cursor::new(&mut *encoded_buf);
-        let mut encoder =
-            TiffEncoder::new(&mut writer).map_err(|err| PipelineError::EncodeFailed {
-                path: target.to_path_buf(),
-                reason: format!("failed to create TIFF encoder: {err}"),
-            })?;
-        let (encoder_compression, predictor) = tiff_encoder_settings(compression);
-        encoder = encoder
-            .with_compression(encoder_compression)
-            .with_predictor(predictor);
-
-        match decoded.format {
-            DecodedPixelFormat::L8 => encoder
-                .write_image::<colortype::Gray8>(decoded.width, decoded.height, pixels)
-                .map_err(|err| PipelineError::EncodeFailed {
-                    path: target.to_path_buf(),
-                    reason: format!("failed to encode TIFF grayscale image: {err}"),
-                })?,
-            DecodedPixelFormat::Rgb8 => encoder
-                .write_image::<colortype::RGB8>(decoded.width, decoded.height, pixels)
-                .map_err(|err| PipelineError::EncodeFailed {
-                    path: target.to_path_buf(),
-                    reason: format!("failed to encode TIFF RGB image: {err}"),
-                })?,
-            DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8 => {
-                let rgba = if decoded.format == DecodedPixelFormat::La8 {
-                    let needed = expand_la8_to_rgba(target, pixels, aux_buf)?;
-                    &aux_buf[..needed]
-                } else {
-                    pixels
-                };
-                // Use RGBA8 (not RGB8 + extra_samples) so tiff's horizontal predictor
-                // steps by 4 samples instead of 3, while still tagging unassociated alpha.
-                let mut image = encoder
-                    .new_image::<colortype::RGBA8>(decoded.width, decoded.height)
-                    .map_err(|err| PipelineError::EncodeFailed {
-                        path: target.to_path_buf(),
-                        reason: format!("failed to create TIFF RGBA image: {err}"),
-                    })?;
-                image
-                    .encoder()
-                    .write_tag(
-                        Tag::ExtraSamples,
-                        &[ExtraSamples::UnassociatedAlpha.to_u16()][..],
-                    )
-                    .map_err(|err| PipelineError::EncodeFailed {
-                        path: target.to_path_buf(),
-                        reason: format!("failed to declare TIFF alpha sample: {err}"),
-                    })?;
-                image
-                    .write_data(rgba)
-                    .map_err(|err| PipelineError::EncodeFailed {
-                        path: target.to_path_buf(),
-                        reason: format!("failed to encode TIFF RGBA image: {err}"),
-                    })?;
-            }
+    // TIFF needs a seekable sink. Ordinary images use the worker's reusable
+    // buffer (one contiguous write to the staging file); images whose worst
+    // case exceeds the budget stream through a file-backed BufWriter instead,
+    // so a large uncompressed batch cannot pin a full output copy per worker.
+    if tiff_use_buffered_sink(pixels.len()) {
+        encoded_buf.clear();
+        {
+            let mut writer = io::Cursor::new(&mut *encoded_buf);
+            write_tiff_image(target, compression, pixels, decoded, aux_buf, &mut writer)?;
         }
-    }
-    if encoded_buf.is_empty() {
-        return Err(PipelineError::EmptyOutput(target.to_path_buf()));
-    }
-    let (staging, file) = StagingFile::create_for(target)?;
-    let mut file = file;
-    file.write_all(encoded_buf)
-        .map_err(|source| PipelineError::Io {
+        if encoded_buf.is_empty() {
+            return Err(PipelineError::EmptyOutput(target.to_path_buf()));
+        }
+        let (staging, mut file) = StagingFile::create_for(target)?;
+        file.write_all(encoded_buf)
+            .map_err(|source| PipelineError::Io {
+                path: target.to_path_buf(),
+                source,
+            })?;
+        file.flush().map_err(|source| PipelineError::Io {
             path: target.to_path_buf(),
             source,
+        })?;
+        staging.commit(target, file)?;
+        return Ok(u64::try_from(encoded_buf.len()).unwrap_or(u64::MAX));
+    }
+
+    let (staging, file) = StagingFile::create_for(target)?;
+    let mut writer = BufWriter::with_capacity(STREAM_IO_BUF_BYTES, file);
+    write_tiff_image(target, compression, pixels, decoded, aux_buf, &mut writer)?;
+    let mut file = writer
+        .into_inner()
+        .map_err(|err| PipelineError::EncodeFailed {
+            path: target.to_path_buf(),
+            reason: format!("failed to flush TIFF writer: {err}"),
         })?;
     file.flush().map_err(|source| PipelineError::Io {
         path: target.to_path_buf(),
         source,
     })?;
+    let bytes = file
+        .metadata()
+        .map_err(|source| PipelineError::Io {
+            path: target.to_path_buf(),
+            source,
+        })?
+        .len();
+    if bytes == 0 {
+        return Err(PipelineError::EmptyOutput(target.to_path_buf()));
+    }
     staging.commit(target, file)?;
-    Ok(u64::try_from(encoded_buf.len()).unwrap_or(u64::MAX))
+    Ok(bytes)
 }
 
 const fn jxl_speed(level: CompressionLevel) -> Speed {
@@ -1260,6 +1311,16 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static CPU_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn tiff_sink_budget_keeps_4k_buffered_and_streams_8k() {
+        // 4K RGB/RGBA must keep the fast cursor path used by the benchmark.
+        assert!(super::tiff_use_buffered_sink(3840 * 2160 * 3));
+        assert!(super::tiff_use_buffered_sink(3840 * 2160 * 4));
+        // An uncompressed 8K RGB frame must stream through the staging file
+        // instead of pinning a full encoded copy in the worker buffer.
+        assert!(!super::tiff_use_buffered_sink(8192 * 8192 * 3));
+    }
 
     struct FailOnceAfterIdatHeader {
         saw_idat_header: bool,
