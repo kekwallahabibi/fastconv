@@ -8,6 +8,14 @@
 | Verify | `cargo xtask verify` green — **707** default tests (33 cli + 3 audio_codecs + 11 cli_help + 101 domain + 407 pipeline + 130 probe + 22 xtask), **474** `--features nvenc` tests (33 cli + 3 audio_codecs + 11 cli_help + 427 pipeline); **273** deps license-checked; fmt + clippy `-D warnings` clean (default and nvenc) |
 | Release binary | default **39,724,568 B (37.88 MiB) → 28,503,464 B (27.18 MiB), −28.25%**; `--features nvenc` **40,410,144 B (38.54 MiB) → 29,155,880 B (27.81 MiB), −27.85%** — `strip = true`, `lto = "fat"`, `codegen-units = 1`, `opt-level = 3` |
 
+## Build size
+| Profile | Stripped | Unstripped | Strip reduction |
+| :--- | ---: | ---: | ---: |
+| `default` | 28,503,464 B (27.18 MiB) | 33,745,336 B (32.18 MiB) | −15.5% |
+| `--features nvenc` | 29,155,880 B (27.81 MiB) | 34,472,792 B (32.88 MiB) | −15.4% |
+
+Profile: `lto = "fat"`, `codegen-units = 1`, `opt-level = 3`, `strip = true` (stripped) / `strip = none` (unstripped).
+
 ## CLI
 | Command | Form |
 | :--- | :--- |
