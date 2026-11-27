@@ -289,10 +289,13 @@ pub fn detect_audio_magic(bytes: &[u8]) -> Option<AudioInputFormat> {
         }
     }
     if bytes.starts_with(b"OggS")
-        && let Some(identification) = ogg_identification_packet(bytes)
+        && let Some((identification, after_skeleton)) = ogg_identification_packet(bytes)
     {
         if identification.starts_with(b"OpusHead") {
-            return Some(AudioInputFormat::Opus);
+            // `opus-pure` reads from offset zero and requires OpusHead as the
+            // first packet; claiming a Skeleton-prefixed file would create a
+            // plan that can never be opened.
+            return (!after_skeleton).then_some(AudioInputFormat::Opus);
         }
         if identification.starts_with(b"\x01vorbis") {
             return Some(AudioInputFormat::Vorbis);
@@ -324,10 +327,15 @@ pub fn detect_audio_magic(bytes: &[u8]) -> Option<AudioInputFormat> {
 /// only the first page would miss the codec identification packet. The codec must come from
 /// a framed identification packet; scanning arbitrary bytes can mistake Vorbis comments for
 /// Opus. The BOS flag is deliberately ignored so a lone identification page still works.
-fn ogg_identification_packet(bytes: &[u8]) -> Option<&[u8]> {
+/// Returns the first audio identification packet and whether a Skeleton page
+/// preceded it. The flag matters for Opus: `opus-pure` requires `OpusHead` to be
+/// the first packet of the file, so a Skeleton-prefixed Opus stream must not be
+/// detected as openable.
+fn ogg_identification_packet(bytes: &[u8]) -> Option<(&[u8], bool)> {
     const TABLE_START: usize = 27;
     let limit = bytes.len().min(MAGIC_PREFIX_BYTES);
     let mut offset = 0_usize;
+    let mut after_skeleton = false;
     while offset < limit {
         let mut page = bytes.get(offset..limit)?;
         if !page.starts_with(b"OggS") || page.len() < TABLE_START {
@@ -350,8 +358,9 @@ fn ogg_identification_packet(bytes: &[u8]) -> Option<&[u8]> {
         if let Some(packet_len) = first_packet_len {
             let packet = page.get(table_end..table_end.checked_add(packet_len)?)?;
             if !packet.starts_with(b"fishead") && !packet.starts_with(b"fisbone") {
-                return Some(packet);
+                return Some((packet, after_skeleton));
             }
+            after_skeleton = true;
         }
         offset = offset.checked_add(page_len)?;
     }
@@ -1652,6 +1661,16 @@ mod tests {
         let mut bytes = ogg_page(0x02, &fishead);
         bytes.extend_from_slice(&ogg_page(0x02, b"\x01vorbis"));
         assert_eq!(detect_audio_magic(&bytes), Some(AudioInputFormat::Vorbis));
+
+        // `opus-pure` needs OpusHead as the very first packet, so a Skeleton
+        // prefix must not be reported as an openable Opus stream.
+        let mut opus = ogg_page(0x02, &fishead);
+        opus.extend_from_slice(&ogg_page(0x02, b"OpusHead"));
+        assert_eq!(detect_audio_magic(&opus), None);
+        assert_eq!(
+            detect_audio_magic(&ogg_page(0x02, b"OpusHead")),
+            Some(AudioInputFormat::Opus)
+        );
     }
 
     #[test]

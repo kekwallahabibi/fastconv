@@ -2434,6 +2434,12 @@ fn convert_item(
 struct PcmEstimate {
     peak_bytes: u64,
     largest_buffer_bytes: u64,
+    /// Maximum capacity each reused worker vector can retain after this item.
+    /// `clear()` keeps capacity, so the batch budget must charge the union of
+    /// buffers across all items a worker may process, not just one item's peak.
+    f32_capacity: u64,
+    i16_capacity: u64,
+    i32_capacity: u64,
 }
 
 /// Whether an item quantizes live `f32` samples into a second full-file integer
@@ -2501,6 +2507,94 @@ fn widens_direct_i16(
             .is_none_or(|depth| depth == AudioBitDepth::Int16)
 }
 
+/// Maximum capacity each of the three reusable worker vectors can reach while
+/// processing `item`. A worker keeps one `AudioWorkerBuffer` for its whole queue;
+/// `clear()` empties a vector but retains its allocation, so the batch budget has
+/// to charge the union of buffers touched by all items, not a single item's peak.
+fn retained_buffer_bytes(
+    item: &AudioBatchItem,
+    codec: AudioTargetCodec,
+    options: &AudioEncodingOptions,
+) -> (u64, u64, u64) {
+    let stream = item.stream();
+    let Some(frames) = stream.total_samples() else {
+        return (
+            MAX_PCM_BYTES_PER_FILE,
+            MAX_PCM_BYTES_PER_FILE.saturating_div(2),
+            MAX_PCM_BYTES_PER_FILE,
+        );
+    };
+    let source_rate = stream.sample_rate().get();
+    let target_rate = effective_sample_rate(codec, source_rate, options);
+    let source_channels = u64::from(stream.channels().get()).max(1);
+    let target_channels = u64::from(
+        options
+            .channels()
+            .map_or(stream.channels().get(), AudioOptionChannels::get),
+    )
+    .max(1);
+    let source_bytes = frames.saturating_mul(source_channels).saturating_mul(4);
+    let final_bytes = frames
+        .saturating_mul(u64::from(target_rate))
+        .div_ceil(u64::from(source_rate).max(1))
+        .saturating_mul(target_channels)
+        .saturating_mul(4);
+    let bits = usize::from(stream.bits_per_sample().map_or(0, NonZeroU16::get));
+    let format = stream.sample_format();
+    let explicit = options.bit_depth();
+    let no_transform = options
+        .sample_rate()
+        .is_none_or(|rate| rate.hz() == source_rate)
+        && options.channels().is_none_or(|channels| {
+            usize::from(channels.get()) == usize::from(stream.channels().get())
+        });
+    let direct_i16 = codec.is_lossless()
+        && bits == 16
+        && format == AudioSampleFormat::Int
+        && no_transform
+        && explicit.is_none_or(|depth| depth == AudioBitDepth::Int16);
+    let direct_i32 = codec == AudioTargetCodec::Pcm
+        && bits == 32
+        && format == AudioSampleFormat::Int
+        && no_transform
+        && explicit.is_none_or(|depth| depth == AudioBitDepth::Int32);
+    let f32_cap = if direct_i16 || direct_i32 {
+        0
+    } else {
+        source_bytes.max(final_bytes)
+    };
+    let mut i16_cap = if direct_i16 {
+        source_bytes.saturating_div(2)
+    } else {
+        0
+    };
+    let mut i32_cap = if direct_i32 { source_bytes } else { 0 };
+    if widens_direct_i16(item, codec, options) {
+        i32_cap = i32_cap.max(final_bytes);
+    }
+    // The target depth decides which integer vector quantization fills. An
+    // already-validated plan cannot fail here; if metadata is incomplete, charge
+    // both integer vectors so the budget stays conservative.
+    match resolve_target_depth(item.source(), codec, bits, format, options).ok() {
+        Some(AudioBitDepth::Int8 | AudioBitDepth::Int16) => {
+            if codec == AudioTargetCodec::Flac {
+                i32_cap = i32_cap.max(final_bytes);
+            } else {
+                i16_cap = i16_cap.max(final_bytes.saturating_div(2));
+            }
+        }
+        Some(AudioBitDepth::Int24 | AudioBitDepth::Int32) => {
+            i32_cap = i32_cap.max(final_bytes);
+        }
+        None if codec.is_lossless() => {
+            i16_cap = i16_cap.max(final_bytes.saturating_div(2));
+            i32_cap = i32_cap.max(final_bytes);
+        }
+        Some(AudioBitDepth::Float32) | None => {}
+    }
+    (f32_cap, i16_cap, i32_cap)
+}
+
 fn estimate_pcm_bytes(
     item: &AudioBatchItem,
     codec: AudioTargetCodec,
@@ -2512,6 +2606,9 @@ fn estimate_pcm_bytes(
         // the decoded input and a simultaneous resample output.
         peak_bytes: MAX_PCM_BYTES_PER_FILE.saturating_mul(2),
         largest_buffer_bytes: MAX_PCM_BYTES_PER_FILE,
+        f32_capacity: MAX_PCM_BYTES_PER_FILE,
+        i16_capacity: MAX_PCM_BYTES_PER_FILE.saturating_div(2),
+        i32_capacity: MAX_PCM_BYTES_PER_FILE,
     };
     let Some(frames) = stream.total_samples() else {
         // A compressed file size is not a PCM frame count: probed AAC streams, for
@@ -2577,9 +2674,13 @@ fn estimate_pcm_bytes(
         let decoded_i16_bytes = bytes(frames, source_channels).saturating_div(2);
         peak_bytes = peak_bytes.max(decoded_i16_bytes.saturating_add(final_bytes));
     }
+    let (f32_capacity, i16_capacity, i32_capacity) = retained_buffer_bytes(item, codec, options);
     PcmEstimate {
         peak_bytes,
         largest_buffer_bytes,
+        f32_capacity,
+        i16_capacity,
+        i32_capacity,
     }
 }
 
@@ -2611,9 +2712,24 @@ fn resolve_worker_count(
         .map(|estimate| estimate.peak_bytes)
         .max()
         .unwrap_or(0);
+    // One worker reuses its buffers for every item it takes. Each vector can be
+    // grown by a different item and `clear()` keeps its allocation, so a worker's
+    // retained working set is the sum of the per-vector maxima across the batch.
+    let retained_per_worker = estimates
+        .iter()
+        .fold([0_u64; 3], |maxima, estimate| {
+            [
+                maxima[0].max(estimate.f32_capacity),
+                maxima[1].max(estimate.i16_capacity),
+                maxima[2].max(estimate.i32_capacity),
+            ]
+        })
+        .into_iter()
+        .fold(0_u64, u64::saturating_add);
+    let per_worker = largest_peak.max(retained_per_worker).max(1);
     let budget_workers = u64::try_from(requested)
         .unwrap_or(u64::MAX)
-        .min(MAX_PCM_BYTES_PER_BATCH / largest_peak.max(1));
+        .min(MAX_PCM_BYTES_PER_BATCH / per_worker);
     Ok(usize::try_from(budget_workers.max(1))
         .unwrap_or(usize::MAX)
         .min(requested))
@@ -5189,6 +5305,57 @@ mod tests {
         // PCM targets consume the i16 copy directly and do not widen it.
         let pcm = estimate_pcm_bytes(&item, AudioTargetCodec::Pcm, &defaults);
         assert_eq!(pcm.peak_bytes, 8_000);
+    }
+
+    #[test]
+    fn worker_count_bounds_capacity_retained_across_items() {
+        let frames = 8_000_000_u64;
+        let item = |name: &str, bits: u16| {
+            AudioBatchItem::new(
+                PathBuf::from(name),
+                PathBuf::from("out.ogg"),
+                AudioInputFormat::Flac,
+                fastconv_domain::AudioStreamInfo::new(
+                    NonZeroU16::new(2).unwrap_or(NonZeroU16::MIN),
+                    NonZeroU32::new(48_000).unwrap_or(NonZeroU32::MIN),
+                    Some(NonZeroU16::new(bits).unwrap_or(NonZeroU16::MIN)),
+                    Some(frames),
+                )
+                .unwrap_or_else(|_| unreachable!()),
+            )
+            .unwrap_or_else(|_| unreachable!())
+        };
+        let deep = item("deep.flac", 24);
+        let narrow = item("narrow.flac", 16);
+        let defaults = AudioEncodingOptions::default();
+
+        let deep_est = estimate_pcm_bytes(&deep, AudioTargetCodec::Flac, &defaults);
+        assert_eq!(
+            (
+                deep_est.f32_capacity,
+                deep_est.i16_capacity,
+                deep_est.i32_capacity
+            ),
+            (64_000_000, 0, 64_000_000)
+        );
+        let narrow_est = estimate_pcm_bytes(&narrow, AudioTargetCodec::Flac, &defaults);
+        assert_eq!(
+            (
+                narrow_est.f32_capacity,
+                narrow_est.i16_capacity,
+                narrow_est.i32_capacity
+            ),
+            (0, 32_000_000, 64_000_000)
+        );
+
+        // A worker can grow f32/i32 from the deep item and i16 from the narrow
+        // item, so its retained set is larger than either item's live peak.
+        let workers = resolve_worker_count(&[deep, narrow], 8, AudioTargetCodec::Flac, &defaults)
+            .unwrap_or(0);
+        assert!(
+            workers < 8,
+            "reused buffer capacity across items must reduce admission"
+        );
     }
 
     #[test]
