@@ -92,6 +92,13 @@ impl AudioWorkerBuffer {
         self.samples_i32.clear();
     }
 
+    /// Drops a retained scratch allocation. `clear()` keeps capacity, so a
+    /// direct path that builds its own full-size buffers must release the
+    /// worker's previous one before allocating to avoid holding both at once.
+    fn release_f32_samples(&mut self) {
+        self.samples_f32 = Vec::new();
+    }
+
     #[cfg(test)]
     fn decoded_len(&self) -> usize {
         self.samples_f32.len()
@@ -878,19 +885,8 @@ fn quantize_for(codec: AudioTargetCodec, depth: AudioBitDepth, buf: &mut AudioWo
     buf.samples_f32.clear();
 }
 
-const WAVE_FORMAT_PCM_GUID: [u8; 16] = [
-    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
-];
-
-fn le_u16(bytes: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([bytes[at], bytes[at + 1]])
-}
-
-fn le_u32(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
-}
-
-/// A validated signed-integer PCM `data` chunk in a RIFF/WAVE file.
+/// A canonical signed-integer PCM `data` chunk whose layout was already parsed
+/// and validated by the boundary probe.
 struct PcmWavStream {
     reader: BufReader<File>,
     channels: usize,
@@ -899,113 +895,46 @@ struct PcmWavStream {
     frame_bytes: usize,
     total_samples: usize,
     remaining_bytes: u64,
+    channel_mask: u32,
 }
 
-/// Opens a canonical signed 16/24/32-bit PCM WAV for a direct encode.
+/// Opens a canonical signed 16/24/32-bit PCM WAV for a direct encode using the
+/// layout validated in `probe`. No header is parsed here: the file is opened,
+/// positioned at the validated `data` offset, and the reader checks every
+/// subsequent payload read.
 ///
-/// Returns `Ok(None)` for anything that needs the full decoder: unsigned 8-bit
-/// WAV, float WAV, RF64, non-canonical extensible PCM, or malformed chunks. All
-/// arithmetic is checked and every chunk must fit within the RIFF-declared end
-/// of the file, so a truncated or inconsistent header can never reach a fast path.
-fn try_open_pcm_wav(path: &Path) -> Result<Option<PcmWavStream>, PipelineError> {
+/// Returns `Ok(None)` when the probe attached no canonical layout (unsigned
+/// 8-bit, float, RF64, non-canonical extensible PCM, or malformed chunks). If
+/// the file was truncated or replaced after probing, the shortened payload is
+/// reported as `DecodeFailed` rather than silently encoding fewer frames.
+fn try_open_pcm_wav(item: &AudioBatchItem) -> Result<Option<PcmWavStream>, PipelineError> {
+    let Some(layout) = item.stream().pcm_wav_layout() else {
+        return Ok(None);
+    };
     let io_err = |source| PipelineError::Io {
-        path: path.to_path_buf(),
+        path: item.source().to_path_buf(),
         source,
     };
-    let mut file = File::open(path).map_err(io_err)?;
+    let mut file = File::open(item.source()).map_err(io_err)?;
     let file_len = file.metadata().map_err(io_err)?.len();
-    let mut head = [0_u8; 12];
-    if file.read_exact(&mut head).is_err() {
-        return Ok(None);
+    let data_end = layout.data_offset().saturating_add(layout.data_bytes());
+    if data_end > file_len {
+        return Err(PipelineError::DecodeFailed {
+            path: item.source().to_path_buf(),
+            reason: "WAV data chunk was truncated after probing".to_owned(),
+        });
     }
-    if &head[..4] != b"RIFF" || &head[8..12] != b"WAVE" {
-        return Ok(None);
-    }
-    if le_u32(&head, 4) == u32::MAX {
-        return Ok(None);
-    }
-    let riff_end = u64::from(le_u32(&head, 4)).saturating_add(8).min(file_len);
-
-    let mut pos = 12_u64;
-    let mut fmt: Option<(usize, u32, usize, usize)> = None;
-    let mut data: Option<(u64, u64)> = None;
-    let mut header = [0_u8; 8];
-    let mut payload = vec![0_u8; 4096];
-
-    while pos.saturating_add(8) <= riff_end {
-        if file.seek(SeekFrom::Start(pos)).is_err() || file.read_exact(&mut header).is_err() {
-            return Ok(None);
-        }
-        let size = u64::from(le_u32(&header, 4));
-        if size == u64::from(u32::MAX) {
-            return Ok(None);
-        }
-        if pos.saturating_add(8).saturating_add(size) > riff_end {
-            return Ok(None);
-        }
-        let padded = size.saturating_add(size & 1);
-        match &header[..4] {
-            b"fmt " => {
-                if !(16..=4096).contains(&size) {
-                    return Ok(None);
-                }
-                let len = usize::try_from(size).unwrap_or(0);
-                payload.resize(len, 0);
-                if file.read_exact(&mut payload[..len]).is_err() {
-                    return Ok(None);
-                }
-                let audio_format = le_u16(&payload, 0);
-                let channels = usize::from(le_u16(&payload, 2));
-                let rate = le_u32(&payload, 4);
-                let block_align = usize::from(le_u16(&payload, 12));
-                let bits = usize::from(le_u16(&payload, 14));
-                let canonical = bits == 16 || bits == 24 || bits == 32;
-                let extensible = audio_format == 0xFFFE
-                    && size >= 40
-                    && le_u16(&payload, 18) == u16::try_from(bits).unwrap_or(0)
-                    && payload
-                        .get(24..40)
-                        .is_some_and(|guid| guid == WAVE_FORMAT_PCM_GUID.as_slice());
-                if !(canonical && (audio_format == 1 || extensible))
-                    || !(1..=8).contains(&channels)
-                    || rate == 0
-                    || block_align != channels.saturating_mul(bits / 8)
-                {
-                    return Ok(None);
-                }
-                fmt = Some((channels, rate, bits, block_align));
-            }
-            b"data" => {
-                data = Some((pos.saturating_add(8), size));
-                if fmt.is_some() {
-                    break;
-                }
-            }
-            _ => {}
-        }
-        pos = pos.saturating_add(8).saturating_add(padded);
-    }
-
-    let (Some((channels, rate, bits, block_align)), Some((data_offset, data_bytes))) = (fmt, data)
-    else {
-        return Ok(None);
-    };
-    let align = u64::try_from(block_align).unwrap_or(u64::MAX);
-    if data_bytes == 0
-        || data_offset.saturating_add(data_bytes) > riff_end
-        || data_bytes % align != 0
-    {
-        return Ok(None);
-    }
-    file.seek(SeekFrom::Start(data_offset)).map_err(io_err)?;
+    file.seek(SeekFrom::Start(layout.data_offset()))
+        .map_err(io_err)?;
     Ok(Some(PcmWavStream {
         reader: BufReader::with_capacity(WAV_READ_BUF_BYTES, file),
-        channels,
-        bits,
-        rate,
-        frame_bytes: block_align,
-        total_samples: usize::try_from(data_bytes / align).unwrap_or(usize::MAX),
-        remaining_bytes: data_bytes,
+        channels: usize::from(layout.channels().get()),
+        bits: usize::from(layout.bits_per_sample().get()),
+        rate: layout.sample_rate().get(),
+        frame_bytes: usize::from(layout.block_align().get()),
+        total_samples: usize::try_from(layout.total_samples()).unwrap_or(usize::MAX),
+        remaining_bytes: layout.data_bytes(),
+        channel_mask: layout.channel_mask(),
     }))
 }
 
@@ -2193,6 +2122,22 @@ pub(crate) fn vorbis_plane_sources(channels: usize) -> Option<&'static [usize]> 
     }
 }
 
+/// Whether the declared WAV speaker layout is exactly the one the direct Vorbis
+/// permutation above assumes. `vorbis_plane_sources` maps physical channel
+/// positions (FL, FC, FR, BL, BR, LFE) to Vorbis planes; a WAVEFORMATEXTENSIBLE
+/// mask that names a different set of speakers (e.g. FL/FR/LFE for 3 channels)
+/// must take the generic pipeline, which decodes by position instead.
+fn vorbis_layout_supported(channels: usize, channel_mask: u32) -> bool {
+    match channels {
+        1 => matches!(channel_mask, 0 | 0x1 | 0x4),
+        2 => matches!(channel_mask, 0 | 0x3),
+        3 => matches!(channel_mask, 0 | 0x7),
+        5 => matches!(channel_mask, 0 | 0x37),
+        6 => matches!(channel_mask, 0 | 0x3F),
+        _ => false,
+    }
+}
+
 fn encode_ogg(
     path: &Path,
     rate: u32,
@@ -2468,6 +2413,7 @@ fn convert_pcm_wav_to_flac(
             frame_bytes,
             total_samples,
             remaining_bytes,
+            channel_mask: _,
         } = stream;
         let source = LeBytesFlacSource {
             reader,
@@ -2502,6 +2448,7 @@ struct PcmWavChunkReader {
     total_samples: usize,
     remaining_bytes: u64,
     read_buf: Vec<u8>,
+    channel_mask: u32,
 }
 
 impl PcmWavChunkReader {
@@ -2514,6 +2461,7 @@ impl PcmWavChunkReader {
             frame_bytes,
             total_samples,
             remaining_bytes,
+            channel_mask,
         } = stream;
         Self {
             path: path.to_path_buf(),
@@ -2525,6 +2473,7 @@ impl PcmWavChunkReader {
             total_samples,
             remaining_bytes,
             read_buf: Vec::with_capacity(WAV_READ_BUF_BYTES),
+            channel_mask,
         }
     }
 
@@ -2801,6 +2750,9 @@ fn convert_pcm_wav_to_vorbis(
     let Some(channel_order) = vorbis_plane_sources(reader.channels) else {
         return Ok(None);
     };
+    if !vorbis_layout_supported(reader.channels, reader.channel_mask) {
+        return Ok(None);
+    }
     let rate_nz = NonZeroU32::new(reader.rate).ok_or_else(|| PipelineError::EncodeFailed {
         path: item.target().to_path_buf(),
         reason: "Ogg Vorbis sample rate must be non-zero".to_owned(),
@@ -2900,7 +2852,12 @@ fn convert_pcm_wav_to_aac(
     stream: PcmWavStream,
     mode: AudioExecutionMode,
     options: &AudioEncodingOptions,
+    buf: &mut AudioWorkerBuffer,
 ) -> Result<Option<u64>, PipelineError> {
+    // A previous item may have left a full-size `samples_f32` allocation in the
+    // reused worker; the planar buffers below are independent and must not
+    // coexist with it.
+    buf.release_f32_samples();
     let mut reader = PcmWavChunkReader::new(item.source(), stream);
     if reader.bits != 16 {
         return Ok(None);
@@ -3005,7 +2962,7 @@ fn convert_pcm_wav_to_encoded(
         AudioExecutionMode::CpuMp3 => convert_pcm_wav_to_mp3(item, stream, options),
         AudioExecutionMode::CpuOgg => convert_pcm_wav_to_vorbis(item, stream, options),
         AudioExecutionMode::CpuAac | AudioExecutionMode::CpuM4a => {
-            convert_pcm_wav_to_aac(item, stream, mode, options)
+            convert_pcm_wav_to_aac(item, stream, mode, options, buf)
         }
         AudioExecutionMode::CpuOpus | AudioExecutionMode::CpuOggOpus => {
             let mut reader = PcmWavChunkReader::new(item.source(), stream);
@@ -3039,7 +2996,7 @@ fn convert_item(
         .len();
     let codec = mode.codec();
     if item.input_format() == AudioInputFormat::Wav
-        && let Some(stream) = try_open_pcm_wav(item.source())?
+        && let Some(stream) = try_open_pcm_wav(item)?
     {
         // The streaming fast paths preserve the source rate/channels exactly; any
         // transform needs the full decode/quantize pipeline instead. FLAC cannot
@@ -3176,6 +3133,15 @@ fn quantizes_to_second_array(
     !direct_i16 && !direct_i32
 }
 
+/// Whether this item takes the generic ALAC path, which builds a full
+/// little-endian byte copy from `samples_i16` while that vector is still live.
+/// The canonical WAV fast path streams bytes directly and makes no such copy.
+fn alac_generic_byte_copy(item: &AudioBatchItem, codec: AudioTargetCodec) -> bool {
+    codec == AudioTargetCodec::Alac
+        && (item.input_format() != AudioInputFormat::Wav
+            || item.stream().pcm_wav_layout().is_none())
+}
+
 /// Maximum capacity each of the three reusable worker vectors can reach while
 /// processing `item`. A worker keeps one `AudioWorkerBuffer` for its whole queue;
 /// `clear()` empties a vector but retains its allocation, so the batch budget has
@@ -3261,6 +3227,12 @@ fn retained_buffer_bytes(
         }
         Some(AudioBitDepth::Float32) | None => {}
     }
+    if alac_generic_byte_copy(item, codec) {
+        // `encode_alac_m4a` holds `samples_i16` and its full little-endian byte
+        // copy at once. Doubling the i16 capacity charges that second buffer
+        // against the reused worker's retained working set.
+        i16_cap = i16_cap.saturating_mul(2);
+    }
     (f32_cap, i16_cap, i32_cap)
 }
 
@@ -3336,6 +3308,12 @@ fn estimate_pcm_bytes(
         // across the extend loop, and the integer array keeps its capacity for
         // later items. Charge a second full-file array at the wider 4-byte size.
         peak_bytes = peak_bytes.max(final_bytes.saturating_add(final_bytes));
+    }
+    if alac_generic_byte_copy(item, codec) {
+        // The generic ALAC encoder keeps `samples_i16` and its little-endian
+        // byte copy live together: 2 bytes + 2 bytes per sample = `final_bytes`,
+        // which is sized here at 4 bytes per sample.
+        peak_bytes = peak_bytes.max(final_bytes);
     }
     let (f32_capacity, i16_capacity, i32_capacity) = retained_buffer_bytes(item, codec, options);
     PcmEstimate {
@@ -3948,6 +3926,51 @@ mod tests {
         .unwrap_or_else(|_| unreachable!())
     }
 
+    /// Builds an item carrying the validated layout the probe would attach to a
+    /// canonical PCM WAV, so the direct path can be exercised without a probe
+    /// dependency. `bytes` is the exact in-memory WAV handed to `write_raw_wav`.
+    fn item_direct_wav(
+        source: PathBuf,
+        target: PathBuf,
+        bytes: &[u8],
+        channels: u16,
+        rate: u32,
+        bits: u16,
+    ) -> AudioBatchItem {
+        let data_at = bytes
+            .windows(4)
+            .position(|window| window == b"data")
+            .unwrap_or(0);
+        let data_offset = u64::try_from(data_at.saturating_add(8)).unwrap_or(0);
+        let data_bytes = u64::from(u32::from_le_bytes([
+            bytes[data_at + 4],
+            bytes[data_at + 5],
+            bytes[data_at + 6],
+            bytes[data_at + 7],
+        ]));
+        let layout = fastconv_domain::PcmWavLayout::new(
+            NonZeroU16::new(channels).unwrap_or(NonZeroU16::MIN),
+            NonZeroU16::new(bits).unwrap_or(NonZeroU16::MIN),
+            NonZeroU32::new(rate).unwrap_or(NonZeroU32::MIN),
+            NonZeroU16::new(channels.saturating_mul(bits / 8)).unwrap_or(NonZeroU16::MIN),
+            0,
+            data_offset,
+            data_bytes,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let frames = layout.total_samples();
+        let stream = fastconv_domain::AudioStreamInfo::new(
+            NonZeroU16::new(channels).unwrap_or(NonZeroU16::MIN),
+            NonZeroU32::new(rate).unwrap_or(NonZeroU32::MIN),
+            NonZeroU16::new(bits),
+            Some(frames),
+        )
+        .unwrap_or_else(|_| unreachable!())
+        .with_pcm_wav_layout(layout);
+        AudioBatchItem::new(source, target, AudioInputFormat::Wav, stream)
+            .unwrap_or_else(|_| unreachable!())
+    }
+
     #[test]
     fn direct_16bit_wav_to_flac_with_odd_junk_chunk_roundtrips_bit_exactly()
     -> Result<(), PipelineError> {
@@ -3962,24 +3985,16 @@ mod tests {
         }
         // A JUNK chunk with an odd body length exercises RIFF even-byte padding.
         let junk = b"JNK";
-        write_raw_wav(
-            &wav,
-            &wav_bytes(&fmt_pcm(2, 48_000, 16), &data, &[(*b"JUNK", junk)]),
-        )?;
+        let bytes = wav_bytes(&fmt_pcm(2, 48_000, 16), &data, &[(*b"JUNK", junk)]);
+        write_raw_wav(&wav, &bytes)?;
+        let direct = item_direct_wav(wav, flac.clone(), &bytes, 2, 48_000, 16);
         assert!(
-            try_open_pcm_wav(&wav)?.is_some(),
+            try_open_pcm_wav(&direct)?.is_some(),
             "16-bit PCM must use the direct source"
         );
 
         execute_audio_batch(&plan(
-            vec![item_bits(
-                wav,
-                flac.clone(),
-                AudioInputFormat::Wav,
-                2,
-                48_000,
-                16,
-            )],
+            vec![direct],
             fastconv_domain::AudioExecutionMode::CpuFlac,
         ))?;
         execute_audio_batch(&plan(
@@ -4012,21 +4027,16 @@ mod tests {
             let bytes = sample.to_le_bytes();
             data.extend_from_slice(&bytes[..3]);
         }
-        write_raw_wav(&wav, &wav_bytes(&fmt_pcm(1, 44_100, 24), &data, &[]))?;
+        let bytes = wav_bytes(&fmt_pcm(1, 44_100, 24), &data, &[]);
+        write_raw_wav(&wav, &bytes)?;
+        let direct = item_direct_wav(wav, flac.clone(), &bytes, 1, 44_100, 24);
         assert!(
-            try_open_pcm_wav(&wav)?.is_some(),
+            try_open_pcm_wav(&direct)?.is_some(),
             "24-bit PCM must use the direct source"
         );
 
         execute_audio_batch(&plan(
-            vec![item_bits(
-                wav,
-                flac.clone(),
-                AudioInputFormat::Wav,
-                1,
-                44_100,
-                24,
-            )],
+            vec![direct],
             fastconv_domain::AudioExecutionMode::CpuFlac,
         ))?;
         execute_audio_batch(&plan(
@@ -4055,10 +4065,8 @@ mod tests {
         // source must reject this file so Symphonia performs the conversion.
         let unsigned: [u8; 8] = [0, 1, 64, 127, 128, 192, 254, 255];
         write_raw_wav(&wav, &wav_bytes(&fmt_pcm(1, 8_000, 8), &unsigned, &[]))?;
-        assert!(
-            try_open_pcm_wav(&wav)?.is_none(),
-            "8-bit WAV must fall back to Symphonia"
-        );
+        // The probe withholds a canonical layout for unsigned 8-bit; without
+        // one this item necessarily takes the generic Symphonia path.
 
         execute_audio_batch(&plan(
             vec![item_bits(
@@ -4105,10 +4113,8 @@ mod tests {
         let mut fmt = fmt_pcm(1, 48_000, 32);
         fmt[..2].copy_from_slice(&3_u16.to_le_bytes());
         write_raw_wav(&wav, &wav_bytes(&fmt, &[0_u8; 32], &[]))?;
-        assert!(
-            try_open_pcm_wav(&wav)?.is_none(),
-            "float WAV must fall back to Symphonia"
-        );
+        // The probe withholds a canonical layout for IEEE-float WAV; without
+        // one this item necessarily takes the generic Symphonia path.
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
@@ -4626,6 +4632,37 @@ mod tests {
             }
         }
         assert_eq!(source_to_plane, [0, 2, 1, 5, 3, 4]);
+    }
+
+    #[test]
+    fn vorbis_direct_path_only_accepts_the_assumed_speaker_layout() {
+        // Unspecified (plain PCM) and the standard masks are safe for the
+        // fixed channel permutation used by the direct WAV-to-Vorbis path.
+        for (channels, mask) in [
+            (1, 0),
+            (1, 0x1),
+            (1, 0x4),
+            (2, 0),
+            (2, 0x3),
+            (3, 0),
+            (3, 0x7),
+            (5, 0),
+            (5, 0x37),
+            (6, 0),
+            (6, 0x3F),
+        ] {
+            assert!(
+                vorbis_layout_supported(channels, mask),
+                "{channels} channels with mask {mask:#x} must use the direct path"
+            );
+        }
+        // A 3-channel FL/FR/LFE mask would have LFE relabeled as front-center.
+        assert!(!vorbis_layout_supported(3, 0xB));
+        // Other valid-but-different speaker sets and unsupported counts fall back.
+        assert!(!vorbis_layout_supported(2, 0x4));
+        assert!(!vorbis_layout_supported(5, 0x3F));
+        assert!(!vorbis_layout_supported(6, 0x37));
+        assert!(!vorbis_layout_supported(4, 0x0));
     }
 
     #[test]
@@ -5973,6 +6010,37 @@ mod tests {
     }
 
     #[test]
+    fn generic_alac_charges_the_live_le_byte_copy() {
+        let defaults = AudioEncodingOptions::default();
+        let generic = item_frames(
+            PathBuf::from("in.flac"),
+            PathBuf::from("out.m4a"),
+            AudioInputFormat::Flac,
+            2,
+            48_000,
+            1_000,
+        );
+        // The generic ALAC path keeps `samples_i16` (4_000 bytes) and a LE byte
+        // copy (another 4_000 bytes) live, so admission charges both.
+        let alac = estimate_pcm_bytes(&generic, AudioTargetCodec::Alac, &defaults);
+        assert_eq!(alac.i16_capacity, 8_000);
+        assert!(alac.peak_bytes >= 8_000);
+
+        // A canonical WAV with a probe-attached layout streams bytes directly.
+        let bytes = wav_bytes(&fmt_pcm(2, 48_000, 16), &[0_u8; 4_000], &[]);
+        let direct_item = item_direct_wav(
+            PathBuf::from("in.wav"),
+            PathBuf::from("out.m4a"),
+            &bytes,
+            2,
+            48_000,
+            16,
+        );
+        let direct = estimate_pcm_bytes(&direct_item, AudioTargetCodec::Alac, &defaults);
+        assert_eq!(direct.i16_capacity, 4_000);
+    }
+
+    #[test]
     fn worker_count_bounds_capacity_retained_across_items() {
         let frames = 8_000_000_u64;
         let item = |name: &str, bits: u16| {
@@ -6422,6 +6490,7 @@ mod tests {
             frame_bytes: 4,
             total_samples: 2_000,
             remaining_bytes: 8_000,
+            channel_mask: 0,
         };
         let mut reader = PcmWavChunkReader::new(&path, stream);
         assert!(matches!(

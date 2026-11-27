@@ -8,7 +8,7 @@ pub use audio::{
     AudioBatchItem, AudioBatchPlan, AudioBitDepth, AudioConversionReport, AudioEncodingOptions,
     AudioExecutionMode, AudioInputFormat, AudioOptionBitrate, AudioOptionChannels,
     AudioOptionSampleRate, AudioOutputFormat, AudioQuality, AudioRateControl, AudioSampleFormat,
-    AudioStreamInfo, AudioTargetCodec, aac_frame_capacity_bps,
+    AudioStreamInfo, AudioTargetCodec, PcmWavLayout, aac_frame_capacity_bps,
 };
 pub use hardware::{
     CpuInfo, DetectedGpuBackend, GpuAdapterInfo, GpuCapability, GpuVendor, HostHardware, SimdLevel,
@@ -204,6 +204,9 @@ pub enum DomainError {
         format: AudioOutputFormat,
         codec: AudioTargetCodec,
         bit_depth: AudioBitDepth,
+        reason: &'static str,
+    },
+    InvalidPcmWavLayout {
         reason: &'static str,
     },
 }
@@ -435,6 +438,9 @@ fn fmt_encoding_error(err: &DomainError, f: &mut fmt::Formatter<'_>) -> fmt::Res
             "--bit-depth {bit_depth} is not supported for {} audio: {reason}",
             format.resolved_label(*codec)
         ),
+        DomainError::InvalidPcmWavLayout { reason } => {
+            write!(f, "invalid canonical PCM WAV layout: {reason}")
+        }
         _ => Err(fmt::Error),
     }
 }
