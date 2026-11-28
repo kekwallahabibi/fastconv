@@ -29,6 +29,7 @@ use fastconv_domain::{
     AudioTrackAction, DomainError, ExternalAudioTrack, GpuBackend, HardwareBackend,
     TargetAudioCodec, VideoCodec, VideoContainerFormat, VideoDecodeMode, VideoEncodeMode,
     VideoTrackAction, VideoTranscodeItem, VideoTranscodePlan, VideoTranscodeReport,
+    aac_frame_capacity_bps,
 };
 use opus_pure::{Application, MAX_PACKET_BYTES, OpusEncoder};
 use rubato::audioadapter_buffers::owned::InterleavedOwned;
@@ -56,12 +57,13 @@ use crate::video_codecs::{
     encode_video_cpu, nv12_buffer_len,
 };
 use crate::video_container::{
-    ContainerPacket, ContainerTrack, TrackPresentation, US_TIMESCALE, demux_video, mux_video,
-    rescale_ticks,
+    ContainerMedia, ContainerPacket, ContainerTrack, TrackPresentation, US_TIMESCALE, demux_video,
+    mux_video, rescale_ticks, visible_track_starts,
 };
 
 const AAC_BITRATE_BPS: u32 = 128_000;
 const MP3_BITRATE_KBPS: u32 = 192;
+const MP3_LOW_RATE_BITRATE_KBPS: u32 = 128;
 const OPUS_BITRATE: i32 = 128_000;
 const OPUS_RATE: u32 = 48_000;
 const OPUS_FRAME: usize = 960;
@@ -963,7 +965,7 @@ fn encode_aac_track(
     let channels = target_channels;
     let asc = aac_config(rate, channels)?;
     let mut encoder = rusty_aac::AacEncoder::new(rusty_aac::AacEncoderConfig {
-        bitrate_bps: configured_aac_bitrate(config),
+        bitrate_bps: configured_aac_bitrate(config, rate, channels),
         ..rusty_aac::AacEncoderConfig::default()
     });
     encoder
@@ -1649,8 +1651,11 @@ fn configured_audio_channels(source_channels: u16, config: AudioEncodeConfig) ->
         .map_or(source_channels, AudioChannels::count)
 }
 
-fn configured_aac_bitrate(config: AudioEncodeConfig) -> u32 {
-    config.bitrate().map_or(AAC_BITRATE_BPS, AudioBitrate::bps)
+fn configured_aac_bitrate(config: AudioEncodeConfig, rate: u32, channels: u16) -> u32 {
+    config.bitrate().map_or_else(
+        || AAC_BITRATE_BPS.min(aac_frame_capacity_bps(rate, channels).max(1)),
+        AudioBitrate::bps,
+    )
 }
 
 fn configured_opus_bitrate(config: AudioEncodeConfig) -> i32 {
@@ -1659,10 +1664,19 @@ fn configured_opus_bitrate(config: AudioEncodeConfig) -> i32 {
     })
 }
 
-fn configured_mp3_kbps(config: AudioEncodeConfig) -> u32 {
-    config.bitrate().map_or(MP3_BITRATE_KBPS, |bitrate| {
-        bitrate.bps().saturating_add(500) / 1_000
-    })
+fn default_mp3_kbps(rate: u32) -> u32 {
+    if rate >= 32_000 {
+        MP3_BITRATE_KBPS
+    } else {
+        MP3_LOW_RATE_BITRATE_KBPS
+    }
+}
+
+fn configured_mp3_kbps(config: AudioEncodeConfig, rate: u32) -> u32 {
+    config.bitrate().map_or_else(
+        || default_mp3_kbps(rate),
+        |bitrate| bitrate.bps().saturating_add(500) / 1_000,
+    )
 }
 
 /// Resolves and validates the concrete MP3 pair before encoder creation.
@@ -1673,7 +1687,7 @@ fn checked_mp3_bitrate_kbps(
     rate: u32,
     path: &Path,
 ) -> Result<u32, PipelineError> {
-    let kbps = configured_mp3_kbps(config);
+    let kbps = configured_mp3_kbps(config, rate);
     config
         .validate_effective_mp3(kbps.saturating_mul(1_000), rate)
         .map_err(|err| encode_error(path, err.to_string()))?;
@@ -2139,7 +2153,7 @@ impl StreamingAudioEncoder {
                 }
                 let asc = aac_config(rate, channels)?.to_vec();
                 let mut encoder = rusty_aac::AacEncoder::new(rusty_aac::AacEncoderConfig {
-                    bitrate_bps: configured_aac_bitrate(config),
+                    bitrate_bps: configured_aac_bitrate(config, rate, channels),
                     ..rusty_aac::AacEncoderConfig::default()
                 });
                 // Without this the encoder buffers the whole track and emits no
@@ -3421,6 +3435,63 @@ fn transcode_to_animation(
     Ok((written, input_size(source), input_size(target), None))
 }
 
+/// Returns whether `track` will remain in the muxed output (excluding source
+/// audio dropped by `--no-audio` or `--replace-audio`).
+fn track_survives(track: &ContainerTrack, item: &VideoTranscodeItem) -> bool {
+    if track.codec.is_audio() {
+        !matches!(item.audio_action(), AudioTrackAction::Drop)
+    } else {
+        true
+    }
+}
+
+/// Selects the shared file-level origin across only the source tracks that
+/// survive into the output.
+///
+/// An added external audio track starts at presentation time zero, so when one
+/// is present the shared origin must be the earliest *visible* presentation
+/// start among surviving source tracks using the muxers' canonical
+/// [`visible_track_starts`] rule:
+/// - dropped source audio (`--replace-audio`) is excluded so it cannot pull
+///   replacement audio ahead of the first visible video frame, while retained
+///   source audio (`--add-audio`) stays eligible to preserve its lead;
+/// - B-frame decode lead (`first_dts < earliest_pts`), edit-list preroll
+///   (`pts < edit.start_us`), and edits starting below `min(first_dts,
+///   earliest_pts)` all match what the MP4/MOV and Matroska/WebM muxers treat
+///   as each track's visible start.
+///
+/// Without external audio the established decode-origin rule is kept.
+fn file_timeline_origin(
+    media: &ContainerMedia,
+    item: &VideoTranscodeItem,
+    has_external_audio: bool,
+) -> i64 {
+    if has_external_audio {
+        visible_track_starts(media)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, start)| {
+                let track = media.tracks.get(index)?;
+                track_survives(track, item).then_some(start)?
+            })
+            .min()
+            .unwrap_or(0)
+    } else {
+        media
+            .packets
+            .iter()
+            .filter(|packet| {
+                media
+                    .tracks
+                    .get(packet.track)
+                    .is_some_and(|track| track_survives(track, item))
+            })
+            .map(|packet| packet.dts)
+            .min()
+            .unwrap_or(0)
+    }
+}
+
 // Track-by-track dispatch keeps copy/encode decisions explicit per codec.
 #[allow(clippy::too_many_lines)]
 fn transcode_file(
@@ -3450,42 +3521,7 @@ fn transcode_file(
                 || (track.codec.is_audio()
                     && matches!(item.audio_action(), AudioTrackAction::Encode(_)))
         });
-    // An added track starts at presentation time zero, so with one present the
-    // shared origin must be the source's first *visible* presentation time.
-    // Using the decode origin would shift B-frame streams forward by their DTS
-    // lead; using the earliest packet PTS would shift tracks whose edit list
-    // keeps preroll packets below the visible start. Both would start the
-    // copied tracks after the added audio. This is the same visible-start rule
-    // the MKV muxer uses. Without external audio the established decode-origin
-    // behaviour (including the copy-only no-rebase path) is unchanged.
-    let origin = if has_external_audio {
-        media
-            .tracks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, track)| {
-                let earliest = media
-                    .packets
-                    .iter()
-                    .filter(|packet| packet.track == index)
-                    .map(|packet| packet.pts)
-                    .min()?;
-                Some(
-                    track
-                        .presentation_edit
-                        .map_or(earliest, |edit| edit.start_us),
-                )
-            })
-            .min()
-            .unwrap_or(0)
-    } else {
-        media
-            .packets
-            .iter()
-            .map(|packet| packet.dts)
-            .min()
-            .unwrap_or(0)
-    };
+    let origin = file_timeline_origin(&media, item, has_external_audio);
     let rebase = needs_rebase.then_some(origin);
     let unsupported = |codec: VideoCodec| PipelineError::RemuxFailed {
         path: target.to_path_buf(),
@@ -4303,13 +4339,14 @@ mod tests {
         AudioEncodeConfig::default_for(codec)
     }
 
-    fn make_source(
+    fn make_source_with_frames(
         path: &Path,
         format: VideoContainerFormat,
         video: VideoEncodeMode,
         audio: TargetAudioCodec,
+        frame_count: usize,
     ) -> Result<(), PipelineError> {
-        let video_frames = frames(4);
+        let video_frames = frames(frame_count);
         let encoded = encode_video_cpu(path, &video_frames, video, 0)?;
         let samples = sine(1_920, 48_000, 2);
         let (audio_track, mut audio_packets) =
@@ -4328,6 +4365,15 @@ mod tests {
         mux_video(&file, path, format, &media)?;
         drop(file);
         Ok(())
+    }
+
+    fn make_source(
+        path: &Path,
+        format: VideoContainerFormat,
+        video: VideoEncodeMode,
+        audio: TargetAudioCodec,
+    ) -> Result<(), PipelineError> {
+        make_source_with_frames(path, format, video, audio, 4)
     }
 
     fn streams(
@@ -6927,13 +6973,32 @@ mod tests {
                 )
                 .map_err(to_err)
             };
-        // Rate-only override inherits the 192 kbps default: out of band below 32 kHz.
+        // Without an explicit bitrate, the default tracks the effective sample-rate band:
+        // 128 kbps below 32 kHz (MPEG-2/2.5 ceiling is 160 kbps) and 192 kbps at/above 32 kHz.
+        let default_opts = config(None, None)?;
+        assert_eq!(
+            checked_mp3_bitrate_kbps(default_opts, 22_050, Path::new("mp3"))?,
+            MP3_LOW_RATE_BITRATE_KBPS
+        );
+        assert_eq!(
+            checked_mp3_bitrate_kbps(default_opts, 8_000, Path::new("mp3"))?,
+            MP3_LOW_RATE_BITRATE_KBPS
+        );
+        assert_eq!(
+            checked_mp3_bitrate_kbps(default_opts, 48_000, Path::new("mp3"))?,
+            MP3_BITRATE_KBPS
+        );
         let rate_only = config(None, Some(22_050))?;
-        assert!(checked_mp3_bitrate_kbps(rate_only, 22_050, Path::new("mp3")).is_err());
-        // Bitrate-only override inherits a 48 kHz source: below the floor.
-        let bitrate_only = config(Some(16_000), None)?;
-        assert!(checked_mp3_bitrate_kbps(bitrate_only, 48_000, Path::new("mp3")).is_err());
-        // Valid pairs keep working in both bands.
+        assert_eq!(
+            checked_mp3_bitrate_kbps(rate_only, 22_050, Path::new("mp3"))?,
+            MP3_LOW_RATE_BITRATE_KBPS
+        );
+        // Explicit out-of-band bitrates are still rejected in both bands.
+        let high_bitrate_only = config(Some(192_000), None)?;
+        assert!(checked_mp3_bitrate_kbps(high_bitrate_only, 22_050, Path::new("mp3")).is_err());
+        let low_bitrate_only = config(Some(16_000), None)?;
+        assert!(checked_mp3_bitrate_kbps(low_bitrate_only, 48_000, Path::new("mp3")).is_err());
+        // Valid explicit pairs keep working in both bands.
         let valid_low = config(Some(128_000), Some(22_050))?;
         assert_eq!(
             checked_mp3_bitrate_kbps(valid_low, 22_050, Path::new("mp3"))?,
@@ -6944,6 +7009,11 @@ mod tests {
             checked_mp3_bitrate_kbps(valid_high, 48_000, Path::new("mp3"))?,
             64
         );
+        // AAC default bitrate stays 128 kbps when frame capacity allows and
+        // clamps cleanly for low-rate mono streams without touching explicit bitrates.
+        let aac_default = AudioEncodeConfig::default_for(TargetAudioCodec::Aac);
+        assert_eq!(configured_aac_bitrate(aac_default, 48_000, 2), 128_000);
+        assert_eq!(configured_aac_bitrate(aac_default, 8_000, 1), 48_000);
         Ok(())
     }
 
@@ -8209,13 +8279,17 @@ mod tests {
     {
         let dir = temp_dir("external-edit-preroll")?;
         let source = dir.join("in.mp4");
-        make_source(
+        // 10 x 20 ms frames = 200 ms: after a -40 ms shift, packets span
+        // [-40 ms, 160 ms), leaving both preroll packets below 80 ms and
+        // visible video frames inside [80 ms, 160 ms).
+        make_source_with_frames(
             &source,
             VideoContainerFormat::Mp4,
             VideoEncodeMode::CpuH264 {
                 rate_control: VideoRateControl::DEFAULT,
             },
             TargetAudioCodec::Aac,
+            10,
         )?;
         // Video becomes visible only at 80 ms while retaining preroll packets
         // below that edit; copied audio stays visible from zero.
@@ -8263,25 +8337,20 @@ mod tests {
                 .any(|packet| packet.pts < 0),
             "fixture must retain preroll below the visible start"
         );
+        assert!(
+            demuxed
+                .packets
+                .iter()
+                .filter(|packet| packet.track == 0)
+                .any(|packet| packet.pts >= 80_000),
+            "fixture must contain visible video frames inside the edit interval"
+        );
 
         let visible_starts = |path: &Path| -> Result<Vec<i64>, PipelineError> {
             let media = demux_video(path, VideoContainerFormat::Mp4)?;
-            Ok(media
-                .tracks
-                .iter()
-                .enumerate()
-                .map(|(index, track)| {
-                    let earliest = media
-                        .packets
-                        .iter()
-                        .filter(|packet| packet.track == index)
-                        .map(|packet| packet.pts)
-                        .min()
-                        .unwrap_or(i64::MAX);
-                    track
-                        .presentation_edit
-                        .map_or(earliest, |edit| edit.start_us)
-                })
+            Ok(visible_track_starts(&media)
+                .into_iter()
+                .map(|start| start.unwrap_or(i64::MAX))
                 .collect())
         };
 
@@ -8312,7 +8381,11 @@ mod tests {
             TargetAudioCodec::Aac,
             ExternalAudioMode::Append,
         )?;
-        let with_added = visible_starts(&added)?;
+        let reopened = demux_video(&added, VideoContainerFormat::Mp4)?;
+        let with_added: Vec<i64> = visible_track_starts(&reopened)
+            .into_iter()
+            .map(|start| start.unwrap_or(i64::MAX))
+            .collect();
         assert_eq!(with_added.len(), 3);
         assert_eq!(with_added[0], baseline[0], "video visible start");
         assert_eq!(with_added[1], baseline[1], "copied audio visible start");
@@ -8320,6 +8393,299 @@ mod tests {
             with_added[2], baseline[1],
             "added audio aligns with the earliest copied visible start"
         );
+        assert!(
+            reopened
+                .packets
+                .iter()
+                .filter(|packet| packet.track == 0)
+                .any(|packet| packet.pts < with_added[0]),
+            "reopened video must retain preroll frames below the visible start"
+        );
+        assert!(
+            reopened
+                .packets
+                .iter()
+                .filter(|packet| packet.track == 0)
+                .any(|packet| packet.pts >= with_added[0]),
+            "reopened video must contain visible frames inside the edit interval"
+        );
+        Ok(())
+    }
+
+    // Compares `--replace-audio` and `--add-audio` on the same delayed-video
+    // source in one pass so both timeline invariants stay side by side.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn external_audio_replace_excludes_dropped_source_audio_from_origin()
+    -> Result<(), PipelineError> {
+        let dir = temp_dir("external-replace-origin")?;
+        let source = dir.join("in.mp4");
+        make_source_with_frames(
+            &source,
+            VideoContainerFormat::Mp4,
+            VideoEncodeMode::CpuH264 {
+                rate_control: VideoRateControl::DEFAULT,
+            },
+            TargetAudioCodec::Aac,
+            10,
+        )?;
+        // Original audio starts at 0 ms while video becomes visible at 80 ms
+        // (retaining preroll frames below 80 ms and visible frames at >= 80 ms).
+        let media = demux_video(&source, VideoContainerFormat::Mp4)?;
+        let mut tracks = media.tracks;
+        tracks[0].presentation_edit = Some(TrackPresentation {
+            start_us: 80_000,
+            duration_us: None,
+        });
+        let packets = media
+            .packets
+            .into_iter()
+            .map(|mut packet| {
+                if packet.track == 0 {
+                    packet.pts = packet.pts.saturating_sub(40_000);
+                    packet.dts = packet.dts.saturating_sub(40_000);
+                }
+                packet
+            })
+            .collect();
+        let file = File::create(&source).map_err(|source_err| PipelineError::Io {
+            path: source.clone(),
+            source: source_err,
+        })?;
+        mux_video(
+            &file,
+            &source,
+            VideoContainerFormat::Mp4,
+            &ContainerMedia { tracks, packets },
+        )?;
+        drop(file);
+
+        let wav = dir.join("song.wav");
+        let stream = write_wav_fixture(&wav, 48_000, 2, 1_920)?;
+
+        // Replace mode drops the 0 ms source audio, so the shared origin must
+        // come from the surviving video track (80 ms) and both output tracks
+        // must become visible together at movie time 0.
+        let replaced = dir.join("replaced.mp4");
+        run_external(
+            &source,
+            &replaced,
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            VideoTrackAction::Copy,
+            AudioTrackAction::Drop,
+            &wav,
+            AudioInputFormat::Wav,
+            stream,
+            TargetAudioCodec::Aac,
+            ExternalAudioMode::Replace,
+        )?;
+        let replaced_media = demux_video(&replaced, VideoContainerFormat::Mp4)?;
+        let replaced_starts: Vec<i64> = visible_track_starts(&replaced_media)
+            .into_iter()
+            .map(|start| start.unwrap_or(i64::MAX))
+            .collect();
+        assert_eq!(replaced_starts, vec![0, 0]);
+        assert!(
+            replaced_media
+                .packets
+                .iter()
+                .filter(|packet| packet.track == 0)
+                .any(|packet| packet.pts < 0),
+            "replaced video must retain preroll frames below movie time 0"
+        );
+        assert!(
+            replaced_media
+                .packets
+                .iter()
+                .filter(|packet| packet.track == 0)
+                .any(|packet| packet.pts >= 0),
+            "replaced video must contain visible frames at or after movie time 0"
+        );
+
+        // Append mode retains the 0 ms source audio, so its 80 ms lead over
+        // video stays intact and the added track aligns with it at 0 ms.
+        let appended = dir.join("appended.mp4");
+        run_external(
+            &source,
+            &appended,
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            VideoTrackAction::Copy,
+            AudioTrackAction::Copy,
+            &wav,
+            AudioInputFormat::Wav,
+            stream,
+            TargetAudioCodec::Aac,
+            ExternalAudioMode::Append,
+        )?;
+        let appended_media = demux_video(&appended, VideoContainerFormat::Mp4)?;
+        let appended_starts: Vec<i64> = visible_track_starts(&appended_media)
+            .into_iter()
+            .map(|start| start.unwrap_or(i64::MAX))
+            .collect();
+        assert_eq!(appended_starts, vec![80_000, 0, 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn external_audio_aligns_when_edit_start_precedes_pts_base() -> Result<(), PipelineError> {
+        let dir = temp_dir("external-edit-below-pts-base")?;
+        let source = dir.join("in.mp4");
+        make_source(
+            &source,
+            VideoContainerFormat::Mp4,
+            VideoEncodeMode::CpuH264 {
+                rate_control: VideoRateControl::DEFAULT,
+            },
+            TargetAudioCodec::Aac,
+        )?;
+        let base_media = demux_video(&source, VideoContainerFormat::Mp4)?;
+        let mut video_track = base_media.tracks[0].clone();
+        video_track.presentation_edit = Some(TrackPresentation {
+            start_us: 0,
+            duration_us: None,
+        });
+        let video_packets: Vec<ContainerPacket> = base_media
+            .packets
+            .into_iter()
+            .filter(|packet| packet.track == 0)
+            .map(|mut packet| {
+                packet.pts = packet.pts.saturating_add(80_000);
+                packet.dts = packet.dts.saturating_add(80_000);
+                packet
+            })
+            .collect();
+        let edited_media = ContainerMedia {
+            tracks: vec![video_track],
+            packets: video_packets,
+        };
+        assert_eq!(visible_track_starts(&edited_media), vec![Some(80_000)]);
+
+        let wav = dir.join("song.wav");
+        let stream = write_wav_fixture(&wav, 48_000, 2, 1_920)?;
+        let to_err = |err: DomainError| PipelineError::RemuxFailed {
+            path: source.clone(),
+            reason: err.to_string(),
+        };
+        let external = ExternalAudioTrack::new(
+            wav,
+            AudioInputFormat::Wav,
+            stream,
+            default_config(TargetAudioCodec::Aac),
+            ExternalAudioMode::Append,
+            VideoContainerFormat::Mp4,
+        )
+        .map_err(to_err)?;
+        let item = VideoTranscodeItem::with_external_audio(
+            source.clone(),
+            dir.join("out.mp4"),
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            streams(&source, VideoContainerFormat::Mp4)?,
+            VideoTrackAction::Copy,
+            AudioTrackAction::Copy,
+            fastconv_domain::VideoDecodeMode::Cpu,
+            Some(external),
+        )
+        .map_err(to_err)?;
+
+        let origin = file_timeline_origin(&edited_media, &item, true);
+        assert_eq!(origin, 80_000);
+
+        // Rebasing by `origin` aligns the video with added audio at movie
+        // time 0 in both MP4 and MKV without a spurious 80 ms delay.
+        let mut rebased_track = edited_media.tracks[0].clone();
+        rebased_track.presentation_edit = rebased_track
+            .presentation_edit
+            .map(|edit| edit.shifted(origin.saturating_neg()));
+        let mut combined_packets = edited_media.packets;
+        rebase_source_packets(&mut combined_packets, origin);
+        let (audio_track, mut audio_packets) = encode_audio_track(
+            &source,
+            &sine(1_920, 48_000, 2),
+            48_000,
+            2,
+            TargetAudioCodec::Aac,
+            default_config(TargetAudioCodec::Aac),
+        )?;
+        for packet in &mut audio_packets {
+            packet.track = 1;
+        }
+        combined_packets.extend(audio_packets);
+        combined_packets.sort_by_key(|packet| (packet.dts, packet.track));
+        let combined = ContainerMedia {
+            tracks: vec![rebased_track, audio_track],
+            packets: combined_packets,
+        };
+
+        for format in [VideoContainerFormat::Mp4, VideoContainerFormat::Mkv] {
+            let out = dir.join(format!("aligned.{}", format.extension()));
+            let out_file = File::create(&out).map_err(|source_err| PipelineError::Io {
+                path: out.clone(),
+                source: source_err,
+            })?;
+            mux_video(&out_file, &out, format, &combined)?;
+            drop(out_file);
+            let reopened = demux_video(&out, format)?;
+            let starts: Vec<i64> = visible_track_starts(&reopened)
+                .into_iter()
+                .map(|start| start.unwrap_or(i64::MAX))
+                .collect();
+            assert_eq!(starts, vec![0, 0], "{format:?}: aligned at 0");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_audio_low_rate_wav_encodes_with_default_mp3_and_aac_bitrates()
+    -> Result<(), PipelineError> {
+        let dir = temp_dir("external-low-rate-defaults")?;
+        let source = dir.join("in.mp4");
+        make_source(
+            &source,
+            VideoContainerFormat::Mp4,
+            VideoEncodeMode::CpuH264 {
+                rate_control: VideoRateControl::DEFAULT,
+            },
+            TargetAudioCodec::Aac,
+        )?;
+
+        for (label, sample_rate, codec) in [
+            ("mp3-22k", 22_050_u32, TargetAudioCodec::Mp3),
+            ("aac-8k", 8_000_u32, TargetAudioCodec::Aac),
+        ] {
+            let wav = dir.join(format!("{label}.wav"));
+            let stream = write_wav_fixture(&wav, sample_rate, 1, 2_048)?;
+            let target = dir.join(format!("{label}.mp4"));
+            run_external(
+                &source,
+                &target,
+                VideoContainerFormat::Mp4,
+                VideoContainerFormat::Mp4,
+                VideoTrackAction::Copy,
+                AudioTrackAction::Drop,
+                &wav,
+                AudioInputFormat::Wav,
+                stream,
+                codec,
+                ExternalAudioMode::Replace,
+            )?;
+            let reopened = demux_video(&target, VideoContainerFormat::Mp4)?;
+            assert_eq!(
+                reopened.tracks.len(),
+                2,
+                "{label}: video + replacement audio"
+            );
+            let added = &reopened.tracks[1];
+            assert_eq!(added.codec, codec.as_video_codec(), "{label}: codec");
+            assert_eq!(added.sample_rate, Some(sample_rate), "{label}: sample rate");
+            assert_eq!(added.channels, Some(1), "{label}: mono channels");
+            assert!(
+                reopened.packets.iter().any(|packet| packet.track == 1),
+                "{label}: encoded audio packets must be present"
+            );
+        }
         Ok(())
     }
 }
