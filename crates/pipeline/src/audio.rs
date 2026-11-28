@@ -42,9 +42,11 @@ use symphonia::core::meta::MetadataOptions;
 use crate::PipelineError;
 use crate::staging::StagingTarget;
 use crate::video_bitstream::{
-    extract_flac_streaminfo_from_mkv_codec_private, parse_flac_streaminfo,
+    PcmFormat, extract_flac_streaminfo_from_mkv_codec_private, parse_flac_streaminfo,
 };
-use crate::video_container::{ContainerTrack, demux_video_audio_track};
+use crate::video_container::{
+    ContainerPacket, ContainerTrack, TrackPresentation, demux_video_audio_track,
+};
 use crate::video_transcode::decode_audio_track_chunks;
 
 const FLAC_BLOCK_SIZE: usize = 4096;
@@ -797,17 +799,177 @@ fn video_track_pcm_facts(
     Ok((16, AudioSampleFormat::Int))
 }
 
-/// Decodes one video container audio track into `buf.samples_f32`, reusing the
-/// same bounded decoder the video transcode pipeline uses.
+/// Presented frame range of a track with a source edit list. `start_us` drops
+/// decoder preroll/priming from the front; `duration_us` bounds the presented
+/// tail. Applying this after decode keeps preroll available to the decoder.
+fn presentation_frame_range(
+    edit: TrackPresentation,
+    rate: u32,
+    total_frames: usize,
+) -> (usize, usize) {
+    let rate = u64::from(rate.max(1));
+    let to_frames = |us: u64| -> usize {
+        let frames = u128::from(us)
+            .saturating_mul(u128::from(rate))
+            .saturating_add(500_000)
+            .checked_div(1_000_000)
+            .unwrap_or(u128::MAX);
+        usize::try_from(frames)
+            .unwrap_or(usize::MAX)
+            .min(total_frames)
+    };
+    let start = u64::try_from(edit.start_us).ok().map_or(0, to_frames);
+    let end = edit
+        .duration_us
+        .map_or(total_frames, |duration| {
+            start.saturating_add(to_frames(duration))
+        })
+        .min(total_frames);
+    (start, end)
+}
+
+/// Keeps only `[start, end)` whole frames of an interleaved sample buffer.
+fn trim_presented_frames<T>(samples: &mut Vec<T>, channels: usize, range: (usize, usize)) {
+    let channels = channels.max(1);
+    let (start, end) = range;
+    let from = start.saturating_mul(channels);
+    let keep = end.saturating_mul(channels).saturating_sub(from);
+    if from >= samples.len() {
+        samples.clear();
+        return;
+    }
+    if from > 0 {
+        samples.drain(..from);
+    }
+    if samples.len() > keep {
+        samples.truncate(keep);
+    }
+}
+
+/// Exact `i32` samples of a 32-bit integer PCM track. Going through `f32`
+/// rounds away the low bits of values such as `16_777_217`, so a lossless target
+/// copies the decoded integer words straight through instead.
+fn s32_bytes_to_i32(data: &[u8], format: PcmFormat) -> Vec<i32> {
+    data.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|sample| {
+            if format == PcmFormat::S32Le {
+                i32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]])
+            } else {
+                i32::from_be_bytes([sample[0], sample[1], sample[2], sample[3]])
+            }
+        })
+        .collect()
+}
+
+/// Decodes a 32-bit integer PCM video track straight into `samples_i32`.
+fn decode_video_pcm_i32(
+    path: &Path,
+    track: &ContainerTrack,
+    packets: &[ContainerPacket],
+    buf: &mut AudioWorkerBuffer,
+) -> Result<(u32, usize, usize, AudioSampleFormat), PipelineError> {
+    let format = track
+        .pcm_format
+        .ok_or_else(|| PipelineError::DecodeFailed {
+            path: path.to_path_buf(),
+            reason: "PCM track has no sample format".to_owned(),
+        })?;
+    if !matches!(format, PcmFormat::S32Le | PcmFormat::S32Be) {
+        return Err(PipelineError::DecodeFailed {
+            path: path.to_path_buf(),
+            reason: "integer PCM direct path requires a 32-bit track".to_owned(),
+        });
+    }
+    let channels = usize::from(track.channels.unwrap_or(2).max(1));
+    let rate = track.sample_rate.unwrap_or(0);
+    let frame_bytes = channels.saturating_mul(4);
+    let max_samples = usize::try_from(MAX_PCM_BYTES_PER_FILE / 4).unwrap_or(usize::MAX);
+    let mut written = 0_usize;
+    for packet in packets {
+        if packet.data.len() % frame_bytes != 0 {
+            return Err(PipelineError::DecodeFailed {
+                path: path.to_path_buf(),
+                reason: "PCM packet is not a whole number of frames".to_owned(),
+            });
+        }
+        let count = packet.data.len() / frame_bytes * channels;
+        if written.saturating_add(count) > max_samples {
+            return Err(PipelineError::DecodeFailed {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "decoded PCM exceeds the {MAX_PCM_BYTES_PER_FILE}-byte per-file limit"
+                ),
+            });
+        }
+        buf.samples_i32
+            .try_reserve(count)
+            .map_err(|_| PipelineError::DecodeFailed {
+                path: path.to_path_buf(),
+                reason: "failed to reserve decoded PCM buffer".to_owned(),
+            })?;
+        buf.samples_i32
+            .extend_from_slice(&s32_bytes_to_i32(&packet.data, format));
+        written = written.saturating_add(count);
+    }
+    if rate == 0 || buf.samples_i32.is_empty() {
+        return Err(PipelineError::EmptyOutput(path.to_path_buf()));
+    }
+    Ok((rate, channels, 32, AudioSampleFormat::Int))
+}
+
+/// Bit-exact 32-bit PCM path including the track's presentation window.
+fn decode_video_pcm_i32_presented(
+    path: &Path,
+    track: &ContainerTrack,
+    packets: &[ContainerPacket],
+    buf: &mut AudioWorkerBuffer,
+) -> Result<(u32, usize, usize, AudioSampleFormat), PipelineError> {
+    let (rate, channels, bits, format) = decode_video_pcm_i32(path, track, packets, buf)?;
+    if let Some(edit) = track.presentation_edit {
+        let frames = buf.samples_i32.len() / channels;
+        trim_presented_frames(
+            &mut buf.samples_i32,
+            channels,
+            presentation_frame_range(edit, rate, frames),
+        );
+    }
+    if buf.samples_i32.is_empty() {
+        return Err(PipelineError::EmptyOutput(path.to_path_buf()));
+    }
+    Ok((rate, channels, bits, format))
+}
+
+/// Decodes one video container audio track into `buf.samples_f32` — or into
+/// `buf.samples_i32` for bit-exact 32-bit PCM — reusing the bounded decoder the
+/// video transcode pipeline uses.
 fn decode_video_audio_track(
     item: &AudioBatchItem,
     container: VideoAudioContainer,
     track_index: usize,
+    codec: AudioTargetCodec,
+    options: &AudioEncodingOptions,
     buf: &mut AudioWorkerBuffer,
 ) -> Result<(u32, usize, usize, AudioSampleFormat), PipelineError> {
     let path = item.source();
     let (track, packets) =
         demux_video_audio_track(path, container.to_video_container(), track_index)?;
+    let direct_i32 = track.codec == VideoCodec::Pcm
+        && matches!(track.pcm_format, Some(PcmFormat::S32Le | PcmFormat::S32Be))
+        && codec == AudioTargetCodec::Pcm
+        && options
+            .bit_depth()
+            .is_none_or(|depth| depth == AudioBitDepth::Int32)
+        && options
+            .sample_rate()
+            .is_none_or(|rate| rate.hz() == track.sample_rate.unwrap_or(0))
+        && options.channels().is_none_or(|channels| {
+            usize::from(channels.get()) == usize::from(track.channels.unwrap_or(2))
+        });
+    if direct_i32 {
+        return decode_video_pcm_i32_presented(path, &track, &packets, buf);
+    }
     let (source_bits, sample_format) = video_track_pcm_facts(path, &track)?;
     if let Some(frames) = item.stream().total_samples() {
         let estimated = frames
@@ -871,6 +1033,14 @@ fn decode_video_audio_track(
             Ok(())
         },
     )?;
+    if let Some(edit) = track.presentation_edit {
+        let frames = buf.samples_f32.len() / usize::from(channels.max(1));
+        trim_presented_frames(
+            &mut buf.samples_f32,
+            usize::from(channels),
+            presentation_frame_range(edit, rate, frames),
+        );
+    }
     if buf.samples_f32.is_empty() || rate == 0 || channels == 0 {
         return Err(PipelineError::EmptyOutput(path.to_path_buf()));
     }
@@ -896,7 +1066,7 @@ fn decode_audio(
         AudioInputFormat::Video {
             container,
             track_index,
-        } => decode_video_audio_track(item, container, track_index, buf)?,
+        } => decode_video_audio_track(item, container, track_index, codec, options, buf)?,
         _ => decode_symphonia(item.source(), item.input_format(), codec, options, buf)?,
     };
 
@@ -3348,6 +3518,13 @@ fn retained_buffer_bytes(
             i32_cap = i32_cap.max(final_bytes);
         }
         Some(AudioBitDepth::Float32) | None => {}
+    }
+    if video_track {
+        // Probing leaves `bits_per_sample` unset for video tracks, so the
+        // estimate above defaults to 16-bit. Decoding resolves the track's real
+        // depth and a 24/32-bit PCM or FLAC track fills `samples_i32`; charge
+        // that vector conservatively so the batch budget cannot be over-subscribed.
+        i32_cap = i32_cap.max(source_bytes.max(final_bytes));
     }
     if alac_generic_byte_copy(item, codec) {
         // `encode_alac_m4a` holds `samples_i16` and its full little-endian byte
@@ -7042,6 +7219,104 @@ mod tests {
             video_track_pcm_facts(path, &track)?,
             (24, AudioSampleFormat::Int)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn video_s32_pcm_direct_path_keeps_low_bits() -> Result<(), PipelineError> {
+        use crate::video_bitstream::PcmFormat;
+        let track = ContainerTrack {
+            codec: fastconv_domain::VideoCodec::Pcm,
+            width: None,
+            height: None,
+            channels: Some(2),
+            sample_rate: Some(48_000),
+            config: Vec::new(),
+            timescale: 1_000_000,
+            presentation_edit: None,
+            pcm_format: Some(PcmFormat::S32Le),
+        };
+        let samples = [16_777_217_i32, -16_777_217, i32::MAX, i32::MIN];
+        let mut data = Vec::new();
+        for sample in samples {
+            data.extend_from_slice(&sample.to_le_bytes());
+        }
+        let packets = [ContainerPacket {
+            track: 0,
+            pts: 0,
+            dts: 0,
+            duration: 4,
+            keyframe: true,
+            data,
+        }];
+        let mut buf = AudioWorkerBuffer::new();
+        let (rate, channels, bits, format) =
+            decode_video_pcm_i32(Path::new("synthetic.mkv"), &track, &packets, &mut buf)?;
+        assert_eq!(
+            (rate, channels, bits, format),
+            (48_000, 2, 32, AudioSampleFormat::Int)
+        );
+        assert_eq!(buf.samples_i32, samples);
+        Ok(())
+    }
+
+    #[test]
+    fn video_presentation_edit_trims_preroll_and_tail() {
+        let edit = TrackPresentation {
+            start_us: 1_000,
+            duration_us: Some(2_000),
+        };
+        // 1 MHz makes one microsecond exactly one frame in this test.
+        assert_eq!(
+            presentation_frame_range(edit, 1_000_000, 5_000),
+            (1_000, 3_000)
+        );
+        let mut samples: Vec<i32> = (0..10_000).collect();
+        trim_presented_frames(&mut samples, 2, (1_000, 3_000));
+        assert_eq!(samples.len(), 4_000);
+        assert_eq!(samples.first(), Some(&2_000));
+        assert_eq!(samples.last(), Some(&5_999));
+        let open = TrackPresentation {
+            start_us: 1_000,
+            duration_us: None,
+        };
+        assert_eq!(
+            presentation_frame_range(open, 1_000_000, 5_000),
+            (1_000, 5_000)
+        );
+        let negative = TrackPresentation {
+            start_us: -1_000,
+            duration_us: None,
+        };
+        assert_eq!(
+            presentation_frame_range(negative, 1_000_000, 5_000),
+            (0, 5_000)
+        );
+    }
+
+    #[test]
+    fn video_pcm_estimate_charges_i32_vector() -> Result<(), Box<dyn std::error::Error>> {
+        let stream = fastconv_domain::AudioStreamInfo::new(
+            NonZeroU16::new(2).unwrap_or(NonZeroU16::MIN),
+            NonZeroU32::new(48_000).unwrap_or(NonZeroU32::MIN),
+            None,
+            Some(480_000),
+        )?;
+        let item = AudioBatchItem::new(
+            PathBuf::from("source.mp4"),
+            PathBuf::from("out.wav"),
+            AudioInputFormat::Video {
+                container: VideoAudioContainer::Mp4,
+                track_index: 0,
+            },
+            stream,
+        )?;
+        let (_, _, i32_capacity) = retained_buffer_bytes(
+            &item,
+            AudioTargetCodec::Pcm,
+            &AudioEncodingOptions::default(),
+        );
+        assert!(i32_capacity > 0, "video PCM must charge the i32 vector");
         Ok(())
     }
 
