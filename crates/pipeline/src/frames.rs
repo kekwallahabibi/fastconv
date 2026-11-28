@@ -188,6 +188,9 @@ struct PoolState {
     closed: bool,
     /// Peak observed aggregate `leased_bytes + external_bytes + free_bytes`.
     peak_live_bytes: usize,
+    /// Producers currently blocked in the admission wait. Lets tests confirm
+    /// a waiter is truly parked before exercising the wake-up path.
+    waiters: usize,
 }
 
 impl PoolState {
@@ -363,6 +366,7 @@ impl PixelPool {
                 free_bytes: 0,
                 closed: false,
                 peak_live_bytes: 0,
+                waiters: 0,
             }),
             changed: Condvar::new(),
             limit,
@@ -373,6 +377,21 @@ impl PixelPool {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Blocks until a budget change, advertising the parked producer so tests
+    /// can synchronize on real admission instead of a timing guess.
+    fn wait_for_change<'a>(
+        &self,
+        mut state: MutexGuard<'a, PoolState>,
+    ) -> MutexGuard<'a, PoolState> {
+        state.waiters = state.waiters.saturating_add(1);
+        state = self
+            .changed
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.waiters = state.waiters.saturating_sub(1);
+        state
     }
 
     /// Marks the pool closed and wakes any blocked admission waiter so worker
@@ -397,6 +416,11 @@ impl PixelPool {
     #[cfg(test)]
     fn leased_bytes(&self) -> usize {
         self.lock_state().leased_bytes
+    }
+
+    #[cfg(test)]
+    fn waiters(&self) -> usize {
+        self.lock_state().waiters
     }
 
     /// Reserves `bytes` of external decoder memory (e.g. a live animation
@@ -440,10 +464,7 @@ impl PixelPool {
                 state.record_peak();
                 break;
             }
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = self.wait_for_change(state);
         }
         drop(state);
         drop(evicted);
@@ -506,10 +527,7 @@ impl PixelPool {
                 state.record_peak();
                 break SinglePlan::Alloc(needed);
             }
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = self.wait_for_change(state);
         };
         drop(state);
         // Free evicted buffers before allocating so physical heap never spikes
@@ -580,10 +598,7 @@ impl PixelPool {
             {
                 break plan;
             }
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = self.wait_for_change(state);
         };
         drop(state);
         drop(evicted);
@@ -1009,10 +1024,13 @@ impl<'pool> FrameEmitter<'_, 'pool> {
         channels: usize,
         fill: FillFn<'_>,
     ) -> Result<(), PipelineError> {
+        // A worker failure must be reported even when every remaining frame is
+        // skipped (e.g. `--every` with a failing first frame): skipped frames
+        // make no pool reservation, so only this check can surface the error.
+        self.check_worker_health()?;
         if !self.selector.should_emit(index, pts_us) {
             return Ok(());
         }
-        self.check_worker_health()?;
         let (out_width, out_height) = output_dimensions((width, height), self.expected);
         let needed = frame_byte_len(out_width, out_height, channels)
             .map_err(|err| attach_path(err, source))?;
@@ -1042,10 +1060,13 @@ impl<'pool> FrameEmitter<'_, 'pool> {
         scratch_len: usize,
         fill: ScratchFillFn<'_>,
     ) -> Result<(), PipelineError> {
+        // A worker failure must be reported even when every remaining frame is
+        // skipped (e.g. `--every` with a failing first frame): skipped frames
+        // make no pool reservation, so only this check can surface the error.
+        self.check_worker_health()?;
         if !self.selector.should_emit(index, pts_us) {
             return Ok(());
         }
-        self.check_worker_health()?;
         let (out_width, out_height) = output_dimensions((width, height), self.expected);
         let needed = frame_byte_len(out_width, out_height, channels)
             .map_err(|err| attach_path(err, source))?;
@@ -1151,23 +1172,27 @@ fn decode_animation(
     };
     match container {
         VideoContainerFormat::Gif => {
-            // GIF disposal `Previous` can hold a backup canvas alongside the
-            // active canvas; charge 2x `canvas_len` as an external hold and
-            // allocate/recycle each sub-frame's decode buffer from `PixelPool`
-            // so canvas + backup + sub-frame + queued/worker frames stay under
-            // the exact same aggregate budget.
+            // GIF disposal `Previous` retains a backup canvas alongside the
+            // active canvas; charge that second canvas only for those frames
+            // (1x otherwise, released on the next provider call after the
+            // previous frame was disposed). Sub-frame decode buffers come from
+            // the same pool, so canvas + backup + sub-frame + queued/worker
+            // frames all stay under the exact same aggregate budget.
             let mut gif_canvas_hold: Option<ExternalHold<'_>> = None;
             decode_gif_frames_streaming_pixels_ctrl(
                 source,
                 max_gif_canvas_bytes,
-                |canvas_len, frame_buf_len, fill| {
-                    let needed_hold =
+                |canvas_len, frame_buf_len, needs_backup, fill| {
+                    let needed_hold = if needs_backup {
                         canvas_len
                             .checked_mul(2)
                             .ok_or_else(|| PipelineError::DecodeFailed {
                                 path: source.to_path_buf(),
                                 reason: "GIF canvas byte hold overflows usize".to_owned(),
-                            })?;
+                            })?
+                    } else {
+                        canvas_len
+                    };
                     ensure_canvas_hold(pool, source, &mut gif_canvas_hold, needed_hold)?;
                     let mut frame_buf = pool
                         .take(frame_buf_len)
@@ -1396,6 +1421,84 @@ fn run_worker(ctx: &WorkerContext<'_, '_>) {
     }
 }
 
+/// Resolves `path` to an absolute location, using the nearest existing
+/// ancestor for outputs that do not exist yet. Equivalent spellings of the
+/// same directory (`frames`, `frames/../frames`) then compare equal, which is
+/// required to reject a generated frame that would overwrite its own source.
+fn canonical_or_parent(path: &Path) -> Result<PathBuf, PipelineError> {
+    use std::path::Component;
+
+    let mut cursor = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(&cursor) {
+            Ok(mut canonical) => {
+                for component in missing.into_iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // A `..` in the unresolved suffix needs its preceding directory
+                // to exist; dropping it would silently change the target.
+                if matches!(cursor.components().next_back(), Some(Component::ParentDir)) {
+                    return Err(PipelineError::Io {
+                        path: cursor,
+                        source: err,
+                    });
+                }
+            }
+            Err(source) => {
+                return Err(PipelineError::Io {
+                    path: cursor,
+                    source,
+                });
+            }
+        }
+        match cursor.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                if let Some(name) = cursor.file_name() {
+                    missing.push(name.to_os_string());
+                }
+                cursor = parent.to_path_buf();
+            }
+            _ => {
+                return Err(PipelineError::DecodeFailed {
+                    path: cursor,
+                    reason: "path has no existing ancestor to resolve".to_owned(),
+                });
+            }
+        }
+    }
+}
+
+/// True when the source itself is at a path this extraction would generate
+/// (`frame_<digits>.<extension>` inside an equivalent output directory). This
+/// is checked once at execution time so callers that build a plan directly
+/// cannot publish a frame over their own source through an alias spelling.
+fn source_is_generated_target(plan: &FrameExtractionPlan) -> Result<bool, PipelineError> {
+    let source = plan.source();
+    let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
+        return Ok(false);
+    };
+    let Some(parent) = source.parent() else {
+        return Ok(false);
+    };
+    let Some((digits, ext)) = name
+        .strip_prefix("frame_")
+        .and_then(|rest| rest.rsplit_once('.'))
+    else {
+        return Ok(false);
+    };
+    if ext != plan.output_format().extension()
+        || digits.is_empty()
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Ok(false);
+    }
+    Ok(canonical_or_parent(parent)? == canonical_or_parent(plan.output_dir())?)
+}
+
 /// Executes a validated [`FrameExtractionPlan`] on its CPU encoder path.
 ///
 /// # Errors
@@ -1403,9 +1506,20 @@ fn run_worker(ctx: &WorkerContext<'_, '_>) {
 /// Returns [`PipelineError`] on demux/decode/encode/write failure, or
 /// [`PipelineError::NoFramesSelected`] (with no files or directory created)
 /// when the selection and range match no frame.
+// Keep the worker lifecycle in one scope: decode result storage, sender drop,
+// and a join of every worker must all run on the same path so no panic can
+// escape `thread::scope` and no sender can keep a join blocked.
+#[allow(clippy::too_many_lines)]
 pub fn execute_frame_extraction(
     plan: &FrameExtractionPlan,
 ) -> Result<FrameExtractionReport, PipelineError> {
+    if source_is_generated_target(plan)? {
+        return Err(PipelineError::EncodeFailed {
+            path: plan.source().to_path_buf(),
+            reason: "extraction would overwrite its own source via a generated frame path"
+                .to_owned(),
+        });
+    }
     let encoder = encoder_for_mode(plan.mode())?;
     let configured = plan.worker_threads().get();
     let (workers, inner_threads) = match encoder {
@@ -1432,8 +1546,9 @@ pub fn execute_frame_extraction(
     let (job_tx, job_rx) = channel::unbounded::<FrameJob<'_>>();
 
     let decode_result = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
-            scope.spawn(|| {
+            let spawned = thread::Builder::new().spawn_scoped(scope, || {
                 let _guard = WorkerExitGuard {
                     active_workers: &active_workers,
                     failed: &failed,
@@ -1454,6 +1569,15 @@ pub fn execute_frame_extraction(
                 };
                 run_worker(&ctx);
             });
+            match spawned {
+                Ok(handle) => handles.push(handle),
+                Err(err) => {
+                    // Returning drops `job_tx` (captured below), disconnecting
+                    // the channel so already-started workers exit before the
+                    // scope joins them.
+                    return Err(PipelineError::WorkerStartFailed(err));
+                }
+            }
         }
         let expected = plan
             .source_dimensions()
@@ -1469,8 +1593,23 @@ pub fn execute_frame_extraction(
             sequence: 0,
             last_dims: None,
         };
-        run_decode(plan, &mut emitter)?;
-        Ok((emitter.sequence, emitter.last_dims))
+        // Store the outcome instead of `?`: cleanup and joins must run on both
+        // success and failure, and a panicked worker's join must consume its
+        // panic here rather than let `thread::scope` re-raise it on unwind.
+        let decoded = run_decode(plan, &mut emitter);
+        let outcome = (emitter.sequence, emitter.last_dims);
+        drop(emitter); // disconnect the job channel so workers can exit
+        let mut all_joined = true;
+        for handle in handles {
+            if handle.join().is_err() {
+                all_joined = false;
+            }
+        }
+        decoded?;
+        if !all_joined {
+            return Err(PipelineError::WorkerPanicked);
+        }
+        Ok(outcome)
     });
 
     if let Ok(err) = error_rx.try_recv() {
@@ -1535,7 +1674,7 @@ mod tests {
     use std::process;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -2152,13 +2291,30 @@ mod tests {
     #[test]
     fn pixel_pool_close_wakes_blocked_waiter_without_deadlock() -> Result<(), Box<dyn Error>> {
         let pool = PixelPool::new(256);
-        let held = pool.take(256)?;
+        let held = pool.take(256)?; // entire budget is leased
+        let (done_tx, done_rx) = channel::bounded(1);
         let result = thread::scope(|scope| {
-            let waiter = scope.spawn(|| pool.take_pair(128, 64));
-            thread::sleep(Duration::from_millis(10));
+            let waiter = scope.spawn(|| {
+                let outcome = pool.take_pair(128, 64).map(|_| ());
+                drop(done_tx.send(outcome));
+            });
+            // Synchronize on actual admission: the waiter must be parked in
+            // the condvar wait before `close()` is called.
+            let start = Instant::now();
+            while pool.waiters() == 0 {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "waiter was never admitted to the pool wait"
+                );
+                thread::yield_now();
+            }
             pool.close();
-            drop(held);
-            waiter.join().ok()
+            // Require a bounded wake-up from `close()` alone while `held` is
+            // still alive; releasing the lease must not be what wakes it.
+            let outcome = done_rx.recv_timeout(Duration::from_secs(5)).ok();
+            drop(waiter.join());
+            drop(held); // cleanup happens only after the result is collected
+            outcome
         });
         assert!(matches!(result, Some(Err(PipelineError::WorkerPanicked))));
         Ok(())
@@ -2172,19 +2328,43 @@ mod tests {
         let active = AtomicUsize::new(1);
         let failed = AtomicBool::new(false);
         let held = pool.take(256)?;
+        let (done_tx, done_rx) = channel::bounded(1);
+        let (exit_tx, exit_rx) = channel::bounded::<()>(1);
         let result = thread::scope(|scope| {
-            let waiter = scope.spawn(|| pool.take_pair(128, 64));
+            let waiter = scope.spawn(|| {
+                let outcome = pool.take_pair(128, 64).map(|_| ());
+                drop(done_tx.send(outcome));
+            });
             let worker = scope.spawn(|| {
+                // Only exit once the decoder is confirmed parked, so this
+                // exercises a genuinely blocked waiter rather than a race.
+                match exit_rx.recv() {
+                    Ok(()) => {}
+                    Err(_) => return,
+                }
                 let _guard = WorkerExitGuard {
                     active_workers: &active,
                     failed: &failed,
                     pool: &pool,
                 };
-                thread::sleep(Duration::from_millis(10));
             });
-            let _joined_worker = worker.join();
-            drop(held);
-            waiter.join().ok()
+            // Wait until the decoder is genuinely parked before the last
+            // worker exits and closes the pool.
+            let start = Instant::now();
+            while pool.waiters() == 0 {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "waiter was never admitted to the pool wait"
+                );
+                thread::yield_now();
+            }
+            let signalled = exit_tx.send(());
+            assert!(signalled.is_ok(), "worker exited before its start signal");
+            drop(worker.join());
+            let outcome = done_rx.recv_timeout(Duration::from_secs(5)).ok();
+            drop(waiter.join());
+            drop(held); // keep the lease until after the waiter result is known
+            outcome
         });
         assert!(matches!(result, Some(Err(PipelineError::WorkerPanicked))));
         assert_eq!(active.load(Ordering::Acquire), 0);
@@ -2292,6 +2472,92 @@ mod tests {
             decode_animation(&gif_path, VideoContainerFormat::Gif, &mut tiny_gif_emitter),
             Err(PipelineError::DecodeFailed { .. })
         ));
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn decode_animation_gif_keep_frames_charge_one_canvas_only() -> Result<(), Box<dyn Error>> {
+        let root = temp_root("gif-keep-budget")?;
+        let gif_path = root.join("keep.gif");
+        {
+            let file = File::create(&gif_path)?;
+            let mut encoder = gif::Encoder::new(file, 4, 4, &[])?;
+            encoder.set_repeat(gif::Repeat::Infinite)?;
+            for step in 0_u8..3 {
+                let mut rgba = vec![step.saturating_mul(70); 4 * 4 * 4];
+                for px in rgba.as_chunks_mut::<4>().0 {
+                    px[3] = 255;
+                }
+                let mut frame = gif::Frame::from_rgba_speed(4, 4, &mut rgba, 10);
+                frame.delay = 10;
+                frame.dispose = gif::DisposalMethod::Keep;
+                encoder.write_frame(&frame)?;
+            }
+        }
+        // Exactly 2x canvas: enough for the 1x canvas hold + 1x sub-frame.
+        // A 2x backup hold would reject; `Keep` frames must never be charged
+        // for a backup they do not retain.
+        let canvas = 4 * 4 * 4;
+        let pool = PixelPool::new(canvas * 2);
+        let (job_tx, job_rx) = channel::unbounded::<FrameJob<'_>>();
+        let (_error_tx, error_rx) = channel::unbounded::<PipelineError>();
+        let failed = AtomicBool::new(false);
+        let emitted = thread::scope(|scope| -> Result<u64, PipelineError> {
+            scope.spawn(|| {
+                while let Ok(job) = job_rx.recv() {
+                    assert_eq!(job.pixels.len(), canvas);
+                }
+            });
+            let mut emitter = FrameEmitter {
+                selector: Selector::new(FrameSelection::All, 0),
+                range: FrameRange::new(0, None).map_err(|err| frame_error(err.to_string()))?,
+                expected: Some((4, 4)),
+                pool: &pool,
+                job_tx,
+                error_rx: &error_rx,
+                failed: &failed,
+                sequence: 0,
+                last_dims: None,
+            };
+            let _flow = decode_animation(&gif_path, VideoContainerFormat::Gif, &mut emitter)?;
+            Ok(emitter.sequence)
+        })?;
+        assert_eq!(emitted, 3);
+        assert!(pool.peak_live_bytes() <= canvas * 2);
+        assert_eq!(pool.leased_bytes(), 0);
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn execute_rejects_generated_frame_path_alias() -> Result<(), Box<dyn Error>> {
+        let root = temp_root("frame-path-alias")?;
+        let source = root.join("frame_000001.gif");
+        // The execution-time guard runs before decoding, so file content is
+        // irrelevant here.
+        File::create(&source)?;
+        let decoy = root.join("decoy");
+        fs::create_dir_all(&decoy)?;
+        // `decoy/..` names the source directory through an equivalent spelling.
+        let alias_out = decoy.join("..");
+        let plan = plan(
+            &source,
+            &alias_out,
+            VideoContainerFormat::Gif,
+            ImageOutputFormat::Gif,
+            FrameSelection::All,
+            FrameRange::new(0, None)?,
+        )?;
+        match execute_frame_extraction(&plan) {
+            Err(PipelineError::EncodeFailed { .. }) => {}
+            other => {
+                return Err(format!(
+                    "expected EncodeFailed for an aliased generated frame path, got {other:?}"
+                )
+                .into());
+            }
+        }
         fs::remove_dir_all(&root)?;
         Ok(())
     }

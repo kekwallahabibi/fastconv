@@ -1070,7 +1070,7 @@ fn gif_streaming_pixels_impl<W, F>(
     mut on_frame: F,
 ) -> Result<(), PipelineError>
 where
-    W: FnMut(usize, usize, &mut GifFrameFill<'_>) -> Result<(), PipelineError>,
+    W: FnMut(usize, usize, bool, &mut GifFrameFill<'_>) -> Result<(), PipelineError>,
     F: FnMut(AnimFrameInfo, &[u8]) -> Result<(), PipelineError>,
 {
     let preserve_alpha = mode != AnimPixelMode::FlattenedRgb;
@@ -1123,13 +1123,20 @@ where
         if disposal == gif::DisposalMethod::Previous {
             save_gif_previous_canvas(path, &canvas, canvas_memory_limit, &mut saved)?;
         }
-        with_frame_buf(canvas_len, frame_buf_len, &mut |frame_buf| {
-            decoder
-                .read_into_buffer(frame_buf)
-                .map_err(|err| decode_error(path, format!("GIF frame is invalid: {err}")))?;
-            composite_gif_frame(&mut canvas, (width, height), frame_buf, rect);
-            Ok(())
-        })?;
+        // `needs_backup` tells the caller to charge a second canvas only for
+        // `Previous` disposal, since only those frames retain a backup.
+        with_frame_buf(
+            canvas_len,
+            frame_buf_len,
+            disposal == gif::DisposalMethod::Previous,
+            &mut |frame_buf| {
+                decoder
+                    .read_into_buffer(frame_buf)
+                    .map_err(|err| decode_error(path, format!("GIF frame is invalid: {err}")))?;
+                composite_gif_frame(&mut canvas, (width, height), frame_buf, rect);
+                Ok(())
+            },
+        )?;
 
         let duration = if delay == 0 {
             100_000_u64
@@ -1195,9 +1202,9 @@ fn apply_gif_disposal(
 
 fn default_gif_frame_buf(
     path: &Path,
-) -> impl FnMut(usize, usize, &mut GifFrameFill<'_>) -> Result<(), PipelineError> + '_ {
+) -> impl FnMut(usize, usize, bool, &mut GifFrameFill<'_>) -> Result<(), PipelineError> + '_ {
     let mut scratch = Vec::new();
-    move |_canvas_len, frame_buf_len, fill| {
+    move |_canvas_len, frame_buf_len, _needs_backup, fill| {
         if u64::try_from(frame_buf_len).unwrap_or(u64::MAX) > ANIM_MEMORY_LIMIT {
             return Err(decode_error(
                 path,
@@ -1263,7 +1270,7 @@ pub(crate) fn decode_gif_frames_streaming_pixels_ctrl<W, F>(
     mut on_frame: F,
 ) -> Result<ControlFlow<()>, PipelineError>
 where
-    W: FnMut(usize, usize, &mut GifFrameFill<'_>) -> Result<(), PipelineError>,
+    W: FnMut(usize, usize, bool, &mut GifFrameFill<'_>) -> Result<(), PipelineError>,
     F: FnMut(AnimFrameInfo, &[u8]) -> Result<ControlFlow<()>, PipelineError>,
 {
     let mut stopped = false;

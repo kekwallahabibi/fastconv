@@ -5,7 +5,7 @@
 | Item | Value |
 | :--- | :--- |
 | Product | `fastconv` 0.1.0 · edition 2024 · AGPL-3.0-only · pre-merge / pre-review branch `feat/extract-frames` (Feature 4/6: `fastconv frames` still-frame extraction from video and animated GIF/WebP) · 5 crates |
-| Verify | `cargo xtask verify` green — **814** default tests (40 cli + 3 audio_codecs + 12 cli_help + 4 frames + 6 validation_errors + 7 video_add_audio + 5 video_extract + 120 domain + 449 pipeline + 146 probe + 22 xtask), **546** `--features nvenc` tests (40 cli + 3 audio_codecs + 12 cli_help + 4 frames + 6 validation_errors + 7 video_add_audio + 5 video_extract + 469 pipeline); 273 deps license-checked; fmt + clippy `-D warnings` clean (default and nvenc); no-FFmpeg/ffprobe scanner clean in `crates/` |
+| Verify | `cargo xtask verify` green — **816** default tests (40 cli + 3 audio_codecs + 12 cli_help + 4 frames + 6 validation_errors + 7 video_add_audio + 5 video_extract + 120 domain + 451 pipeline + 146 probe + 22 xtask), **548** `--features nvenc` tests (40 cli + 3 audio_codecs + 12 cli_help + 4 frames + 6 validation_errors + 7 video_add_audio + 5 video_extract + 471 pipeline); 273 deps license-checked; fmt + clippy `-D warnings` clean (default and nvenc); no-FFmpeg/ffprobe scanner clean in `crates/` |
 | Release binary | default **39,724,568 B (37.88 MiB) → 28,503,464 B (27.18 MiB), −28.25%**; `--features nvenc` **40,410,144 B (38.54 MiB) → 29,155,880 B (27.81 MiB), −27.85%** — `strip = true`, `lto = "fat"`, `codegen-units = 1`, `opt-level = 3` (retained from prior snapshot; not re-measured for this feature) |
 
 ## Build size
