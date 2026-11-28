@@ -2,6 +2,7 @@ pub mod audio;
 pub mod frames;
 pub mod hardware;
 pub mod image;
+pub mod stack;
 pub mod video;
 
 pub use audio::{
@@ -11,7 +12,11 @@ pub use audio::{
 };
 pub use frames::prepare_frame_extraction;
 pub use hardware::detect_host_hardware;
-pub use image::{ProbedImage, prepare_image_batch, prepare_image_batch_with_options, probe_image};
+pub use image::{
+    ProbedImage, ProbedImageWithAlpha, prepare_image_batch, prepare_image_batch_with_options,
+    probe_image, probe_image_with_alpha,
+};
+pub use stack::{natural_cmp_bytes, natural_cmp_str, prepare_frame_sequence};
 pub use video::{
     ExternalAudioRequest, ProbedVideo, RequestedAudioCodec, RequestedVideoCodec,
     VideoTranscodeOptions, detect_video_magic, parse_requested_audio_codec, prepare_video_batch,
@@ -41,6 +46,20 @@ pub enum ProbeError {
     TargetNotADirectory(PathBuf),
     EmptySourceDirectory(PathBuf),
     EmptyAudioDirectory(PathBuf),
+    /// The animation target exists as a directory (or a symlink to one).
+    StackTargetIsDirectory(PathBuf),
+    /// `--to` disagreed with an animation extension on the target.
+    ConflictingStackTargetFormat {
+        path: PathBuf,
+        explicit: &'static str,
+        inferred: &'static str,
+    },
+    /// A stack frame's decoded dimensions differ from the first frame's.
+    StackFrameDimensionMismatch {
+        path: PathBuf,
+        expected: fastconv_domain::ImageDimensions,
+        actual: fastconv_domain::ImageDimensions,
+    },
     InvalidImage {
         path: PathBuf,
         reason: String,
@@ -100,6 +119,31 @@ impl fmt::Display for ProbeError {
                     path.display()
                 )
             }
+            Self::StackTargetIsDirectory(path) => {
+                write!(
+                    f,
+                    "stack target must be a file, not a directory: {}",
+                    path.display()
+                )
+            }
+            Self::ConflictingStackTargetFormat {
+                path,
+                explicit,
+                inferred,
+            } => write!(
+                f,
+                "target extension '{inferred}' conflicts with --to {explicit}: {}",
+                path.display()
+            ),
+            Self::StackFrameDimensionMismatch {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "stack frame '{}' is {actual} but the first frame is {expected}",
+                path.display()
+            ),
             Self::InvalidImage { path, reason } => {
                 write!(f, "invalid image '{}': {reason}", path.display())
             }
@@ -153,6 +197,9 @@ impl Error for ProbeError {
             | Self::EmptyVideoDirectory(_)
             | Self::InvalidAudio { .. }
             | Self::UnsupportedTargetFormat { .. }
+            | Self::StackTargetIsDirectory(_)
+            | Self::ConflictingStackTargetFormat { .. }
+            | Self::StackFrameDimensionMismatch { .. }
             | Self::UnresolvedParentComponent(_) => None,
         }
     }

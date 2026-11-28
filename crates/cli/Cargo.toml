@@ -17,5 +17,8 @@ fastconv-domain.workspace = true
 fastconv-probe.workspace = true
 fastconv-pipeline.workspace = true
 
+[dev-dependencies]
+png.workspace = true
+
 [lints]
 workspace = true

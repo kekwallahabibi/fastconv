@@ -18,6 +18,7 @@ mod ogg_flac;
 mod pnm;
 mod qoi;
 pub mod remux;
+pub mod stack;
 mod staging;
 mod video_anim;
 mod video_bitstream;
@@ -27,6 +28,7 @@ pub mod video_transcode;
 
 pub use audio::execute_audio_batch;
 pub use frames::execute_frame_extraction;
+pub use stack::execute_frame_sequence;
 pub use video_transcode::execute_video_transcode_batch;
 
 use std::error::Error;

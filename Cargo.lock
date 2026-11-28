@@ -508,6 +508,7 @@ dependencies = [
  "fastconv-domain",
  "fastconv-pipeline",
  "fastconv-probe",
+ "png",
 ]
 
 [[package]]

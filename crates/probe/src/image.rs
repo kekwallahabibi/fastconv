@@ -85,6 +85,26 @@ pub struct ProbedImage {
     pub dimensions: ImageDimensions,
 }
 
+/// Header-only probe result including the alpha signal of a still image.
+/// Kept separate from [`ProbedImage`] so existing callers do not have to
+/// account for a channel they never use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbedImageWithAlpha {
+    pub format: ImageInputFormat,
+    pub dimensions: ImageDimensions,
+    pub has_alpha: bool,
+}
+
+impl ProbedImageWithAlpha {
+    #[must_use]
+    pub const fn image(self) -> ProbedImage {
+        ProbedImage {
+            format: self.format,
+            dimensions: self.dimensions,
+        }
+    }
+}
+
 fn is_known_bmp_dib_size(size: u32) -> bool {
     matches!(size, 12 | 40 | 52 | 56 | 108 | 124)
 }
@@ -500,7 +520,7 @@ fn is_supported_jpeg_colorspace(cs: Option<ColorSpace>) -> bool {
     )
 }
 
-fn probe_webp(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+fn probe_webp(file: &mut File, path: &Path) -> Result<(ImageDimensions, bool), ProbeError> {
     let file_len = file
         .metadata()
         .map_err(|source| ProbeError::Io {
@@ -542,7 +562,7 @@ fn probe_webp(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeErro
     }
 
     match &first_fourcc {
-        b"VP8 " => probe_webp_vp8(file, path, chunk_size),
+        b"VP8 " => Ok((probe_webp_vp8(file, path, chunk_size)?, false)),
         b"VP8L" => probe_webp_vp8l(file, path, chunk_size),
         b"VP8X" => probe_webp_vp8x(file, path, chunk_size, riff_end),
         other => Err(invalid_image(
@@ -577,7 +597,7 @@ fn probe_webp_vp8l(
     file: &mut File,
     path: &Path,
     chunk_size: u64,
-) -> Result<ImageDimensions, ProbeError> {
+) -> Result<(ImageDimensions, bool), ProbeError> {
     if chunk_size < 5 {
         return Err(invalid_image(path, "truncated VP8L lossless header"));
     }
@@ -595,7 +615,9 @@ fn probe_webp_vp8l(
     }
     let width = (bits & 0x3FFF) + 1;
     let height = ((bits >> 14) & 0x3FFF) + 1;
-    Ok(ImageDimensions::new(width, height)?)
+    // VP8L reserves bit 28 for `alpha_is_used`; the embedded RGB bitstream
+    // itself cannot signal transparency without it.
+    Ok((ImageDimensions::new(width, height)?, (bits >> 28) & 1 != 0))
 }
 
 fn probe_webp_vp8x(
@@ -603,7 +625,7 @@ fn probe_webp_vp8x(
     path: &Path,
     chunk_size: u64,
     riff_end: u64,
-) -> Result<ImageDimensions, ProbeError> {
+) -> Result<(ImageDimensions, bool), ProbeError> {
     if chunk_size < 10 {
         return Err(invalid_image(path, "truncated VP8X extended header"));
     }
@@ -618,6 +640,8 @@ fn probe_webp_vp8x(
     let width = (u32::from(vp8x[4]) | (u32::from(vp8x[5]) << 8) | (u32::from(vp8x[6]) << 16)) + 1;
     let height = (u32::from(vp8x[7]) | (u32::from(vp8x[8]) << 8) | (u32::from(vp8x[9]) << 16)) + 1;
     let canvas_dims = ImageDimensions::new(width, height)?;
+    // VP8X flag bit 0x10 tells decoders to allocate an alpha plane.
+    let mut has_alpha = (vp8x[0] & 0x10) != 0;
 
     let padded_vp8x = chunk_size + (chunk_size & 1);
     let mut pos = 20_u64
@@ -663,7 +687,9 @@ fn probe_webp_vp8x(
                 let frame_dims = if &fourcc == b"VP8 " {
                     probe_webp_vp8(file, path, len)?
                 } else {
-                    probe_webp_vp8l(file, path, len)?
+                    let (dims, vp8l_alpha) = probe_webp_vp8l(file, path, len)?;
+                    has_alpha |= vp8l_alpha;
+                    dims
                 };
                 if frame_dims != canvas_dims {
                     return Err(invalid_image(
@@ -692,7 +718,7 @@ fn probe_webp_vp8x(
         ));
     }
 
-    Ok(canvas_dims)
+    Ok((canvas_dims, has_alpha))
 }
 
 fn read_bmp_dib_header(
@@ -741,7 +767,7 @@ fn read_bmp_dib_header(
     Ok((w, raw_h.unsigned_abs(), bpp, comp, colors_used))
 }
 
-fn probe_bmp(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+fn probe_bmp(file: &mut File, path: &Path) -> Result<(ImageDimensions, bool), ProbeError> {
     let file_len = file
         .metadata()
         .map_err(|source| ProbeError::Io {
@@ -817,7 +843,9 @@ fn probe_bmp(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError
         ));
     }
 
-    Ok(dims)
+    // A 32-bpp BMP carries an alpha byte even when no bitfields mask is set;
+    // conservative alpha signalling keeps mixed stacks on one channel layout.
+    Ok((dims, bit_count == 32))
 }
 
 fn validate_bmp_palette_bounds(
@@ -990,7 +1018,7 @@ fn validate_bmp_encoding(
     }
 }
 
-fn probe_qoi(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+fn probe_qoi(file: &mut File, path: &Path) -> Result<(ImageDimensions, bool), ProbeError> {
     let file_len = file
         .metadata()
         .map_err(|source| ProbeError::Io {
@@ -1066,10 +1094,10 @@ fn probe_qoi(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError
         return Err(invalid_image(path, "invalid or missing QOI end marker"));
     }
 
-    Ok(dims)
+    Ok((dims, channels == 4))
 }
 
-fn probe_avif(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+fn probe_avif(file: File, path: &Path) -> Result<(ImageDimensions, bool), ProbeError> {
     let config = zenavif_parse::DecodeConfig::default()
         .lenient(true)
         .with_peak_memory_limit(512 * 1024 * 1024)
@@ -1106,7 +1134,10 @@ fn probe_avif(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
             ),
         ));
     }
-    Ok(ImageDimensions::new(width, height)?)
+    Ok((
+        ImageDimensions::new(width, height)?,
+        parser.alpha_metadata().is_some(),
+    ))
 }
 
 /// Finds one child box of a container box. Malformed children are ignored so the
@@ -1992,7 +2023,7 @@ fn heic_clean_aperture_dimensions(
 /// with bounded count/byte budgets; only `ftyp`, `meta` and `moov` are buffered,
 /// while `mdat` is skipped by seeking. No pixel data is decoded here.
 #[allow(clippy::too_many_lines)] // Explicit box, brand, track, extent and item validation steps.
-fn probe_heic(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+fn probe_heic(file: &mut File, path: &Path) -> Result<(ImageDimensions, bool), ProbeError> {
     let file_len = file
         .seek(SeekFrom::End(0))
         .map_err(|source| ProbeError::Io {
@@ -2212,10 +2243,11 @@ fn probe_heic(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeErro
             format!("HEIC pixel count ({pixels}) exceeds {MAX_STILL_IMAGE_PIXELS}-pixel limit"),
         ));
     }
-    Ok(ImageDimensions::new(width, height)?)
+    let has_alpha = !index.alpha_or_invalid_auxl(container.primary_id).is_empty();
+    Ok((ImageDimensions::new(width, height)?, has_alpha))
 }
 
-fn probe_gif(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+fn probe_gif(file: File, path: &Path) -> Result<(ImageDimensions, bool), ProbeError> {
     let mut options = gif::DecodeOptions::new();
     options.set_memory_limit(gif::MemoryLimit::Bytes(
         NonZeroU64::new(MAX_GIF_DECODE_BYTES).unwrap_or(NonZeroU64::MIN),
@@ -2234,11 +2266,13 @@ fn probe_gif(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
             format!("GIF pixel count ({pixel_count}) exceeds {MAX_STILL_IMAGE_PIXELS}-pixel limit"),
         ));
     }
-    if decoder
+    let first_frame = decoder
         .next_frame_info()
-        .map_err(|err| invalid_image(path, format!("invalid GIF frame: {err}")))?
-        .is_none()
-    {
+        .map_err(|err| invalid_image(path, format!("invalid GIF frame: {err}")))?;
+    let has_alpha = first_frame
+        .as_ref()
+        .is_some_and(|f| f.transparent.is_some());
+    if first_frame.is_none() {
         return Err(invalid_image(path, "GIF contains no image frames"));
     }
     if decoder
@@ -2251,10 +2285,10 @@ fn probe_gif(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
             "animated GIF is not supported by the still-image pipeline",
         ));
     }
-    Ok(dims)
+    Ok((dims, has_alpha))
 }
 
-fn probe_ico(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+fn probe_ico(file: File, path: &Path) -> Result<(ImageDimensions, bool), ProbeError> {
     let icon_dir = ico::IconDir::read(BufReader::new(file))
         .map_err(|err| invalid_image(path, format!("invalid ICO container: {err}")))?;
     if icon_dir.resource_type() != ico::ResourceType::Icon {
@@ -2326,7 +2360,9 @@ fn probe_ico(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
             format!("ICO pixel count ({pixel_count}) exceeds {MAX_STILL_IMAGE_PIXELS}-pixel limit"),
         ));
     }
-    Ok(ImageDimensions::new(entry.width(), entry.height())?)
+    // ICO directory entries may declare no alpha, but PNG/BMP payloads carry a
+    // mask; treat every icon as alpha-capable so stacks keep a uniform layout.
+    Ok((ImageDimensions::new(entry.width(), entry.height())?, true))
 }
 
 fn parse_pnm_number(buf: &[u8], pos: &mut usize) -> Option<u64> {
@@ -2501,7 +2537,11 @@ fn parse_pam_header_fields(buf: &[u8], path: &Path) -> Result<PamHeaderFields, P
     })
 }
 
-fn probe_pam(buf: &[u8], file_len: u64, path: &Path) -> Result<ImageDimensions, ProbeError> {
+fn probe_pam(
+    buf: &[u8],
+    file_len: u64,
+    path: &Path,
+) -> Result<(ImageDimensions, bool), ProbeError> {
     let fields = parse_pam_header_fields(buf, path)?;
     if !(1..=4).contains(&fields.depth) {
         return Err(invalid_image(
@@ -2532,7 +2572,7 @@ fn probe_pam(buf: &[u8], file_len: u64, path: &Path) -> Result<ImageDimensions, 
             format!("truncated PAM raster (need {needed} bytes, file has {file_len})"),
         ));
     }
-    Ok(dims)
+    Ok((dims, matches!(fields.depth, 2 | 4)))
 }
 
 fn validate_pnm_raster(
@@ -2560,7 +2600,7 @@ fn probe_pnm_standard(
     file_len: u64,
     path: &Path,
     variant: u8,
-) -> Result<ImageDimensions, ProbeError> {
+) -> Result<(ImageDimensions, bool), ProbeError> {
     let mut pos = 2_usize;
     skip_pnm_whitespace_and_comments(buf, &mut pos);
     let width =
@@ -2620,10 +2660,10 @@ fn probe_pnm_standard(
             "truncated PNM raster (no data after header)",
         ));
     }
-    Ok(dims)
+    Ok((dims, false))
 }
 
-fn probe_pnm(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+fn probe_pnm(file: &mut File, path: &Path) -> Result<(ImageDimensions, bool), ProbeError> {
     let file_len = file
         .metadata()
         .map_err(|source| ProbeError::Io {
@@ -2659,17 +2699,26 @@ fn probe_pnm(file: &mut File, path: &Path) -> Result<ImageDimensions, ProbeError
 }
 
 fn probe_opened_image(
-    mut file: File,
+    file: File,
     path: &Path,
     format: ImageInputFormat,
 ) -> Result<ProbedImage, ProbeError> {
+    Ok(probe_opened_image_with_alpha(file, path, format)?.image())
+}
+
+/// Probes headers once and reports both dimensions and the alpha signal.
+fn probe_opened_image_with_alpha(
+    mut file: File,
+    path: &Path,
+    format: ImageInputFormat,
+) -> Result<ProbedImageWithAlpha, ProbeError> {
     file.seek(SeekFrom::Start(0))
         .map_err(|source| ProbeError::Io {
             path: path.to_path_buf(),
             source,
         })?;
 
-    let dimensions = match format {
+    let (dimensions, has_alpha) = match format {
         ImageInputFormat::Png => {
             let mut decoder = png::Decoder::new(BufReader::new(file));
             decoder.set_ignore_text_chunk(true);
@@ -2677,7 +2726,11 @@ fn probe_opened_image(
                 .read_info()
                 .map_err(|err| invalid_image(path, err.to_string()))?;
             let info = reader.info();
-            ImageDimensions::new(info.width, info.height)?
+            let has_alpha = matches!(
+                info.color_type,
+                png::ColorType::Rgba | png::ColorType::GrayscaleAlpha
+            ) || info.trns.is_some();
+            (ImageDimensions::new(info.width, info.height)?, has_alpha)
         }
         ImageInputFormat::Jpeg => {
             let mut decoder = JpegDecoder::new(BufReader::new(file));
@@ -2694,7 +2747,10 @@ fn probe_opened_image(
                     format!("unsupported JPEG color space: {input_cs:?}"),
                 ));
             }
-            ImageDimensions::new(u32::from(info.width), u32::from(info.height))?
+            (
+                ImageDimensions::new(u32::from(info.width), u32::from(info.height))?,
+                false,
+            )
         }
         ImageInputFormat::Webp => probe_webp(&mut file, path)?,
         ImageInputFormat::Bmp => probe_bmp(&mut file, path)?,
@@ -2708,10 +2764,14 @@ fn probe_opened_image(
         ImageInputFormat::Pnm => probe_pnm(&mut file, path)?,
     };
 
-    Ok(ProbedImage { format, dimensions })
+    Ok(ProbedImageWithAlpha {
+        format,
+        dimensions,
+        has_alpha,
+    })
 }
 
-fn probe_tiff(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+fn probe_tiff(file: File, path: &Path) -> Result<(ImageDimensions, bool), ProbeError> {
     let mut decoder = tiff::decoder::Decoder::new(BufReader::new(file))
         .map_err(|err| invalid_image(path, format!("invalid TIFF header: {err}")))?;
     let (width, height) = decoder
@@ -2746,10 +2806,11 @@ fn probe_tiff(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
             format!("invalid TIFF dimensions {width}x{height}"),
         ));
     }
-    Ok(ImageDimensions::new(width, height)?)
+    let has_alpha = matches!(color, tiff::ColorType::RGBA(_) | tiff::ColorType::GrayA(_));
+    Ok((ImageDimensions::new(width, height)?, has_alpha))
 }
 
-fn probe_jxl(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
+fn probe_jxl(file: File, path: &Path) -> Result<(ImageDimensions, bool), ProbeError> {
     let mut reader = BufReader::new(file);
     let mut options = jxl::api::JxlDecoderOptions::default();
     options.sample_limit = Some(MAX_JXL_SAMPLES);
@@ -2767,6 +2828,13 @@ fn probe_jxl(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
                         "animated JPEG XL is not supported by the still-image pipeline",
                     ));
                 }
+                let has_alpha = info
+                    .extra_channels
+                    .iter()
+                    .any(|channel| channel.ec_type == jxl::api::ExtraChannel::Alpha)
+                    || decoder
+                        .current_pixel_format()
+                        .is_some_and(|format| format.color_type.has_alpha());
                 let (width, height) = info.size;
                 let width = u32::try_from(width).map_err(|_| {
                     invalid_image(path, format!("JPEG XL width {width} is too large"))
@@ -2774,7 +2842,7 @@ fn probe_jxl(file: File, path: &Path) -> Result<ImageDimensions, ProbeError> {
                 let height = u32::try_from(height).map_err(|_| {
                     invalid_image(path, format!("JPEG XL height {height} is too large"))
                 })?;
-                return Ok(ImageDimensions::new(width, height)?);
+                return Ok((ImageDimensions::new(width, height)?, has_alpha));
             }
             Ok(jxl::api::Event::NeedMoreInput { .. }) => {
                 let remaining = reader.available_bytes().map_err(|source| ProbeError::Io {
@@ -2821,6 +2889,25 @@ pub fn probe_image(path: &Path) -> Result<ProbedImage, ProbeError> {
     let format = resolve_sniffed_input(&mut file, path, sniffed)?.format;
 
     probe_opened_image(file, path, format)
+}
+
+/// Probes a still image's headers together with its alpha signal.
+///
+/// # Errors
+///
+/// Same failures as [`probe_image`], plus animated inputs are rejected by the
+/// per-format header probe exactly as they are for the still-image pipeline.
+pub fn probe_image_with_alpha(path: &Path) -> Result<ProbedImageWithAlpha, ProbeError> {
+    let mut file = File::open(path).map_err(|source| ProbeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let (prefix, len) = read_magic_prefix(&mut file, path)?;
+    let header_slice = prefix.get(..len).unwrap_or(&prefix);
+    let sniffed = sniff_magic_format(header_slice, false)
+        .ok_or_else(|| invalid_image(path, UNRECOGNIZED_MAGIC_REASON))?;
+    let format = resolve_sniffed_input(&mut file, path, sniffed)?.format;
+    probe_opened_image_with_alpha(file, path, format)
 }
 
 /// Validates a single image file or mixed image folder at the boundary against live host
@@ -3094,6 +3181,14 @@ fn prepare_directory_batch(
 }
 
 fn probe_directory_entry(path: &Path) -> Result<Option<ProbedImage>, ProbeError> {
+    Ok(probe_directory_entry_with_alpha(path)?.map(ProbedImageWithAlpha::image))
+}
+
+/// Directory-entry variant of [`probe_image_with_alpha`] with the same skip
+/// policy as [`probe_directory_entry`] (hidden files and subdirectories).
+pub(crate) fn probe_directory_entry_with_alpha(
+    path: &Path,
+) -> Result<Option<ProbedImageWithAlpha>, ProbeError> {
     let is_hidden = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -3119,7 +3214,7 @@ fn probe_directory_entry(path: &Path) -> Result<Option<ProbedImage>, ProbeError>
     let strict_ambiguous = !has_any_extension(path, KNOWN_IMAGE_EXTENSIONS);
     if let Some(sniffed) = sniff_magic_format(header_slice, strict_ambiguous) {
         let resolved = resolve_sniffed_input(&mut file, path, sniffed)?;
-        return match probe_opened_image(file, path, resolved.format) {
+        return match probe_opened_image_with_alpha(file, path, resolved.format) {
             Ok(probed) => Ok(Some(probed)),
             Err(err) => {
                 // An unreadable file is an I/O failure, not an unknown image: the

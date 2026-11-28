@@ -1739,7 +1739,7 @@ enum PreparedFrame {
 fn prepare_frame(
     format: VideoContainerFormat,
     quality: VideoQuality,
-    job: &AnimJob,
+    job: AnimJob,
 ) -> Result<PreparedFrame, PipelineError> {
     let w = u16::try_from(job.info.width).unwrap_or(u16::MAX);
     let h = u16::try_from(job.info.height).unwrap_or(u16::MAX);
@@ -1747,7 +1747,7 @@ fn prepare_frame(
         let mut frame = if job.info.channels == 4 {
             // GIF stores a one-bit transparency mask; `from_rgba_speed`
             // selects a transparent palette index for zero-alpha pixels.
-            let mut rgba = job.rgb.clone();
+            let mut rgba = job.rgb;
             gif::Frame::from_rgba_speed(w, h, &mut rgba, gif_speed(quality))
         } else {
             gif::Frame::from_rgb_speed(w, h, &job.rgb, gif_speed(quality))
@@ -1853,7 +1853,7 @@ fn spawn_animation_workers<'scope>(
                         let info = job.info;
                         let prepared =
                             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                prepare_frame(format, quality, &job)
+                                prepare_frame(format, quality, job)
                             })) {
                                 Ok(Ok(frame)) => frame,
                                 Ok(Err(err)) => PreparedFrame::Failed(err.to_string()),
@@ -1893,8 +1893,49 @@ where
         &mut dyn FnMut(AnimFrameInfo, &[u8]) -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError>,
 {
+    encode_animation_stream_bounded(
+        format,
+        quality,
+        worker_threads,
+        loop_count,
+        file,
+        u64::MAX,
+        1,
+        produce,
+    )
+}
+
+/// Bounded variant used by frame stacks. `max_inflight_bytes` caps the total
+/// raw pixels held by the admission queue, prepared jobs and pending writes;
+/// `bytes_per_frame` scales that budget to the plan's actual frame size so an
+/// 8K stack cannot multiply a small worker count into gigabytes of RAM.
+#[allow(clippy::too_many_arguments)] // Flat budget knobs keep the default wrapper zero-cost.
+pub(crate) fn encode_animation_stream_bounded<P>(
+    format: VideoContainerFormat,
+    quality: VideoQuality,
+    worker_threads: usize,
+    loop_count: AnimationLoop,
+    file: &File,
+    max_inflight_bytes: u64,
+    bytes_per_frame: u64,
+    produce: P,
+) -> Result<u64, PipelineError>
+where
+    P: FnOnce(
+        &mut dyn FnMut(AnimFrameInfo, &[u8]) -> Result<(), PipelineError>,
+    ) -> Result<(), PipelineError>,
+{
     let workers = worker_threads.clamp(1, MAX_ANIM_WORKERS);
-    let capacity = workers.saturating_mul(2).max(1);
+    // Two admission slots per worker (one queued, one being prepared) plus one
+    // reserved for the ordered writer. Every slot costs one raw frame.
+    let mut capacity = workers.saturating_mul(2).max(1);
+    if max_inflight_bytes != u64::MAX {
+        let frame_bytes = bytes_per_frame.max(1);
+        let slot_budget = max_inflight_bytes / frame_bytes.saturating_mul(2);
+        let slot_budget = usize::try_from(slot_budget).unwrap_or(usize::MAX).max(1);
+        capacity = capacity.min(slot_budget);
+    }
+    let workers = workers.min(capacity).max(1);
     thread::scope(|scope| -> Result<u64, PipelineError> {
         let (job_tx, job_rx) = mpsc::sync_channel::<AnimJob>(capacity);
         let (ready_tx, ready_rx) =

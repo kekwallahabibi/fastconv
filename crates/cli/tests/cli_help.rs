@@ -50,6 +50,7 @@ fn global_help_is_available_through_all_entry_points() -> Result<(), String> {
         "probe ",
         "convert ",
         "frames ",
+        "stack ",
         "audio ",
         "remux ",
         "video ",
@@ -86,7 +87,9 @@ fn version_flag_reports_version() -> Result<(), String> {
 #[test]
 fn every_subcommand_has_dedicated_help() -> Result<(), String> {
     let global = stdout(&["--help"])?;
-    for command in ["probe", "convert", "frames", "audio", "remux", "video"] {
+    for command in [
+        "probe", "convert", "frames", "stack", "audio", "remux", "video",
+    ] {
         let by_flag = stdout(&[command, "--help"])?;
         assert_eq!(stdout(&[command, "-h"])?, by_flag, "{command} -h differs");
         assert_eq!(
@@ -230,6 +233,35 @@ fn frames_help_documents_selection_and_backend_rules() -> Result<(), String> {
         "vulkan",
     ] {
         assert!(text.contains(needle), "frames help missing '{needle}'");
+    }
+    Ok(())
+}
+
+#[test]
+fn stack_help_documents_flags_and_backend_rules() -> Result<(), String> {
+    let text = stdout(&["stack", "--help"])?;
+    for needle in [
+        "fastconv stack <image-dir | img1 img2 ...> <target>",
+        "[--fps <N>] [--to <gif|webp>] [--quality <0..=100>]",
+        "[--loop <infinite|N>] [--threads <N>] [--backend <auto|cpu>]",
+        "--fps <N>",
+        "--to <gif|webp>",
+        "--quality <0..=100>",
+        "--loop <infinite|N>",
+        "--threads <N>",
+        "--backend <auto|cpu>",
+        "-h, --help",
+        "frame_2 before frame_10",
+        "duplicate paths are kept",
+        "default 15",
+        "1e-6..=1_000_000",
+        "default 80",
+        "1..=65535",
+        "no silent CPU fallback",
+        "nvenc",
+        "vulkan",
+    ] {
+        assert!(text.contains(needle), "stack help missing '{needle}'");
     }
     Ok(())
 }
