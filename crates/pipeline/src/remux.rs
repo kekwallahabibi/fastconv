@@ -20,7 +20,7 @@ use containr::Packet;
 use containr::mkv::DocType;
 use containr::mp4::Brand;
 use fastconv_domain::{
-    HardwareBackend, VideoCodec, VideoContainerFormat, VideoRemuxItem, VideoRemuxPlan,
+    DomainError, HardwareBackend, VideoCodec, VideoContainerFormat, VideoRemuxItem, VideoRemuxPlan,
     VideoRemuxReport,
 };
 
@@ -351,11 +351,11 @@ fn remux_file(item: &VideoRemuxItem, target: &File) -> Result<(), PipelineError>
         if !stream.codec().supported_in(output) {
             return Err(remux_failed(
                 item.target(),
-                format!(
-                    "codec {} cannot be carried by {}",
-                    stream.codec(),
-                    output.label()
-                ),
+                DomainError::UnsupportedVideoCodec {
+                    codec: stream.codec(),
+                    container: output,
+                }
+                .to_string(),
             ));
         }
     }
@@ -1850,7 +1850,7 @@ mod container_tests {
             Err(err) => err,
         };
         assert!(
-            err.to_string().contains("MJPEG") && err.to_string().contains("MP4"),
+            err.to_string().contains("mjpeg") && err.to_string().contains("MP4"),
             "unexpected error: {err}"
         );
 

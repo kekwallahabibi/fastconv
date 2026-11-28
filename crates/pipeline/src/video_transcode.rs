@@ -26,7 +26,7 @@ use flacenc::source::{Fill, FrameBuf};
 use fastconv_domain::video::VideoDecodePaths;
 use fastconv_domain::{
     AnimationMeta, AudioBitrate, AudioChannels, AudioEncodeConfig, AudioSampleRate,
-    AudioTrackAction, GpuBackend, HardwareBackend, TargetAudioCodec, VideoCodec,
+    AudioTrackAction, DomainError, GpuBackend, HardwareBackend, TargetAudioCodec, VideoCodec,
     VideoContainerFormat, VideoDecodeMode, VideoEncodeMode, VideoTrackAction, VideoTranscodeItem,
     VideoTranscodePlan, VideoTranscodeReport,
 };
@@ -3381,7 +3381,11 @@ fn transcode_file(
     let rebase = needs_rebase.then_some(origin);
     let unsupported = |codec: VideoCodec| PipelineError::RemuxFailed {
         path: target.to_path_buf(),
-        reason: format!("codec {codec} cannot be carried by {}", format.label()),
+        reason: DomainError::UnsupportedVideoCodec {
+            codec,
+            container: format,
+        }
+        .to_string(),
     };
 
     // Partition once, without cloning packets once per track.

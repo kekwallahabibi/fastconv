@@ -32,6 +32,15 @@ fn parse_target_format(value: &str) -> Result<VideoContainerFormat, String> {
     })
 }
 
+/// `fastconv video` also accepts animated GIF/WebP targets, unlike remux.
+fn parse_video_target_format(value: &str) -> Result<VideoContainerFormat, String> {
+    VideoContainerFormat::from_extension(value).ok_or_else(|| {
+        format!(
+            "unknown video format '{value}' (expected mp4, mkv, webm, mov, avi, ts, gif, or webp)"
+        )
+    })
+}
+
 pub(crate) const REMUX_HELP: &str = r"fastconv remux - losslessly remux video containers
 
 Usage:
@@ -266,7 +275,7 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
                 if to.is_some() {
                     return Err(duplicate_flag("--to"));
                 }
-                to = Some(parse_target_format(flag_value(args, index, "--to")?)?);
+                to = Some(parse_video_target_format(flag_value(args, index, "--to")?)?);
                 index += 2;
             }
             "--vcodec" => {

@@ -18,6 +18,11 @@ use fastconv_domain::{
 
 use crate::{ProbeError, available_cpu_threads, canonical_or_parent};
 
+/// Target containers accepted by `fastconv video` (animation included).
+const VIDEO_TARGETS: &str = "mp4, mkv, webm, mov, avi, ts, gif, or webp";
+/// Target containers accepted by `fastconv remux` (stream copy only).
+const REMUX_TARGETS: &str = "mp4, mkv, webm, mov, avi, or ts";
+
 /// Three 188-byte TS or 192-byte M2TS packets, plus EBML/`ftyp`/RIFF headers.
 const MAGIC_PREFIX_BYTES: usize = 576;
 
@@ -2068,6 +2073,7 @@ fn resolve_single_target(
     source: &Path,
     target: &Path,
     to: Option<VideoContainerFormat>,
+    expected: &'static str,
 ) -> Result<(PathBuf, VideoContainerFormat), ProbeError> {
     let target_is_dir = target.is_dir()
         || target
@@ -2087,13 +2093,13 @@ fn resolve_single_target(
     let ext = target.extension().and_then(|e| e.to_str()).ok_or_else(|| {
         ProbeError::UnsupportedTargetFormat {
             path: target.to_path_buf(),
-            expected: "mp4, mkv, webm, mov, avi, or ts",
+            expected,
         }
     })?;
     let inferred = VideoContainerFormat::from_extension(ext).ok_or_else(|| {
         ProbeError::UnsupportedTargetFormat {
             path: target.to_path_buf(),
-            expected: "mp4, mkv, webm, mov, avi, or ts",
+            expected,
         }
     })?;
     if let Some(explicit) = to
@@ -2116,7 +2122,7 @@ fn prepare_directory_batch(
     if !format.supports_remux() {
         return Err(ProbeError::UnsupportedTargetFormat {
             path: target_dir.to_path_buf(),
-            expected: "mp4, mkv, webm, mov, avi, or ts",
+            expected: REMUX_TARGETS,
         });
     }
     if !target_dir.is_dir() {
@@ -2228,7 +2234,7 @@ pub fn prepare_video_batch(
         if !format.supports_remux() {
             return Err(ProbeError::UnsupportedTargetFormat {
                 path: target.to_path_buf(),
-                expected: "mp4, mkv, webm, mov, avi, or ts",
+                expected: REMUX_TARGETS,
             });
         }
         return prepare_directory_batch(source, target, format, threads);
@@ -2237,11 +2243,11 @@ pub fn prepare_video_batch(
         return Err(ProbeError::NotAFileOrDirectory(source.to_path_buf()));
     }
 
-    let (resolved_target, format) = resolve_single_target(source, target, to)?;
+    let (resolved_target, format) = resolve_single_target(source, target, to, REMUX_TARGETS)?;
     if !format.supports_remux() {
         return Err(ProbeError::UnsupportedTargetFormat {
             path: resolved_target,
-            expected: "mp4, mkv, webm, mov, avi, or ts",
+            expected: REMUX_TARGETS,
         });
     }
     reject_alias_collision(source, &resolved_target)?;
@@ -2353,6 +2359,35 @@ impl VideoTranscodeOptions {
     }
 }
 
+/// Rejects an explicit `--vcodec`/`--acodec` that the resolved container cannot
+/// carry. Called immediately after target resolution so no directory, probe or
+/// decoded frame is created for a request that can never be valid.
+fn validate_explicit_codecs_for_container(
+    video_codec: Option<RequestedVideoCodec>,
+    audio_codec: Option<RequestedAudioCodec>,
+    container: VideoContainerFormat,
+) -> Result<(), ProbeError> {
+    if let Some(RequestedVideoCodec::Encode(codec)) = video_codec
+        && !codec.supported_in(container)
+    {
+        return Err(DomainError::UnsupportedVideoCodec {
+            codec: codec.as_video_codec(),
+            container,
+        }
+        .into());
+    }
+    if let Some(RequestedAudioCodec::Encode(codec)) = audio_codec
+        && !codec.supported_in(container)
+    {
+        return Err(DomainError::UnsupportedVideoCodec {
+            codec: codec.as_video_codec(),
+            container,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Builds a validated [`VideoTranscodePlan`] from CLI inputs.
 ///
 /// # Errors
@@ -2455,6 +2490,7 @@ pub fn prepare_video_transcode_batch_with_options(
     let mut specs: Vec<(PathBuf, PathBuf)> = Vec::new();
     let output_format = if source_meta.is_dir() {
         let format = to.ok_or_else(ProbeError::requires_to_for_video_directory)?;
+        validate_explicit_codecs_for_container(video_codec, audio_codec, format)?;
         if !target.is_dir() {
             if fs::metadata(target).is_ok() {
                 return Err(ProbeError::TargetNotADirectory(target.to_path_buf()));
@@ -2492,7 +2528,8 @@ pub fn prepare_video_transcode_batch_with_options(
         }
         format
     } else if source_meta.is_file() {
-        let (resolved, format) = resolve_single_target(source, target, to)?;
+        let (resolved, format) = resolve_single_target(source, target, to, VIDEO_TARGETS)?;
+        validate_explicit_codecs_for_container(video_codec, audio_codec, format)?;
         specs.push((source.to_path_buf(), resolved));
         format
     } else {

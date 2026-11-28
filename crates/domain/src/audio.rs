@@ -78,6 +78,19 @@ pub enum AudioOutputFormat {
 }
 
 impl AudioOutputFormat {
+    /// Every audio output container, in CLI help order.
+    pub const ALL: [Self; 9] = [
+        Self::Wav,
+        Self::Flac,
+        Self::Opus,
+        Self::Ogg,
+        Self::Mp3,
+        Self::Aac,
+        Self::M4a,
+        Self::Alac,
+        Self::Aiff,
+    ];
+
     #[must_use]
     pub const fn extension(self) -> &'static str {
         match self {
@@ -103,6 +116,39 @@ impl AudioOutputFormat {
             Self::Aac => "AAC",
             Self::M4a => "M4A (AAC)",
             Self::Alac => "ALAC (M4A)",
+            Self::Aiff => "AIFF",
+        }
+    }
+
+    /// CLI-facing container name, free of any codec qualifier.
+    #[must_use]
+    pub const fn cli_name(self) -> &'static str {
+        match self {
+            Self::Wav => "wav",
+            Self::Flac => "flac",
+            Self::Opus => "opus",
+            Self::Ogg => "ogg",
+            Self::Mp3 => "mp3",
+            Self::Aac => "aac",
+            Self::M4a => "m4a",
+            Self::Alac => "alac",
+            Self::Aiff => "aiff",
+        }
+    }
+
+    /// Neutral container label for diagnostics: never misleading pairs such as
+    /// "M4A (AAC)" or "Ogg Vorbis" when an explicit codec is rejected.
+    #[must_use]
+    pub const fn container_label(self) -> &'static str {
+        match self {
+            Self::Wav => "WAV",
+            Self::Flac => "FLAC",
+            Self::Opus => "Opus",
+            Self::Ogg => "Ogg",
+            Self::Mp3 => "MP3",
+            Self::Aac => "AAC",
+            Self::M4a => "M4A",
+            Self::Alac => "ALAC",
             Self::Aiff => "AIFF",
         }
     }
@@ -185,16 +231,6 @@ impl AudioOutputFormat {
         }
     }
 
-    /// Human-readable list of the codecs valid for this container.
-    #[must_use]
-    pub const fn supported_codec_list(self) -> &'static str {
-        match self {
-            Self::Ogg => "vorbis, opus, or flac",
-            Self::M4a => "aac or alac",
-            _ => self.default_codec().label(),
-        }
-    }
-
     /// Label for the resolved container/codec pair, used in diagnostics so an
     /// explicit `--codec` is never reported under the container's default name.
     #[must_use]
@@ -226,7 +262,6 @@ impl AudioOutputFormat {
             Some(codec) => Err(DomainError::UnsupportedAudioCodecForFormat {
                 format: self,
                 codec,
-                supported: self.supported_codec_list(),
             }),
         }
     }
@@ -256,6 +291,17 @@ pub enum AudioTargetCodec {
 }
 
 impl AudioTargetCodec {
+    /// Every audio codec, in CLI help order.
+    pub const ALL: [Self; 7] = [
+        Self::Pcm,
+        Self::Flac,
+        Self::Opus,
+        Self::Vorbis,
+        Self::Mp3,
+        Self::Aac,
+        Self::Alac,
+    ];
+
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -266,6 +312,35 @@ impl AudioTargetCodec {
             Self::Mp3 => "MP3",
             Self::Aac => "AAC",
             Self::Alac => "ALAC",
+        }
+    }
+
+    /// CLI-facing codec name, used in diagnostics and help messages.
+    #[must_use]
+    pub const fn cli_name(self) -> &'static str {
+        match self {
+            Self::Pcm => "pcm",
+            Self::Flac => "flac",
+            Self::Opus => "opus",
+            Self::Vorbis => "vorbis",
+            Self::Mp3 => "mp3",
+            Self::Aac => "aac",
+            Self::Alac => "alac",
+        }
+    }
+
+    /// Containers that can carry this codec, in canonical order. This is the
+    /// reverse of [`AudioOutputFormat::supported_codecs`]; both must agree.
+    #[must_use]
+    pub const fn supported_formats(self) -> &'static [AudioOutputFormat] {
+        match self {
+            Self::Pcm => &[AudioOutputFormat::Wav, AudioOutputFormat::Aiff],
+            Self::Flac => &[AudioOutputFormat::Flac, AudioOutputFormat::Ogg],
+            Self::Opus => &[AudioOutputFormat::Opus, AudioOutputFormat::Ogg],
+            Self::Vorbis => &[AudioOutputFormat::Ogg],
+            Self::Mp3 => &[AudioOutputFormat::Mp3],
+            Self::Aac => &[AudioOutputFormat::Aac, AudioOutputFormat::M4a],
+            Self::Alac => &[AudioOutputFormat::M4a, AudioOutputFormat::Alac],
         }
     }
 
@@ -1139,11 +1214,7 @@ impl AudioExecutionMode {
                     (AudioOutputFormat::Aiff, AudioTargetCodec::Pcm) => Self::CpuAiff,
                     // `format.resolve_codec` already accepts only the pairs above.
                     _ => {
-                        return Err(DomainError::UnsupportedAudioCodecForFormat {
-                            format,
-                            codec,
-                            supported: format.supported_codec_list(),
-                        });
+                        return Err(DomainError::UnsupportedAudioCodecForFormat { format, codec });
                     }
                 })
             }
@@ -2137,22 +2208,35 @@ mod tests {
             (
                 AudioOutputFormat::Ogg,
                 AudioTargetCodec::Aac,
-                "vorbis, opus, or flac",
+                "vorbis, opus, flac",
+                "aac, m4a",
             ),
             (
                 AudioOutputFormat::Ogg,
                 AudioTargetCodec::Pcm,
-                "vorbis, opus, or flac",
+                "vorbis, opus, flac",
+                "wav, aiff",
             ),
             (
                 AudioOutputFormat::M4a,
                 AudioTargetCodec::Opus,
-                "aac or alac",
+                "aac, alac",
+                "opus, ogg",
             ),
-            (AudioOutputFormat::Flac, AudioTargetCodec::Alac, "FLAC"),
-            (AudioOutputFormat::Wav, AudioTargetCodec::Flac, "PCM"),
+            (
+                AudioOutputFormat::Flac,
+                AudioTargetCodec::Alac,
+                "flac",
+                "m4a, alac",
+            ),
+            (
+                AudioOutputFormat::Wav,
+                AudioTargetCodec::Flac,
+                "pcm",
+                "flac, ogg",
+            ),
         ];
-        for (format, codec, expected) in invalid {
+        for (format, codec, expected_codecs, expected_containers) in invalid {
             let err = format
                 .resolve_codec(Some(codec))
                 .err()
@@ -2161,14 +2245,12 @@ mod tests {
                 matches!(err, DomainError::UnsupportedAudioCodecForFormat { .. }),
                 "{format} {codec}: {err}"
             );
-            assert!(err.to_string().contains(expected), "{err}");
+            let msg = err.to_string();
+            assert!(msg.contains(expected_codecs), "{msg}");
+            assert!(msg.contains(expected_containers), "{msg}");
             assert_eq!(
                 AudioExecutionMode::resolve_with_codec(format, Some(codec), HardwareBackend::Cpu),
-                Err(DomainError::UnsupportedAudioCodecForFormat {
-                    format,
-                    codec,
-                    supported: format.supported_codec_list(),
-                })
+                Err(DomainError::UnsupportedAudioCodecForFormat { format, codec })
             );
         }
         Ok(())
@@ -2680,5 +2762,55 @@ mod tests {
             Err(DomainError::UnsupportedAudioRateControl { .. })
         ));
         Ok(())
+    }
+
+    #[test]
+    fn container_codec_matrix_is_symmetric_across_all_pairs() {
+        for format in AudioOutputFormat::ALL {
+            for codec in AudioTargetCodec::ALL {
+                let forward = format.supported_codecs().contains(&codec);
+                let reverse = codec.supported_formats().contains(&format);
+                let resolved = format.resolve_codec(Some(codec)).is_ok();
+                assert_eq!(
+                    forward, reverse,
+                    "{format}/{codec}: forward and reverse lists disagree"
+                );
+                assert_eq!(
+                    forward, resolved,
+                    "{format}/{codec}: resolve_codec disagrees with the matrix"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_container_codec_error_is_bidirectional() {
+        let cases: &[(AudioOutputFormat, AudioTargetCodec, &[&str])] = &[
+            (
+                AudioOutputFormat::M4a,
+                AudioTargetCodec::Mp3,
+                &["aac", "alac", "mp3"],
+            ),
+            (
+                AudioOutputFormat::Ogg,
+                AudioTargetCodec::Aac,
+                &["vorbis", "opus", "flac", "aac", "m4a"],
+            ),
+        ];
+        for &(format, codec, expected) in cases {
+            let err = format
+                .resolve_codec(Some(codec))
+                .err()
+                .ok_or(DomainError::EmptyField("audio.codec"))
+                .unwrap_or_else(|_| unreachable!());
+            let text = err.to_string();
+            for &needle in expected {
+                assert!(text.contains(needle), "{text}");
+            }
+        }
+        assert_eq!(AudioOutputFormat::Alac.cli_name(), "alac");
+        assert_eq!(AudioOutputFormat::Alac.container_label(), "ALAC");
+        assert_eq!(AudioOutputFormat::M4a.container_label(), "M4A");
+        assert_eq!(AudioTargetCodec::Alac.cli_name(), "alac");
     }
 }
