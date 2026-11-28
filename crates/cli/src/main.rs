@@ -28,7 +28,7 @@ const GLOBAL_HELP: &str = r"Usage:
   fastconv remux <source> <target> [--to <mp4|mkv|webm|mov|avi|ts>] [--threads <N>]
   fastconv video <source> <target> [--to <format>] [--vcodec <codec>]
                  [--acodec <codec>] [--quality <0..=100> | --vbitrate <rate>]
-                 [--abitrate <rate>] [--asample-rate <Hz>] [--achannels <N>]
+                 [--abitrate <rate>] [--asample-rate <Hz>] [--achannels <N>] [--add-audio <path>] [--replace-audio]
                  [--threads <N>] [--backend <name>] [--hwdecode <auto|cpu|nvdec>]
   fastconv help [command]
   fastconv -V, --version

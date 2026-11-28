@@ -6,7 +6,10 @@ use std::time::Duration;
 #[cfg(feature = "serde")]
 use serde::Serialize;
 
-use crate::{DomainError, GpuBackend, HardwareBackend, PathRole, u64_to_f64};
+use crate::{
+    AudioInputFormat, AudioStreamInfo, DomainError, GpuBackend, HardwareBackend, PathRole,
+    u64_to_f64,
+};
 
 /// Video container formats supported for remuxing and transcoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -108,6 +111,21 @@ impl VideoContainerFormat {
             Self::Gif | Self::Webp => None,
             Self::Webm => Some(TargetAudioCodec::Opus),
             Self::Mp4 | Self::Mkv | Self::Mov | Self::Avi | Self::Ts => Some(TargetAudioCodec::Aac),
+        }
+    }
+
+    /// Default codec for an audio track added with `--add-audio`.
+    ///
+    /// Matroska-family containers use Opus (their native, patent-free codec),
+    /// while MP4/MOV/AVI/TS use AAC. Animation containers have no audio at all.
+    /// This is deliberately separate from [`Self::default_audio_codec`] so the
+    /// established per-container transcode default stays unchanged.
+    #[must_use]
+    pub const fn default_added_audio_codec(self) -> Option<TargetAudioCodec> {
+        match self {
+            Self::Mp4 | Self::Mov | Self::Avi | Self::Ts => Some(TargetAudioCodec::Aac),
+            Self::Mkv | Self::Webm => Some(TargetAudioCodec::Opus),
+            Self::Gif | Self::Webp => None,
         }
     }
 
@@ -1611,6 +1629,103 @@ impl fmt::Display for AudioTrackAction {
     }
 }
 
+/// How an external audio track relates to the source video's own audio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub enum ExternalAudioMode {
+    /// Keep the source audio tracks and add the external track after them.
+    Append,
+    /// Drop every source audio track and keep only the external track.
+    Replace,
+}
+
+impl fmt::Display for ExternalAudioMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Append => "append",
+            Self::Replace => "replace",
+        })
+    }
+}
+
+/// A validated external audio file to mux into a video transcode item.
+///
+/// The probe boundary resolves the input format and stream metadata exactly
+/// once; from here on only a validated codec/container pair can be represented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAudioTrack {
+    source: PathBuf,
+    input_format: AudioInputFormat,
+    stream: AudioStreamInfo,
+    config: AudioEncodeConfig,
+    mode: ExternalAudioMode,
+}
+
+impl ExternalAudioTrack {
+    /// Creates a validated external audio track.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::EmptyPath`] for an empty source and
+    /// [`DomainError::UnsupportedVideoCodec`] when `container` cannot carry
+    /// audio or `config.codec()` is not storable in it.
+    pub fn new(
+        source: PathBuf,
+        input_format: AudioInputFormat,
+        stream: AudioStreamInfo,
+        config: AudioEncodeConfig,
+        mode: ExternalAudioMode,
+        container: VideoContainerFormat,
+    ) -> Result<Self, DomainError> {
+        if source.as_os_str().is_empty() {
+            return Err(DomainError::EmptyPath(PathRole::Source));
+        }
+        if !container.supports_audio() || !config.codec().supported_in(container) {
+            return Err(DomainError::UnsupportedVideoCodec {
+                codec: config.codec().as_video_codec(),
+                container,
+            });
+        }
+        Ok(Self {
+            source,
+            input_format,
+            stream,
+            config,
+            mode,
+        })
+    }
+
+    #[must_use]
+    pub fn source(&self) -> &Path {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn input_format(&self) -> AudioInputFormat {
+        self.input_format
+    }
+
+    #[must_use]
+    pub const fn stream(&self) -> AudioStreamInfo {
+        self.stream
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> AudioEncodeConfig {
+        self.config
+    }
+
+    #[must_use]
+    pub const fn codec(&self) -> TargetAudioCodec {
+        self.config.codec()
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> ExternalAudioMode {
+        self.mode
+    }
+}
+
 /// Kind of a stream inside a container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
@@ -2005,21 +2120,18 @@ pub struct VideoTranscodeItem {
     video_action: VideoTrackAction,
     audio_action: AudioTrackAction,
     decode_mode: VideoDecodeMode,
+    external_audio: Option<ExternalAudioTrack>,
 }
 
 impl VideoTranscodeItem {
     /// Creates a transcode item after rejecting codec/container mismatches.
     ///
+    /// Equivalent to [`Self::with_external_audio`] with no external track.
+    ///
     /// # Errors
     ///
-    /// Returns [`DomainError::EmptyPath`] or [`DomainError::IdenticalSourceAndTarget`]
-    /// for invalid paths, [`DomainError::UnsupportedVideoCodec`] when a copied or
-    /// encoded track cannot be carried by `output_format`, and
-    /// [`DomainError::UnsupportedVideoPipeline`] when `decode_mode` is NVDEC but
-    /// the encode backend or source codec cannot support it.
-    // Every validated input is passed explicitly at the probe boundary; the
-    // decode-mode invariant belongs with the other track actions.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    /// See [`Self::with_external_audio`].
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         source: PathBuf,
         target: PathBuf,
@@ -2030,6 +2142,46 @@ impl VideoTranscodeItem {
         audio_action: AudioTrackAction,
         decode_mode: VideoDecodeMode,
     ) -> Result<Self, DomainError> {
+        Self::with_external_audio(
+            source,
+            target,
+            input_format,
+            output_format,
+            streams,
+            video_action,
+            audio_action,
+            decode_mode,
+            None,
+        )
+    }
+
+    /// Creates a transcode item that may carry one validated external audio
+    /// track, after rejecting codec/container/action mismatches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::EmptyPath`] or [`DomainError::IdenticalSourceAndTarget`]
+    /// for invalid paths, [`DomainError::UnsupportedVideoCodec`] when a copied or
+    /// encoded track cannot be carried by `output_format`,
+    /// [`DomainError::ConflictingAudioEncodeOptions`] when `--replace-audio` is
+    /// combined with a non-drop source audio action (or `--add-audio` with a
+    /// dropped source audio action), and [`DomainError::UnsupportedVideoPipeline`]
+    /// when `decode_mode` is NVDEC but the encode backend or source codec cannot
+    /// support it.
+    // Every validated input is passed explicitly at the probe boundary; the
+    // decode-mode and external-track invariants belong with the other actions.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn with_external_audio(
+        source: PathBuf,
+        target: PathBuf,
+        input_format: VideoContainerFormat,
+        output_format: VideoContainerFormat,
+        streams: Vec<VideoStreamInfo>,
+        video_action: VideoTrackAction,
+        audio_action: AudioTrackAction,
+        decode_mode: VideoDecodeMode,
+        external_audio: Option<ExternalAudioTrack>,
+    ) -> Result<Self, DomainError> {
         if source.as_os_str().is_empty() {
             return Err(DomainError::EmptyPath(PathRole::Source));
         }
@@ -2038,6 +2190,33 @@ impl VideoTranscodeItem {
         }
         if source == target {
             return Err(DomainError::IdenticalSourceAndTarget(source));
+        }
+        if let Some(ext) = &external_audio {
+            if ext.source() == target {
+                return Err(DomainError::IdenticalSourceAndTarget(target));
+            }
+            if !output_format.supports_audio() || !ext.codec().supported_in(output_format) {
+                return Err(DomainError::UnsupportedVideoCodec {
+                    codec: ext.codec().as_video_codec(),
+                    container: output_format,
+                });
+            }
+            let conflicting = match ext.mode() {
+                ExternalAudioMode::Replace => audio_action != AudioTrackAction::Drop,
+                ExternalAudioMode::Append => audio_action == AudioTrackAction::Drop,
+            };
+            if conflicting {
+                return Err(DomainError::ConflictingAudioEncodeOptions {
+                    reason: match ext.mode() {
+                        ExternalAudioMode::Replace => {
+                            "--replace-audio requires source audio tracks to be dropped".to_owned()
+                        }
+                        ExternalAudioMode::Append => {
+                            "--add-audio requires source audio tracks to be kept".to_owned()
+                        }
+                    },
+                });
+            }
         }
 
         if decode_mode.is_nvdec() {
@@ -2153,6 +2332,7 @@ impl VideoTranscodeItem {
             video_action,
             audio_action,
             decode_mode,
+            external_audio,
         })
     }
 
@@ -2196,6 +2376,12 @@ impl VideoTranscodeItem {
     pub const fn decode_mode(&self) -> VideoDecodeMode {
         self.decode_mode
     }
+
+    /// Validated external audio track appended to or replacing source audio.
+    #[must_use]
+    pub fn external_audio(&self) -> Option<&ExternalAudioTrack> {
+        self.external_audio.as_ref()
+    }
 }
 
 /// Validated batch plan for video transcoding.
@@ -2212,9 +2398,12 @@ impl VideoTranscodePlan {
     ///
     /// Returns [`DomainError::EmptyBatch`] if `items` is empty, or
     /// [`DomainError::DuplicateTargetPath`] / [`DomainError::TargetOverwritesSource`].
-    /// A batch that mixes encoder backends (e.g. CPU and NVENC items) is rejected
-    /// with [`DomainError::UnsupportedVideoPipeline`]: the batch report carries a
-    /// single encoder backend, so a mixed batch would mislabel the other items.
+    /// An external audio track is a single-file operation: a batch with more
+    /// than one item or with a target that overwrites an external audio source
+    /// is rejected. A batch that mixes encoder backends (e.g. CPU and NVENC
+    /// items) is rejected with [`DomainError::UnsupportedVideoPipeline`]: the
+    /// batch report carries a single encoder backend, so a mixed batch would
+    /// mislabel the other items.
     pub fn new(
         items: Vec<VideoTranscodeItem>,
         worker_threads: NonZeroUsize,
@@ -2222,9 +2411,22 @@ impl VideoTranscodePlan {
         if items.is_empty() {
             return Err(DomainError::EmptyBatch);
         }
+        if items.iter().any(|item| item.external_audio().is_some()) && items.len() > 1 {
+            return Err(DomainError::UnsupportedVideoPipeline {
+                codec: VideoCodec::Unknown,
+                backend: HardwareBackend::Cpu,
+                reason: "--add-audio applies to exactly one video file; directory batches are not supported"
+                    .to_owned(),
+            });
+        }
         let mut targets = std::collections::HashSet::new();
-        let sources: std::collections::HashSet<PathBuf> =
+        let mut sources: std::collections::HashSet<PathBuf> =
             items.iter().map(|i| i.source().to_path_buf()).collect();
+        for item in &items {
+            if let Some(ext) = item.external_audio() {
+                sources.insert(ext.source().to_path_buf());
+            }
+        }
         for item in &items {
             if !targets.insert(item.target().to_path_buf()) {
                 return Err(DomainError::DuplicateTargetPath(
@@ -4283,5 +4485,316 @@ mod tests {
             }
         }
         assert!(!VideoCodec::TimedText.supported_in(VideoContainerFormat::Webm));
+    }
+
+    fn ext(
+        source: &str,
+        codec: TargetAudioCodec,
+        container: VideoContainerFormat,
+        mode: ExternalAudioMode,
+    ) -> Result<ExternalAudioTrack, DomainError> {
+        let stream = AudioStreamInfo::new(
+            NonZeroU16::new(2).ok_or(DomainError::EmptyField("test.channels"))?,
+            NonZeroU32::new(48_000).ok_or(DomainError::EmptyField("test.rate"))?,
+            None,
+            Some(1_920),
+        )?;
+        ExternalAudioTrack::new(
+            PathBuf::from(source),
+            crate::AudioInputFormat::Wav,
+            stream,
+            AudioEncodeConfig::default_for(codec),
+            mode,
+            container,
+        )
+    }
+
+    #[test]
+    fn default_added_audio_codec_matches_container_family() {
+        use VideoContainerFormat as C;
+        assert_eq!(
+            C::Mp4.default_added_audio_codec(),
+            Some(TargetAudioCodec::Aac)
+        );
+        assert_eq!(
+            C::Mov.default_added_audio_codec(),
+            Some(TargetAudioCodec::Aac)
+        );
+        assert_eq!(
+            C::Avi.default_added_audio_codec(),
+            Some(TargetAudioCodec::Aac)
+        );
+        assert_eq!(
+            C::Ts.default_added_audio_codec(),
+            Some(TargetAudioCodec::Aac)
+        );
+        assert_eq!(
+            C::Mkv.default_added_audio_codec(),
+            Some(TargetAudioCodec::Opus)
+        );
+        assert_eq!(
+            C::Webm.default_added_audio_codec(),
+            Some(TargetAudioCodec::Opus)
+        );
+        assert_eq!(C::Gif.default_added_audio_codec(), None);
+        assert_eq!(C::Webp.default_added_audio_codec(), None);
+        // The established transcode default is deliberately unchanged.
+        assert_eq!(C::Mkv.default_audio_codec(), Some(TargetAudioCodec::Aac));
+    }
+
+    #[test]
+    fn external_track_rejects_empty_source_and_unsupported_container() {
+        let err = ext(
+            "",
+            TargetAudioCodec::Aac,
+            VideoContainerFormat::Mp4,
+            ExternalAudioMode::Append,
+        );
+        assert_eq!(err, Err(DomainError::EmptyPath(PathRole::Source)));
+
+        for container in [VideoContainerFormat::Gif, VideoContainerFormat::Webp] {
+            let err = ext(
+                "song.wav",
+                TargetAudioCodec::Aac,
+                container,
+                ExternalAudioMode::Append,
+            );
+            assert_eq!(
+                err,
+                Err(DomainError::UnsupportedVideoCodec {
+                    codec: VideoCodec::Aac,
+                    container,
+                })
+            );
+        }
+        let err = ext(
+            "song.wav",
+            TargetAudioCodec::Vorbis,
+            VideoContainerFormat::Mp4,
+            ExternalAudioMode::Append,
+        );
+        assert!(matches!(
+            err,
+            Err(DomainError::UnsupportedVideoCodec { .. })
+        ));
+    }
+
+    #[test]
+    fn external_track_accessors_and_supported_matrix() -> Result<(), DomainError> {
+        for (container, codec) in [
+            (VideoContainerFormat::Mp4, TargetAudioCodec::Aac),
+            (VideoContainerFormat::Mp4, TargetAudioCodec::Opus),
+            (VideoContainerFormat::Mov, TargetAudioCodec::Pcm),
+            (VideoContainerFormat::Mkv, TargetAudioCodec::Vorbis),
+            (VideoContainerFormat::Webm, TargetAudioCodec::Opus),
+            (VideoContainerFormat::Avi, TargetAudioCodec::Mp3),
+            (VideoContainerFormat::Ts, TargetAudioCodec::Mp3),
+        ] {
+            let track = ext("song.wav", codec, container, ExternalAudioMode::Replace)?;
+            assert_eq!(track.source(), Path::new("song.wav"));
+            assert_eq!(track.input_format(), crate::AudioInputFormat::Wav);
+            assert_eq!(track.codec(), codec);
+            assert_eq!(track.config().codec(), codec);
+            assert_eq!(track.mode(), ExternalAudioMode::Replace);
+            assert_eq!(track.stream().channels().get(), 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    // One test covers every constructor rejection branch so the mode/action
+    // matrix stays visible side by side.
+    #[allow(clippy::too_many_lines)]
+    fn external_track_item_enforces_mode_and_audio_action() -> Result<(), DomainError> {
+        let streams = vec![stream(VideoCodec::H264, VideoStreamKind::Video)];
+        let append = ext(
+            "song.wav",
+            TargetAudioCodec::Aac,
+            VideoContainerFormat::Mp4,
+            ExternalAudioMode::Append,
+        )?;
+        let replace = ext(
+            "song.wav",
+            TargetAudioCodec::Aac,
+            VideoContainerFormat::Mp4,
+            ExternalAudioMode::Replace,
+        )?;
+
+        let with_append = VideoTranscodeItem::with_external_audio(
+            PathBuf::from("in.mp4"),
+            PathBuf::from("out.mp4"),
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            streams.clone(),
+            cpu_encode(TargetVideoCodec::H264),
+            AudioTrackAction::Copy,
+            VideoDecodeMode::Cpu,
+            Some(append.clone()),
+        )?;
+        assert_eq!(with_append.external_audio(), Some(&append));
+        assert!(
+            item(
+                "in.mp4",
+                "out.mp4",
+                VideoContainerFormat::Mp4,
+                VideoContainerFormat::Mp4,
+                streams.clone(),
+                cpu_encode(TargetVideoCodec::H264),
+                AudioTrackAction::Copy
+            )?
+            .external_audio()
+            .is_none()
+        );
+
+        let err = VideoTranscodeItem::with_external_audio(
+            PathBuf::from("in.mp4"),
+            PathBuf::from("out.mp4"),
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            streams.clone(),
+            cpu_encode(TargetVideoCodec::H264),
+            AudioTrackAction::Copy,
+            VideoDecodeMode::Cpu,
+            Some(replace),
+        );
+        assert!(matches!(
+            err,
+            Err(DomainError::ConflictingAudioEncodeOptions { .. })
+        ));
+
+        let err = VideoTranscodeItem::with_external_audio(
+            PathBuf::from("in.mp4"),
+            PathBuf::from("out.mp4"),
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            streams.clone(),
+            cpu_encode(TargetVideoCodec::H264),
+            AudioTrackAction::Drop,
+            VideoDecodeMode::Cpu,
+            Some(append.clone()),
+        );
+        assert!(matches!(
+            err,
+            Err(DomainError::ConflictingAudioEncodeOptions { .. })
+        ));
+
+        let err = VideoTranscodeItem::with_external_audio(
+            PathBuf::from("in.mp4"),
+            PathBuf::from("song.wav"),
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            streams.clone(),
+            cpu_encode(TargetVideoCodec::H264),
+            AudioTrackAction::Copy,
+            VideoDecodeMode::Cpu,
+            Some(append.clone()),
+        );
+        assert_eq!(
+            err,
+            Err(DomainError::IdenticalSourceAndTarget(PathBuf::from(
+                "song.wav"
+            )))
+        );
+
+        let with_replace = VideoTranscodeItem::with_external_audio(
+            PathBuf::from("in.mp4"),
+            PathBuf::from("out.mp4"),
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            streams,
+            cpu_encode(TargetVideoCodec::H264),
+            AudioTrackAction::Drop,
+            VideoDecodeMode::Cpu,
+            Some(ext(
+                "song.wav",
+                TargetAudioCodec::Aac,
+                VideoContainerFormat::Mp4,
+                ExternalAudioMode::Replace,
+            )?),
+        )?;
+        assert_eq!(
+            with_replace.external_audio().map(ExternalAudioTrack::mode),
+            Some(ExternalAudioMode::Replace)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_rejects_external_audio_batch_and_target_overwrite() -> Result<(), DomainError> {
+        let w = NonZeroUsize::new(2).ok_or(DomainError::EmptyBatch)?;
+        let append = ext(
+            "song.wav",
+            TargetAudioCodec::Aac,
+            VideoContainerFormat::Mp4,
+            ExternalAudioMode::Append,
+        )?;
+        let streams = vec![stream(VideoCodec::H264, VideoStreamKind::Video)];
+        let first = VideoTranscodeItem::with_external_audio(
+            PathBuf::from("a.mp4"),
+            PathBuf::from("out.mp4"),
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            streams.clone(),
+            cpu_encode(TargetVideoCodec::H264),
+            AudioTrackAction::Copy,
+            VideoDecodeMode::Cpu,
+            Some(append),
+        )?;
+        let second = item(
+            "b.mp4",
+            "b2.mp4",
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            streams,
+            cpu_encode(TargetVideoCodec::H264),
+            AudioTrackAction::Copy,
+        )?;
+        assert!(matches!(
+            VideoTranscodePlan::new(vec![first.clone(), second], w),
+            Err(DomainError::UnsupportedVideoPipeline { .. })
+        ));
+
+        let overwrite = VideoTranscodeItem::with_external_audio(
+            PathBuf::from("a.mp4"),
+            PathBuf::from("song.wav"),
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            vec![stream(VideoCodec::H264, VideoStreamKind::Video)],
+            cpu_encode(TargetVideoCodec::H264),
+            AudioTrackAction::Copy,
+            VideoDecodeMode::Cpu,
+            Some(ext(
+                "song.wav",
+                TargetAudioCodec::Aac,
+                VideoContainerFormat::Mp4,
+                ExternalAudioMode::Append,
+            )?),
+        );
+        // The item itself rejects an identical external source/target path.
+        assert_eq!(
+            overwrite,
+            Err(DomainError::IdenticalSourceAndTarget(PathBuf::from(
+                "song.wav"
+            )))
+        );
+
+        let distinct = VideoTranscodeItem::with_external_audio(
+            PathBuf::from("a.mp4"),
+            PathBuf::from("out.mp4"),
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            vec![stream(VideoCodec::H264, VideoStreamKind::Video)],
+            cpu_encode(TargetVideoCodec::H264),
+            AudioTrackAction::Copy,
+            VideoDecodeMode::Cpu,
+            Some(ext(
+                "song.wav",
+                TargetAudioCodec::Aac,
+                VideoContainerFormat::Mp4,
+                ExternalAudioMode::Append,
+            )?),
+        )?;
+        assert!(VideoTranscodePlan::new(vec![distinct], w).is_ok());
+        Ok(())
     }
 }

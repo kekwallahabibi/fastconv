@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 use crate::{duplicate_flag, flag_value, parse_threads};
 use fastconv_domain::{
-    AudioBitrate, AudioChannels, AudioEncodeOptions, AudioSampleRate, HardwareBackend,
-    HardwareDecodeBackend, TargetVideoCodec, VideoBitrate, VideoContainerFormat, VideoQuality,
-    VideoRateControl, u64_to_f64,
+    AudioBitrate, AudioChannels, AudioEncodeOptions, AudioSampleRate, ExternalAudioMode,
+    HardwareBackend, HardwareDecodeBackend, TargetVideoCodec, VideoBitrate, VideoContainerFormat,
+    VideoQuality, VideoRateControl, u64_to_f64,
 };
 use fastconv_probe::{
     RequestedVideoCodec, VideoTranscodeOptions, parse_requested_audio_codec,
@@ -166,6 +166,8 @@ pub(crate) struct VideoArgs {
     abitrate: Option<AudioBitrate>,
     asample_rate: Option<AudioSampleRate>,
     achannels: Option<AudioChannels>,
+    add_audio: Option<PathBuf>,
+    replace_audio: bool,
     threads: Option<NonZeroUsize>,
     backend: HardwareBackend,
     decode_backend: HardwareDecodeBackend,
@@ -183,6 +185,7 @@ Usage:
   fastconv video <source> <target> [--to <format>] [--vcodec <codec>]
                  [--acodec <codec>] [--quality <0..=100> | --vbitrate <rate>]
                  [--abitrate <rate>] [--asample-rate <Hz>] [--achannels <N>]
+                 [--add-audio <path>] [--replace-audio]
                  [--threads <N>] [--backend <name>] [--hwdecode <auto|cpu|nvdec>]
 
 Transcode audio/video tracks while converting between MP4/MOV, MKV, WebM, AVI,
@@ -210,6 +213,14 @@ Options:
                         specific limits apply)
   --achannels <N>       Audio channel count (requires audio re-encoding;
                         codec-specific limits apply)
+  --add-audio <path>    Add an external audio file as an extra track. Single
+                        video files only; supports WAV/FLAC/MP3/OGG/Opus/AAC/
+                        M4A/ALAC/AIFF and audio tracks inside video containers.
+                        Defaults to AAC in MP4/MOV/AVI/TS and Opus in MKV/WebM;
+                        --acodec overrides the codec. Cannot be combined with
+                        --acodec copy or none.
+  --replace-audio       Drop the source video's audio tracks and keep only the
+                        external track. Requires --add-audio.
   --threads <N>         Number of parallel workers
   --backend <name>      cpu (default: H.264/AV1/VP9/MJPEG/GIF/WebP and copy) or
                         nvenc (H.264/HEVC only; HEVC has no CPU encoder)
@@ -263,6 +274,8 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
     let mut abitrate = None;
     let mut asample_rate = None;
     let mut achannels = None;
+    let mut add_audio = None;
+    let mut replace_audio = false;
     let mut threads = None;
     let mut backend = None;
     let mut decode_backend = None;
@@ -361,6 +374,24 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
                 achannels = Some(AudioChannels::new(count).map_err(|err| err.to_string())?);
                 index += 2;
             }
+            "--add-audio" => {
+                if add_audio.is_some() {
+                    return Err(duplicate_flag("--add-audio"));
+                }
+                let raw = flag_value(args, index, "--add-audio")?;
+                if raw.is_empty() {
+                    return Err("--add-audio requires a non-empty path".to_owned());
+                }
+                add_audio = Some(PathBuf::from(raw));
+                index += 2;
+            }
+            "--replace-audio" => {
+                if replace_audio {
+                    return Err(duplicate_flag("--replace-audio"));
+                }
+                replace_audio = true;
+                index += 1;
+            }
             "--threads" => {
                 let (parsed, next) = parse_threads(args, index, threads.is_some())?;
                 threads = Some(parsed);
@@ -397,6 +428,9 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
                 .to_owned(),
         );
     };
+    if replace_audio && add_audio.is_none() {
+        return Err("--replace-audio requires --add-audio".to_owned());
+    }
 
     Ok(VideoCommand::Run(VideoArgs {
         source: PathBuf::from(*source),
@@ -409,6 +443,8 @@ pub(crate) fn parse_video_args(args: &[&str]) -> Result<VideoCommand, String> {
         abitrate,
         asample_rate,
         achannels,
+        add_audio,
+        replace_audio,
         threads,
         backend: backend.unwrap_or(HardwareBackend::Cpu),
         decode_backend: decode_backend.unwrap_or(HardwareDecodeBackend::Auto),
@@ -436,13 +472,22 @@ pub(crate) fn run_video(args: &VideoArgs) -> Result<(), String> {
         .map(parse_requested_audio_codec)
         .transpose()
         .map_err(|err| err.to_string())?;
+    let mut options = VideoTranscodeOptions::new(rate_control, audio_options);
+    if let Some(path) = &args.add_audio {
+        let mode = if args.replace_audio {
+            ExternalAudioMode::Replace
+        } else {
+            ExternalAudioMode::Append
+        };
+        options = options.with_external_audio(path.clone(), mode);
+    }
     let plan = prepare_video_transcode_batch_with_options(
         &args.source,
         &args.target,
         args.to,
         args.video_codec,
         audio_codec,
-        VideoTranscodeOptions::new(rate_control, audio_options),
+        options,
         args.backend,
         args.decode_backend,
         args.threads,
@@ -515,6 +560,8 @@ mod tests {
                     "--abitrate",
                     "--asample-rate",
                     "--achannels",
+                    "--add-audio",
+                    "--replace-audio",
                     "--threads",
                     "--backend",
                     "--hwdecode",
@@ -629,6 +676,8 @@ mod tests {
                 abitrate: None,
                 asample_rate: None,
                 achannels: None,
+                add_audio: None,
+                replace_audio: false,
                 threads: None,
                 backend: HardwareBackend::Cpu,
                 decode_backend: HardwareDecodeBackend::Auto,
@@ -955,6 +1004,61 @@ mod tests {
                     "{flag} with --acodec {codec}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn parses_add_audio_and_replace_audio_flags() -> Result<(), String> {
+        let VideoCommand::Run(append) =
+            parse_video_args(&["in.mp4", "out.mp4", "--add-audio", "song.wav"])?
+        else {
+            return Err("expected video run args".to_owned());
+        };
+        assert_eq!(append.add_audio, Some(PathBuf::from("song.wav")));
+        assert!(!append.replace_audio);
+
+        let VideoCommand::Run(replace) = parse_video_args(&[
+            "in.mp4",
+            "out.mp4",
+            "--add-audio",
+            "song.wav",
+            "--replace-audio",
+            "--acodec",
+            "opus",
+        ])?
+        else {
+            return Err("expected video run args".to_owned());
+        };
+        assert_eq!(replace.add_audio, Some(PathBuf::from("song.wav")));
+        assert!(replace.replace_audio);
+        assert_eq!(replace.audio_codec.as_deref(), Some("opus"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_external_audio_flags() {
+        for args in [
+            vec!["in.mp4", "out.mp4", "--replace-audio"],
+            vec![
+                "in.mp4",
+                "out.mp4",
+                "--add-audio",
+                "a.wav",
+                "--add-audio",
+                "b.wav",
+            ],
+            vec!["in.mp4", "out.mp4", "--add-audio"],
+            vec!["in.mp4", "out.mp4", "--add-audio", ""],
+            vec![
+                "in.mp4",
+                "out.mp4",
+                "--replace-audio",
+                "--add-audio",
+                "a.wav",
+                "--replace-audio",
+            ],
+        ] {
+            assert!(parse_video_args(&args).is_err(), "{args:?}");
         }
     }
 
