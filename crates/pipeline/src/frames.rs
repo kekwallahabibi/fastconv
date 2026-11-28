@@ -1,16 +1,20 @@
 //! Streaming still-frame extraction with bounded, recycled pixel buffers.
 //!
-//! Frames are never accumulated in memory: the decode thread fills one
-//! recycled RGB(A) buffer at a time and hands it to a bounded pool of encoder
-//! workers through a channel whose capacity is derived from a hard byte budget.
-//! Workers return their buffer to the decoder instead of dropping it, so the
-//! in-flight raw pixel footprint stays far below 256 MiB even for 4K sources.
+//! Frames are never accumulated in memory: the decode thread reserves all
+//! extraction-pipeline raw pixel buffers (NV12 conversion scratch, GIF
+//! sub-frame decode scratch and canvas holds, WebP frame holds, and emitted
+//! RGB/RGBA frame buffers) from one byte-bounded [`PixelPool`] and hands each
+//! job to a pool of encoder workers. Workers return their buffer to the pool on
+//! drop, so aggregate extraction-pipeline pixel bytes never exceed
+//! [`MAX_IN_FLIGHT_BYTES`] (256 MiB). Codec-internal decoder state (such as
+//! H.264/HEVC/AV1/VP9 reference DPBs and MJPEG's bounded RGB scratch) is capped
+//! separately by each codec decoder.
 
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard};
 use std::thread;
 
 use crossbeam_channel as channel;
@@ -31,19 +35,19 @@ use crate::video_anim::{
 use crate::video_codecs::{decode_video_track_streaming_ctrl, nv12_buffer_len};
 use crate::video_container::demux_video;
 
-/// Hard upper bound on the *aggregate* raw decoded-pixel bytes held at once by
-/// one extraction: decoder-held, queued, worker-held and buffers kept for reuse
-/// all count. Every live buffer stays charged to this budget until dropped.
+/// Hard upper bound on the *aggregate* raw pixel bytes held by the extraction
+/// pipeline: NV12 conversion scratch, GIF sub-frame scratch + canvas holds,
+/// WebP frame holds, queued frames, worker-held frames, and pooled buffers kept
+/// for reuse all count against this single 256 MiB budget.
 const MAX_IN_FLIGHT_BYTES: usize = 256 * 1024 * 1024;
 /// Memory-hungry 4K still encoders use at most this many image workers.
 const MAX_HEAVY_WORKERS: usize = 8;
 
-/// A decoded frame travelling from decoder to encoder worker. `charged` is the
-/// byte amount this buffer holds against the pool budget until it is returned.
-struct FrameJob {
+/// A decoded frame travelling from decoder to encoder worker. Dropping
+/// `pixels` automatically returns its buffer to the pool.
+struct FrameJob<'pool> {
     sequence: u64,
-    pixels: Vec<u8>,
-    charged: usize,
+    pixels: PooledBuffer<'pool>,
     width: u32,
     height: u32,
     format: DecodedPixelFormat,
@@ -53,6 +57,18 @@ fn frame_error(reason: impl Into<String>) -> PipelineError {
     PipelineError::DecodeFailed {
         path: PathBuf::new(),
         reason: reason.into(),
+    }
+}
+
+fn attach_path(err: PipelineError, source: &Path) -> PipelineError {
+    match err {
+        PipelineError::DecodeFailed { path, reason } if path.as_os_str().is_empty() => {
+            PipelineError::DecodeFailed {
+                path: source.to_path_buf(),
+                reason,
+            }
+        }
+        other => other,
     }
 }
 
@@ -115,32 +131,42 @@ fn output_dimensions(decoded: (u32, u32), probed: Option<(u32, u32)>) -> (u32, u
     }
 }
 
-/// Compacts a padded RGB buffer down to its cropped dimensions in place, so no
-/// second raw-pixel allocation is needed for odd-sized decoded frames.
+/// Compacts a padded RGB buffer down to its cropped dimensions in place,
+/// returning the cropped byte length so no second raw-pixel allocation is
+/// needed for odd-sized decoded frames.
 fn compact_cropped_rgb(
-    rgb: &mut Vec<u8>,
+    rgb: &mut [u8],
     padded_width: u32,
     out_width: u32,
     out_height: u32,
-) -> Result<(), PipelineError> {
+) -> Result<usize, PipelineError> {
     let overflow = || frame_error("cropped row offset overflows usize");
+    if out_width > padded_width {
+        return Err(frame_error("cropped width exceeds padded frame width"));
+    }
     let src_stride = row_bytes(padded_width, 3)?;
     let out_stride = row_bytes(out_width, 3)?;
     let rows = usize::try_from(out_height).map_err(|_| overflow())?;
+    let required = rows.checked_mul(src_stride).ok_or_else(overflow)?;
+    if rgb.len() < required {
+        return Err(frame_error("padded RGB buffer is shorter than expected"));
+    }
     for row in 0..rows {
         let start = row.checked_mul(src_stride).ok_or_else(overflow)?;
         let end = start.checked_add(out_stride).ok_or_else(overflow)?;
         let target = row.checked_mul(out_stride).ok_or_else(overflow)?;
         rgb.copy_within(start..end, target);
     }
-    let cropped = rows.checked_mul(out_stride).ok_or_else(overflow)?;
-    rgb.truncate(cropped);
-    Ok(())
+    rows.checked_mul(out_stride).ok_or_else(overflow)
 }
 
-/// Byte-bounded pool of raw decoded-pixel buffers. Admission is based on the
-/// actual frame length at `take` time; pooled buffers remain charged so the
-/// decoder, the job queue and all workers together can never exceed `limit`.
+/// Byte-bounded pool of raw decoded-pixel buffers.
+///
+/// Every live raw pixel buffer (decoder NV12 scratch, animation canvas holds,
+/// queued frame jobs, worker-held buffers, and idle recycled buffers) counts
+/// against `limit`. Multi-buffer admission (`take_pair`) reserves both buffers
+/// atomically under the mutex, so no caller ever holds one reservation while
+/// blocking for a second and deadlock is impossible.
 struct PixelPool {
     state: Mutex<PoolState>,
     changed: Condvar,
@@ -148,10 +174,183 @@ struct PixelPool {
 }
 
 struct PoolState {
-    /// Returned buffers with the byte amount charged for each.
-    free: Vec<(Vec<u8>, usize)>,
-    /// Sum of charges for every live buffer, including worker-held ones.
-    live_bytes: usize,
+    /// Idle buffers available for reuse. Each buffer's byte charge is its
+    /// exact `capacity()`.
+    free: Vec<Vec<u8>>,
+    /// Bytes currently checked out via active `PooledBuffer` leases.
+    leased_bytes: usize,
+    /// Bytes held by live decoder-owned buffers (e.g. animation canvas) that
+    /// workers cannot release.
+    external_bytes: usize,
+    /// Sum of `Vec::capacity()` for all buffers currently sitting in `free`.
+    free_bytes: usize,
+    /// Set on worker error/exit so a waiting producer wakes immediately.
+    closed: bool,
+    /// Peak observed aggregate `leased_bytes + external_bytes + free_bytes`.
+    peak_live_bytes: usize,
+}
+
+impl PoolState {
+    fn live_bytes(&self) -> usize {
+        self.leased_bytes
+            .saturating_add(self.external_bytes)
+            .saturating_add(self.free_bytes)
+    }
+
+    fn record_peak(&mut self) {
+        let live = self.live_bytes();
+        if live > self.peak_live_bytes {
+            self.peak_live_bytes = live;
+        }
+    }
+
+    /// Moves idle buffers into `evicted` (smallest first) until
+    /// `self.live_bytes() + additional <= limit`.
+    fn evict_free_for(&mut self, additional: usize, limit: usize, evicted: &mut Vec<Vec<u8>>) {
+        while self.live_bytes().saturating_add(additional) > limit {
+            let Some((pos, _)) = self
+                .free
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, buf)| buf.capacity())
+            else {
+                break;
+            };
+            let buf = self.free.swap_remove(pos);
+            self.free_bytes = self.free_bytes.saturating_sub(buf.capacity());
+            evicted.push(buf);
+        }
+    }
+}
+
+/// Best-fit index in `free`: smallest buffer with `capacity() >= needed`,
+/// excluding `exclude`. Zero-byte requests never claim a non-empty buffer.
+fn best_fit(free: &[Vec<u8>], needed: usize, exclude: Option<usize>) -> Option<usize> {
+    if needed == 0 {
+        return None;
+    }
+    free.iter()
+        .enumerate()
+        .filter(|(idx, buf)| Some(*idx) != exclude && buf.capacity() >= needed)
+        .min_by_key(|(_, buf)| buf.capacity())
+        .map(|(idx, _)| idx)
+}
+
+fn alloc_zeroed(len: usize) -> Result<Vec<u8>, PipelineError> {
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len)
+        .map_err(|_| frame_error(format!("failed to allocate {len}-byte pixel buffer")))?;
+    buf.resize(len, 0);
+    Ok(buf)
+}
+
+fn reset_len(buf: &mut Vec<u8>, len: usize) {
+    buf.clear();
+    buf.resize(len, 0);
+}
+
+/// RAII lease for one pooled raw-pixel buffer. Callers can read, mutate in
+/// place, or truncate, but cannot grow the backing `Vec` past its charged
+/// capacity. Dropping returns the buffer to the pool automatically.
+struct PooledBuffer<'pool> {
+    pool: &'pool PixelPool,
+    pixels: Vec<u8>,
+    charged: usize,
+}
+
+impl PooledBuffer<'_> {
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.pixels
+    }
+
+    fn len(&self) -> usize {
+        self.pixels.len()
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.pixels.truncate(len);
+    }
+}
+
+impl Drop for PooledBuffer<'_> {
+    fn drop(&mut self) {
+        if self.charged > 0 {
+            let pixels = std::mem::take(&mut self.pixels);
+            let charged = self.charged;
+            self.charged = 0;
+            self.pool.release(pixels, charged);
+        }
+    }
+}
+
+/// RAII accounting hold for a live external decoder pixel buffer (such as an
+/// animation canvas) so it shares the exact same aggregate byte budget.
+struct ExternalHold<'pool> {
+    pool: &'pool PixelPool,
+    bytes: usize,
+}
+
+impl ExternalHold<'_> {
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for ExternalHold<'_> {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            let bytes = self.bytes;
+            self.bytes = 0;
+            self.pool.release_external(bytes);
+        }
+    }
+}
+
+/// Rolls back pre-reserved `leased_bytes` if an allocation outside the lock
+/// fails (e.g. OOM) before constructing a `PooledBuffer`.
+struct LeaseReservation<'pool> {
+    pool: &'pool PixelPool,
+    bytes: usize,
+}
+
+impl LeaseReservation<'_> {
+    fn disarm(&mut self) {
+        self.bytes = 0;
+    }
+}
+
+impl Drop for LeaseReservation<'_> {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            let mut state = self.pool.lock_state();
+            state.leased_bytes = state.leased_bytes.saturating_sub(self.bytes);
+            drop(state);
+            self.pool.changed.notify_all();
+        }
+    }
+}
+
+enum SinglePlan {
+    Reuse(Vec<u8>, usize),
+    Alloc(usize),
+}
+
+enum PairPlan {
+    ReuseBoth(Vec<u8>, usize, Vec<u8>, usize),
+    ReuseFirstAllocSecond {
+        first: Vec<u8>,
+        first_cap: usize,
+        second_len: usize,
+    },
+    AllocFirstReuseSecond {
+        first_len: usize,
+        second: Vec<u8>,
+        second_cap: usize,
+    },
+    AllocBoth {
+        first_len: usize,
+        second_len: usize,
+    },
 }
 
 impl PixelPool {
@@ -159,72 +358,458 @@ impl PixelPool {
         Self {
             state: Mutex::new(PoolState {
                 free: Vec::new(),
-                live_bytes: 0,
+                leased_bytes: 0,
+                external_bytes: 0,
+                free_bytes: 0,
+                closed: false,
+                peak_live_bytes: 0,
             }),
             changed: Condvar::new(),
             limit,
         }
     }
 
-    /// Reserves `needed` bytes and returns a cleared buffer with at least that
-    /// capacity, plus the amount charged to the budget for this buffer.
-    fn take(&self, needed: usize) -> Result<(Vec<u8>, usize), PipelineError> {
+    fn lock_state(&self) -> MutexGuard<'_, PoolState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Marks the pool closed and wakes any blocked admission waiter so worker
+    /// failures or panics can never leave the decoder hanging.
+    fn close(&self) {
+        let mut state = self.lock_state();
+        state.closed = true;
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    #[cfg(test)]
+    fn peak_live_bytes(&self) -> usize {
+        self.lock_state().peak_live_bytes
+    }
+
+    #[cfg(test)]
+    fn live_bytes(&self) -> usize {
+        self.lock_state().live_bytes()
+    }
+
+    #[cfg(test)]
+    fn leased_bytes(&self) -> usize {
+        self.lock_state().leased_bytes
+    }
+
+    /// Reserves `bytes` of external decoder memory (e.g. a live animation
+    /// canvas) against the same aggregate budget without allocating a buffer.
+    fn reserve_external(&self, bytes: usize) -> Result<ExternalHold<'_>, PipelineError> {
+        if bytes == 0 {
+            return Ok(ExternalHold {
+                pool: self,
+                bytes: 0,
+            });
+        }
+        if bytes > self.limit {
+            return Err(frame_error(format!(
+                "decoder pixel canvas needs {bytes} bytes, above the {}-byte budget",
+                self.limit
+            )));
+        }
+        let mut evicted = Vec::new();
+        let mut state = self.lock_state();
+        loop {
+            if state.closed {
+                return Err(PipelineError::WorkerPanicked);
+            }
+            if state
+                .external_bytes
+                .checked_add(bytes)
+                .is_none_or(|sum| sum > self.limit)
+            {
+                return Err(frame_error(format!(
+                    "decoder pixel canvas needs {bytes} bytes alongside {} live decoder bytes, above the {}-byte budget",
+                    state.external_bytes, self.limit
+                )));
+            }
+            let min_live = state
+                .leased_bytes
+                .checked_add(state.external_bytes)
+                .and_then(|v| v.checked_add(bytes));
+            if min_live.is_some_and(|v| v <= self.limit) {
+                state.evict_free_for(bytes, self.limit, &mut evicted);
+                state.external_bytes = state.external_bytes.saturating_add(bytes);
+                state.record_peak();
+                break;
+            }
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        drop(state);
+        drop(evicted);
+        Ok(ExternalHold { pool: self, bytes })
+    }
+
+    fn release_external(&self, bytes: usize) {
+        let mut state = self.lock_state();
+        state.external_bytes = state.external_bytes.saturating_sub(bytes);
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    /// Reserves one buffer of `needed` bytes from the aggregate budget.
+    fn take(&self, needed: usize) -> Result<PooledBuffer<'_>, PipelineError> {
+        if needed == 0 {
+            return Ok(PooledBuffer {
+                pool: self,
+                pixels: Vec::new(),
+                charged: 0,
+            });
+        }
         if needed > self.limit {
             return Err(frame_error(format!(
                 "a frame needs {needed} pixel bytes, above the {}-byte budget",
                 self.limit
             )));
         }
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        loop {
-            if let Some(pos) = state
-                .free
-                .iter()
-                .position(|(buffer, _)| buffer.capacity() >= needed)
+        let mut evicted = Vec::new();
+        let mut state = self.lock_state();
+        let plan = loop {
+            if state.closed {
+                return Err(PipelineError::WorkerPanicked);
+            }
+            if state
+                .external_bytes
+                .checked_add(needed)
+                .is_none_or(|sum| sum > self.limit)
             {
-                let (mut buffer, charged) = state.free.remove(pos);
-                buffer.clear();
-                buffer.resize(needed, 0);
-                return Ok((buffer, charged));
+                return Err(frame_error(format!(
+                    "a frame needs {needed} pixel bytes alongside {} decoder bytes, above the {}-byte budget",
+                    state.external_bytes, self.limit
+                )));
             }
-            let additional = state.live_bytes.saturating_add(needed);
-            if additional <= self.limit {
-                state.live_bytes = additional;
-                return Ok((vec![0_u8; needed], needed));
+            if let Some(pos) = best_fit(&state.free, needed, None) {
+                let buf = state.free.swap_remove(pos);
+                let cap = buf.capacity();
+                state.free_bytes = state.free_bytes.saturating_sub(cap);
+                state.leased_bytes = state.leased_bytes.saturating_add(cap);
+                state.record_peak();
+                break SinglePlan::Reuse(buf, cap);
             }
-            // An idle buffer too small for this frame can be released; its
-            // charge stays counted until this exact point.
-            if let Some(pos) = state
-                .free
-                .iter()
-                .position(|(buffer, _)| buffer.capacity() < needed)
-            {
-                let (buffer, charged) = state.free.remove(pos);
-                drop(buffer);
-                state.live_bytes = state.live_bytes.saturating_sub(charged);
-                continue;
+            let min_live = state
+                .leased_bytes
+                .checked_add(state.external_bytes)
+                .and_then(|v| v.checked_add(needed));
+            if min_live.is_some_and(|v| v <= self.limit) {
+                state.evict_free_for(needed, self.limit, &mut evicted);
+                state.leased_bytes = state.leased_bytes.saturating_add(needed);
+                state.record_peak();
+                break SinglePlan::Alloc(needed);
             }
-            // Every remaining byte is in a queued or worker-owned buffer; a
-            // returning worker notifies this wait.
             state = self
                 .changed
                 .wait(state)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+        };
+        drop(state);
+        // Free evicted buffers before allocating so physical heap never spikes
+        // above `self.limit`.
+        drop(evicted);
+
+        match plan {
+            SinglePlan::Reuse(mut pixels, charged) => {
+                reset_len(&mut pixels, needed);
+                Ok(PooledBuffer {
+                    pool: self,
+                    pixels,
+                    charged,
+                })
+            }
+            SinglePlan::Alloc(len) => {
+                let mut reservation = LeaseReservation {
+                    pool: self,
+                    bytes: len,
+                };
+                let pixels = alloc_zeroed(len)?;
+                reservation.disarm();
+                Ok(PooledBuffer {
+                    pool: self,
+                    pixels,
+                    charged: len,
+                })
+            }
         }
     }
 
-    /// Returns a buffer to the pool; its bytes stay charged to the budget.
-    fn release(&self, buffer: Vec<u8>, charged: usize) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.free.push((buffer, charged));
+    /// Atomically reserves two buffers (`first_len` and `second_len`) under
+    /// the same aggregate budget. Rejects requests whose combined footprint
+    /// cannot fit in `limit` without waiting, and never holds one buffer while
+    /// blocking for the second, making deadlock impossible.
+    fn take_pair(
+        &self,
+        first_len: usize,
+        second_len: usize,
+    ) -> Result<(PooledBuffer<'_>, PooledBuffer<'_>), PipelineError> {
+        let total = first_len
+            .checked_add(second_len)
+            .ok_or_else(|| frame_error("combined frame pixel buffers overflow usize"))?;
+        if total > self.limit {
+            return Err(frame_error(format!(
+                "a frame needs {total} pixel bytes ({first_len} + {second_len}), above the {}-byte budget",
+                self.limit
+            )));
+        }
+        let mut evicted = Vec::new();
+        let mut state = self.lock_state();
+        let plan = loop {
+            if state.closed {
+                return Err(PipelineError::WorkerPanicked);
+            }
+            if state
+                .external_bytes
+                .checked_add(total)
+                .is_none_or(|sum| sum > self.limit)
+            {
+                return Err(frame_error(format!(
+                    "a frame needs {total} pixel bytes alongside {} decoder bytes, above the {}-byte budget",
+                    state.external_bytes, self.limit
+                )));
+            }
+            if let Some(plan) =
+                self.try_plan_pair(&mut state, first_len, second_len, total, &mut evicted)
+            {
+                break plan;
+            }
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        };
         drop(state);
-        self.changed.notify_one();
+        drop(evicted);
+        self.materialize_pair(plan, first_len, second_len, total)
+    }
+
+    fn try_plan_pair(
+        &self,
+        state: &mut PoolState,
+        first_len: usize,
+        second_len: usize,
+        total: usize,
+        evicted: &mut Vec<Vec<u8>>,
+    ) -> Option<PairPlan> {
+        // Match the larger request first so a smaller scratch slot (NV12)
+        // never steals a larger frame buffer (RGB) from `free`.
+        let (first_idx, second_idx) = if first_len >= second_len {
+            let fi = best_fit(&state.free, first_len, None);
+            let si = best_fit(&state.free, second_len, fi);
+            (fi, si)
+        } else {
+            let si = best_fit(&state.free, second_len, None);
+            let fi = best_fit(&state.free, first_len, si);
+            (fi, si)
+        };
+        match (first_idx, second_idx) {
+            (Some(fi), Some(si)) => {
+                let (first, second) = if fi > si {
+                    let f = state.free.swap_remove(fi);
+                    let s = state.free.swap_remove(si);
+                    (f, s)
+                } else {
+                    let s = state.free.swap_remove(si);
+                    let f = state.free.swap_remove(fi);
+                    (f, s)
+                };
+                let fc = first.capacity();
+                let sc = second.capacity();
+                let sum = fc.saturating_add(sc);
+                state.free_bytes = state.free_bytes.saturating_sub(sum);
+                state.leased_bytes = state.leased_bytes.saturating_add(sum);
+                state.record_peak();
+                return Some(PairPlan::ReuseBoth(first, fc, second, sc));
+            }
+            (Some(fi), None) => {
+                let fc = state.free[fi].capacity();
+                let min_live = state
+                    .leased_bytes
+                    .checked_add(state.external_bytes)
+                    .and_then(|v| v.checked_add(fc))
+                    .and_then(|v| v.checked_add(second_len));
+                if min_live.is_some_and(|v| v <= self.limit) {
+                    let first = state.free.swap_remove(fi);
+                    state.free_bytes = state.free_bytes.saturating_sub(fc);
+                    state.leased_bytes = state.leased_bytes.saturating_add(fc);
+                    state.evict_free_for(second_len, self.limit, evicted);
+                    state.leased_bytes = state.leased_bytes.saturating_add(second_len);
+                    state.record_peak();
+                    return Some(PairPlan::ReuseFirstAllocSecond {
+                        first,
+                        first_cap: fc,
+                        second_len,
+                    });
+                }
+            }
+            (None, Some(si)) => {
+                let sc = state.free[si].capacity();
+                let min_live = state
+                    .leased_bytes
+                    .checked_add(state.external_bytes)
+                    .and_then(|v| v.checked_add(sc))
+                    .and_then(|v| v.checked_add(first_len));
+                if min_live.is_some_and(|v| v <= self.limit) {
+                    let second = state.free.swap_remove(si);
+                    state.free_bytes = state.free_bytes.saturating_sub(sc);
+                    state.leased_bytes = state.leased_bytes.saturating_add(sc);
+                    state.evict_free_for(first_len, self.limit, evicted);
+                    state.leased_bytes = state.leased_bytes.saturating_add(first_len);
+                    state.record_peak();
+                    return Some(PairPlan::AllocFirstReuseSecond {
+                        first_len,
+                        second,
+                        second_cap: sc,
+                    });
+                }
+            }
+            (None, None) => {}
+        }
+        // Fallback: either no free buffer matched, or an oversized free buffer
+        // would push `live_bytes` past `limit`. Evicting free buffers and
+        // allocating exact sizes guarantees admission whenever
+        // `leased_bytes + external_bytes + total <= limit`.
+        let min_live = state
+            .leased_bytes
+            .checked_add(state.external_bytes)
+            .and_then(|v| v.checked_add(total));
+        if min_live.is_some_and(|v| v <= self.limit) {
+            state.evict_free_for(total, self.limit, evicted);
+            state.leased_bytes = state.leased_bytes.saturating_add(total);
+            state.record_peak();
+            return Some(PairPlan::AllocBoth {
+                first_len,
+                second_len,
+            });
+        }
+        None
+    }
+
+    fn materialize_pair(
+        &self,
+        plan: PairPlan,
+        first_len: usize,
+        second_len: usize,
+        total: usize,
+    ) -> Result<(PooledBuffer<'_>, PooledBuffer<'_>), PipelineError> {
+        match plan {
+            PairPlan::ReuseBoth(mut first, fc, mut second, sc) => {
+                reset_len(&mut first, first_len);
+                reset_len(&mut second, second_len);
+                Ok((
+                    PooledBuffer {
+                        pool: self,
+                        pixels: first,
+                        charged: fc,
+                    },
+                    PooledBuffer {
+                        pool: self,
+                        pixels: second,
+                        charged: sc,
+                    },
+                ))
+            }
+            PairPlan::ReuseFirstAllocSecond {
+                first,
+                first_cap,
+                second_len,
+            } => {
+                let mut first_buf = PooledBuffer {
+                    pool: self,
+                    pixels: first,
+                    charged: first_cap,
+                };
+                let mut reservation = LeaseReservation {
+                    pool: self,
+                    bytes: second_len,
+                };
+                reset_len(&mut first_buf.pixels, first_len);
+                let second = alloc_zeroed(second_len)?;
+                reservation.disarm();
+                Ok((
+                    first_buf,
+                    PooledBuffer {
+                        pool: self,
+                        pixels: second,
+                        charged: second_len,
+                    },
+                ))
+            }
+            PairPlan::AllocFirstReuseSecond {
+                first_len,
+                second,
+                second_cap,
+            } => {
+                let mut second_buf = PooledBuffer {
+                    pool: self,
+                    pixels: second,
+                    charged: second_cap,
+                };
+                let mut reservation = LeaseReservation {
+                    pool: self,
+                    bytes: first_len,
+                };
+                reset_len(&mut second_buf.pixels, second_len);
+                let first = alloc_zeroed(first_len)?;
+                reservation.disarm();
+                Ok((
+                    PooledBuffer {
+                        pool: self,
+                        pixels: first,
+                        charged: first_len,
+                    },
+                    second_buf,
+                ))
+            }
+            PairPlan::AllocBoth {
+                first_len,
+                second_len,
+            } => {
+                let mut reservation = LeaseReservation {
+                    pool: self,
+                    bytes: total,
+                };
+                let first = alloc_zeroed(first_len)?;
+                let second = alloc_zeroed(second_len)?;
+                reservation.disarm();
+                Ok((
+                    PooledBuffer {
+                        pool: self,
+                        pixels: first,
+                        charged: first_len,
+                    },
+                    PooledBuffer {
+                        pool: self,
+                        pixels: second,
+                        charged: second_len,
+                    },
+                ))
+            }
+        }
+    }
+
+    /// Returns a leased buffer to the pool (or drops it if the pool is closed
+    /// or its backing capacity drifted from `charged`).
+    fn release(&self, buffer: Vec<u8>, charged: usize) {
+        let mut discard = None;
+        let mut state = self.lock_state();
+        state.leased_bytes = state.leased_bytes.saturating_sub(charged);
+        if state.closed || buffer.capacity() != charged {
+            discard = Some(buffer);
+        } else {
+            state.free_bytes = state.free_bytes.saturating_add(charged);
+            state.free.push(buffer);
+        }
+        drop(state);
+        drop(discard);
+        self.changed.notify_all();
     }
 }
 
@@ -347,25 +932,71 @@ fn frame_byte_len(width: u32, height: u32, channels: usize) -> Result<usize, Pip
         })
 }
 
-type FillFn<'a> = &'a mut (dyn FnMut(&mut Vec<u8>, u32, u32) -> Result<(), PipelineError> + 'a);
+type FillFn<'a> =
+    &'a mut (dyn FnMut(&mut PooledBuffer<'_>, u32, u32) -> Result<(), PipelineError> + 'a);
+type ScratchFillFn<'a> = &'a mut (
+            dyn FnMut(&mut PooledBuffer<'_>, &mut [u8], u32, u32) -> Result<(), PipelineError> + 'a
+        );
 
 /// Decode-side state: selection, byte budget, and job production.
-struct FrameEmitter<'a> {
+struct FrameEmitter<'ctx, 'pool> {
     selector: Selector,
     range: FrameRange,
     expected: Option<(u32, u32)>,
-    pool: &'a PixelPool,
-    job_tx: channel::Sender<FrameJob>,
-    error_rx: &'a channel::Receiver<PipelineError>,
-    failed: &'a AtomicBool,
+    pool: &'pool PixelPool,
+    job_tx: channel::Sender<FrameJob<'pool>>,
+    error_rx: &'ctx channel::Receiver<PipelineError>,
+    failed: &'ctx AtomicBool,
     sequence: u64,
     last_dims: Option<(u32, u32)>,
 }
 
-impl FrameEmitter<'_> {
+impl<'pool> FrameEmitter<'_, 'pool> {
+    fn check_worker_health(&self) -> Result<(), PipelineError> {
+        if self.failed.load(Ordering::Acquire) {
+            return Err(self
+                .error_rx
+                .try_recv()
+                .unwrap_or(PipelineError::WorkerPanicked));
+        }
+        Ok(())
+    }
+
+    fn enqueue(
+        &mut self,
+        pixels: PooledBuffer<'pool>,
+        expected_len: usize,
+        width: u32,
+        height: u32,
+        format: DecodedPixelFormat,
+    ) -> Result<(), PipelineError> {
+        if pixels.len() != expected_len {
+            let actual = pixels.len();
+            return Err(frame_error(format!(
+                "frame buffer is {actual} bytes, expected {expected_len} after cropping"
+            )));
+        }
+        self.sequence = self.sequence.saturating_add(1);
+        self.job_tx
+            .send(FrameJob {
+                sequence: self.sequence,
+                pixels,
+                width,
+                height,
+                format,
+            })
+            .map_err(|_| {
+                self.error_rx
+                    .try_recv()
+                    .unwrap_or(PipelineError::WorkerPanicked)
+            })?;
+        self.last_dims = Some((width, height));
+        Ok(())
+    }
+
     /// Fills a budgeted buffer for one selected frame and queues it. `fill`
-    /// receives the cropped output dimensions so padded decoders can trim the
-    /// extra columns/rows before emission.
+    /// receives the cropped output dimensions so decoders can trim alignment
+    /// padding before emission.
     #[allow(clippy::too_many_arguments)]
     fn emit(
         &mut self,
@@ -376,66 +1007,100 @@ impl FrameEmitter<'_> {
         height: u32,
         format: DecodedPixelFormat,
         channels: usize,
-        reserve: Option<usize>,
         fill: FillFn<'_>,
     ) -> Result<(), PipelineError> {
         if !self.selector.should_emit(index, pts_us) {
             return Ok(());
         }
-        if self.failed.load(Ordering::Relaxed) {
-            return Err(PipelineError::WorkerPanicked);
-        }
-        // Only alignment padding is trimmed; an oversized decoded frame keeps
-        // its full size so no real pixels are silently dropped.
+        self.check_worker_health()?;
         let (out_width, out_height) = output_dimensions((width, height), self.expected);
-        let needed = frame_byte_len(out_width, out_height, channels).map_err(|_| {
-            PipelineError::DecodeFailed {
-                path: source.to_path_buf(),
-                reason: "frame dimensions overflow the pixel buffer".to_owned(),
-            }
-        })?;
-        // A padded decoder reserves its larger frame size but compacts to the
-        // cropped length inside `fill`; both sizes stay charged to the same pool.
-        let reserved = reserve.unwrap_or(needed).max(needed);
-        let (mut pixels, charged) = self.pool.take(reserved)?;
-        if let Err(err) = fill(&mut pixels, out_width, out_height) {
-            self.pool.release(pixels, charged);
-            return Err(err);
+        let needed = frame_byte_len(out_width, out_height, channels)
+            .map_err(|err| attach_path(err, source))?;
+        let mut pixels = self
+            .pool
+            .take(needed)
+            .map_err(|err| attach_path(err, source))?;
+        fill(&mut pixels, out_width, out_height)?;
+        self.enqueue(pixels, needed, out_width, out_height, format)
+    }
+
+    /// Atomically reserves both an output pixel buffer (`reserve` bytes) and a
+    /// decode scratch buffer (`scratch_len` bytes) from the same `PixelPool`,
+    /// converts the frame, immediately returns the scratch buffer to the pool,
+    /// and queues the compacted output buffer.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_with_scratch(
+        &mut self,
+        source: &Path,
+        index: u64,
+        pts_us: i64,
+        width: u32,
+        height: u32,
+        format: DecodedPixelFormat,
+        channels: usize,
+        reserve: usize,
+        scratch_len: usize,
+        fill: ScratchFillFn<'_>,
+    ) -> Result<(), PipelineError> {
+        if !self.selector.should_emit(index, pts_us) {
+            return Ok(());
         }
-        if pixels.len() != needed {
-            let actual = pixels.len();
-            self.pool.release(pixels, charged);
-            return Err(frame_error(format!(
-                "frame buffer is {actual} bytes, expected {needed} after cropping"
-            )));
+        self.check_worker_health()?;
+        let (out_width, out_height) = output_dimensions((width, height), self.expected);
+        let needed = frame_byte_len(out_width, out_height, channels)
+            .map_err(|err| attach_path(err, source))?;
+        let reserved = reserve.max(needed);
+        let (mut pixels, mut scratch) = self
+            .pool
+            .take_pair(reserved, scratch_len)
+            .map_err(|err| attach_path(err, source))?;
+        fill(&mut pixels, scratch.as_mut_slice(), out_width, out_height)?;
+        // Return decode scratch immediately so its bytes can be reused or
+        // evicted while encoder workers process queued frames.
+        drop(scratch);
+        self.enqueue(pixels, needed, out_width, out_height, format)
+    }
+}
+
+fn ensure_canvas_hold<'pool>(
+    pool: &'pool PixelPool,
+    source: &Path,
+    slot: &mut Option<ExternalHold<'pool>>,
+    needed_hold: usize,
+) -> Result<(), PipelineError> {
+    match slot {
+        Some(hold) if hold.bytes() == needed_hold => Ok(()),
+        slot => {
+            // Release any prior hold before acquiring a resized one so we
+            // never double-charge across a size change.
+            *slot = None;
+            *slot = Some(
+                pool.reserve_external(needed_hold)
+                    .map_err(|err| attach_path(err, source))?,
+            );
+            Ok(())
         }
-        self.sequence = self.sequence.saturating_add(1);
-        self.job_tx
-            .send(FrameJob {
-                sequence: self.sequence,
-                pixels,
-                charged,
-                width: out_width,
-                height: out_height,
-                format,
-            })
-            .map_err(|_| {
-                self.error_rx
-                    .try_recv()
-                    .unwrap_or(PipelineError::WorkerPanicked)
-            })?;
-        self.last_dims = Some((out_width, out_height));
-        Ok(())
     }
 }
 
 fn decode_animation(
     source: &Path,
     container: VideoContainerFormat,
-    emitter: &mut FrameEmitter<'_>,
+    emitter: &mut FrameEmitter<'_, '_>,
 ) -> Result<ControlFlow<()>, PipelineError> {
+    let pool = emitter.pool;
+    // Reject canvases that cannot coexist with an emitted frame before
+    // allocating them: GIF retains up to 2x canvas (active + `Previous`
+    // backup) alongside a sub-frame/emitted frame (<= 2/3 of `pool.limit`),
+    // while WebP holds 1x frame buffer alongside an emitted frame (<= 1/2).
+    let max_gif_canvas_bytes = pool.limit.saturating_sub(pool.limit / 3);
+    let max_webp_frame_bytes = pool.limit / 2;
     let mut frame_index = 0_u64;
-    let mut on_frame = |info: crate::video_anim::AnimFrameInfo, pixels: &[u8]| {
+    let mut webp_canvas_hold: Option<ExternalHold<'_>> = None;
+    let mut emit_anim_frame = |info: crate::video_anim::AnimFrameInfo,
+                               pixels: &[u8],
+                               charge_hold: bool|
+     -> Result<ControlFlow<()>, PipelineError> {
         let index = frame_index;
         frame_index = frame_index.saturating_add(1);
         let at_end = emitter.range.end() == Some(index);
@@ -443,17 +1108,36 @@ fn decode_animation(
             return Ok(ControlFlow::Break(()));
         }
         if emitter.range.contains(index) {
+            let (format, channels) = match info.channels {
+                3 => (DecodedPixelFormat::Rgb8, 3_usize),
+                4 => (DecodedPixelFormat::Rgba8, 4_usize),
+                other => {
+                    return Err(PipelineError::DecodeFailed {
+                        path: source.to_path_buf(),
+                        reason: format!("unsupported animation pixel layout: {other} channels"),
+                    });
+                }
+            };
+            if charge_hold {
+                ensure_canvas_hold(pool, source, &mut webp_canvas_hold, pixels.len())?;
+            }
             emitter.emit(
                 source,
                 index,
                 info.pts_us,
                 info.width,
                 info.height,
-                DecodedPixelFormat::Rgba8,
-                4,
-                None,
+                format,
+                channels,
                 &mut |dst, out_width, out_height| {
-                    copy_cropped_rows(pixels, info.width, &mut dst[..], out_width, out_height, 4)
+                    copy_cropped_rows(
+                        pixels,
+                        info.width,
+                        dst.as_mut_slice(),
+                        out_width,
+                        out_height,
+                        channels,
+                    )
                 },
             )?;
         }
@@ -467,11 +1151,37 @@ fn decode_animation(
     };
     match container {
         VideoContainerFormat::Gif => {
-            decode_gif_frames_streaming_pixels_ctrl(source, |info, pixels| on_frame(info, pixels))
+            // GIF disposal `Previous` can hold a backup canvas alongside the
+            // active canvas; charge 2x `canvas_len` as an external hold and
+            // allocate/recycle each sub-frame's decode buffer from `PixelPool`
+            // so canvas + backup + sub-frame + queued/worker frames stay under
+            // the exact same aggregate budget.
+            let mut gif_canvas_hold: Option<ExternalHold<'_>> = None;
+            decode_gif_frames_streaming_pixels_ctrl(
+                source,
+                max_gif_canvas_bytes,
+                |canvas_len, frame_buf_len, fill| {
+                    let needed_hold =
+                        canvas_len
+                            .checked_mul(2)
+                            .ok_or_else(|| PipelineError::DecodeFailed {
+                                path: source.to_path_buf(),
+                                reason: "GIF canvas byte hold overflows usize".to_owned(),
+                            })?;
+                    ensure_canvas_hold(pool, source, &mut gif_canvas_hold, needed_hold)?;
+                    let mut frame_buf = pool
+                        .take(frame_buf_len)
+                        .map_err(|err| attach_path(err, source))?;
+                    fill(frame_buf.as_mut_slice())
+                },
+                |info, pixels| emit_anim_frame(info, pixels, false),
+            )
         }
-        VideoContainerFormat::Webp => {
-            decode_webp_frames_streaming_pixels_ctrl(source, |info, pixels| on_frame(info, pixels))
-        }
+        VideoContainerFormat::Webp => decode_webp_frames_streaming_pixels_ctrl(
+            source,
+            max_webp_frame_bytes,
+            |info, pixels| emit_anim_frame(info, pixels, true),
+        ),
         _ => Err(PipelineError::DecodeFailed {
             path: source.to_path_buf(),
             reason: "not an animation container".to_owned(),
@@ -482,9 +1192,9 @@ fn decode_animation(
 fn decode_video(
     source: &Path,
     container: VideoContainerFormat,
-    emitter: &mut FrameEmitter<'_>,
+    emitter: &mut FrameEmitter<'_, '_>,
 ) -> Result<ControlFlow<()>, PipelineError> {
-    let media = demux_video(source, container)?;
+    let mut media = demux_video(source, container)?;
     let track_index = media
         .tracks
         .iter()
@@ -493,16 +1203,14 @@ fn decode_video(
             path: source.to_path_buf(),
             reason: "source has no video track".to_owned(),
         })?;
-    let track = &media.tracks[track_index];
+    let track = media.tracks.swap_remove(track_index);
     let packets: Vec<_> = media
         .packets
-        .iter()
+        .into_iter()
         .filter(|packet| packet.track == track_index)
-        .cloned()
         .collect();
     let mut frame_index = 0_u64;
-    let mut nv12 = Vec::new();
-    decode_video_track_streaming_ctrl(source, track, &packets, |info, pack| {
+    decode_video_track_streaming_ctrl(source, &track, &packets, |info, pack| {
         let index = frame_index;
         frame_index = frame_index.saturating_add(1);
         let at_end = emitter.range.end() == Some(index);
@@ -510,11 +1218,18 @@ fn decode_video(
             return Ok(ControlFlow::Break(()));
         }
         if emitter.range.contains(index) {
-            // MJPEG rounds odd dimensions up to even for NV12. Reserve the
-            // padded RGB bytes from the same pool as the emitted frame, then
-            // compact in place: no second raw-pixel allocation escapes the cap.
-            let padded = frame_byte_len(info.width, info.height, 3)?;
-            emitter.emit(
+            // MJPEG rounds odd dimensions up to even for NV12. Reserve BOTH
+            // the NV12 scratch and the padded RGB output atomically from the
+            // same pool, convert, compact cropped rows in place, and release
+            // NV12 immediately: no raw-pixel allocation escapes the budget.
+            let padded_rgb = frame_byte_len(info.width, info.height, 3)
+                .map_err(|err| attach_path(err, source))?;
+            let pitch = usize::try_from(info.width).map_err(|_| PipelineError::DecodeFailed {
+                path: source.to_path_buf(),
+                reason: "NV12 pitch overflows usize".to_owned(),
+            })?;
+            let nv12_len = nv12_buffer_len(info.width, info.height, pitch)?;
+            emitter.emit_with_scratch(
                 source,
                 index,
                 info.pts_us,
@@ -522,35 +1237,26 @@ fn decode_video(
                 info.height,
                 DecodedPixelFormat::Rgb8,
                 3,
-                Some(padded),
-                &mut |dst, out_width, out_height| {
-                    let pitch =
-                        usize::try_from(info.width).map_err(|_| PipelineError::DecodeFailed {
-                            path: source.to_path_buf(),
-                            reason: "NV12 pitch overflows usize".to_owned(),
-                        })?;
-                    let needed = nv12_buffer_len(info.width, info.height, pitch)?;
-                    if nv12.len() < needed {
-                        if needed > MAX_IN_FLIGHT_BYTES {
-                            return Err(PipelineError::DecodeFailed {
-                                path: source.to_path_buf(),
-                                reason: "NV12 scratch exceeds the frame budget".to_owned(),
-                            });
-                        }
-                        nv12.clear();
-                        nv12.resize(needed, 0);
-                    }
-                    pack(nv12.as_mut_slice(), pitch)?;
+                padded_rgb,
+                nv12_len,
+                &mut |dst, nv12, out_width, out_height| {
+                    pack(&mut nv12[..nv12_len], pitch)?;
                     nv12_to_rgb8_into(
-                        &nv12,
-                        &mut dst[..padded],
+                        &nv12[..nv12_len],
+                        &mut dst.as_mut_slice()[..padded_rgb],
                         pitch,
                         info.width,
                         info.height,
                         info.color,
                     )?;
                     if (info.width, info.height) != (out_width, out_height) {
-                        compact_cropped_rgb(dst, info.width, out_width, out_height)?;
+                        let cropped = compact_cropped_rgb(
+                            dst.as_mut_slice(),
+                            info.width,
+                            out_width,
+                            out_height,
+                        )?;
+                        dst.truncate(cropped);
                     }
                     Ok(())
                 },
@@ -565,7 +1271,7 @@ fn decode_video(
 
 fn run_decode(
     plan: &FrameExtractionPlan,
-    emitter: &mut FrameEmitter<'_>,
+    emitter: &mut FrameEmitter<'_, '_>,
 ) -> Result<(), PipelineError> {
     let flow = match plan.source_container() {
         VideoContainerFormat::Gif | VideoContainerFormat::Webp => {
@@ -573,27 +1279,47 @@ fn run_decode(
         }
         container => decode_video(plan.source(), container, emitter)?,
     };
-    // Breaking early (past `--end`) is an expected optimisation. This discards
-    // only a `#[must_use]` flow marker, never an error or a fallback.
-    let _ = flow;
-    Ok(())
+    match flow {
+        ControlFlow::Continue(()) | ControlFlow::Break(()) => Ok(()),
+    }
 }
 
-struct WorkerContext<'a> {
-    job_rx: &'a channel::Receiver<FrameJob>,
-    pool: &'a PixelPool,
-    error_tx: &'a channel::Sender<PipelineError>,
-    failed: &'a AtomicBool,
-    total_bytes: &'a AtomicU64,
-    bmp_write_lock: &'a Mutex<()>,
-    encoder: &'a CpuImageEncoder,
+/// Ensures that if a worker unwinds (or the last worker exits), `PixelPool` is
+/// closed so the decode thread can never remain blocked in `take`/`take_pair`.
+struct WorkerExitGuard<'pool> {
+    active_workers: &'pool AtomicUsize,
+    failed: &'pool AtomicBool,
+    pool: &'pool PixelPool,
+}
+
+impl Drop for WorkerExitGuard<'_> {
+    fn drop(&mut self) {
+        let panicking = thread::panicking();
+        let remaining = self.active_workers.fetch_sub(1, Ordering::AcqRel);
+        if panicking {
+            self.failed.store(true, Ordering::Release);
+            self.pool.close();
+        } else if remaining == 1 {
+            self.pool.close();
+        }
+    }
+}
+
+struct WorkerContext<'ctx, 'pool> {
+    job_rx: &'ctx channel::Receiver<FrameJob<'pool>>,
+    pool: &'pool PixelPool,
+    error_tx: &'ctx channel::Sender<PipelineError>,
+    failed: &'ctx AtomicBool,
+    total_bytes: &'ctx AtomicU64,
+    bmp_write_lock: &'ctx Mutex<()>,
+    encoder: &'ctx CpuImageEncoder,
     inner_threads: usize,
-    source: &'a Path,
-    output_dir: &'a Path,
-    extension: &'a str,
+    source: &'ctx Path,
+    output_dir: &'ctx Path,
+    extension: &'ctx str,
 }
 
-fn run_worker(ctx: &WorkerContext<'_>) {
+fn run_worker(ctx: &WorkerContext<'_, '_>) {
     let job_rx = ctx.job_rx;
     let pool = ctx.pool;
     let error_tx = ctx.error_tx;
@@ -609,10 +1335,8 @@ fn run_worker(ctx: &WorkerContext<'_>) {
     let mut aux = Vec::new();
     let mut bmp_frame = BmpFrameScratch::new();
     while let Ok(mut job) = job_rx.recv() {
-        if failed.load(Ordering::Relaxed) {
-            // Keep draining jobs and returning buffers so the decoder can
-            // never block on a failed worker.
-            pool.release(job.pixels, job.charged);
+        if failed.load(Ordering::Acquire) {
+            // Dropping `job` returns its `PooledBuffer` immediately.
             continue;
         }
         let target = output_dir.join(format!("frame_{:06}.{extension}", job.sequence));
@@ -623,11 +1347,12 @@ fn run_worker(ctx: &WorkerContext<'_>) {
                 path: target,
                 reason: "frame target would overwrite the extraction source".to_owned(),
             };
-            failed.store(true, Ordering::Relaxed);
-            if error_tx.send(err).is_err() {
+            let sent = error_tx.send(err).is_ok();
+            failed.store(true, Ordering::Release);
+            pool.close();
+            if !sent {
                 break;
             }
-            pool.release(job.pixels, job.charged);
             continue;
         }
         let decoded = crate::decode::DecodedFrameMeta {
@@ -647,7 +1372,7 @@ fn run_worker(ctx: &WorkerContext<'_>) {
             &target,
             source,
             *encoder,
-            &mut job.pixels,
+            job.pixels.as_mut_slice(),
             decoded,
             &mut buffers,
             inner_threads,
@@ -658,15 +1383,16 @@ fn run_worker(ctx: &WorkerContext<'_>) {
                 total_bytes.fetch_add(bytes, Ordering::Relaxed);
             }
             Err(err) => {
-                failed.store(true, Ordering::Relaxed);
-                if error_tx.send(err).is_err() {
-                    // The decoder has already stopped; nothing can block on
-                    // this worker's remaining jobs.
+                // Send the real error BEFORE closing the pool so the main
+                // thread always observes it rather than `WorkerPanicked`.
+                let sent = error_tx.send(err).is_ok();
+                failed.store(true, Ordering::Release);
+                pool.close();
+                if !sent {
                     break;
                 }
             }
         }
-        pool.release(job.pixels, job.charged);
     }
 }
 
@@ -694,18 +1420,25 @@ pub fn execute_frame_extraction(
         _ => (configured.max(1), 1),
     };
     // The aggregate byte budget, not a slot count, is the memory limiter: the
-    // pool charges every live buffer regardless of where it currently sits.
+    // pool charges every live raw pixel buffer (decoder scratch, animation
+    // canvas, queued jobs, worker-held frames and recycled buffers).
     let pool = PixelPool::new(MAX_IN_FLIGHT_BYTES);
-    let (job_tx, job_rx) = channel::unbounded::<FrameJob>();
     let (error_tx, error_rx) = channel::unbounded::<PipelineError>();
     let failed = AtomicBool::new(false);
+    let active_workers = AtomicUsize::new(workers);
     let total_bytes = AtomicU64::new(0);
     let bmp_write_lock = Mutex::new(());
     let extension = plan.output_format().extension();
+    let (job_tx, job_rx) = channel::unbounded::<FrameJob<'_>>();
 
     let decode_result = thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
+                let _guard = WorkerExitGuard {
+                    active_workers: &active_workers,
+                    failed: &failed,
+                    pool: &pool,
+                };
                 let ctx = WorkerContext {
                     job_rx: &job_rx,
                     pool: &pool,
@@ -744,7 +1477,7 @@ pub fn execute_frame_extraction(
         return Err(err);
     }
     let (frame_count, dims) = decode_result?;
-    if failed.load(Ordering::Relaxed) {
+    if failed.load(Ordering::Acquire) {
         return Err(error_rx.try_recv().unwrap_or(PipelineError::WorkerPanicked));
     }
     let output_dir = plan.output_dir();
@@ -776,14 +1509,18 @@ pub fn execute_frame_extraction(
 #[cfg(test)]
 mod tests {
     use super::{
-        FrameExtractionPlan, PipelineError, compact_cropped_rgb, copy_cropped_rows,
-        execute_frame_extraction, output_dimensions,
+        FrameEmitter, FrameExtractionPlan, FrameJob, LeaseReservation, MAX_IN_FLIGHT_BYTES,
+        PipelineError, PixelPool, Selector, WorkerExitGuard, compact_cropped_rgb,
+        copy_cropped_rows, decode_animation, decode_video, execute_frame_extraction,
+        frame_byte_len, frame_error, output_dimensions,
     };
+    use crate::decode::DecodedPixelFormat;
     use crate::video_anim::{AnimFrameInfo, encode_animation_stream};
     use crate::video_codecs::{
-        Yuv420Frame, YuvColor, decode_video_track_streaming_ctrl, encode_video_cpu,
+        Yuv420Frame, YuvColor, decode_video_track_streaming_ctrl, encode_video_cpu, nv12_buffer_len,
     };
     use crate::video_container::{ContainerMedia, demux_video, mux_video};
+    use crossbeam_channel as channel;
     use fastconv_domain::{
         AnimationLoop, FrameRange, FrameSelection, ImageDimensions, ImageExecutionMode,
         ImageOutputFormat, VideoContainerFormat, VideoEncodeMode, VideoQuality, VideoRateControl,
@@ -796,7 +1533,9 @@ mod tests {
     use std::ops::ControlFlow;
     use std::path::{Path, PathBuf};
     use std::process;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1240,13 +1979,457 @@ mod tests {
     fn compact_cropped_rgb_trims_padded_rows_in_place() -> Result<(), Box<dyn Error>> {
         // Padded 4x2 RGB buffer (24 bytes) cropped to 3x2 (18 bytes).
         let mut rgb: Vec<u8> = (1_u8..=24).collect();
-        compact_cropped_rgb(&mut rgb, 4, 3, 2)?;
+        let cropped = compact_cropped_rgb(&mut rgb, 4, 3, 2)?;
+        rgb.truncate(cropped);
         assert_eq!(
             rgb,
             vec![
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 14, 15, 16, 17, 18, 19, 20, 21
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn pixel_pool_enforces_aggregate_cap_with_concurrent_workers() -> Result<(), Box<dyn Error>> {
+        // Simulates 2:1 RGB:NV12 frames (192 + 96 = 288 bytes) under a 1024-byte
+        // aggregate budget with 4 concurrent workers.
+        let limit = 1024_usize;
+        let rgb_len = 192_usize;
+        let nv12_len = 96_usize;
+        let pool = PixelPool::new(limit);
+        let (tx, rx) = channel::unbounded::<FrameJob<'_>>();
+        let processed = AtomicUsize::new(0);
+
+        thread::scope(|scope| -> Result<(), PipelineError> {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    while let Ok(job) = rx.recv() {
+                        assert_eq!(job.pixels.len(), rgb_len);
+                        assert!(pool.live_bytes() <= limit);
+                        thread::sleep(Duration::from_millis(2));
+                        processed.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            for seq in 1_u64..=40 {
+                let (mut rgb, mut nv12) = pool.take_pair(rgb_len, nv12_len)?;
+                assert!(
+                    pool.live_bytes() <= limit,
+                    "live bytes {} exceeded limit {limit} while holding RGB + NV12",
+                    pool.live_bytes()
+                );
+                nv12.as_mut_slice()
+                    .fill(u8::try_from(seq % 251).unwrap_or(0));
+                rgb.as_mut_slice()
+                    .fill(u8::try_from(seq % 251).unwrap_or(0));
+                drop(nv12);
+                tx.send(FrameJob {
+                    sequence: seq,
+                    pixels: rgb,
+                    width: 8,
+                    height: 8,
+                    format: DecodedPixelFormat::Rgb8,
+                })
+                .map_err(|_| PipelineError::WorkerPanicked)?;
+            }
+            drop(tx);
+            Ok(())
+        })?;
+
+        assert_eq!(processed.load(Ordering::Relaxed), 40);
+        assert!(
+            pool.peak_live_bytes() <= limit,
+            "peak live bytes {} exceeded aggregate cap {limit}",
+            pool.peak_live_bytes()
+        );
+        assert!(
+            pool.peak_live_bytes() > rgb_len + nv12_len,
+            "expected concurrent pipelining beyond one frame (peak {})",
+            pool.peak_live_bytes()
+        );
+        assert_eq!(pool.leased_bytes(), 0, "all buffers must be returned");
+        Ok(())
+    }
+
+    #[test]
+    fn pixel_pool_rejects_oversized_nv12_plus_rgb_without_deadlocking() -> Result<(), Box<dyn Error>>
+    {
+        // 8192x8192 needs 192 MiB RGB + 96 MiB NV12 = 288 MiB > 256 MiB cap.
+        let rgb = frame_byte_len(8192, 8192, 3)?;
+        let nv12 = nv12_buffer_len(8192, 8192, 8192)?;
+        assert_eq!(rgb, 192 * 1024 * 1024);
+        assert_eq!(nv12, 96 * 1024 * 1024);
+        let pool = PixelPool::new(MAX_IN_FLIGHT_BYTES);
+        let result = pool.take_pair(rgb, nv12);
+        assert!(matches!(result, Err(PipelineError::DecodeFailed { .. })));
+        assert_eq!(
+            pool.peak_live_bytes(),
+            0,
+            "oversized pair must fail before allocating"
+        );
+        assert!(matches!(
+            pool.take_pair(usize::MAX, 1),
+            Err(PipelineError::DecodeFailed { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn pixel_pool_handles_borderline_frame_and_resizing_without_deadlock()
+    -> Result<(), Box<dyn Error>> {
+        // Part A: single frame consumes 100% of the budget (192 + 96 == 288).
+        let exact_limit = 288_usize;
+        let pool = PixelPool::new(exact_limit);
+        let (tx, rx) = channel::unbounded::<FrameJob<'_>>();
+        let processed = AtomicUsize::new(0);
+        thread::scope(|scope| -> Result<(), PipelineError> {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    while let Ok(_job) = rx.recv() {
+                        thread::sleep(Duration::from_millis(1));
+                        processed.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            for seq in 1_u64..=12 {
+                let (rgb, nv12) = pool.take_pair(192, 96)?;
+                drop(nv12);
+                tx.send(FrameJob {
+                    sequence: seq,
+                    pixels: rgb,
+                    width: 8,
+                    height: 8,
+                    format: DecodedPixelFormat::Rgb8,
+                })
+                .map_err(|_| PipelineError::WorkerPanicked)?;
+            }
+            drop(tx);
+            Ok(())
+        })?;
+        assert_eq!(processed.load(Ordering::Relaxed), 12);
+        assert_eq!(pool.peak_live_bytes(), exact_limit);
+
+        // Part B: variable-resolution resize where keeping an oversized idle
+        // buffer (100 bytes) for an 80-byte slot alongside a 160-byte slot
+        // would exceed the 256-byte limit; evicting idle buffers must succeed.
+        let resize_pool = PixelPool::new(256);
+        {
+            let (_a, _b) = resize_pool.take_pair(100, 50)?;
+        }
+        let (big_rgb, big_nv12) = resize_pool.take_pair(160, 80)?;
+        assert_eq!(big_rgb.len(), 160);
+        assert_eq!(big_nv12.len(), 80);
+        assert!(resize_pool.peak_live_bytes() <= 256);
+        drop(big_rgb);
+        drop(big_nv12);
+        assert_eq!(resize_pool.leased_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn pixel_pool_external_canvas_hold_shares_budget_and_rejects_overflow()
+    -> Result<(), Box<dyn Error>> {
+        let pool = PixelPool::new(256);
+        let hold = pool.reserve_external(128)?;
+        assert_eq!(pool.live_bytes(), 128);
+        {
+            let frame = pool.take(128)?;
+            assert_eq!(frame.len(), 128);
+            assert_eq!(pool.live_bytes(), 256);
+        }
+        assert!(matches!(
+            pool.take(129),
+            Err(PipelineError::DecodeFailed { .. })
+        ));
+        drop(hold);
+        let full = pool.take(256)?;
+        assert_eq!(full.len(), 256);
+        assert_eq!(pool.peak_live_bytes(), 256);
+        Ok(())
+    }
+
+    #[test]
+    fn pixel_pool_close_wakes_blocked_waiter_without_deadlock() -> Result<(), Box<dyn Error>> {
+        let pool = PixelPool::new(256);
+        let held = pool.take(256)?;
+        let result = thread::scope(|scope| {
+            let waiter = scope.spawn(|| pool.take_pair(128, 64));
+            thread::sleep(Duration::from_millis(10));
+            pool.close();
+            drop(held);
+            waiter.join().ok()
+        });
+        assert!(matches!(result, Some(Err(PipelineError::WorkerPanicked))));
+        Ok(())
+    }
+
+    #[test]
+    fn worker_exit_guard_and_reservation_rollback_prevent_deadlock() -> Result<(), Box<dyn Error>> {
+        // WorkerExitGuard closes the pool when the last worker exits while the
+        // decoder is blocked in `take_pair`.
+        let pool = PixelPool::new(256);
+        let active = AtomicUsize::new(1);
+        let failed = AtomicBool::new(false);
+        let held = pool.take(256)?;
+        let result = thread::scope(|scope| {
+            let waiter = scope.spawn(|| pool.take_pair(128, 64));
+            let worker = scope.spawn(|| {
+                let _guard = WorkerExitGuard {
+                    active_workers: &active,
+                    failed: &failed,
+                    pool: &pool,
+                };
+                thread::sleep(Duration::from_millis(10));
+            });
+            let _joined_worker = worker.join();
+            drop(held);
+            waiter.join().ok()
+        });
+        assert!(matches!(result, Some(Err(PipelineError::WorkerPanicked))));
+        assert_eq!(active.load(Ordering::Acquire), 0);
+
+        // LeaseReservation rolls back pre-reserved bytes on drop (e.g. OOM)
+        // and wakes any thread waiting for budget.
+        let rollback_pool = PixelPool::new(256);
+        {
+            let mut state = rollback_pool.lock_state();
+            state.leased_bytes = 256;
+            drop(state);
+            let reservation = LeaseReservation {
+                pool: &rollback_pool,
+                bytes: 256,
+            };
+            let acquired = thread::scope(|scope| {
+                let waiter = scope.spawn(|| rollback_pool.take(256).map(|buf| buf.len()));
+                thread::sleep(Duration::from_millis(10));
+                drop(reservation);
+                waiter.join().ok()
+            });
+            assert!(matches!(acquired, Some(Ok(256))));
+        }
+        assert_eq!(rollback_pool.leased_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn decode_animation_enforces_gif_budget_end_to_end() -> Result<(), Box<dyn Error>> {
+        let root = temp_root("gif-budget")?;
+        // Animated GIF with DisposalMethod::Previous (4x4 RGBA = 64 bytes/canvas).
+        // Hold = 2 * 64 = 128 bytes; sub-frame / output frame = 64 bytes;
+        // exact single-frame budget = 192 bytes.
+        let gif_path = root.join("prev.gif");
+        {
+            let file = File::create(&gif_path)?;
+            let mut encoder = gif::Encoder::new(file, 4, 4, &[])?;
+            encoder.set_repeat(gif::Repeat::Infinite)?;
+            for step in 0_u8..4 {
+                let mut rgba = vec![step.saturating_mul(50); 4 * 4 * 4];
+                for px in rgba.as_chunks_mut::<4>().0 {
+                    px[3] = 255;
+                }
+                let mut frame = gif::Frame::from_rgba_speed(4, 4, &mut rgba, 10);
+                frame.delay = 10;
+                frame.dispose = if step % 2 == 0 {
+                    gif::DisposalMethod::Previous
+                } else {
+                    gif::DisposalMethod::Keep
+                };
+                encoder.write_frame(&frame)?;
+            }
+        }
+        let gif_canvas = 4 * 4 * 4;
+        let gif_budget = gif_canvas * 3;
+        let gif_pool = PixelPool::new(gif_budget);
+        let (job_tx, job_rx) = channel::unbounded::<FrameJob<'_>>();
+        let (_error_tx, error_rx) = channel::unbounded::<PipelineError>();
+        let failed = AtomicBool::new(false);
+        let gif_seen = AtomicUsize::new(0);
+        let gif_emitted = thread::scope(|scope| -> Result<u64, PipelineError> {
+            scope.spawn(|| {
+                while let Ok(job) = job_rx.recv() {
+                    assert_eq!(job.pixels.len(), gif_canvas);
+                    thread::sleep(Duration::from_millis(1));
+                    gif_seen.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            let mut emitter = FrameEmitter {
+                selector: Selector::new(FrameSelection::All, 0),
+                range: FrameRange::new(0, None).map_err(|err| frame_error(err.to_string()))?,
+                expected: Some((4, 4)),
+                pool: &gif_pool,
+                job_tx,
+                error_rx: &error_rx,
+                failed: &failed,
+                sequence: 0,
+                last_dims: None,
+            };
+            let _flow = decode_animation(&gif_path, VideoContainerFormat::Gif, &mut emitter)?;
+            Ok(emitter.sequence)
+        })?;
+        assert_eq!(gif_emitted, 4);
+        assert_eq!(gif_seen.load(Ordering::Relaxed), 4);
+        assert!(gif_pool.peak_live_bytes() <= gif_budget);
+        assert_eq!(gif_pool.leased_bytes(), 0);
+
+        // One byte below GIF canvas hold + frame rejects cleanly without hanging.
+        let tiny_gif_pool = PixelPool::new(gif_budget - 1);
+        let (job_tx, _job_rx) = channel::unbounded::<FrameJob<'_>>();
+        let (_error_tx, error_rx) = channel::unbounded::<PipelineError>();
+        let failed = AtomicBool::new(false);
+        let mut tiny_gif_emitter = FrameEmitter {
+            selector: Selector::new(FrameSelection::All, 0),
+            range: FrameRange::new(0, None)?,
+            expected: Some((4, 4)),
+            pool: &tiny_gif_pool,
+            job_tx,
+            error_rx: &error_rx,
+            failed: &failed,
+            sequence: 0,
+            last_dims: None,
+        };
+        assert!(matches!(
+            decode_animation(&gif_path, VideoContainerFormat::Gif, &mut tiny_gif_emitter),
+            Err(PipelineError::DecodeFailed { .. })
+        ));
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn decode_animation_enforces_webp_budget_end_to_end() -> Result<(), Box<dyn Error>> {
+        let root = temp_root("webp-budget")?;
+        // Animated WebP with alpha (8x8 RGBA = 256 bytes/frame).
+        // Hold = 256 bytes; output = 256 bytes; exact budget = 512 bytes.
+        let webp_path = root.join("anim.webp");
+        write_animated_webp(&webp_path, 3)?;
+        let webp_frame = 8 * 8 * 4;
+        let webp_budget = webp_frame * 2;
+        let webp_pool = PixelPool::new(webp_budget);
+        let (job_tx, job_rx) = channel::unbounded::<FrameJob<'_>>();
+        let (_error_tx, error_rx) = channel::unbounded::<PipelineError>();
+        let failed = AtomicBool::new(false);
+        let webp_seen = AtomicUsize::new(0);
+        let webp_emitted = thread::scope(|scope| -> Result<u64, PipelineError> {
+            scope.spawn(|| {
+                while let Ok(job) = job_rx.recv() {
+                    assert_eq!(job.pixels.len(), webp_frame);
+                    thread::sleep(Duration::from_millis(1));
+                    webp_seen.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            let mut emitter = FrameEmitter {
+                selector: Selector::new(FrameSelection::All, 0),
+                range: FrameRange::new(0, None).map_err(|err| frame_error(err.to_string()))?,
+                expected: Some((8, 8)),
+                pool: &webp_pool,
+                job_tx,
+                error_rx: &error_rx,
+                failed: &failed,
+                sequence: 0,
+                last_dims: None,
+            };
+            let _flow = decode_animation(&webp_path, VideoContainerFormat::Webp, &mut emitter)?;
+            Ok(emitter.sequence)
+        })?;
+        assert_eq!(webp_emitted, 3);
+        assert_eq!(webp_seen.load(Ordering::Relaxed), 3);
+        assert!(webp_pool.peak_live_bytes() <= webp_budget);
+        assert_eq!(webp_pool.leased_bytes(), 0);
+
+        let tiny_webp_pool = PixelPool::new(webp_budget - 1);
+        let (job_tx, _job_rx) = channel::unbounded::<FrameJob<'_>>();
+        let (_error_tx, error_rx) = channel::unbounded::<PipelineError>();
+        let failed = AtomicBool::new(false);
+        let mut tiny_webp_emitter = FrameEmitter {
+            selector: Selector::new(FrameSelection::All, 0),
+            range: FrameRange::new(0, None)?,
+            expected: Some((8, 8)),
+            pool: &tiny_webp_pool,
+            job_tx,
+            error_rx: &error_rx,
+            failed: &failed,
+            sequence: 0,
+            last_dims: None,
+        };
+        assert!(matches!(
+            decode_animation(
+                &webp_path,
+                VideoContainerFormat::Webp,
+                &mut tiny_webp_emitter
+            ),
+            Err(PipelineError::DecodeFailed { .. })
+        ));
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn decode_video_enforces_pooled_nv12_and_rgb_budget_end_to_end() -> Result<(), Box<dyn Error>> {
+        let root = temp_root("video-budget")?;
+        let source = root.join("in.mp4");
+        write_video(&source, VideoContainerFormat::Mp4, &solid_frames(6, 32, 32))?;
+        let rgb_bytes = frame_byte_len(32, 32, 3)?;
+        let nv12_bytes = nv12_buffer_len(32, 32, 32)?;
+        let exact_frame_budget = rgb_bytes + nv12_bytes;
+
+        // Exact combined RGB + NV12 budget succeeds across 6 frames with
+        // concurrent consumers and never exceeds the cap.
+        let pool = PixelPool::new(exact_frame_budget);
+        let (job_tx, job_rx) = channel::unbounded::<FrameJob<'_>>();
+        let (_error_tx, error_rx) = channel::unbounded::<PipelineError>();
+        let failed = AtomicBool::new(false);
+        let seen = AtomicUsize::new(0);
+        let frame_count = thread::scope(|scope| -> Result<u64, PipelineError> {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    while let Ok(job) = job_rx.recv() {
+                        assert_eq!(job.pixels.len(), rgb_bytes);
+                        thread::sleep(Duration::from_millis(1));
+                        seen.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            let mut emitter = FrameEmitter {
+                selector: Selector::new(FrameSelection::All, 0),
+                range: FrameRange::new(0, None).map_err(|err| frame_error(err.to_string()))?,
+                expected: Some((32, 32)),
+                pool: &pool,
+                job_tx,
+                error_rx: &error_rx,
+                failed: &failed,
+                sequence: 0,
+                last_dims: None,
+            };
+            let _flow = decode_video(&source, VideoContainerFormat::Mp4, &mut emitter)?;
+            Ok(emitter.sequence)
+        })?;
+        assert_eq!(frame_count, 6);
+        assert_eq!(seen.load(Ordering::Relaxed), 6);
+        assert_eq!(pool.peak_live_bytes(), exact_frame_budget);
+        assert_eq!(pool.leased_bytes(), 0);
+
+        // One byte below RGB + NV12 rejects cleanly without hanging.
+        let tiny_pool = PixelPool::new(exact_frame_budget - 1);
+        let (job_tx, _job_rx) = channel::unbounded::<FrameJob<'_>>();
+        let (_error_tx, error_rx) = channel::unbounded::<PipelineError>();
+        let failed = AtomicBool::new(false);
+        let mut emitter = FrameEmitter {
+            selector: Selector::new(FrameSelection::All, 0),
+            range: FrameRange::new(0, None)?,
+            expected: Some((32, 32)),
+            pool: &tiny_pool,
+            job_tx,
+            error_rx: &error_rx,
+            failed: &failed,
+            sequence: 0,
+            last_dims: None,
+        };
+        let rejected = decode_video(&source, VideoContainerFormat::Mp4, &mut emitter);
+        assert!(matches!(rejected, Err(PipelineError::DecodeFailed { .. })));
+        assert_eq!(tiny_pool.peak_live_bytes(), 0);
+
+        fs::remove_dir_all(&root)?;
         Ok(())
     }
 

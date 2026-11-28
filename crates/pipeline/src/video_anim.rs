@@ -989,20 +989,96 @@ fn rgb_to_rgba(src: &[u8], width: u32, height: u32) -> Result<Vec<u8>, PipelineE
     Ok(rgba)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnimPixelMode {
+    FlattenedRgb,
+    AlwaysRgba,
+    /// Preserves the decoder's native channel count (RGB8 when opaque, RGBA8
+    /// when alpha is present) without allocating a temporary expansion buffer.
+    Native,
+}
+
+fn save_gif_previous_canvas(
+    path: &Path,
+    canvas: &[u8],
+    canvas_memory_limit: u64,
+    saved: &mut Option<Vec<u8>>,
+) -> Result<(), PipelineError> {
+    let two_canvases = u64::try_from(canvas.len())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(2);
+    if two_canvases > canvas_memory_limit {
+        return Err(decode_error(
+            path,
+            format!(
+                "GIF previous-frame canvas backup ({two_canvases} bytes) exceeds the {canvas_memory_limit}-byte memory limit"
+            ),
+        ));
+    }
+    match saved {
+        Some(buf) if buf.len() == canvas.len() => buf.copy_from_slice(canvas),
+        slot => *slot = Some(canvas.to_vec()),
+    }
+    Ok(())
+}
+
+fn composite_gif_frame(
+    canvas: &mut [u8],
+    canvas_dims: (usize, usize),
+    frame_buf: &[u8],
+    rect: (usize, usize, usize, usize),
+) {
+    let (canvas_w, canvas_h) = canvas_dims;
+    let (left, top, fw, fh) = rect;
+    let x0 = left.min(canvas_w);
+    let y0 = top.min(canvas_h);
+    let x1 = left.saturating_add(fw).min(canvas_w);
+    let y1 = top.saturating_add(fh).min(canvas_h);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    for y in y0..y1 {
+        let sy = y - top;
+        for x in x0..x1 {
+            let sx = x - left;
+            let src_idx = (sy * fw + sx) * 4;
+            let Some(src) = frame_buf.get(src_idx..src_idx + 4) else {
+                continue;
+            };
+            if src[3] == 0 {
+                continue;
+            }
+            let dst_idx = (y * canvas_w + x) * 4;
+            canvas[dst_idx..dst_idx + 4].copy_from_slice(src);
+        }
+    }
+}
+
+type GifFrameFill<'a> = dyn FnMut(&mut [u8]) -> Result<(), PipelineError> + 'a;
+
 /// Composites every GIF frame onto an RGBA canvas and streams either packed
 /// RGB8 (flattened) or RGBA8 (transparency preserved).
-fn gif_streaming_pixels_impl<F>(
+///
+/// Decodes each sub-frame directly into a buffer supplied by `with_frame_buf`
+/// via `next_frame_info` + `read_into_buffer`, so `gif::Decoder` never retains
+/// an unbudgeted internal `frame.buffer` allocation.
+fn gif_streaming_pixels_impl<W, F>(
     path: &Path,
-    preserve_alpha: bool,
+    mode: AnimPixelMode,
+    canvas_memory_limit: u64,
+    mut with_frame_buf: W,
     mut on_frame: F,
 ) -> Result<(), PipelineError>
 where
+    W: FnMut(usize, usize, &mut GifFrameFill<'_>) -> Result<(), PipelineError>,
     F: FnMut(AnimFrameInfo, &[u8]) -> Result<(), PipelineError>,
 {
+    let preserve_alpha = mode != AnimPixelMode::FlattenedRgb;
+    let decoder_limit = ANIM_MEMORY_LIMIT.min(canvas_memory_limit.max(1));
     let mut options = gif::DecodeOptions::new();
     options.set_color_output(gif::ColorOutput::RGBA);
     options.set_memory_limit(gif::MemoryLimit::Bytes(
-        NonZeroU64::new(ANIM_MEMORY_LIMIT).unwrap_or(NonZeroU64::MIN),
+        NonZeroU64::new(decoder_limit).unwrap_or(NonZeroU64::MIN),
     ));
     let file = File::open(path).map_err(|source| io_error(path, source))?;
     let mut decoder = options
@@ -1018,11 +1094,11 @@ where
     let canvas_len = byte_len(anim_w, anim_h, 4)?;
     // A hostile logical screen (e.g. 65535x65535) must fail before the RGBA
     // canvas is requested from the allocator.
-    if u64::try_from(canvas_len).unwrap_or(u64::MAX) > ANIM_MEMORY_LIMIT {
+    if u64::try_from(canvas_len).unwrap_or(u64::MAX) > canvas_memory_limit {
         return Err(decode_error(
             path,
             format!(
-                "GIF canvas ({canvas_len} bytes) exceeds the {ANIM_MEMORY_LIMIT}-byte memory limit"
+                "GIF canvas ({canvas_len} bytes) exceeds the {canvas_memory_limit}-byte memory limit"
             ),
         ));
     }
@@ -1030,44 +1106,35 @@ where
     let mut pts_us = 0_i64;
     let mut saved: Option<Vec<u8>> = None;
 
-    while let Some(frame) = decoder
-        .read_next_frame()
+    while let Some(frame_info) = decoder
+        .next_frame_info()
         .map_err(|err| decode_error(path, format!("GIF frame is invalid: {err}")))?
     {
-        let disposal = frame.dispose;
-        if disposal == gif::DisposalMethod::Previous {
-            saved = Some(canvas.clone());
-        }
-        let left = usize::from(frame.left);
-        let top = usize::from(frame.top);
-        let fw = usize::from(frame.width);
-        let fh = usize::from(frame.height);
-        let x0 = left.min(width);
-        let y0 = top.min(height);
-        let x1 = left.saturating_add(fw).min(width);
-        let y1 = top.saturating_add(fh).min(height);
-        if x1 > x0 && y1 > y0 {
-            for y in y0..y1 {
-                let sy = y - top;
-                for x in x0..x1 {
-                    let sx = x - left;
-                    let src_idx = (sy * fw + sx) * 4;
-                    let Some(src) = frame.buffer.get(src_idx..src_idx + 4) else {
-                        continue;
-                    };
-                    if src[3] == 0 {
-                        continue;
-                    }
-                    let dst_idx = (y * width + x) * 4;
-                    canvas[dst_idx..dst_idx + 4].copy_from_slice(src);
-                }
-            }
-        }
+        let disposal = frame_info.dispose;
+        let rect = (
+            usize::from(frame_info.left),
+            usize::from(frame_info.top),
+            usize::from(frame_info.width),
+            usize::from(frame_info.height),
+        );
+        let delay = frame_info.delay;
+        let frame_buf_len = byte_len(u32::from(frame_info.width), u32::from(frame_info.height), 4)?;
 
-        let duration = if frame.delay == 0 {
+        if disposal == gif::DisposalMethod::Previous {
+            save_gif_previous_canvas(path, &canvas, canvas_memory_limit, &mut saved)?;
+        }
+        with_frame_buf(canvas_len, frame_buf_len, &mut |frame_buf| {
+            decoder
+                .read_into_buffer(frame_buf)
+                .map_err(|err| decode_error(path, format!("GIF frame is invalid: {err}")))?;
+            composite_gif_frame(&mut canvas, (width, height), frame_buf, rect);
+            Ok(())
+        })?;
+
+        let duration = if delay == 0 {
             100_000_u64
         } else {
-            u64::from(frame.delay) * 10_000
+            u64::from(delay) * 10_000
         };
         if preserve_alpha {
             let info = AnimFrameInfo {
@@ -1091,7 +1158,7 @@ where
         }
         pts_us = pts_us.saturating_add(i64::try_from(duration).unwrap_or(i64::MAX));
 
-        apply_gif_disposal(&mut canvas, width, frame, &mut saved);
+        apply_gif_disposal(&mut canvas, width, rect, disposal, &mut saved);
     }
     Ok(())
 }
@@ -1099,17 +1166,17 @@ where
 fn apply_gif_disposal(
     canvas: &mut Vec<u8>,
     width: usize,
-    frame: &gif::Frame<'_>,
+    rect: (usize, usize, usize, usize),
+    disposal: gif::DisposalMethod,
     saved: &mut Option<Vec<u8>>,
 ) {
+    let (left, top, fw, fh) = rect;
     let height = canvas.len() / 4 / width;
-    let left = usize::from(frame.left);
-    let top = usize::from(frame.top);
     let x0 = left.min(width);
     let y0 = top.min(height);
-    let x1 = left.saturating_add(usize::from(frame.width)).min(width);
-    let y1 = top.saturating_add(usize::from(frame.height)).min(height);
-    match frame.dispose {
+    let x1 = left.saturating_add(fw).min(width);
+    let y1 = top.saturating_add(fh).min(height);
+    match disposal {
         gif::DisposalMethod::Background => {
             for y in y0..y1 {
                 let start = (y * width + x0) * 4;
@@ -1126,6 +1193,30 @@ fn apply_gif_disposal(
     }
 }
 
+fn default_gif_frame_buf(
+    path: &Path,
+) -> impl FnMut(usize, usize, &mut GifFrameFill<'_>) -> Result<(), PipelineError> + '_ {
+    let mut scratch = Vec::new();
+    move |_canvas_len, frame_buf_len, fill| {
+        if u64::try_from(frame_buf_len).unwrap_or(u64::MAX) > ANIM_MEMORY_LIMIT {
+            return Err(decode_error(
+                path,
+                format!(
+                    "GIF frame buffer ({frame_buf_len} bytes) exceeds the {ANIM_MEMORY_LIMIT}-byte memory limit"
+                ),
+            ));
+        }
+        scratch.clear();
+        if scratch.capacity() < frame_buf_len {
+            scratch
+                .try_reserve_exact(frame_buf_len)
+                .map_err(|_| decode_error(path, "GIF frame buffer allocation failed"))?;
+        }
+        scratch.resize(frame_buf_len, 0);
+        fill(scratch.as_mut_slice())
+    }
+}
+
 /// Composites GIF frames and streams flattened RGB8 for non-animation outputs.
 #[cfg(test)]
 pub(crate) fn decode_gif_frames_streaming_rgb<F>(
@@ -1135,7 +1226,13 @@ pub(crate) fn decode_gif_frames_streaming_rgb<F>(
 where
     F: FnMut(AnimFrameInfo, &[u8]) -> Result<(), PipelineError>,
 {
-    gif_streaming_pixels_impl(path, false, on_frame)
+    gif_streaming_pixels_impl(
+        path,
+        AnimPixelMode::FlattenedRgb,
+        ANIM_MEMORY_LIMIT,
+        default_gif_frame_buf(path),
+        on_frame,
+    )
 }
 
 /// Composites GIF frames and streams RGBA8, preserving the one-bit GIF mask.
@@ -1146,16 +1243,27 @@ pub(crate) fn decode_gif_frames_streaming_pixels<F>(
 where
     F: FnMut(AnimFrameInfo, &[u8]) -> Result<(), PipelineError>,
 {
-    gif_streaming_pixels_impl(path, true, on_frame)
+    gif_streaming_pixels_impl(
+        path,
+        AnimPixelMode::AlwaysRgba,
+        ANIM_MEMORY_LIMIT,
+        default_gif_frame_buf(path),
+        on_frame,
+    )
 }
 
 /// `ControlFlow`-returning GIF variant: `Break` stops compositing immediately.
-/// Existing callers keep using the `Result` wrapper above unchanged.
-pub(crate) fn decode_gif_frames_streaming_pixels_ctrl<F>(
+/// `max_canvas_bytes` caps canvas allocations upfront, and `with_frame_buf`
+/// supplies the temporary sub-frame decode buffer from the caller's pool so
+/// every raw pixel allocation stays under one aggregate budget.
+pub(crate) fn decode_gif_frames_streaming_pixels_ctrl<W, F>(
     path: &Path,
+    max_canvas_bytes: usize,
+    with_frame_buf: W,
     mut on_frame: F,
 ) -> Result<ControlFlow<()>, PipelineError>
 where
+    W: FnMut(usize, usize, &mut GifFrameFill<'_>) -> Result<(), PipelineError>,
     F: FnMut(AnimFrameInfo, &[u8]) -> Result<ControlFlow<()>, PipelineError>,
 {
     let mut stopped = false;
@@ -1168,7 +1276,16 @@ where
             }
         }
     };
-    match decode_gif_frames_streaming_pixels(path, wrapped) {
+    let limit = u64::try_from(max_canvas_bytes)
+        .unwrap_or(u64::MAX)
+        .min(ANIM_MEMORY_LIMIT);
+    match gif_streaming_pixels_impl(
+        path,
+        AnimPixelMode::AlwaysRgba,
+        limit,
+        with_frame_buf,
+        wrapped,
+    ) {
         Ok(()) => Ok(ControlFlow::Continue(())),
         Err(PipelineError::DecodeFailed { reason, .. })
             if stopped && reason == FRAMES_EARLY_STOP =>
@@ -1270,10 +1387,50 @@ fn read_bounded_animation_file(path: &Path, limit: u64) -> Result<Vec<u8>, Pipel
     Ok(bytes)
 }
 
+fn emit_webp_frame<F>(
+    mode: AnimPixelMode,
+    bpp: usize,
+    info: AnimFrameInfo,
+    buf: &[u8],
+    on_frame: &mut F,
+) -> Result<(), PipelineError>
+where
+    F: FnMut(AnimFrameInfo, &[u8]) -> Result<(), PipelineError>,
+{
+    match mode {
+        AnimPixelMode::Native => on_frame(info, buf),
+        AnimPixelMode::AlwaysRgba => {
+            if bpp == 4 {
+                on_frame(
+                    AnimFrameInfo {
+                        channels: 4,
+                        ..info
+                    },
+                    buf,
+                )
+            } else {
+                let rgba = rgb_to_rgba(buf, info.width, info.height)?;
+                on_frame(
+                    AnimFrameInfo {
+                        channels: 4,
+                        ..info
+                    },
+                    &rgba,
+                )
+            }
+        }
+        AnimPixelMode::FlattenedRgb => {
+            let rgb = rgba_to_rgb(buf, bpp, info.width, info.height)?;
+            on_frame(info, &rgb)
+        }
+    }
+}
+
 /// Decodes a still or animated WebP file and streams packed RGB8 or RGBA8.
 fn webp_streaming_pixels_impl<F>(
     path: &Path,
-    preserve_alpha: bool,
+    mode: AnimPixelMode,
+    frame_memory_limit: u64,
     mut on_frame: F,
 ) -> Result<(), PipelineError>
 where
@@ -1301,31 +1458,20 @@ where
             "WebP decoder reported an inconsistent buffer size",
         ));
     }
+    if u64::try_from(buf_len).unwrap_or(u64::MAX) > frame_memory_limit {
+        return Err(decode_error(
+            path,
+            format!(
+                "WebP frame buffer ({buf_len} bytes) exceeds the {frame_memory_limit}-byte memory limit"
+            ),
+        ));
+    }
     let mut buf = vec![0_u8; buf_len];
     let mut pts_us = 0_i64;
-
-    let emit = |info: AnimFrameInfo, buf: &[u8], on_frame: &mut F| -> Result<(), PipelineError> {
-        if preserve_alpha {
-            if bpp == 4 {
-                let info = AnimFrameInfo {
-                    channels: 4,
-                    ..info
-                };
-                on_frame(info, buf)
-            } else {
-                let rgba = rgb_to_rgba(buf, width, height)?;
-                on_frame(
-                    AnimFrameInfo {
-                        channels: 4,
-                        ..info
-                    },
-                    &rgba,
-                )
-            }
-        } else {
-            let rgb = rgba_to_rgb(buf, bpp, width, height)?;
-            on_frame(info, &rgb)
-        }
+    let out_channels: u8 = match mode {
+        AnimPixelMode::FlattenedRgb => 3,
+        AnimPixelMode::AlwaysRgba => 4,
+        AnimPixelMode::Native => u8::try_from(bpp).unwrap_or(4),
     };
 
     if decoder.is_animated() {
@@ -1350,9 +1496,9 @@ where
                 height,
                 pts_us,
                 duration_us: duration,
-                channels: if preserve_alpha { 4 } else { 3 },
+                channels: out_channels,
             };
-            emit(info, &buf, &mut on_frame)?;
+            emit_webp_frame(mode, bpp, info, &buf, &mut on_frame)?;
             pts_us = pts_us.saturating_add(i64::try_from(duration).unwrap_or(i64::MAX));
         }
     } else {
@@ -1364,9 +1510,9 @@ where
             height,
             pts_us,
             duration_us: 100_000,
-            channels: if preserve_alpha { 4 } else { 3 },
+            channels: out_channels,
         };
-        emit(info, &buf, &mut on_frame)?;
+        emit_webp_frame(mode, bpp, info, &buf, &mut on_frame)?;
     }
     Ok(())
 }
@@ -1380,7 +1526,12 @@ pub(crate) fn decode_webp_frames_streaming_rgb<F>(
 where
     F: FnMut(AnimFrameInfo, &[u8]) -> Result<(), PipelineError>,
 {
-    webp_streaming_pixels_impl(path, false, on_frame)
+    webp_streaming_pixels_impl(
+        path,
+        AnimPixelMode::FlattenedRgb,
+        ANIM_MEMORY_LIMIT,
+        on_frame,
+    )
 }
 
 /// Streams WebP frames as RGBA8 so transparency survives animation re-encoding.
@@ -1391,12 +1542,15 @@ pub(crate) fn decode_webp_frames_streaming_pixels<F>(
 where
     F: FnMut(AnimFrameInfo, &[u8]) -> Result<(), PipelineError>,
 {
-    webp_streaming_pixels_impl(path, true, on_frame)
+    webp_streaming_pixels_impl(path, AnimPixelMode::AlwaysRgba, ANIM_MEMORY_LIMIT, on_frame)
 }
 
 /// `ControlFlow`-returning WebP variant: `Break` stops frame decoding immediately.
+/// Streams the decoder's native pixel format (RGB8 or RGBA8) with no extra
+/// per-frame expansion copy and enforces `max_frame_bytes` before allocation.
 pub(crate) fn decode_webp_frames_streaming_pixels_ctrl<F>(
     path: &Path,
+    max_frame_bytes: usize,
     mut on_frame: F,
 ) -> Result<ControlFlow<()>, PipelineError>
 where
@@ -1412,7 +1566,10 @@ where
             }
         }
     };
-    match decode_webp_frames_streaming_pixels(path, wrapped) {
+    let limit = u64::try_from(max_frame_bytes)
+        .unwrap_or(u64::MAX)
+        .min(ANIM_MEMORY_LIMIT);
+    match webp_streaming_pixels_impl(path, AnimPixelMode::Native, limit, wrapped) {
         Ok(()) => Ok(ControlFlow::Continue(())),
         Err(PipelineError::DecodeFailed { reason, .. })
             if stopped && reason == FRAMES_EARLY_STOP =>
