@@ -7612,6 +7612,7 @@ mod tests {
         })
     }
 
+    // One argument per test input keeps the container/codec matrix explicit.
     #[allow(clippy::too_many_arguments)]
     fn run_external(
         source: &Path,
@@ -7876,16 +7877,21 @@ mod tests {
             ExternalAudioMode::Append,
         )?;
         let media = demux_video(&target, VideoContainerFormat::Mp4)?;
-        let min_pts = media
-            .packets
-            .iter()
-            .map(|packet| packet.pts)
-            .min()
-            .unwrap_or(1);
-        assert_eq!(
-            min_pts, 0,
-            "copied tracks must rebase to the added track's origin"
-        );
+        // Check each track separately: a global minimum would pass even if a
+        // copied track kept its original 500,000 µs offset while the added
+        // track (which always starts at zero) masked it.
+        let min_pts = |track: usize| {
+            media
+                .packets
+                .iter()
+                .filter(|packet| packet.track == track)
+                .map(|packet| packet.pts)
+                .min()
+                .unwrap_or(1)
+        };
+        assert_eq!(min_pts(0), 0, "copied video must rebase to zero");
+        assert_eq!(min_pts(1), 0, "copied audio must rebase to zero");
+        assert_eq!(min_pts(2), 0, "added audio must start at zero");
         Ok(())
     }
 

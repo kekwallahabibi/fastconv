@@ -954,6 +954,28 @@ impl AudioEncodeConfig {
         }
     }
 
+    /// Shared channel-range check for both requested and inherited counts.
+    /// An inherited count reaches the encoder unmodified when no remix was
+    /// requested, so an unsupported count must be rejected before a plan can
+    /// be built around it.
+    fn validate_channels(codec: TargetAudioCodec, count: u16) -> Result<(), DomainError> {
+        let allowed = match codec {
+            TargetAudioCodec::Aac | TargetAudioCodec::Vorbis => {
+                (1..=6).contains(&count) && count != 4
+            }
+            TargetAudioCodec::Opus | TargetAudioCodec::Mp3 => (1..=2).contains(&count),
+            TargetAudioCodec::Flac | TargetAudioCodec::Pcm => (1..=8).contains(&count),
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(DomainError::UnsupportedAudioEncodeOption {
+                codec,
+                reason: format!("channel count {count}ch is not supported by {codec}"),
+            })
+        }
+    }
+
     /// Validates `options` against the concrete codec's supported range.
     ///
     /// # Errors
@@ -1014,19 +1036,7 @@ impl AudioEncodeConfig {
             }
         }
         if let Some(channels) = options.channels() {
-            let count = channels.count();
-            let allowed = match codec {
-                TargetAudioCodec::Aac | TargetAudioCodec::Vorbis => {
-                    (1..=6).contains(&count) && count != 4
-                }
-                TargetAudioCodec::Opus | TargetAudioCodec::Mp3 => (1..=2).contains(&count),
-                TargetAudioCodec::Flac | TargetAudioCodec::Pcm => (1..=8).contains(&count),
-            };
-            if !allowed {
-                return Err(unsupported(format!(
-                    "channel count {channels} is not supported by {codec}"
-                )));
-            }
+            Self::validate_channels(codec, channels.count())?;
         }
         Ok(Self {
             codec,
@@ -1666,9 +1676,12 @@ impl ExternalAudioTrack {
     ///
     /// # Errors
     ///
-    /// Returns [`DomainError::EmptyPath`] for an empty source and
+    /// Returns [`DomainError::EmptyPath`] for an empty source,
     /// [`DomainError::UnsupportedVideoCodec`] when `container` cannot carry
-    /// audio or `config.codec()` is not storable in it.
+    /// audio or `config.codec()` is not storable in it, and
+    /// [`DomainError::UnsupportedAudioEncodeOption`] when the effective channel
+    /// count (explicit override or probed source channels) is unsupported by
+    /// the target codec.
     pub fn new(
         source: PathBuf,
         input_format: AudioInputFormat,
@@ -1686,6 +1699,10 @@ impl ExternalAudioTrack {
                 container,
             });
         }
+        let inherited_channels = config
+            .channels()
+            .map_or(stream.channels().get(), AudioChannels::count);
+        AudioEncodeConfig::validate_channels(config.codec(), inherited_channels)?;
         Ok(Self {
             source,
             input_format,
@@ -2131,6 +2148,7 @@ impl VideoTranscodeItem {
     /// # Errors
     ///
     /// See [`Self::with_external_audio`].
+    // One argument per source fact keeps the boundary mapping explicit.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         source: PathBuf,
@@ -4540,6 +4558,44 @@ mod tests {
         assert_eq!(C::Webp.default_added_audio_codec(), None);
         // The established transcode default is deliberately unchanged.
         assert_eq!(C::Mkv.default_audio_codec(), Some(TargetAudioCodec::Aac));
+    }
+
+    #[test]
+    fn external_track_validates_inherited_and_explicit_channel_counts() -> Result<(), DomainError> {
+        let six_channels = AudioStreamInfo::new(
+            NonZeroU16::new(6).ok_or(DomainError::EmptyField("test.channels"))?,
+            NonZeroU32::new(48_000).ok_or(DomainError::EmptyField("test.rate"))?,
+            None,
+            Some(1_920),
+        )?;
+        // Opus is MKV's default added codec and accepts at most stereo: an
+        // inherited six-channel source must fail before a plan is built.
+        assert!(matches!(
+            ExternalAudioTrack::new(
+                PathBuf::from("song.wav"),
+                crate::AudioInputFormat::Wav,
+                six_channels,
+                AudioEncodeConfig::default_for(TargetAudioCodec::Opus),
+                ExternalAudioMode::Append,
+                VideoContainerFormat::Mkv,
+            ),
+            Err(DomainError::UnsupportedAudioEncodeOption { .. })
+        ));
+        // An explicit two-channel remix stays legal and reaches the encoder.
+        let remixed = AudioEncodeConfig::new(
+            TargetAudioCodec::Opus,
+            AudioEncodeOptions::new(None, None, Some(AudioChannels::new(2)?)),
+        )?;
+        let track = ExternalAudioTrack::new(
+            PathBuf::from("song.wav"),
+            crate::AudioInputFormat::Wav,
+            six_channels,
+            remixed,
+            ExternalAudioMode::Append,
+            VideoContainerFormat::Mkv,
+        )?;
+        assert_eq!(track.config().channels(), Some(AudioChannels::new(2)?));
+        Ok(())
     }
 
     #[test]
