@@ -3443,16 +3443,29 @@ fn transcode_file(
     // timestamps, while CPU-encoded video and decoded audio start at zero
     // relative to their own source track. Rebasing both onto this origin keeps
     // the input's inter-track spacing instead of zeroing each track separately.
-    let needs_rebase = item.external_audio().is_some()
+    let has_external_audio = item.external_audio().is_some();
+    let needs_rebase = has_external_audio
         || media.tracks.iter().any(|track| {
             (track.codec.is_video() && matches!(item.video_action(), VideoTrackAction::Encode(_)))
                 || (track.codec.is_audio()
                     && matches!(item.audio_action(), AudioTrackAction::Encode(_)))
         });
+    // An added track starts at presentation time zero, so with one present the
+    // shared origin must be the source's first presentation time. Using the
+    // decode origin here would shift B-frame streams forward by their DTS lead
+    // and start the copied tracks after the added audio. Without external
+    // audio the established decode-origin behaviour (including the copy-only
+    // no-rebase path) is unchanged.
     let origin = media
         .packets
         .iter()
-        .map(|packet| packet.dts)
+        .map(|packet| {
+            if has_external_audio {
+                packet.pts
+            } else {
+                packet.dts
+            }
+        })
         .min()
         .unwrap_or(0);
     let rebase = needs_rebase.then_some(origin);
@@ -8070,6 +8083,103 @@ mod tests {
                 TargetAudioCodec::Pcm => assert!(added.pcm_format.is_some(), "{container}: lpcm"),
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn external_audio_aligns_with_copied_tracks_when_dts_precedes_pts() -> Result<(), PipelineError>
+    {
+        let dir = temp_dir("external-dts-before-pts")?;
+        let source = dir.join("in.mp4");
+        make_source(
+            &source,
+            VideoContainerFormat::Mp4,
+            VideoEncodeMode::CpuH264 {
+                rate_control: VideoRateControl::DEFAULT,
+            },
+            TargetAudioCodec::Aac,
+        )?;
+        // Give the copied video a decode origin ahead of its first presentation.
+        let media = demux_video(&source, VideoContainerFormat::Mp4)?;
+        let shifted = ContainerMedia {
+            tracks: media.tracks,
+            packets: media
+                .packets
+                .into_iter()
+                .map(|mut packet| {
+                    if packet.track == 0 {
+                        packet.dts = packet.dts.saturating_sub(80_000);
+                    }
+                    packet
+                })
+                .collect(),
+        };
+        let file = File::create(&source).map_err(|source_err| PipelineError::Io {
+            path: source.clone(),
+            source: source_err,
+        })?;
+        mux_video(&file, &source, VideoContainerFormat::Mp4, &shifted)?;
+        drop(file);
+
+        let demuxed = demux_video(&source, VideoContainerFormat::Mp4)?;
+        let decode_origin = demuxed.packets.iter().map(|p| p.dts).min().unwrap_or(0);
+        let presentation_origin = demuxed.packets.iter().map(|p| p.pts).min().unwrap_or(0);
+        assert!(
+            decode_origin < presentation_origin,
+            "fixture must start DTS before PTS"
+        );
+
+        // First presentation time of every track, with and without the added track.
+        let first_pts = |path: &Path| -> Result<Vec<i64>, PipelineError> {
+            let media = demux_video(path, VideoContainerFormat::Mp4)?;
+            Ok((0..media.tracks.len())
+                .map(|track| {
+                    media
+                        .packets
+                        .iter()
+                        .filter(|packet| packet.track == track)
+                        .map(|packet| packet.pts)
+                        .min()
+                        .unwrap_or(i64::MAX)
+                })
+                .collect())
+        };
+
+        let copy_only = dir.join("copy-only.mp4");
+        transcode(
+            &source,
+            &copy_only,
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            VideoTrackAction::Copy,
+            AudioTrackAction::Copy,
+        )?;
+        let baseline = first_pts(&copy_only)?;
+
+        let wav = dir.join("song.wav");
+        let stream = write_wav_fixture(&wav, 48_000, 2, 1_920)?;
+        let added = dir.join("added.mp4");
+        run_external(
+            &source,
+            &added,
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            VideoTrackAction::Copy,
+            AudioTrackAction::Copy,
+            &wav,
+            AudioInputFormat::Wav,
+            stream,
+            TargetAudioCodec::Aac,
+            ExternalAudioMode::Append,
+        )?;
+        let with_added = first_pts(&added)?;
+        assert_eq!(with_added.len(), 3);
+        assert_eq!(with_added[0], baseline[0], "copied video start");
+        assert_eq!(with_added[1], baseline[1], "copied audio start");
+        assert_eq!(
+            with_added[2], baseline[0],
+            "added audio must start at the source presentation start"
+        );
         Ok(())
     }
 }
