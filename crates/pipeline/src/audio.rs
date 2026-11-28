@@ -919,6 +919,18 @@ fn decode_video_pcm_i32(
     Ok((rate, channels, 32, AudioSampleFormat::Int))
 }
 
+/// Presentation edit to apply to a decoded video audio track. Opus decoders
+/// already drop the `OpusHead` pre-skip, so decoded PCM starts at the presented
+/// origin: a leading empty-edit delay must not be removed a second time. Other
+/// codecs (notably AAC) return their priming and still need the start trim.
+fn video_audio_presentation_edit(track: &ContainerTrack) -> Option<TrackPresentation> {
+    let mut edit = track.presentation_edit?;
+    if track.codec == VideoCodec::Opus {
+        edit.start_us = 0;
+    }
+    Some(edit)
+}
+
 /// Bit-exact 32-bit PCM path including the track's presentation window.
 fn decode_video_pcm_i32_presented(
     path: &Path,
@@ -927,7 +939,7 @@ fn decode_video_pcm_i32_presented(
     buf: &mut AudioWorkerBuffer,
 ) -> Result<(u32, usize, usize, AudioSampleFormat), PipelineError> {
     let (rate, channels, bits, format) = decode_video_pcm_i32(path, track, packets, buf)?;
-    if let Some(edit) = track.presentation_edit {
+    if let Some(edit) = video_audio_presentation_edit(track) {
         let frames = buf.samples_i32.len() / channels;
         trim_presented_frames(
             &mut buf.samples_i32,
@@ -1033,7 +1045,7 @@ fn decode_video_audio_track(
             Ok(())
         },
     )?;
-    if let Some(edit) = track.presentation_edit {
+    if let Some(edit) = video_audio_presentation_edit(&track) {
         let frames = buf.samples_f32.len() / usize::from(channels.max(1));
         trim_presented_frames(
             &mut buf.samples_f32,
@@ -7291,6 +7303,37 @@ mod tests {
         assert_eq!(
             presentation_frame_range(negative, 1_000_000, 5_000),
             (0, 5_000)
+        );
+    }
+
+    #[test]
+    fn opus_presentation_edit_skips_already_removed_pre_skip() {
+        let edit = TrackPresentation {
+            start_us: 21_333,
+            duration_us: Some(1_000_000),
+        };
+        let mut track = ContainerTrack {
+            codec: fastconv_domain::VideoCodec::Opus,
+            width: None,
+            height: None,
+            channels: Some(2),
+            sample_rate: Some(48_000),
+            config: Vec::new(),
+            timescale: 1_000_000,
+            presentation_edit: Some(edit),
+            pcm_format: None,
+        };
+        let adjusted = video_audio_presentation_edit(&track).unwrap_or(edit);
+        assert_eq!(
+            adjusted.start_us, 0,
+            "Opus pre-skip is already decoded away"
+        );
+        assert_eq!(adjusted.duration_us, edit.duration_us);
+        track.codec = fastconv_domain::VideoCodec::Aac;
+        assert_eq!(
+            video_audio_presentation_edit(&track),
+            Some(edit),
+            "AAC still returns priming and needs the start trim"
         );
     }
 
