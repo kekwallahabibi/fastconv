@@ -56,6 +56,8 @@ fn global_help_is_available_through_all_entry_points() -> Result<(), String> {
         "-h, --help",
         "-V, --version",
         "--hwdecode <auto|cpu|nvdec>",
+        "--add-audio <path>",
+        "--replace-audio",
         "--compression-level <fast|balanced|best>",
         "--tiff-compression <deflate|lzw|packbits|none>",
         "--chroma <420|444>",
@@ -279,6 +281,8 @@ fn remux_and_video_help_cover_their_constraints() -> Result<(), String> {
     let video = stdout(&["video", "--help"])?;
     for needle in [
         "--hwdecode <auto|cpu|nvdec>",
+        "--add-audio <path>",
+        "--replace-audio",
         "--vcodec",
         "--acodec",
         "--quality <0..=100>",
@@ -290,6 +294,8 @@ fn remux_and_video_help_cover_their_constraints() -> Result<(), String> {
         "software -> cpu",
         "cuda/gpu -> nvdec",
         "hard error",
+        "--add-audio <path>",
+        "--replace-audio",
         "GIF",
         "webp",
         "mjpeg (mjpg)",

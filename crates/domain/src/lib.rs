@@ -22,12 +22,12 @@ pub use image::{
 pub use metrics::{BenchmarkMetrics, BenchmarkSample, PeakMemory, Throughput, WorkloadUnit};
 pub use video::{
     AnimationLoop, AnimationMeta, AudioBitrate, AudioChannels, AudioEncodeConfig,
-    AudioEncodeOptions, AudioSampleRate, AudioTrackAction, HardwareDecodeBackend, TargetAudioCodec,
-    TargetVideoCodec, VideoBitrate, VideoCodec, VideoContainerFormat, VideoDecodeMode,
-    VideoEncodeMode, VideoQuality, VideoRateControl, VideoRemuxItem, VideoRemuxPlan,
-    VideoRemuxReport, VideoStreamInfo, VideoStreamKind, VideoTrackAction, VideoTranscodeItem,
-    VideoTranscodePlan, VideoTranscodeReport, resolve_audio_encode_options,
-    resolve_video_rate_control, validate_audio_options_for_container,
+    AudioEncodeOptions, AudioSampleRate, AudioTrackAction, ExternalAudioMode, ExternalAudioTrack,
+    HardwareDecodeBackend, TargetAudioCodec, TargetVideoCodec, VideoBitrate, VideoCodec,
+    VideoContainerFormat, VideoDecodeMode, VideoEncodeMode, VideoQuality, VideoRateControl,
+    VideoRemuxItem, VideoRemuxPlan, VideoRemuxReport, VideoStreamInfo, VideoStreamKind,
+    VideoTrackAction, VideoTranscodeItem, VideoTranscodePlan, VideoTranscodeReport,
+    resolve_audio_encode_options, resolve_video_rate_control, validate_audio_options_for_container,
 };
 
 use std::error::Error;

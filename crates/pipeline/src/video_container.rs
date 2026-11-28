@@ -1507,8 +1507,10 @@ fn mp4_earliest_presentation_times(media: &ContainerMedia) -> Vec<Option<i64>> {
     earliest_pts
 }
 
-fn mp4_presentation_bases(media: &ContainerMedia, origins: &[Option<i64>]) -> Vec<Option<i64>> {
-    let earliest_pts = mp4_earliest_presentation_times(media);
+fn mp4_presentation_bases_from(
+    origins: &[Option<i64>],
+    earliest_pts: &[Option<i64>],
+) -> Vec<Option<i64>> {
     origins
         .iter()
         .zip(earliest_pts)
@@ -1516,6 +1518,12 @@ fn mp4_presentation_bases(media: &ContainerMedia, origins: &[Option<i64>]) -> Ve
             origin.and_then(|first_dts| earliest.map(|earliest| first_dts.min(earliest)))
         })
         .collect()
+}
+
+#[cfg(test)]
+fn mp4_presentation_bases(media: &ContainerMedia, origins: &[Option<i64>]) -> Vec<Option<i64>> {
+    let earliest_pts = mp4_earliest_presentation_times(media);
+    mp4_presentation_bases_from(origins, &earliest_pts)
 }
 
 /// Visible movie-timeline start per track. When a track carries an explicit
@@ -1540,6 +1548,21 @@ fn mp4_visible_starts(
             })
         })
         .collect()
+}
+
+/// Canonical visible movie-timeline start per track shared by container muxers
+/// and transcode origin selection.
+///
+/// Tracks without a presentation edit start at their earliest presentation
+/// timestamp. Tracks with an edit start at `edit.start_us` clamped up to the
+/// track's presentation base `min(first_dts, earliest_pts)` so an edit whose
+/// start precedes all packets never pulls the shared origin earlier than what
+/// the MP4/MOV and Matroska/WebM muxers treat as visible start.
+pub(crate) fn visible_track_starts(media: &ContainerMedia) -> Vec<Option<i64>> {
+    let dts_origins = mp4_decode_origins(media);
+    let earliest_pts = mp4_earliest_presentation_times(media);
+    let pts_bases = mp4_presentation_bases_from(&dts_origins, &earliest_pts);
+    mp4_visible_starts(media, &pts_bases, &earliest_pts)
 }
 
 /// `(decode, presentation)` timestamps in decode order. DTS is made strictly
@@ -1784,8 +1807,8 @@ fn mux_mp4_into<W: Read + Write + Seek>(
     // B-frame never produces a negative presentation time. The edit list
     // restores each track's delay relative to the common timeline.
     let dts_origins = mp4_decode_origins(media);
-    let pts_bases = mp4_presentation_bases(media, &dts_origins);
     let earliest_pts = mp4_earliest_presentation_times(media);
+    let pts_bases = mp4_presentation_bases_from(&dts_origins, &earliest_pts);
     let visible_starts = mp4_visible_starts(media, &pts_bases, &earliest_pts);
     // The common timeline starts at the earliest *visible* presentation time.
     // Decode preroll and audio priming packets sit before `visible_starts` and
@@ -2121,19 +2144,9 @@ fn mux_mkv(
         );
     }
     validate_mkv_presentation_edits(media, target_path)?;
-    let earliest_pts = mp4_earliest_presentation_times(media);
-    let base = media
-        .tracks
-        .iter()
-        .enumerate()
-        .filter_map(|(index, track)| {
-            let earliest = earliest_pts[index]?;
-            Some(
-                track
-                    .presentation_edit
-                    .map_or(earliest, |edit| edit.start_us),
-            )
-        })
+    let base = visible_track_starts(media)
+        .into_iter()
+        .flatten()
         .min()
         .unwrap_or(0);
     for packet in &media.packets {

@@ -11,8 +11,8 @@ pub use audio::{
 pub use hardware::detect_host_hardware;
 pub use image::{ProbedImage, prepare_image_batch, prepare_image_batch_with_options, probe_image};
 pub use video::{
-    ProbedVideo, RequestedAudioCodec, RequestedVideoCodec, VideoTranscodeOptions,
-    detect_video_magic, parse_requested_audio_codec, prepare_video_batch,
+    ExternalAudioRequest, ProbedVideo, RequestedAudioCodec, RequestedVideoCodec,
+    VideoTranscodeOptions, detect_video_magic, parse_requested_audio_codec, prepare_video_batch,
     prepare_video_transcode_batch, prepare_video_transcode_batch_with_decode,
     prepare_video_transcode_batch_with_options, probe_video,
 };

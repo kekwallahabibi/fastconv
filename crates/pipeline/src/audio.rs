@@ -14,8 +14,8 @@ use std::time::Instant;
 use fastconv_domain::{
     AudioBatchItem, AudioBatchPlan, AudioBitDepth, AudioConversionReport, AudioEncodingOptions,
     AudioExecutionMode, AudioInputFormat, AudioOptionChannels, AudioOptionSampleRate,
-    AudioRateControl, AudioSampleFormat, AudioTargetCodec, HardwareBackend, VideoAudioContainer,
-    VideoCodec, aac_frame_capacity_bps, fnv1a64,
+    AudioRateControl, AudioSampleFormat, AudioStreamInfo, AudioTargetCodec, HardwareBackend,
+    VideoAudioContainer, VideoCodec, aac_frame_capacity_bps, fnv1a64,
 };
 use flacenc::bitsink::ByteSink;
 use flacenc::component::{BitRepr, Stream};
@@ -406,6 +406,24 @@ fn decode_opus(path: &Path, buf: &mut AudioWorkerBuffer) -> Result<(u32, usize),
             })?;
         let end = produced.saturating_mul(channels).min(block.len());
         let kept = trim.keep(&packet, &block[..end]);
+        let pcm_bytes = u64::try_from(buf.samples_f32.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(kept.len()).unwrap_or(u64::MAX))
+            .saturating_mul(4);
+        if pcm_bytes > MAX_PCM_BYTES_PER_FILE {
+            return Err(PipelineError::DecodeFailed {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "decoded PCM exceeds the {MAX_PCM_BYTES_PER_FILE}-byte per-file limit"
+                ),
+            });
+        }
+        buf.samples_f32
+            .try_reserve(kept.len())
+            .map_err(|_| PipelineError::DecodeFailed {
+                path: path.to_path_buf(),
+                reason: "failed to reserve decoded PCM buffer".to_owned(),
+            })?;
         buf.samples_f32.extend_from_slice(kept);
     }
     Ok((OPUS_RATE, channels))
@@ -957,14 +975,14 @@ fn decode_video_pcm_i32_presented(
 /// `buf.samples_i32` for bit-exact 32-bit PCM — reusing the bounded decoder the
 /// video transcode pipeline uses.
 fn decode_video_audio_track(
-    item: &AudioBatchItem,
+    path: &Path,
     container: VideoAudioContainer,
     track_index: usize,
+    stream: &AudioStreamInfo,
     codec: AudioTargetCodec,
     options: &AudioEncodingOptions,
     buf: &mut AudioWorkerBuffer,
 ) -> Result<(u32, usize, usize, AudioSampleFormat), PipelineError> {
-    let path = item.source();
     let (track, packets) =
         demux_video_audio_track(path, container.to_video_container(), track_index)?;
     let direct_i32 = track.codec == VideoCodec::Pcm
@@ -983,9 +1001,9 @@ fn decode_video_audio_track(
         return decode_video_pcm_i32_presented(path, &track, &packets, buf);
     }
     let (source_bits, sample_format) = video_track_pcm_facts(path, &track)?;
-    if let Some(frames) = item.stream().total_samples() {
+    if let Some(frames) = stream.total_samples() {
         let estimated = frames
-            .saturating_mul(u64::from(item.stream().channels().get()))
+            .saturating_mul(u64::from(stream.channels().get()))
             .min(u64::try_from(MAX_F32_SAMPLES_PER_FILE).unwrap_or(u64::MAX));
         if let Ok(reserve) = usize::try_from(estimated)
             && reserve > buf.samples_f32.capacity()
@@ -1078,7 +1096,18 @@ fn decode_audio(
         AudioInputFormat::Video {
             container,
             track_index,
-        } => decode_video_audio_track(item, container, track_index, codec, options, buf)?,
+        } => {
+            let stream = item.stream();
+            decode_video_audio_track(
+                item.source(),
+                container,
+                track_index,
+                &stream,
+                codec,
+                options,
+                buf,
+            )?
+        }
         _ => decode_symphonia(item.source(), item.input_format(), codec, options, buf)?,
     };
 
@@ -1093,6 +1122,71 @@ fn decode_audio(
     }
 
     Ok((rate, channels, source_bits, sample_format))
+}
+
+/// Decodes any supported audio input file into normalized interleaved `f32`
+/// samples for in-container re-encoding (e.g. `--add-audio`).
+///
+/// Every existing bounded decoder is reused: Opus and ADTS AAC have dedicated
+/// native paths, video-container tracks go through the shared chunk decoder,
+/// and all other formats go through the symphonia path. The lossy codec selector
+/// forces the normalized `f32` path so no bit-exact integer shortcut can leak an
+/// `i16`/`i32` buffer into a caller that expects `f32`.
+pub(crate) fn decode_audio_source_f32(
+    path: &Path,
+    input_format: AudioInputFormat,
+    stream: &AudioStreamInfo,
+) -> Result<(Vec<f32>, u32, u16), PipelineError> {
+    let mut buf = AudioWorkerBuffer::new();
+    let options = AudioEncodingOptions::default();
+    let (rate, channels, _bits, _format) = match input_format {
+        AudioInputFormat::Opus => {
+            let (rate, channels) = decode_opus(path, &mut buf)?;
+            (rate, channels, 16, AudioSampleFormat::Int)
+        }
+        AudioInputFormat::Aac => {
+            let (rate, channels) = decode_adts_aac(path, &mut buf)?;
+            (rate, channels, 16, AudioSampleFormat::Int)
+        }
+        AudioInputFormat::Video {
+            container,
+            track_index,
+        } => decode_video_audio_track(
+            path,
+            container,
+            track_index,
+            stream,
+            AudioTargetCodec::Vorbis,
+            &options,
+            &mut buf,
+        )?,
+        _ => decode_symphonia(
+            path,
+            input_format,
+            AudioTargetCodec::Vorbis,
+            &options,
+            &mut buf,
+        )?,
+    };
+    let channels_u16 = u16::try_from(channels).map_err(|_| PipelineError::DecodeFailed {
+        path: path.to_path_buf(),
+        reason: format!("audio source has {channels} channels, exceeding u16"),
+    })?;
+    if rate == 0 || channels_u16 == 0 {
+        return Err(PipelineError::DecodeFailed {
+            path: path.to_path_buf(),
+            reason: format!("audio source has invalid format: {rate} Hz, {channels} channels"),
+        });
+    }
+    let channels_usize = usize::from(channels_u16);
+    let frames = u64::try_from(buf.samples_f32.len())
+        .unwrap_or(u64::MAX)
+        .saturating_div(u64::try_from(channels_usize).unwrap_or(u64::MAX));
+    checked_f32_capacity(frames, channels_usize, path)?;
+    if buf.samples_f32.is_empty() {
+        return Err(PipelineError::EmptyOutput(path.to_path_buf()));
+    }
+    Ok((std::mem::take(&mut buf.samples_f32), rate, channels_u16))
 }
 
 /// Resolves the lossless encoder's PCM depth from the source stream and the
