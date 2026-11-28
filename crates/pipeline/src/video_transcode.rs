@@ -3451,23 +3451,41 @@ fn transcode_file(
                     && matches!(item.audio_action(), AudioTrackAction::Encode(_)))
         });
     // An added track starts at presentation time zero, so with one present the
-    // shared origin must be the source's first presentation time. Using the
-    // decode origin here would shift B-frame streams forward by their DTS lead
-    // and start the copied tracks after the added audio. Without external
-    // audio the established decode-origin behaviour (including the copy-only
-    // no-rebase path) is unchanged.
-    let origin = media
-        .packets
-        .iter()
-        .map(|packet| {
-            if has_external_audio {
-                packet.pts
-            } else {
-                packet.dts
-            }
-        })
-        .min()
-        .unwrap_or(0);
+    // shared origin must be the source's first *visible* presentation time.
+    // Using the decode origin would shift B-frame streams forward by their DTS
+    // lead; using the earliest packet PTS would shift tracks whose edit list
+    // keeps preroll packets below the visible start. Both would start the
+    // copied tracks after the added audio. This is the same visible-start rule
+    // the MKV muxer uses. Without external audio the established decode-origin
+    // behaviour (including the copy-only no-rebase path) is unchanged.
+    let origin = if has_external_audio {
+        media
+            .tracks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, track)| {
+                let earliest = media
+                    .packets
+                    .iter()
+                    .filter(|packet| packet.track == index)
+                    .map(|packet| packet.pts)
+                    .min()?;
+                Some(
+                    track
+                        .presentation_edit
+                        .map_or(earliest, |edit| edit.start_us),
+                )
+            })
+            .min()
+            .unwrap_or(0)
+    } else {
+        media
+            .packets
+            .iter()
+            .map(|packet| packet.dts)
+            .min()
+            .unwrap_or(0)
+    };
     let rebase = needs_rebase.then_some(origin);
     let unsupported = |codec: VideoCodec| PipelineError::RemuxFailed {
         path: target.to_path_buf(),
@@ -8179,6 +8197,128 @@ mod tests {
         assert_eq!(
             with_added[2], baseline[0],
             "added audio must start at the source presentation start"
+        );
+        Ok(())
+    }
+
+    // The copy-only and added-track timelines are compared in one pass so
+    // every visible start stays directly comparable.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn external_audio_keeps_copy_only_visible_starts_with_edit_preroll() -> Result<(), PipelineError>
+    {
+        let dir = temp_dir("external-edit-preroll")?;
+        let source = dir.join("in.mp4");
+        make_source(
+            &source,
+            VideoContainerFormat::Mp4,
+            VideoEncodeMode::CpuH264 {
+                rate_control: VideoRateControl::DEFAULT,
+            },
+            TargetAudioCodec::Aac,
+        )?;
+        // Video becomes visible only at 80 ms while retaining preroll packets
+        // below that edit; copied audio stays visible from zero.
+        let media = demux_video(&source, VideoContainerFormat::Mp4)?;
+        let mut tracks = media.tracks;
+        tracks[0].presentation_edit = Some(TrackPresentation {
+            start_us: 80_000,
+            duration_us: None,
+        });
+        let packets = media
+            .packets
+            .into_iter()
+            .map(|mut packet| {
+                if packet.track == 0 {
+                    packet.pts = packet.pts.saturating_sub(40_000);
+                    packet.dts = packet.dts.saturating_sub(40_000);
+                }
+                packet
+            })
+            .collect();
+        let file = File::create(&source).map_err(|source_err| PipelineError::Io {
+            path: source.clone(),
+            source: source_err,
+        })?;
+        mux_video(
+            &file,
+            &source,
+            VideoContainerFormat::Mp4,
+            &ContainerMedia { tracks, packets },
+        )?;
+        drop(file);
+
+        let demuxed = demux_video(&source, VideoContainerFormat::Mp4)?;
+        assert_eq!(
+            demuxed.tracks[0]
+                .presentation_edit
+                .map(|edit| edit.start_us),
+            Some(80_000)
+        );
+        assert!(
+            demuxed
+                .packets
+                .iter()
+                .filter(|packet| packet.track == 0)
+                .any(|packet| packet.pts < 0),
+            "fixture must retain preroll below the visible start"
+        );
+
+        let visible_starts = |path: &Path| -> Result<Vec<i64>, PipelineError> {
+            let media = demux_video(path, VideoContainerFormat::Mp4)?;
+            Ok(media
+                .tracks
+                .iter()
+                .enumerate()
+                .map(|(index, track)| {
+                    let earliest = media
+                        .packets
+                        .iter()
+                        .filter(|packet| packet.track == index)
+                        .map(|packet| packet.pts)
+                        .min()
+                        .unwrap_or(i64::MAX);
+                    track
+                        .presentation_edit
+                        .map_or(earliest, |edit| edit.start_us)
+                })
+                .collect())
+        };
+
+        let copy_only = dir.join("copy-only.mp4");
+        transcode(
+            &source,
+            &copy_only,
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            VideoTrackAction::Copy,
+            AudioTrackAction::Copy,
+        )?;
+        let baseline = visible_starts(&copy_only)?;
+
+        let wav = dir.join("song.wav");
+        let stream = write_wav_fixture(&wav, 48_000, 2, 1_920)?;
+        let added = dir.join("added.mp4");
+        run_external(
+            &source,
+            &added,
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mp4,
+            VideoTrackAction::Copy,
+            AudioTrackAction::Copy,
+            &wav,
+            AudioInputFormat::Wav,
+            stream,
+            TargetAudioCodec::Aac,
+            ExternalAudioMode::Append,
+        )?;
+        let with_added = visible_starts(&added)?;
+        assert_eq!(with_added.len(), 3);
+        assert_eq!(with_added[0], baseline[0], "video visible start");
+        assert_eq!(with_added[1], baseline[1], "copied audio visible start");
+        assert_eq!(
+            with_added[2], baseline[1],
+            "added audio aligns with the earliest copied visible start"
         );
         Ok(())
     }
