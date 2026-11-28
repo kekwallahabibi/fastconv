@@ -965,7 +965,7 @@ fn encode_aac_track(
     let channels = target_channels;
     let asc = aac_config(rate, channels)?;
     let mut encoder = rusty_aac::AacEncoder::new(rusty_aac::AacEncoderConfig {
-        bitrate_bps: configured_aac_bitrate(config, rate, channels),
+        bitrate_bps: checked_aac_bitrate_bps(config, rate, channels, path)?,
         ..rusty_aac::AacEncoderConfig::default()
     });
     encoder
@@ -1658,6 +1658,22 @@ fn configured_aac_bitrate(config: AudioEncodeConfig, rate: u32, channels: u16) -
     )
 }
 
+/// Resolves and validates the concrete AAC pair before encoder creation. An
+/// explicit bitrate can exceed the frame model's per-channel limit even when
+/// the default would have been clamped, so the effective pair is checked here.
+fn checked_aac_bitrate_bps(
+    config: AudioEncodeConfig,
+    rate: u32,
+    channels: u16,
+    path: &Path,
+) -> Result<u32, PipelineError> {
+    let bps = configured_aac_bitrate(config, rate, channels);
+    config
+        .validate_effective_aac(bps, rate, channels)
+        .map_err(|err| encode_error(path, err.to_string()))?;
+    Ok(bps)
+}
+
 fn configured_opus_bitrate(config: AudioEncodeConfig) -> i32 {
     config.bitrate().map_or(OPUS_BITRATE, |bitrate| {
         i32::try_from(bitrate.bps()).unwrap_or(OPUS_BITRATE)
@@ -2153,7 +2169,7 @@ impl StreamingAudioEncoder {
                 }
                 let asc = aac_config(rate, channels)?.to_vec();
                 let mut encoder = rusty_aac::AacEncoder::new(rusty_aac::AacEncoderConfig {
-                    bitrate_bps: configured_aac_bitrate(config, rate, channels),
+                    bitrate_bps: checked_aac_bitrate_bps(config, rate, channels, Path::new("aac"))?,
                     ..rusty_aac::AacEncoderConfig::default()
                 });
                 // Without this the encoder buffers the whole track and emits no
@@ -2608,9 +2624,14 @@ impl StreamingAudioEncoder {
 
     /// Flushes the tail and emits the final Opus packet with the exact
     /// remaining unplayed duration, mirroring `encode_opus_track`.
+    ///
+    /// `constant_opus_tail` is set for AVI targets: AVI stores one `dwScale`
+    /// per stream, so the final packet must declare the same nominal duration
+    /// as every other Opus packet or muxing fails after encoding. Other
+    /// containers keep the exact tail duration.
     // One branch per codec keeps the flush and tail-duration math explicit.
     #[allow(clippy::too_many_lines)]
-    fn finish(&mut self) -> Result<Vec<ContainerPacket>, PipelineError> {
+    fn finish(&mut self, constant_opus_tail: bool) -> Result<Vec<ContainerPacket>, PipelineError> {
         match self {
             Self::Aac {
                 rate,
@@ -2750,13 +2771,23 @@ impl StreamingAudioEncoder {
                     *frames_emitted = frames_emitted.saturating_add(1);
                 }
                 if let Some(mut last) = held.take() {
-                    let final_frames = total_frames
-                        .saturating_sub(frames_emitted.saturating_sub(1).saturating_mul(OPUS_FRAME))
-                        .clamp(1, OPUS_FRAME);
-                    last.duration = u64::try_from(final_frames)
-                        .unwrap_or(u64::MAX)
-                        .saturating_mul(1_000_000)
-                        / u64::from(OPUS_RATE);
+                    if constant_opus_tail {
+                        // AVI cannot represent a per-packet sample count: one
+                        // constant `dwScale` covers the whole stream. Declaring
+                        // the full frame adds at most 20 ms of silence instead
+                        // of making the job fail after the audio was encoded.
+                        last.duration = 20_000;
+                    } else {
+                        let final_frames = total_frames
+                            .saturating_sub(
+                                frames_emitted.saturating_sub(1).saturating_mul(OPUS_FRAME),
+                            )
+                            .clamp(1, OPUS_FRAME);
+                        last.duration = u64::try_from(final_frames)
+                            .unwrap_or(u64::MAX)
+                            .saturating_mul(1_000_000)
+                            / u64::from(OPUS_RATE);
+                    }
                     out.push(last);
                 }
                 Ok(out)
@@ -2851,6 +2882,9 @@ impl StreamingAudioEncoder {
 struct AudioStreamContext<'a> {
     new_index: usize,
     rebase: Option<(i64, i64)>,
+    /// AVI stores one constant sample count per Opus stream; its muxer rejects
+    /// the variable final duration the encoder otherwise emits.
+    constant_opus_tail: bool,
     cancelled: &'a AtomicBool,
     audio_tx: &'a SyncSender<AudioWorkerEvent>,
 }
@@ -2996,7 +3030,7 @@ where
             batch.extend(encoder.push(&remixed)?);
         }
     }
-    batch.extend(encoder.finish()?);
+    batch.extend(encoder.finish(ctx.constant_opus_tail)?);
     queue_batch(&mut batch);
     Ok(())
 }
@@ -3668,6 +3702,7 @@ fn transcode_file(
 
     let cancelled = AtomicBool::new(false);
     let audio_failed = AtomicBool::new(false);
+    let constant_opus_tail = format == VideoContainerFormat::Avi;
     thread::scope(
         |scope| -> Result<(u64, u64, u64, Option<String>), PipelineError> {
             let (audio_tx, audio_rx) = if audio_jobs.is_empty() {
@@ -3700,6 +3735,7 @@ fn transcode_file(
                                                 ),
                                                 origin,
                                             )),
+                                            constant_opus_tail,
                                             cancelled,
                                             audio_tx: &audio_tx,
                                         };
@@ -3725,6 +3761,7 @@ fn transcode_file(
                                                 let ctx = AudioStreamContext {
                                                     new_index: job.new_index,
                                                     rebase: None,
+                                                    constant_opus_tail,
                                                     cancelled,
                                                     audio_tx: &audio_tx,
                                                 };
@@ -7014,6 +7051,29 @@ mod tests {
         let aac_default = AudioEncodeConfig::default_for(TargetAudioCodec::Aac);
         assert_eq!(configured_aac_bitrate(aac_default, 48_000, 2), 128_000);
         assert_eq!(configured_aac_bitrate(aac_default, 8_000, 1), 48_000);
+        // An explicit bitrate above the frame capacity is rejected rather than
+        // silently lowered by the encoder; an in-capacity pair stays legal.
+        let aac_config = |bps: u32, hz: u32, ch: u16| -> Result<AudioEncodeConfig, PipelineError> {
+            let to_err = |err: DomainError| PipelineError::RemuxFailed {
+                path: PathBuf::new(),
+                reason: err.to_string(),
+            };
+            let bitrate = AudioBitrate::new(bps).map_err(to_err)?;
+            let rate = AudioSampleRate::new(hz).map_err(to_err)?;
+            let channels = AudioChannels::new(ch).map_err(to_err)?;
+            AudioEncodeConfig::new(
+                TargetAudioCodec::Aac,
+                AudioEncodeOptions::new(Some(bitrate), Some(rate), Some(channels)),
+            )
+            .map_err(to_err)
+        };
+        let over_capacity = aac_config(96_000, 8_000, 1)?;
+        assert!(checked_aac_bitrate_bps(over_capacity, 8_000, 1, Path::new("aac")).is_err());
+        let in_capacity = aac_config(32_000, 8_000, 1)?;
+        assert_eq!(
+            checked_aac_bitrate_bps(in_capacity, 8_000, 1, Path::new("aac"))?,
+            32_000
+        );
         Ok(())
     }
 
@@ -7931,35 +7991,53 @@ mod tests {
             },
             TargetAudioCodec::Aac,
         )?;
-        // Shift every source timestamp so only `--add-audio` triggers rebasing.
+        // Shift only the video track. A uniform shift is normalized to zero by
+        // the MP4 muxer, but leaving source audio at zero makes the video's
+        // +500 ms origin observable after reopening the fixture. Replacing the
+        // audio drops that zero-origin track, so the surviving video is the
+        // sole source of the rebase origin.
         let media = demux_video(&source, VideoContainerFormat::Mp4)?;
-        let mut shifted = ContainerMedia {
+        let shifted = ContainerMedia {
             tracks: media.tracks,
             packets: media
                 .packets
                 .into_iter()
                 .map(|mut packet| {
-                    packet.pts = packet.pts.saturating_add(500_000);
-                    packet.dts = packet.dts.saturating_add(500_000);
+                    if packet.track == 0 {
+                        packet.pts = packet.pts.saturating_add(500_000);
+                        packet.dts = packet.dts.saturating_add(500_000);
+                    }
                     packet
                 })
                 .collect(),
         };
-        for track in &mut shifted.tracks {
-            track.presentation_edit =
-                track
-                    .presentation_edit
-                    .map(|edit| crate::video_container::TrackPresentation {
-                        start_us: edit.start_us.saturating_add(500_000),
-                        ..edit
-                    });
-        }
         let file = File::create(&source).map_err(|source_err| PipelineError::Io {
             path: source.clone(),
             source: source_err,
         })?;
         mux_video(&file, &source, VideoContainerFormat::Mp4, &shifted)?;
         drop(file);
+
+        let min_pts = |media: &ContainerMedia, track: usize| {
+            media
+                .packets
+                .iter()
+                .filter(|packet| packet.track == track)
+                .map(|packet| packet.pts)
+                .min()
+                .unwrap_or(1)
+        };
+        let before = demux_video(&source, VideoContainerFormat::Mp4)?;
+        assert_eq!(
+            min_pts(&before, 0),
+            500_000,
+            "fixture must preserve the video's nonzero origin after reopening"
+        );
+        assert_eq!(
+            min_pts(&before, 1),
+            0,
+            "source audio stays at zero as the track dropped by --replace-audio"
+        );
 
         let wav = dir.join("song.wav");
         let stream = write_wav_fixture(&wav, 48_000, 2, 1_920)?;
@@ -7970,29 +8048,19 @@ mod tests {
             VideoContainerFormat::Mp4,
             VideoContainerFormat::Mp4,
             VideoTrackAction::Copy,
-            AudioTrackAction::Copy,
+            AudioTrackAction::Drop,
             &wav,
             AudioInputFormat::Wav,
             stream,
             TargetAudioCodec::Aac,
-            ExternalAudioMode::Append,
+            ExternalAudioMode::Replace,
         )?;
         let media = demux_video(&target, VideoContainerFormat::Mp4)?;
-        // Check each track separately: a global minimum would pass even if a
-        // copied track kept its original 500,000 µs offset while the added
+        // Check each track separately: a global minimum would pass even if the
+        // copied video kept its original 500,000 µs offset while the added
         // track (which always starts at zero) masked it.
-        let min_pts = |track: usize| {
-            media
-                .packets
-                .iter()
-                .filter(|packet| packet.track == track)
-                .map(|packet| packet.pts)
-                .min()
-                .unwrap_or(1)
-        };
-        assert_eq!(min_pts(0), 0, "copied video must rebase to zero");
-        assert_eq!(min_pts(1), 0, "copied audio must rebase to zero");
-        assert_eq!(min_pts(2), 0, "added audio must start at zero");
+        assert_eq!(min_pts(&media, 0), 0, "copied video must rebase to zero");
+        assert_eq!(min_pts(&media, 1), 0, "added audio must start at zero");
         Ok(())
     }
 
@@ -8171,6 +8239,60 @@ mod tests {
                 TargetAudioCodec::Pcm => assert!(added.pcm_format.is_some(), "{container}: lpcm"),
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn external_audio_opus_tail_uses_constant_duration_for_avi() -> Result<(), PipelineError> {
+        let dir = temp_dir("external-avi-opus-tail")?;
+        let source = dir.join("in.avi");
+        make_source(
+            &source,
+            VideoContainerFormat::Avi,
+            VideoEncodeMode::CpuH264 {
+                rate_control: VideoRateControl::DEFAULT,
+            },
+            TargetAudioCodec::Aac,
+        )?;
+        // 2,048 samples plus the encoder pre-skip is not a multiple of the
+        // 960-sample Opus frame, so the encoder's final packet has a short
+        // exact duration. AVI has only one dwScale per stream and rejects it.
+        let wav = dir.join("song.wav");
+        let stream = write_wav_fixture(&wav, 48_000, 2, 2_048)?;
+        let target = dir.join("out.avi");
+        run_external(
+            &source,
+            &target,
+            VideoContainerFormat::Avi,
+            VideoContainerFormat::Avi,
+            VideoTrackAction::Copy,
+            AudioTrackAction::Copy,
+            &wav,
+            AudioInputFormat::Wav,
+            stream,
+            TargetAudioCodec::Opus,
+            ExternalAudioMode::Append,
+        )?;
+        let media = demux_video(&target, VideoContainerFormat::Avi)?;
+        let opus_index = media
+            .tracks
+            .iter()
+            .position(|track| track.codec == VideoCodec::Opus)
+            .ok_or_else(|| PipelineError::RemuxFailed {
+                path: target.clone(),
+                reason: "added Opus track is missing".to_owned(),
+            })?;
+        let added: Vec<u64> = media
+            .packets
+            .iter()
+            .filter(|packet| packet.track == opus_index)
+            .map(|packet| packet.duration)
+            .collect();
+        assert!(!added.is_empty(), "AVI must contain the added Opus packets");
+        assert!(
+            added.iter().all(|duration| *duration == 20_000),
+            "AVI Opus packets must declare one constant nominal duration: {added:?}"
+        );
         Ok(())
     }
 

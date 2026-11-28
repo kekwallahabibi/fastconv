@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::{
     AudioInputFormat, AudioStreamInfo, DomainError, GpuBackend, HardwareBackend, PathRole,
-    u64_to_f64,
+    aac_frame_capacity_bps, u64_to_f64,
 };
 
 /// Video container formats supported for remuxing and transcoding.
@@ -1075,6 +1075,37 @@ impl AudioEncodeConfig {
         Ok(())
     }
 
+    /// Validates the effective AAC bitrate against the frame capacity of the
+    /// resolved rate/channel pair. [`Self::new`] only sees caller-supplied
+    /// values; inherited defaults are resolved later by the worker, so the
+    /// final pair must be checked before the encoder is created.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::UnsupportedAudioEncodeOption`] when `bitrate_bps`
+    /// exceeds `aac_frame_capacity_bps(sample_rate_hz, channels)`. Other codecs
+    /// are unaffected.
+    pub fn validate_effective_aac(
+        self,
+        bitrate_bps: u32,
+        sample_rate_hz: u32,
+        channels: u16,
+    ) -> Result<(), DomainError> {
+        if self.codec != TargetAudioCodec::Aac {
+            return Ok(());
+        }
+        let max_bps = aac_frame_capacity_bps(sample_rate_hz, channels);
+        if bitrate_bps > max_bps {
+            return Err(DomainError::UnsupportedAudioEncodeOption {
+                codec: self.codec,
+                reason: format!(
+                    "AAC bitrate {bitrate_bps} bps exceeds the {max_bps} bps frame capacity at {sample_rate_hz} Hz / {channels}ch"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Applies no overrides; the pipeline keeps its per-codec defaults.
     #[must_use]
     pub const fn default_for(codec: TargetAudioCodec) -> Self {
@@ -1681,7 +1712,8 @@ impl ExternalAudioTrack {
     /// audio or `config.codec()` is not storable in it, and
     /// [`DomainError::UnsupportedAudioEncodeOption`] when the effective channel
     /// count (explicit override or probed source channels) is unsupported by
-    /// the target codec.
+    /// the target codec, or when an explicit AAC bitrate exceeds the frame
+    /// capacity of the explicit rate/channel pair.
     pub fn new(
         source: PathBuf,
         input_format: AudioInputFormat,
@@ -1703,6 +1735,14 @@ impl ExternalAudioTrack {
             .channels()
             .map_or(stream.channels().get(), AudioChannels::count);
         AudioEncodeConfig::validate_channels(config.codec(), inherited_channels)?;
+        // When every relevant field is explicit the pair is knowable at this
+        // boundary; inherited rates are checked by the worker with its
+        // resolved effective values before encoder creation.
+        if let (Some(bitrate), Some(rate), Some(channels)) =
+            (config.bitrate(), config.sample_rate(), config.channels())
+        {
+            config.validate_effective_aac(bitrate.bps(), rate.hz(), channels.count())?;
+        }
         Ok(Self {
             source,
             input_format,
@@ -4273,6 +4313,61 @@ mod tests {
         // Other codecs have no rate-dependent band.
         AudioEncodeConfig::default_for(TargetAudioCodec::Aac)
             .validate_effective_mp3(16_000, 22_050)?;
+        Ok(())
+    }
+
+    #[test]
+    fn effective_aac_pair_checks_frame_capacity() -> Result<(), DomainError> {
+        let config = AudioEncodeConfig::default_for(TargetAudioCodec::Aac);
+        // 8 kHz mono carries at most 48 kbps; 96 kbps would be silently
+        // lowered by the encoder, so the effective pair must be rejected.
+        assert!(config.validate_effective_aac(96_000, 8_000, 1).is_err());
+        config.validate_effective_aac(32_000, 8_000, 1)?;
+        config.validate_effective_aac(128_000, 48_000, 2)?;
+        // Other codecs have no AAC frame-capacity limit.
+        AudioEncodeConfig::default_for(TargetAudioCodec::Mp3)
+            .validate_effective_aac(320_000, 8_000, 1)?;
+
+        let stream = AudioStreamInfo::new(
+            NonZeroU16::new(1).ok_or(DomainError::EmptyField("test.channels"))?,
+            NonZeroU32::new(8_000).ok_or(DomainError::EmptyField("test.rate"))?,
+            None,
+            Some(2_048),
+        )?;
+        let options = AudioEncodeOptions::new(
+            Some(AudioBitrate::new(96_000)?),
+            Some(AudioSampleRate::new(8_000)?),
+            Some(AudioChannels::new(1)?),
+        );
+        let explicit = AudioEncodeConfig::new(TargetAudioCodec::Aac, options)?;
+        assert!(
+            ExternalAudioTrack::new(
+                PathBuf::from("song.wav"),
+                AudioInputFormat::Wav,
+                stream,
+                explicit,
+                ExternalAudioMode::Append,
+                VideoContainerFormat::Mp4,
+            )
+            .is_err()
+        );
+        let options = AudioEncodeOptions::new(
+            Some(AudioBitrate::new(32_000)?),
+            Some(AudioSampleRate::new(8_000)?),
+            Some(AudioChannels::new(1)?),
+        );
+        let in_range = AudioEncodeConfig::new(TargetAudioCodec::Aac, options)?;
+        assert!(
+            ExternalAudioTrack::new(
+                PathBuf::from("song.wav"),
+                AudioInputFormat::Wav,
+                stream,
+                in_range,
+                ExternalAudioMode::Append,
+                VideoContainerFormat::Mp4,
+            )
+            .is_ok()
+        );
         Ok(())
     }
 
