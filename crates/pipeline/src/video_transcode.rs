@@ -498,7 +498,7 @@ fn pcm_bytes_to_f32(data: &[u8], format: PcmFormat) -> Vec<f32> {
 /// every packet so a failing sibling worker can stop this one immediately.
 // One branch per codec keeps decode-order and rate/channel handling explicit.
 #[allow(clippy::too_many_lines)]
-fn decode_audio_track_chunks<F>(
+pub(crate) fn decode_audio_track_chunks<F>(
     path: &Path,
     track: &ContainerTrack,
     packets: &[ContainerPacket],

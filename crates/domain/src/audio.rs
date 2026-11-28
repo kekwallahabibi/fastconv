@@ -6,7 +6,67 @@ use std::time::Duration;
 #[cfg(feature = "serde")]
 use serde::Serialize;
 
-use crate::{DomainError, HardwareBackend, PathRole, u64_to_f64};
+use crate::{DomainError, HardwareBackend, PathRole, VideoContainerFormat, u64_to_f64};
+
+/// Video containers that carry a demuxable audio track.
+///
+/// A narrow copy of [`VideoContainerFormat`] without the still-image
+/// containers: `Gif` and `Webp` can never be audio extraction sources, so an
+/// `AudioInputFormat::Video` value cannot represent them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub enum VideoAudioContainer {
+    Mp4,
+    Mov,
+    Mkv,
+    Webm,
+    Avi,
+    Ts,
+}
+
+impl VideoAudioContainer {
+    /// Narrows a video container to one that can hold an audio track.
+    #[must_use]
+    pub const fn try_from_video_container(container: VideoContainerFormat) -> Option<Self> {
+        match container {
+            VideoContainerFormat::Mp4 => Some(Self::Mp4),
+            VideoContainerFormat::Mov => Some(Self::Mov),
+            VideoContainerFormat::Mkv => Some(Self::Mkv),
+            VideoContainerFormat::Webm => Some(Self::Webm),
+            VideoContainerFormat::Avi => Some(Self::Avi),
+            VideoContainerFormat::Ts => Some(Self::Ts),
+            VideoContainerFormat::Gif | VideoContainerFormat::Webp => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn to_video_container(self) -> VideoContainerFormat {
+        match self {
+            Self::Mp4 => VideoContainerFormat::Mp4,
+            Self::Mov => VideoContainerFormat::Mov,
+            Self::Mkv => VideoContainerFormat::Mkv,
+            Self::Webm => VideoContainerFormat::Webm,
+            Self::Avi => VideoContainerFormat::Avi,
+            Self::Ts => VideoContainerFormat::Ts,
+        }
+    }
+
+    #[must_use]
+    pub const fn extension(self) -> &'static str {
+        self.to_video_container().extension()
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        self.to_video_container().label()
+    }
+}
+
+impl fmt::Display for VideoAudioContainer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
 
 /// Audio container/codec formats accepted at the system boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -22,6 +82,12 @@ pub enum AudioInputFormat {
     M4a,
     Alac,
     Aiff,
+    /// A zero-based audio track inside a video container. The container is a
+    /// narrow type so animated-image containers cannot be represented here.
+    Video {
+        container: VideoAudioContainer,
+        track_index: usize,
+    },
 }
 
 impl AudioInputFormat {
@@ -36,6 +102,7 @@ impl AudioInputFormat {
             Self::Aac => "aac",
             Self::M4a | Self::Alac => "m4a",
             Self::Aiff => "aiff",
+            Self::Video { container, .. } => container.extension(),
         }
     }
 
@@ -52,6 +119,25 @@ impl AudioInputFormat {
             Self::M4a => "M4A",
             Self::Alac => "ALAC",
             Self::Aiff => "AIFF",
+            Self::Video { container, .. } => container.label(),
+        }
+    }
+
+    /// True when this input is an audio track inside a video container.
+    #[must_use]
+    pub const fn is_video_container(self) -> bool {
+        matches!(self, Self::Video { .. })
+    }
+
+    /// Returns the video container and zero-based track index for video inputs.
+    #[must_use]
+    pub const fn video_track(self) -> Option<(VideoAudioContainer, usize)> {
+        match self {
+            Self::Video {
+                container,
+                track_index,
+            } => Some((container, track_index)),
+            _ => None,
         }
     }
 }
@@ -1527,6 +1613,66 @@ impl AudioConversionReport {
 mod tests {
     use super::*;
     use crate::GpuBackend;
+
+    #[test]
+    fn video_audio_container_narrows_animations_out() {
+        for (video, expected) in [
+            (VideoContainerFormat::Mp4, Some(VideoAudioContainer::Mp4)),
+            (VideoContainerFormat::Mov, Some(VideoAudioContainer::Mov)),
+            (VideoContainerFormat::Mkv, Some(VideoAudioContainer::Mkv)),
+            (VideoContainerFormat::Webm, Some(VideoAudioContainer::Webm)),
+            (VideoContainerFormat::Avi, Some(VideoAudioContainer::Avi)),
+            (VideoContainerFormat::Ts, Some(VideoAudioContainer::Ts)),
+            (VideoContainerFormat::Gif, None),
+            (VideoContainerFormat::Webp, None),
+        ] {
+            assert_eq!(
+                VideoAudioContainer::try_from_video_container(video),
+                expected,
+                "{video:?}"
+            );
+        }
+        for container in [
+            VideoAudioContainer::Mp4,
+            VideoAudioContainer::Mov,
+            VideoAudioContainer::Mkv,
+            VideoAudioContainer::Webm,
+            VideoAudioContainer::Avi,
+            VideoAudioContainer::Ts,
+        ] {
+            assert_eq!(
+                container.to_video_container().extension(),
+                container.extension()
+            );
+            assert_eq!(container.to_string(), container.label());
+            let format = AudioInputFormat::Video {
+                container,
+                track_index: 1,
+            };
+            assert!(format.is_video_container());
+            assert_eq!(format.video_track(), Some((container, 1)));
+            assert_eq!(format.extension(), container.extension());
+        }
+        assert!(!AudioInputFormat::Wav.is_video_container());
+        assert_eq!(AudioInputFormat::Wav.video_track(), None);
+    }
+
+    #[test]
+    fn audio_track_errors_report_both_sides() {
+        let invalid = DomainError::InvalidAudioTrack {
+            raw: "-1".to_owned(),
+            expected: "a non-negative whole number",
+        };
+        assert!(invalid.to_string().contains("-1"));
+        let range = DomainError::AudioTrackOutOfRange {
+            requested: 2,
+            count: 2,
+        };
+        assert_eq!(
+            range.to_string(),
+            "audio track 2 is out of range (source has 2 audio track(s))"
+        );
+    }
 
     fn item(name: &str) -> AudioBatchItem {
         AudioBatchItem::new(

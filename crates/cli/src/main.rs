@@ -20,9 +20,11 @@ const GLOBAL_HELP: &str = r"Usage:
   fastconv audio <source> <target> [--to <format>] [--codec <codec>]
                  [--bitrate <rate> | --quality <0..=100>] [--sample-rate <hz>]
                  [--channels <1..=8>] [--bit-depth <8|16|24|32|f32>]
-                 [--threads <N>] [--backend <name>]
+                 [--track <N>] [--threads <N>] [--backend <name>]
   --codec: vorbis, opus, flac, aac, alac, pcm, mp3; ogg defaults to vorbis
            (also accepts opus/flac), m4a defaults to aac (also accepts alac).
+  audio sources: wav/flac/mp3/ogg/opus/aac/m4a/alac/aiff, or an audio track
+           from mp4/mov/mkv/webm/avi/ts (--track <N>, zero-based, default 0).
   fastconv remux <source> <target> [--to <mp4|mkv|webm|mov|avi|ts>] [--threads <N>]
   fastconv video <source> <target> [--to <format>] [--vcodec <codec>]
                  [--acodec <codec>] [--quality <0..=100> | --vbitrate <rate>]
@@ -35,7 +37,7 @@ const GLOBAL_HELP: &str = r"Usage:
 Commands:
   probe    Inspect CPU, GPU adapters, and GPU media backends
   convert  Convert still images (lossy/lossless; CPU or NVENC HEIC)
-  audio    Convert audio files (CPU encoders only)
+  audio    Convert audio files or extract audio tracks from video containers
   remux    Losslessly remux video containers (no re-encoding)
   video    Transcode audio/video tracks between containers
   help     Print this help or detailed help for one command

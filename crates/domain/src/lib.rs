@@ -8,7 +8,8 @@ pub use audio::{
     AudioBatchItem, AudioBatchPlan, AudioBitDepth, AudioConversionReport, AudioEncodingOptions,
     AudioExecutionMode, AudioInputFormat, AudioOptionBitrate, AudioOptionChannels,
     AudioOptionSampleRate, AudioOutputFormat, AudioQuality, AudioRateControl, AudioSampleFormat,
-    AudioStreamInfo, AudioTargetCodec, PcmWavLayout, aac_frame_capacity_bps, fnv1a64,
+    AudioStreamInfo, AudioTargetCodec, PcmWavLayout, VideoAudioContainer, aac_frame_capacity_bps,
+    fnv1a64,
 };
 pub use hardware::{
     CpuInfo, DetectedGpuBackend, GpuAdapterInfo, GpuCapability, GpuVendor, HostHardware, SimdLevel,
@@ -221,6 +222,16 @@ pub enum DomainError {
     },
     InvalidPcmWavLayout {
         reason: &'static str,
+    },
+    /// `--track` was not a non-negative whole number.
+    InvalidAudioTrack {
+        raw: String,
+        expected: &'static str,
+    },
+    /// `--track` named an audio track that the source does not have.
+    AudioTrackOutOfRange {
+        requested: usize,
+        count: usize,
     },
 }
 
@@ -542,6 +553,13 @@ fn fmt_encoding_error(err: &DomainError, f: &mut fmt::Formatter<'_>) -> fmt::Res
         DomainError::InvalidPcmWavLayout { reason } => {
             write!(f, "invalid canonical PCM WAV layout: {reason}")
         }
+        DomainError::InvalidAudioTrack { raw, expected } => {
+            write!(f, "invalid audio track '{raw}' (expected {expected})")
+        }
+        DomainError::AudioTrackOutOfRange { requested, count } => write!(
+            f,
+            "audio track {requested} is out of range (source has {count} audio track(s))"
+        ),
         _ => Err(fmt::Error),
     }
 }

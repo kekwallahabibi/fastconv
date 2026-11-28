@@ -857,15 +857,20 @@ fn mp4_track_edit(track: &Track) -> Option<(i64, TrackPresentation)> {
 }
 
 fn demux_mp4(path: &Path) -> Result<ContainerMedia, PipelineError> {
-    demux_mp4_with_format(path, VideoContainerFormat::Mp4)
+    demux_mp4_with_format(path, VideoContainerFormat::Mp4, None)
 }
 
 // Track facts, edits and codec-private validation share one demuxer walk.
+// `audio_track` keeps only the requested zero-based audio track: tracks that
+// are not selected never enter `id_to_index`, so their packet payloads are
+// never read from disk.
 #[allow(clippy::too_many_lines)]
 fn demux_mp4_with_format(
     path: &Path,
     format: VideoContainerFormat,
+    audio_track: Option<usize>,
 ) -> Result<ContainerMedia, PipelineError> {
+    let mut audio_ordinal = 0_usize;
     let reader = WindowedFileReader::open(path).map_err(|source| PipelineError::Io {
         path: path.to_path_buf(),
         source,
@@ -876,6 +881,18 @@ fn demux_mp4_with_format(
     let mut id_to_index = std::collections::HashMap::new();
     let mut track_meta: Vec<(u32, i64)> = Vec::new();
     for track in input.tracks().iter().filter(|t| !t.chapter_track) {
+        // Count every audio track, even one with an unsupported codec, so the
+        // ordinal matches the boundary probe's `probe_video` enumeration.
+        let ordinal = if track.kind == TrackKind::Audio {
+            let current = audio_ordinal;
+            audio_ordinal = audio_ordinal.saturating_add(1);
+            Some(current)
+        } else {
+            None
+        };
+        if audio_track.is_some_and(|wanted| ordinal != Some(wanted)) {
+            continue;
+        }
         let Some(codec) = mp4_codec(track) else {
             continue;
         };
@@ -922,7 +939,13 @@ fn demux_mp4_with_format(
         });
     }
     if media.tracks.is_empty() {
-        return Err(container_error(path, "MP4 source has no supported tracks"));
+        return Err(container_error(
+            path,
+            match audio_track {
+                Some(index) => format!("MP4 source has no audio track at index {index}"),
+                None => "MP4 source has no supported tracks".to_owned(),
+            },
+        ));
     }
     // MOV PCM stores one decoded frame per MP4 sample. Coalesce while reading
     // so an hour of 48 kHz audio never holds 172.8M per-frame packets in RAM.
@@ -1116,7 +1139,7 @@ impl MovPcmCoalescer {
 // Track facts and packet timestamps come from one demuxer walk; extracting
 // them would require threading the decoded track index through every packet.
 #[allow(clippy::too_many_lines)]
-fn demux_mkv(path: &Path) -> Result<ContainerMedia, PipelineError> {
+fn demux_mkv(path: &Path, audio_track: Option<usize>) -> Result<ContainerMedia, PipelineError> {
     let reader = WindowedFileReader::open(path).map_err(|source| PipelineError::Io {
         path: path.to_path_buf(),
         source,
@@ -1128,7 +1151,19 @@ fn demux_mkv(path: &Path) -> Result<ContainerMedia, PipelineError> {
     }
     let mut media = ContainerMedia::default();
     let mut id_to_index = std::collections::HashMap::new();
+    let mut scales = Vec::new();
+    let mut audio_ordinal = 0_usize;
     for track in input.tracks() {
+        let ordinal = if track.kind == TrackKind::Audio {
+            let current = audio_ordinal;
+            audio_ordinal = audio_ordinal.saturating_add(1);
+            Some(current)
+        } else {
+            None
+        };
+        if audio_track.is_some_and(|wanted| ordinal != Some(wanted)) {
+            continue;
+        }
         let Some(codec_id) = track.codec_id() else {
             continue;
         };
@@ -1203,6 +1238,10 @@ fn demux_mkv(path: &Path) -> Result<ContainerMedia, PipelineError> {
             }
         }
         id_to_index.insert(track.id, media.tracks.len());
+        scales.push((
+            i64::from(track.timebase.num).max(1),
+            i64::from(track.timebase.den).max(1),
+        ));
         media.tracks.push(ContainerTrack {
             codec,
             width,
@@ -1218,19 +1257,12 @@ fn demux_mkv(path: &Path) -> Result<ContainerMedia, PipelineError> {
     if media.tracks.is_empty() {
         return Err(container_error(
             path,
-            "Matroska source has no supported tracks",
+            match audio_track {
+                Some(index) => format!("Matroska source has no audio track at index {index}"),
+                None => "Matroska source has no supported tracks".to_owned(),
+            },
         ));
     }
-    let scales: Vec<(i64, i64)> = input
-        .tracks()
-        .iter()
-        .map(|t| {
-            (
-                i64::from(t.timebase.num).max(1),
-                i64::from(t.timebase.den).max(1),
-            )
-        })
-        .collect();
     let mut buf = Vec::new();
     for packet in input.packets() {
         let packet = packet.map_err(|err| containr_error(path, &err))?;
@@ -1341,13 +1373,71 @@ pub(crate) fn demux_video(
 ) -> Result<ContainerMedia, PipelineError> {
     match format {
         VideoContainerFormat::Mp4 => demux_mp4(path),
-        VideoContainerFormat::Mov => demux_mp4_with_format(path, VideoContainerFormat::Mov),
-        VideoContainerFormat::Mkv | VideoContainerFormat::Webm => demux_mkv(path),
+        VideoContainerFormat::Mov => demux_mp4_with_format(path, VideoContainerFormat::Mov, None),
+        VideoContainerFormat::Mkv | VideoContainerFormat::Webm => demux_mkv(path, None),
         VideoContainerFormat::Avi => crate::avi::demux_avi(path),
         VideoContainerFormat::Ts => crate::mpegts::demux_ts(path),
         VideoContainerFormat::Gif => crate::video_anim::demux_gif_metadata(path),
         VideoContainerFormat::Webp => crate::video_anim::demux_webp_metadata(path),
     }
+}
+
+/// Demuxes a single audio track for direct audio extraction.
+///
+/// MP4/MOV/MKV/WebM skip non-selected tracks before reading their packet
+/// payloads; AVI/TS parse the whole file but still return only the selected
+/// track and its packets. Track ordinals count every audio track, so the index
+/// matches the one the boundary probe validated.
+pub(crate) fn demux_video_audio_track(
+    path: &Path,
+    format: VideoContainerFormat,
+    audio_track_index: usize,
+) -> Result<(ContainerTrack, Vec<ContainerPacket>), PipelineError> {
+    let selected_by_demuxer = matches!(
+        format,
+        VideoContainerFormat::Mp4
+            | VideoContainerFormat::Mov
+            | VideoContainerFormat::Mkv
+            | VideoContainerFormat::Webm
+    );
+    let media = match format {
+        VideoContainerFormat::Mp4 | VideoContainerFormat::Mov => {
+            demux_mp4_with_format(path, format, Some(audio_track_index))?
+        }
+        VideoContainerFormat::Mkv | VideoContainerFormat::Webm => {
+            demux_mkv(path, Some(audio_track_index))?
+        }
+        VideoContainerFormat::Avi | VideoContainerFormat::Ts => demux_video(path, format)?,
+        VideoContainerFormat::Gif | VideoContainerFormat::Webp => {
+            return Err(container_error(
+                path,
+                "animated containers have no audio track",
+            ));
+        }
+    };
+    let track_index = if selected_by_demuxer {
+        0
+    } else {
+        media
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, track)| track.codec.is_audio())
+            .nth(audio_track_index)
+            .map(|(index, _)| index)
+            .ok_or_else(|| {
+                container_error(path, format!("no audio track at index {audio_track_index}"))
+            })?
+    };
+    let track = media.tracks.get(track_index).cloned().ok_or_else(|| {
+        container_error(path, format!("no audio track at index {audio_track_index}"))
+    })?;
+    let packets = media
+        .packets
+        .into_iter()
+        .filter(|packet| packet.track == track_index)
+        .collect();
+    Ok((track, packets))
 }
 
 fn mux_mp4(
@@ -2708,7 +2798,7 @@ mod tests {
         mux_video(&file, &path, VideoContainerFormat::Mkv, &media)
             .map_err(|err| err.to_string())?;
         drop(file);
-        let reopened = demux_mkv(&path).map_err(|err| err.to_string())?;
+        let reopened = demux_mkv(&path, None).map_err(|err| err.to_string())?;
         std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
         let mut sorted: Vec<&ContainerPacket> = reopened.packets.iter().collect();
         sorted.sort_by_key(|packet| (packet.dts, packet.pts));
@@ -3240,7 +3330,7 @@ mod tests {
         )
         .map_err(|err| err.to_string())?;
         drop(file);
-        let reopened = demux_mkv(&path).map_err(|err| err.to_string())?;
+        let reopened = demux_mkv(&path, None).map_err(|err| err.to_string())?;
         std::fs::remove_dir_all(&dir).map_err(|err| err.to_string())?;
         assert_eq!(reopened.tracks.len(), 1);
         assert_eq!(reopened.tracks[0].codec, VideoCodec::Vorbis);

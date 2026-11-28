@@ -44,7 +44,7 @@ const MOV_TOP_LEVEL_BOXES: [&[u8; 4]; 9] = [
 ];
 
 /// ISOBMFF major brands for still images; never media containers for us.
-const IMAGE_MAJOR_BRANDS: [&[u8; 4]; 9] = [
+pub(crate) const IMAGE_MAJOR_BRANDS: [&[u8; 4]; 9] = [
     b"avif", b"avis", b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1", b"jxl ",
 ];
 
