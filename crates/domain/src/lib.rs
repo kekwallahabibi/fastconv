@@ -3,6 +3,7 @@ pub mod frames;
 pub mod hardware;
 pub mod image;
 pub mod metrics;
+pub mod stack;
 pub mod video;
 
 pub use audio::{
@@ -24,6 +25,10 @@ pub use image::{
     ImageInputFormat, ImageOutputFormat, ImageQuality, TiffCompression, TiffCompressionKind,
 };
 pub use metrics::{BenchmarkMetrics, BenchmarkSample, PeakMemory, Throughput, WorkloadUnit};
+pub use stack::{
+    FrameSequencePlan, FrameSequenceReport, StackExecutionMode, StackFps, StackFrame,
+    StackTargetFormat, parse_animation_loop,
+};
 pub use video::{
     AnimationLoop, AnimationMeta, AudioBitrate, AudioChannels, AudioEncodeConfig,
     AudioEncodeOptions, AudioSampleRate, AudioTrackAction, ExternalAudioMode, ExternalAudioTrack,
@@ -258,6 +263,38 @@ pub enum DomainError {
         max_width: u32,
         max_height: u32,
     },
+    /// A frame sequence must contain at least one image.
+    EmptyFrameSequence,
+    /// A frame sequence source path was empty.
+    EmptyStackFrameSource,
+    /// `--fps` was outside the drift-free, non-overflowing range.
+    InvalidStackFps {
+        reason: String,
+    },
+    /// `--loop` was not `infinite`, `0`, or `1..=65535`.
+    InvalidAnimationLoop {
+        raw: String,
+    },
+    /// An explicit `--to` disagreed with an animation extension on the target.
+    ConflictingStackTargetFormat {
+        path: PathBuf,
+        expected: &'static str,
+        actual: &'static str,
+    },
+    /// Frame dimensions exceed the animation container's static limit.
+    StackDimensionLimit {
+        format: stack::StackTargetFormat,
+        width: u32,
+        height: u32,
+        max_width: u32,
+        max_height: u32,
+    },
+    /// The animation target would overwrite one of its source images.
+    StackTargetOverlapsSource(PathBuf),
+    /// A GPU backend was requested for an animation stack (CPU only).
+    UnsupportedStackBackend {
+        backend: HardwareBackend,
+    },
 }
 
 pub(crate) fn require_non_empty(value: &str, field: &'static str) -> Result<String, DomainError> {
@@ -391,6 +428,9 @@ fn fmt_unsupported_video_codec(
 }
 
 impl fmt::Display for DomainError {
+    // One explicit arm per error family keeps diagnostics exhaustive and
+    // prevents a catch-all from silently mislabelling a validation failure.
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyPath(role) => write!(f, "{role} path must not be empty"),
@@ -474,6 +514,14 @@ impl fmt::Display for DomainError {
             | Self::InvalidFrameRange { .. }
             | Self::FrameSourceRejected { .. }
             | Self::FrameDimensionLimit { .. } => fmt_frame_error(self, f),
+            Self::EmptyFrameSequence
+            | Self::EmptyStackFrameSource
+            | Self::InvalidStackFps { .. }
+            | Self::InvalidAnimationLoop { .. }
+            | Self::ConflictingStackTargetFormat { .. }
+            | Self::StackDimensionLimit { .. }
+            | Self::StackTargetOverlapsSource(_)
+            | Self::UnsupportedStackBackend { .. } => fmt_stack_error(self, f),
             Self::UnsupportedAudioRateControl {
                 format,
                 codec,
@@ -510,6 +558,54 @@ fn fmt_frame_error(err: &DomainError, f: &mut fmt::Formatter<'_>) -> fmt::Result
         } => write!(
             f,
             "frame dimensions {width}x{height} exceed the .{format} static limit of {max_width}x{max_height}"
+        ),
+        _ => Err(fmt::Error),
+    }
+}
+
+/// Formats frame-stack validation errors. The caller's guard is the only path
+/// into this helper, so any other variant is a formatter bug.
+fn fmt_stack_error(err: &DomainError, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match err {
+        DomainError::EmptyFrameSequence => {
+            f.write_str("frame stack must contain at least one image")
+        }
+        DomainError::EmptyStackFrameSource => {
+            f.write_str("frame stack source path must not be empty")
+        }
+        DomainError::InvalidStackFps { reason } => f.write_str(reason),
+        DomainError::InvalidAnimationLoop { raw } => write!(
+            f,
+            "invalid --loop '{raw}' (expected infinite, 0, or 1..=65535)"
+        ),
+        DomainError::ConflictingStackTargetFormat {
+            path,
+            expected,
+            actual,
+        } => write!(
+            f,
+            "target extension '{actual}' conflicts with --to {expected}: {}",
+            path.display()
+        ),
+        DomainError::StackDimensionLimit {
+            format,
+            width,
+            height,
+            max_width,
+            max_height,
+        } => write!(
+            f,
+            "stack frame dimensions {width}x{height} exceed the .{} static limit of {max_width}x{max_height}",
+            format.extension()
+        ),
+        DomainError::StackTargetOverlapsSource(path) => write!(
+            f,
+            "stack target would overwrite a source image: {}",
+            path.display()
+        ),
+        DomainError::UnsupportedStackBackend { backend } => write!(
+            f,
+            "backend '{backend}' is not supported for image stacks; use cpu (no silent CPU fallback)"
         ),
         _ => Err(fmt::Error),
     }

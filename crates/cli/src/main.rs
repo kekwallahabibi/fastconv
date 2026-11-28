@@ -1,5 +1,6 @@
 mod audio;
 mod frames;
+mod stack;
 mod video;
 
 use std::env;
@@ -29,6 +30,9 @@ const GLOBAL_HELP: &str = r"Usage:
   fastconv frames <source> <output-dir> [--to <png|jpeg|webp|qoi|bmp|tiff|jxl|avif|gif|ico|pnm|heic>]
                   [--quality <0..=100> | --lossless] [--fps <N> | --every <N>]
                   [--start <N>] [--end <N>] [--threads <N>] [--backend <auto|cpu>]
+  fastconv stack <image-dir | img1 img2 ...> <target>
+                 [--fps <N>] [--to <gif|webp>] [--quality <0..=100>]
+                 [--loop <infinite|N>] [--threads <N>] [--backend <auto|cpu>]
   fastconv remux <source> <target> [--to <mp4|mkv|webm|mov|avi|ts>] [--threads <N>]
   fastconv video <source> <target> [--to <format>] [--vcodec <codec>]
                  [--acodec <codec>] [--quality <0..=100> | --vbitrate <rate>]
@@ -42,6 +46,7 @@ Commands:
   probe    Inspect CPU, GPU adapters, and GPU media backends
   convert  Convert still images (lossy/lossless; CPU or NVENC HEIC)
   frames   Extract still image frames from video or animated GIF/WebP
+  stack    Encode a stack of still images into animated GIF or WebP
   audio    Convert audio files or extract audio tracks from video containers
   remux    Losslessly remux video containers (no re-encoding)
   video    Transcode audio/video tracks between containers
@@ -144,6 +149,7 @@ fn help_text(topic: &str) -> Option<&'static str> {
         "probe" => Some(PROBE_HELP),
         "convert" => Some(CONVERT_HELP),
         "frames" => Some(frames::FRAMES_HELP),
+        "stack" => Some(stack::STACK_HELP),
         "audio" => Some(audio::AUDIO_HELP),
         "remux" => Some(video::REMUX_HELP),
         "video" => Some(video::VIDEO_HELP),
@@ -625,6 +631,14 @@ fn main() -> ExitCode {
             Ok(frames::FramesCommand::Run(parsed)) => run_with_failure(frames::run_frames(&parsed)),
             Err(message) => fail(&message),
         },
+        ["stack", rest @ ..] => match stack::parse_stack_args(rest) {
+            Ok(stack::StackCommand::Help) => {
+                println!("{}", stack::STACK_HELP);
+                ExitCode::SUCCESS
+            }
+            Ok(stack::StackCommand::Run(parsed)) => run_with_failure(stack::run_stack(&parsed)),
+            Err(message) => fail(&message),
+        },
         ["audio", rest @ ..] => match audio::parse_audio_args(rest) {
             Ok(audio::AudioCommand::Help) => {
                 audio::print_audio_help();
@@ -696,7 +710,9 @@ mod tests {
 
     #[test]
     fn every_command_has_dedicated_help_text() -> Result<(), String> {
-        for topic in ["probe", "convert", "frames", "audio", "remux", "video"] {
+        for topic in [
+            "probe", "convert", "frames", "stack", "audio", "remux", "video",
+        ] {
             let text = help_text(topic).ok_or_else(|| format!("missing help for {topic}"))?;
             assert!(text.contains("Usage:"), "missing usage for {topic}");
             assert!(
