@@ -8,7 +8,8 @@ use fastconv_domain::{
     AudioBatchItem, AudioBatchPlan, AudioBitDepth, AudioEncodingOptions, AudioExecutionMode,
     AudioInputFormat, AudioOptionBitrate, AudioOptionChannels, AudioOptionSampleRate,
     AudioOutputFormat, AudioQuality, AudioRateControl, AudioSampleFormat, AudioStreamInfo,
-    AudioTargetCodec, DomainError, HardwareBackend, PathRole, PcmWavLayout, fnv1a64,
+    AudioTargetCodec, DomainError, HardwareBackend, PathRole, PcmWavLayout, VideoAudioContainer,
+    VideoCodec, VideoContainerFormat, VideoStreamInfo, VideoStreamKind, fnv1a64,
 };
 use symphonia::core::audio::sample::SampleFormat as SymphoniaSampleFormat;
 use symphonia::core::codecs::audio::{
@@ -24,7 +25,10 @@ use symphonia::core::formats::probe::Hint;
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 
-use crate::{ProbeError, canonical_or_parent};
+use crate::{
+    ProbeError, canonical_or_parent,
+    video::{IMAGE_MAJOR_BRANDS, detect_video_magic, probe_video},
+};
 
 const MAGIC_PREFIX_BYTES: usize = 4096;
 const SUPPORTED_AUDIO_TARGETS: &str = "flac, wav, opus, ogg, mp3, aac, m4a, alac, or aiff";
@@ -41,6 +45,8 @@ pub struct AudioEncodingRequest {
     pub sample_rate: Option<AudioOptionSampleRate>,
     pub channels: Option<AudioOptionChannels>,
     pub bit_depth: Option<AudioBitDepth>,
+    /// Zero-based audio track index; `None` selects track 0.
+    pub track: Option<usize>,
 }
 
 const BITRATE_PARSE_EXPECTED: &str =
@@ -135,6 +141,26 @@ pub fn parse_audio_codec(raw: &str) -> Result<AudioTargetCodec, DomainError> {
     }
 }
 
+/// Parses the raw `--track` value at the system boundary.
+///
+/// Only non-negative whole numbers are accepted; an invalid value never reaches
+/// the domain or the file system.
+///
+/// # Errors
+///
+/// Returns [`DomainError::InvalidAudioTrack`] for negative, empty, or malformed input.
+pub fn parse_audio_track(raw: &str) -> Result<usize, DomainError> {
+    let trimmed = raw.trim();
+    let invalid = || DomainError::InvalidAudioTrack {
+        raw: raw.to_owned(),
+        expected: "a non-negative whole number (0 is the first audio track)",
+    };
+    if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    trimmed.parse::<usize>().map_err(|_| invalid())
+}
+
 /// Parses and validates the raw encoding flag values into an [`AudioEncodingRequest`].
 ///
 /// This is the single boundary where the CLI's raw `--bitrate`, `--quality`,
@@ -205,6 +231,7 @@ pub fn parse_audio_encoding_request(
         sample_rate,
         channels,
         bit_depth,
+        track: None,
     })
 }
 
@@ -285,7 +312,17 @@ pub fn detect_audio_magic(bytes: &[u8]) -> Option<AudioInputFormat> {
     if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
         let box_size = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         if box_size == 0 || box_size >= 12 {
-            return Some(AudioInputFormat::M4a);
+            let brand = &bytes[8..12];
+            // Still-image ISOBMFF brands (AVIF/HEIC/JXL) are never audio files.
+            if IMAGE_MAJOR_BRANDS.iter().any(|known| *known == brand) {
+                return None;
+            }
+            // Only the dedicated audio brands take the direct fast path. Other
+            // ISOBMFF brands (e.g. `isom`) are resolved in `probe_audio_track`
+            // by inspecting the container's tracks first.
+            if matches!(brand, b"M4A " | b"M4B " | b"M4P ") {
+                return Some(AudioInputFormat::M4a);
+            }
         }
     }
     if bytes.starts_with(b"OggS")
@@ -954,44 +991,25 @@ fn probe_symphonia(
     Ok((detected_format, stream))
 }
 
-/// Probes one file: detects its container by magic bytes and validates stream metadata.
-///
-/// # Errors
-///
-/// Returns [`ProbeError`] for unreadable files, unrecognized magic bytes, or invalid metadata.
-pub fn probe_audio(path: &Path) -> Result<ProbedAudio, ProbeError> {
-    let metadata = fs::metadata(path).map_err(|source| ProbeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !metadata.is_file() {
-        return Err(ProbeError::NotAFile(path.to_path_buf()));
-    }
-    if metadata.len() == 0 {
-        return Err(invalid_audio(path, "audio file is empty"));
-    }
-
-    let mut file = File::open(path).map_err(|source| ProbeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let prefix = read_magic_prefix(&mut file, path)?;
+/// Probes a recognized pure-audio file using the already-opened handle and magic
+/// prefix so pure-audio files incur zero extra syscalls. The caller has already
+/// checked the requested track index (pure audio files always have one track).
+fn probe_audio_direct(
+    path: &Path,
+    mut format: AudioInputFormat,
+    mut file: File,
+    prefix: &[u8; MAGIC_PREFIX_BYTES],
+) -> Result<ProbedAudio, ProbeError> {
     file.seek(SeekFrom::Start(0))
         .map_err(|source| ProbeError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-    let mut format = detect_audio_magic(&prefix).ok_or_else(|| {
-        invalid_audio(
-            path,
-            "unrecognized audio magic bytes (expected WAV, FLAC, MP3, Ogg Vorbis, Ogg Opus, Ogg FLAC, AAC, M4A, ALAC, or AIFF)",
-        )
-    })?;
 
     // Large ID3v2 tags (e.g. cover art) push the ADTS frame past the prefix, or leave
     // fewer than 7 header bytes in it so `detect_audio_magic` cannot see the syncword.
     if prefix.starts_with(b"ID3")
-        && let Some(tag_len) = id3v2_tag_len(&prefix)
+        && let Some(tag_len) = id3v2_tag_len(prefix)
         && tag_len.saturating_add(7) > prefix.len()
     {
         let offset = u64::try_from(tag_len)
@@ -1064,6 +1082,206 @@ pub fn probe_audio(path: &Path) -> Result<ProbedAudio, ProbeError> {
     })
 }
 
+/// Probes the zero-based audio track requested from a pure-audio file or a
+/// video container. All rejections happen here, before any decode or target
+/// file creation.
+///
+/// # Errors
+///
+/// Returns [`ProbeError`] for unreadable or unrecognized files, animation
+/// inputs, videos without an audio track, out-of-range track indices, and
+/// unsupported track codecs.
+pub fn probe_audio_track(path: &Path, track_index: usize) -> Result<ProbedAudio, ProbeError> {
+    let metadata = fs::metadata(path).map_err(|source| ProbeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(ProbeError::NotAFile(path.to_path_buf()));
+    }
+    if metadata.len() == 0 {
+        return Err(invalid_audio(path, "audio file is empty"));
+    }
+
+    let mut file = File::open(path).map_err(|source| ProbeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let prefix = read_magic_prefix(&mut file, path)?;
+
+    // Pure audio containers (including the fast `ftypM4A` path) always carry
+    // exactly one track.
+    if let Some(format) = detect_audio_magic(&prefix) {
+        if track_index != 0 {
+            return Err(DomainError::AudioTrackOutOfRange {
+                requested: track_index,
+                count: 1,
+            }
+            .into());
+        }
+        return probe_audio_direct(path, format, file, &prefix);
+    }
+
+    let video_format = detect_video_magic(&prefix).ok_or_else(|| {
+        invalid_audio(
+            path,
+            "unrecognized audio/video magic bytes (expected WAV, FLAC, MP3, Ogg Vorbis, Ogg Opus, Ogg FLAC, AAC, M4A, ALAC, AIFF, MP4, MOV, MKV, WebM, AVI, or TS)",
+        )
+    })?;
+    probe_video_audio_track(path, video_format, track_index, file)
+}
+
+/// Probes the requested track of a video container. Every rejection here
+/// happens before any decode or target file creation.
+fn probe_video_audio_track(
+    path: &Path,
+    video_format: VideoContainerFormat,
+    track_index: usize,
+    mut file: File,
+) -> Result<ProbedAudio, ProbeError> {
+    if VideoAudioContainer::try_from_video_container(video_format).is_none() {
+        return Err(invalid_audio(
+            path,
+            "animated GIF/WebP inputs contain no audio tracks; audio extraction requires a video container with an audio track",
+        ));
+    }
+
+    // Track ordinals come from `probe_video`, which counts every audio track
+    // (including unknown-codec ones) in container order.
+    let probed_video = probe_video(path)?;
+    // The AVI demuxer drops audio streams whose format tag it cannot map, while
+    // `probe_video` still reports them as `Audio` with an `Unknown` codec. Exclude
+    // them here so `--track N` indexes only tracks extraction can actually decode
+    // and the ordinal matches the demuxer's. MP4/MOV/MKV/WebM count every audio
+    // track before codec mapping, and TS reports unknown stream types as `Other`,
+    // so neither needs this filter.
+    let audio_tracks: Vec<&VideoStreamInfo> = probed_video
+        .streams
+        .iter()
+        .filter(|stream| {
+            stream.kind() == VideoStreamKind::Audio
+                && (video_format != VideoContainerFormat::Avi
+                    || stream.codec() != VideoCodec::Unknown)
+        })
+        .collect();
+    if audio_tracks.is_empty() {
+        return Err(invalid_audio(
+            path,
+            "video contains no audio track to extract",
+        ));
+    }
+    if track_index >= audio_tracks.len() {
+        return Err(DomainError::AudioTrackOutOfRange {
+            requested: track_index,
+            count: audio_tracks.len(),
+        }
+        .into());
+    }
+    // `fastconv`'s own audio-only .m4a files use the generic `isom` brand, so
+    // they are not claimed by `detect_audio_magic`. When the container has no
+    // video track and exactly one audio track, keep them on the same fast
+    // Symphonia path as `ftypM4A` files so ALAC/AAC still probe as audio. Do
+    // this before codec validation: `containr` reports ALAC in an audio-only
+    // ISOBMFF file as an unknown sample entry, while Symphonia decodes it.
+    let has_video_track = probed_video
+        .streams
+        .iter()
+        .any(|stream| stream.kind() == VideoStreamKind::Video);
+    if video_format == VideoContainerFormat::Mp4
+        && track_index == 0
+        && audio_tracks.len() == 1
+        && !has_video_track
+    {
+        file.seek(SeekFrom::Start(0))
+            .map_err(|source| ProbeError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let (format, stream) = probe_symphonia(path, AudioInputFormat::M4a, file)?;
+        return Ok(ProbedAudio {
+            path: path.to_path_buf(),
+            format,
+            stream,
+        });
+    }
+
+    let selected = audio_tracks[track_index];
+    let stream = video_track_stream_info(path, selected, track_index)?;
+    let container = VideoAudioContainer::try_from_video_container(video_format)
+        .ok_or_else(|| invalid_audio(path, "container has no extractable audio tracks"))?;
+    Ok(ProbedAudio {
+        path: path.to_path_buf(),
+        format: AudioInputFormat::Video {
+            container,
+            track_index,
+        },
+        stream,
+    })
+}
+
+/// Validates the selected video audio track and derives the domain stream
+/// metadata the shared audio pipeline consumes.
+fn video_track_stream_info(
+    path: &Path,
+    selected: &VideoStreamInfo,
+    track_index: usize,
+) -> Result<AudioStreamInfo, ProbeError> {
+    if !matches!(
+        selected.codec(),
+        VideoCodec::Opus
+            | VideoCodec::Aac
+            | VideoCodec::Mp3
+            | VideoCodec::Vorbis
+            | VideoCodec::Flac
+            | VideoCodec::Pcm
+    ) {
+        return Err(invalid_audio(
+            path,
+            format!(
+                "audio track {track_index} uses unsupported codec '{}' (supported: opus, aac, mp3, vorbis, flac, pcm)",
+                selected.codec().cli_name()
+            ),
+        ));
+    }
+    let channels = selected.channels().ok_or_else(|| {
+        invalid_audio(
+            path,
+            format!("audio track {track_index} has no channel count"),
+        )
+    })?;
+    let sample_rate = selected.sample_rate().ok_or_else(|| {
+        invalid_audio(
+            path,
+            format!("audio track {track_index} has no sample rate"),
+        )
+    })?;
+    let (timebase_num, timebase_den) = selected.timebase();
+    let total_samples = selected.duration().filter(|&d| d > 0).and_then(|duration| {
+        let numerator = u128::from(duration)
+            .checked_mul(u128::from(timebase_num))?
+            .checked_mul(u128::from(sample_rate.get()))?;
+        let samples = numerator.div_ceil(u128::from(timebase_den.max(1)));
+        u64::try_from(samples).ok()
+    });
+    AudioStreamInfo::with_sample_format(
+        channels,
+        sample_rate,
+        None,
+        AudioSampleFormat::Int,
+        total_samples,
+    )
+    .map_err(|err| invalid_audio(path, err.to_string()))
+}
+
+/// Probes a file with magic-byte detection and validates stream metadata.
+///
+/// # Errors
+///
+/// Returns [`ProbeError`] for unreadable files, unrecognized magic bytes, or invalid metadata.
+pub fn probe_audio(path: &Path) -> Result<ProbedAudio, ProbeError> {
+    probe_audio_track(path, 0)
+}
+
 fn resolve_single_target(
     source: &Path,
     target: &Path,
@@ -1114,6 +1332,7 @@ fn prepare_directory_batch(
     mode: AudioExecutionMode,
     threads: NonZeroUsize,
     options: AudioEncodingOptions,
+    track_index: usize,
 ) -> Result<AudioBatchPlan, ProbeError> {
     let format = mode.output_format();
     match fs::metadata(target_dir) {
@@ -1163,6 +1382,17 @@ fn prepare_directory_batch(
                     | "aiff"
                     | "aif"
                     | "aifc"
+                    // Video containers with an extractable audio track.
+                    | "mp4"
+                    | "m4v"
+                    | "mov"
+                    | "qt"
+                    | "mkv"
+                    | "webm"
+                    | "avi"
+                    | "ts"
+                    | "m2ts"
+                    | "mts"
             )
         });
         if path.is_file() && !is_hidden && has_audio_extension {
@@ -1173,7 +1403,7 @@ fn prepare_directory_batch(
 
     let mut items = Vec::with_capacity(candidates.len());
     for path in candidates {
-        let probed = probe_audio(&path)?;
+        let probed = probe_audio_track(&path, track_index)?;
         let stem = path
             .file_stem()
             .ok_or_else(|| invalid_audio(&path, "source path has no file stem"))?;
@@ -1236,7 +1466,14 @@ pub fn prepare_audio_batch(
             request.channels,
             request.bit_depth,
         )?;
-        return prepare_directory_batch(source, target, mode, threads, options);
+        return prepare_directory_batch(
+            source,
+            target,
+            mode,
+            threads,
+            options,
+            request.track.unwrap_or(0),
+        );
     }
     if !source_meta.is_file() {
         return Err(ProbeError::NotAFileOrDirectory(source.to_path_buf()));
@@ -1257,7 +1494,7 @@ pub fn prepare_audio_batch(
     if canonical_source == canonical_target {
         return Err(DomainError::IdenticalSourceAndTarget(source.to_path_buf()).into());
     }
-    let probed = probe_audio(source)?;
+    let probed = probe_audio_track(source, request.track.unwrap_or(0))?;
     let item = AudioBatchItem::new(
         canonical_source,
         resolved_target,
@@ -1276,6 +1513,93 @@ pub fn prepare_audio_batch(
 mod tests {
     use super::*;
     use fastconv_domain::AudioOptionBitrate;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_file(label: &str, bytes: &[u8]) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path = std::env::temp_dir().join(format!("fastconv-probe-audio-{label}-{nanos}"));
+        fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
+    fn ts_section(table_id: u8, body: &[u8]) -> Vec<u8> {
+        let length = body.len() + 4; // CRC32 placeholder
+        let mut out = vec![
+            table_id,
+            0x80 | u8::try_from((length >> 8) & 0x0F).unwrap_or(0),
+            u8::try_from(length & 0xFF).unwrap_or(0),
+        ];
+        out.extend_from_slice(body);
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out
+    }
+
+    fn ts_packet(pid: u16, pusi: bool, payload: &[u8]) -> Vec<u8> {
+        let high = u8::try_from(pid >> 8).unwrap_or(0) & 0x1F;
+        let low = u8::try_from(pid & 0xFF).unwrap_or(0);
+        let short = payload.len() < 184;
+        let mut packet = vec![
+            0x47,
+            high | if pusi { 0x40 } else { 0 },
+            low,
+            if short { 0x30 } else { 0x10 },
+        ];
+        if short {
+            let af_len = 183_usize.saturating_sub(payload.len());
+            packet.push(u8::try_from(af_len).unwrap_or(0));
+            packet.push(0);
+            packet.resize(188_usize.saturating_sub(payload.len()), 0xFF);
+        }
+        packet.extend_from_slice(payload);
+        packet.resize(188, 0xFF);
+        packet
+    }
+
+    fn ts_es(stream_type: u8, pid: u16) -> Vec<u8> {
+        vec![
+            stream_type,
+            0xE0 | (u8::try_from(pid >> 8).unwrap_or(0) & 0x1F),
+            u8::try_from(pid & 0xFF).unwrap_or(0),
+            0xF0,
+            0x00,
+        ]
+    }
+
+    fn ts_pes(pid: u16, stream_id: u8, header_data: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut pes = vec![0x00, 0x00, 0x01, stream_id];
+        let length = 3_usize + header_data.len() + payload.len();
+        pes.extend_from_slice(&u16::try_from(length).unwrap_or(u16::MAX).to_be_bytes());
+        pes.extend_from_slice(&[
+            0x80,
+            0x00,
+            u8::try_from(header_data.len()).unwrap_or(u8::MAX),
+        ]);
+        pes.extend_from_slice(header_data);
+        pes.extend_from_slice(payload);
+        ts_packet(pid, true, &pes)
+    }
+
+    fn synthetic_ts(audio: bool) -> Vec<u8> {
+        let mut association_body = vec![0x00, 0x01, 0xC1, 0x00, 0x00];
+        association_body.extend_from_slice(&[0x00, 0x01, 0xF0, 0x00]);
+        let mut program_map_body = vec![0x00, 0x01, 0xC1, 0x00, 0x00, 0xF0, 0x00, 0xF0, 0x00];
+        program_map_body.extend_from_slice(&ts_es(0x1B, 0x0100));
+        if audio {
+            program_map_body.extend_from_slice(&ts_es(0x0F, 0x0110));
+        }
+        let mut pat = vec![0];
+        pat.extend_from_slice(&ts_section(0x00, &association_body));
+        let mut pmt = vec![0];
+        pmt.extend_from_slice(&ts_section(0x02, &program_map_body));
+        let mut bytes = ts_packet(0, true, &pat);
+        bytes.extend_from_slice(&ts_packet(0x1000, true, &pmt));
+        bytes.extend_from_slice(&ts_packet(0x0100, true, &[]));
+        if audio {
+            // A real AAC PES carries an ADTS header with rate/channel facts.
+            bytes.extend_from_slice(&ts_pes(0x0110, 0xC0, &[], &[0xFF, 0xF1, 0x10, 0x80, 0x00]));
+        }
+        bytes
+    }
 
     #[test]
     fn detects_magic_without_extension_help() {
@@ -1309,6 +1633,99 @@ mod tests {
         opus_page.extend_from_slice(b"OpusHead");
         assert_eq!(detect_audio_magic(&opus_page), Some(AudioInputFormat::Opus));
         assert_eq!(detect_audio_magic(b"UNKNOWN"), None);
+    }
+
+    #[test]
+    fn still_image_and_generic_isobmff_brands_are_not_audio_magic() {
+        for brand in [
+            b"avif", b"avis", b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1", b"jxl ",
+        ] {
+            let mut bytes = vec![0_u8; 16];
+            bytes[..4].copy_from_slice(&16_u32.to_be_bytes());
+            bytes[4..8].copy_from_slice(b"ftyp");
+            bytes[8..12].copy_from_slice(brand);
+            assert_eq!(detect_audio_magic(&bytes), None, "{brand:?}");
+        }
+        // Dedicated audio brands stay on the fast path.
+        let mut m4a = vec![0_u8; 16];
+        m4a[..4].copy_from_slice(&16_u32.to_be_bytes());
+        m4a[4..8].copy_from_slice(b"ftyp");
+        m4a[8..12].copy_from_slice(b"M4A ");
+        assert_eq!(detect_audio_magic(&m4a), Some(AudioInputFormat::M4a));
+        // `isom` audio-only files are resolved via the container track list.
+        let mut isom = vec![0_u8; 16];
+        isom[..4].copy_from_slice(&16_u32.to_be_bytes());
+        isom[4..8].copy_from_slice(b"ftyp");
+        isom[8..12].copy_from_slice(b"isom");
+        assert_eq!(detect_audio_magic(&isom), None);
+    }
+
+    #[test]
+    fn track_index_is_parsed_once_at_the_boundary() {
+        assert_eq!(parse_audio_track("0"), Ok(0));
+        assert_eq!(parse_audio_track("12"), Ok(12));
+        assert_eq!(parse_audio_track(" 3 "), Ok(3));
+        for raw in ["", "-1", "1.5", "abc", "18446744073709551616"] {
+            assert!(parse_audio_track(raw).is_err(), "'{raw}' must be rejected");
+        }
+    }
+
+    #[test]
+    fn probe_rejects_animation_inputs_before_decoding() -> Result<(), Box<dyn std::error::Error>> {
+        for (label, bytes) in [
+            ("animated.gif", b"GIF89a\x01\x00\x01\x00".as_slice()),
+            ("animated.webp", b"RIFF\x04\x00\x00\x00WEBP".as_slice()),
+        ] {
+            let path = temp_file(label, bytes)?;
+            let Err(err) = probe_audio_track(&path, 0) else {
+                return Err(format!("{label} must be rejected").into());
+            };
+            assert!(
+                err.to_string().contains("no audio tracks"),
+                "{label}: {err}"
+            );
+            fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn probe_rejects_silent_video_and_out_of_range_tracks() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let silent = temp_file("silent.ts", &synthetic_ts(false))?;
+        let Err(err) = probe_audio_track(&silent, 0) else {
+            return Err("silent video must be rejected".to_owned().into());
+        };
+        assert!(
+            err.to_string().contains("no audio track"),
+            "silent video: {err}"
+        );
+
+        let with_audio = temp_file("with-audio.ts", &synthetic_ts(true))?;
+        let probed = probe_audio_track(&with_audio, 0)?;
+        assert_eq!(
+            probed.format,
+            AudioInputFormat::Video {
+                container: VideoAudioContainer::Ts,
+                track_index: 0,
+            }
+        );
+        let Err(out_of_range) = probe_audio_track(&with_audio, 1) else {
+            return Err("track 1 must be rejected".to_owned().into());
+        };
+        assert!(
+            out_of_range
+                .to_string()
+                .contains("audio track 1 is out of range"),
+            "out of range: {out_of_range}"
+        );
+        assert!(
+            out_of_range.to_string().contains("1 audio track"),
+            "out of range: {out_of_range}"
+        );
+        fs::remove_file(&silent)?;
+        fs::remove_file(&with_audio)?;
+        Ok(())
     }
 
     #[test]
@@ -1599,6 +2016,7 @@ mod tests {
             sample_rate: Some(AudioOptionSampleRate::new(48_000).map_err(|err| err.to_string())?),
             channels: Some(AudioOptionChannels::new(2).map_err(|err| err.to_string())?),
             bit_depth: None,
+            track: None,
         };
         assert_eq!(
             parse_audio_encoding_request(None, Some("192k"), None, Some("48000"), Some("2"), None)?,

@@ -13,10 +13,10 @@ Usage:
   fastconv audio <source> <target> [--to <format>] [--codec <codec>]
                  [--bitrate <rate> | --quality <0..=100>] [--sample-rate <hz>]
                  [--channels <1..=8>] [--bit-depth <8|16|24|32|f32>]
-                 [--threads <N>] [--backend <name>]
+                 [--track <N>] [--threads <N>] [--backend <name>]
 
 Arguments:
-  <source>              Source audio file or directory
+  <source>              Source audio file, video file, or directory
   <target>              Target file or directory
 
 Options:
@@ -49,6 +49,9 @@ Options:
                         where the target stores it; otherwise float to flac gives
                         24-bit integer, and float or 8-bit input to alac gives
                         16-bit.
+  --track <N>           Zero-based audio track to extract (default 0). Only
+                        meaningful for video sources; out-of-range indices and
+                        pure-audio files with --track 1 are rejected.
   --threads <N>         Number of parallel workers
   --backend <name>      cpu (default). Audio runs on CPU only; GPU backends
                         nvenc, vaapi, qsv, amf, videotoolbox, and vulkan are
@@ -57,6 +60,7 @@ Options:
 
 Supported input formats:
   wav, flac, mp3, ogg (Vorbis, Opus, Ogg FLAC), opus, aac (ADTS), m4a (AAC/ALAC), alac, aiff
+  Video containers with an extractable audio track: mp4, mov, mkv, webm, avi, ts
   Output aliases: wave -> wav, oga -> ogg, aif/aifc -> aiff
   Lossless outputs: wav, flac, ogg (--codec flac), m4a (--codec alac), alac, aiff
   ALAC writes an M4A container; use a .m4a or .alac target extension.";
@@ -75,6 +79,7 @@ pub(crate) struct AudioArgs {
     sample_rate: Option<AudioOptionSampleRate>,
     channels: Option<AudioOptionChannels>,
     bit_depth: Option<AudioBitDepth>,
+    track: Option<usize>,
     threads: Option<NonZeroUsize>,
     backend: HardwareBackend,
 }
@@ -115,6 +120,7 @@ struct AudioOptionState {
     sample_rate: Option<String>,
     channels: Option<String>,
     bit_depth: Option<String>,
+    track: Option<String>,
 }
 
 impl AudioOptionState {
@@ -131,6 +137,7 @@ impl AudioOptionState {
             "--sample-rate" => &mut self.sample_rate,
             "--channels" => &mut self.channels,
             "--bit-depth" => &mut self.bit_depth,
+            "--track" => &mut self.track,
             _ => return Ok(None),
         };
         if slot.is_some() {
@@ -207,6 +214,13 @@ pub(crate) fn parse_audio_args(args: &[&str]) -> Result<AudioCommand, String> {
         options.bit_depth.as_deref(),
     )?;
 
+    let track = options
+        .track
+        .as_deref()
+        .map(fastconv_probe::parse_audio_track)
+        .transpose()
+        .map_err(|err| err.to_string())?;
+
     Ok(AudioCommand::Run(AudioArgs {
         source: PathBuf::from(*source),
         target: PathBuf::from(*target),
@@ -216,6 +230,7 @@ pub(crate) fn parse_audio_args(args: &[&str]) -> Result<AudioCommand, String> {
         sample_rate: request.sample_rate,
         channels: request.channels,
         bit_depth: request.bit_depth,
+        track,
         threads,
         backend: backend.unwrap_or(HardwareBackend::Cpu),
     }))
@@ -240,6 +255,7 @@ pub(crate) fn run_audio(args: &AudioArgs) -> Result<(), String> {
             sample_rate: args.sample_rate,
             channels: args.channels,
             bit_depth: args.bit_depth,
+            track: args.track,
         },
     )
     .map_err(|err| err.to_string())?;
@@ -274,6 +290,7 @@ mod tests {
             "--sample-rate <hz>",
             "--channels <1..=8>",
             "--bit-depth <8|16|24|32|f32>",
+            "--track <N>",
             "--threads",
             "--backend",
             "-h, --help",
@@ -296,6 +313,7 @@ mod tests {
         assert!(AUDIO_HELP.contains("pcm/flac/alac 1-8"));
         assert!(AUDIO_HELP.contains("no silent CPU fallback"));
         assert!(AUDIO_HELP.contains("ALAC writes an M4A container"));
+        assert!(AUDIO_HELP.contains("mp4, mov, mkv, webm, avi, ts"));
         assert!(AUDIO_HELP.contains("mutually exclusive with --bitrate"));
         assert!(AUDIO_HELP.contains("use --bitrate"));
         assert!(!AUDIO_HELP.contains("--lossless"));
@@ -317,6 +335,7 @@ mod tests {
                 sample_rate: None,
                 channels: None,
                 bit_depth: None,
+                track: None,
                 threads: None,
                 backend: HardwareBackend::Cpu,
             })
@@ -481,6 +500,29 @@ mod tests {
         assert!(parse_audio_args(&["a", "b", "--bit-depth"]).is_err());
         assert!(parse_audio_args(&["a", "b", "--bit-depth", "64"]).is_err());
         assert!(parse_audio_args(&["a", "b", "--bit-depth", "16", "--bit-depth", "32"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--track"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--track", "-1"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--track", "abc"]).is_err());
+        assert!(parse_audio_args(&["a", "b", "--track", "1", "--track", "2"]).is_err());
+    }
+
+    #[test]
+    fn parses_track_flag_at_the_probe_boundary() -> Result<(), String> {
+        let AudioCommand::Run(default) = parse_audio_args(&["a.mp4", "b.flac"])? else {
+            return Err("expected audio run args".to_owned());
+        };
+        assert_eq!(default.track, None);
+        let AudioCommand::Run(parsed) = parse_audio_args(&["a.mp4", "b.flac", "--track", "1"])?
+        else {
+            return Err("expected audio run args".to_owned());
+        };
+        assert_eq!(parsed.track, Some(1));
+        let AudioCommand::Run(parsed) = parse_audio_args(&["a.mp4", "b.flac", "--track", "0"])?
+        else {
+            return Err("expected audio run args".to_owned());
+        };
+        assert_eq!(parsed.track, Some(0));
+        Ok(())
     }
 
     #[test]

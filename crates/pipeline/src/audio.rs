@@ -14,8 +14,8 @@ use std::time::Instant;
 use fastconv_domain::{
     AudioBatchItem, AudioBatchPlan, AudioBitDepth, AudioConversionReport, AudioEncodingOptions,
     AudioExecutionMode, AudioInputFormat, AudioOptionChannels, AudioOptionSampleRate,
-    AudioRateControl, AudioSampleFormat, AudioTargetCodec, HardwareBackend, aac_frame_capacity_bps,
-    fnv1a64,
+    AudioRateControl, AudioSampleFormat, AudioTargetCodec, HardwareBackend, VideoAudioContainer,
+    VideoCodec, aac_frame_capacity_bps, fnv1a64,
 };
 use flacenc::bitsink::ByteSink;
 use flacenc::component::{BitRepr, Stream};
@@ -41,6 +41,13 @@ use symphonia::core::meta::MetadataOptions;
 
 use crate::PipelineError;
 use crate::staging::StagingTarget;
+use crate::video_bitstream::{
+    PcmFormat, extract_flac_streaminfo_from_mkv_codec_private, parse_flac_streaminfo,
+};
+use crate::video_container::{
+    ContainerPacket, ContainerTrack, TrackPresentation, demux_video_audio_track,
+};
+use crate::video_transcode::decode_audio_track_chunks;
 
 const FLAC_BLOCK_SIZE: usize = 4096;
 const OPUS_RATE: u32 = 48_000;
@@ -747,6 +754,311 @@ fn decode_symphonia(
     Ok((sample_rate, channels, bits, sample_format))
 }
 
+/// Exact source sample facts of a demuxed video audio track. Codec-private
+/// data was validated at the boundary, so PCM sample entries and FLAC
+/// STREAMINFO give authoritative depth and integer/float format.
+fn video_track_pcm_facts(
+    path: &Path,
+    track: &ContainerTrack,
+) -> Result<(usize, AudioSampleFormat), PipelineError> {
+    if let Some(format) = track.pcm_format {
+        let sample_format = if format.is_float() {
+            AudioSampleFormat::Float
+        } else {
+            AudioSampleFormat::Int
+        };
+        return Ok((usize::from(format.bit_depth()), sample_format));
+    }
+    if track.codec == VideoCodec::Flac {
+        let streaminfo: [u8; 34] = if track.config.starts_with(b"fLaC") {
+            extract_flac_streaminfo_from_mkv_codec_private(&track.config).map_err(|reason| {
+                PipelineError::DecodeFailed {
+                    path: path.to_path_buf(),
+                    reason: format!("invalid FLAC metadata: {reason}"),
+                }
+            })?
+        } else {
+            track
+                .config
+                .as_slice()
+                .try_into()
+                .map_err(|_| PipelineError::DecodeFailed {
+                    path: path.to_path_buf(),
+                    reason: "FLAC track has no 34-byte STREAMINFO".to_owned(),
+                })?
+        };
+        let (_, _, bits) =
+            parse_flac_streaminfo(&streaminfo).map_err(|reason| PipelineError::DecodeFailed {
+                path: path.to_path_buf(),
+                reason,
+            })?;
+        return Ok((usize::from(bits), AudioSampleFormat::Int));
+    }
+    // Lossy codecs decode to normalized f32; 16-bit integer metadata keeps the
+    // same lossless-target default as the pure-audio decoders.
+    Ok((16, AudioSampleFormat::Int))
+}
+
+/// Presented frame range of a track with a source edit list. `start_us` drops
+/// decoder preroll/priming from the front; `duration_us` bounds the presented
+/// tail. Applying this after decode keeps preroll available to the decoder.
+fn presentation_frame_range(
+    edit: TrackPresentation,
+    rate: u32,
+    total_frames: usize,
+) -> (usize, usize) {
+    let rate = u64::from(rate.max(1));
+    let to_frames = |us: u64| -> usize {
+        let frames = u128::from(us)
+            .saturating_mul(u128::from(rate))
+            .saturating_add(500_000)
+            .checked_div(1_000_000)
+            .unwrap_or(u128::MAX);
+        usize::try_from(frames)
+            .unwrap_or(usize::MAX)
+            .min(total_frames)
+    };
+    let start = u64::try_from(edit.start_us).ok().map_or(0, to_frames);
+    let end = edit
+        .duration_us
+        .map_or(total_frames, |duration| {
+            start.saturating_add(to_frames(duration))
+        })
+        .min(total_frames);
+    (start, end)
+}
+
+/// Keeps only `[start, end)` whole frames of an interleaved sample buffer.
+fn trim_presented_frames<T>(samples: &mut Vec<T>, channels: usize, range: (usize, usize)) {
+    let channels = channels.max(1);
+    let (start, end) = range;
+    let from = start.saturating_mul(channels);
+    let keep = end.saturating_mul(channels).saturating_sub(from);
+    if from >= samples.len() {
+        samples.clear();
+        return;
+    }
+    if from > 0 {
+        samples.drain(..from);
+    }
+    if samples.len() > keep {
+        samples.truncate(keep);
+    }
+}
+
+/// Exact `i32` samples of a 32-bit integer PCM track. Going through `f32`
+/// rounds away the low bits of values such as `16_777_217`, so a lossless target
+/// copies the decoded integer words straight through instead.
+fn s32_bytes_to_i32(data: &[u8], format: PcmFormat) -> Vec<i32> {
+    data.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|sample| {
+            if format == PcmFormat::S32Le {
+                i32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]])
+            } else {
+                i32::from_be_bytes([sample[0], sample[1], sample[2], sample[3]])
+            }
+        })
+        .collect()
+}
+
+/// Decodes a 32-bit integer PCM video track straight into `samples_i32`.
+fn decode_video_pcm_i32(
+    path: &Path,
+    track: &ContainerTrack,
+    packets: &[ContainerPacket],
+    buf: &mut AudioWorkerBuffer,
+) -> Result<(u32, usize, usize, AudioSampleFormat), PipelineError> {
+    let format = track
+        .pcm_format
+        .ok_or_else(|| PipelineError::DecodeFailed {
+            path: path.to_path_buf(),
+            reason: "PCM track has no sample format".to_owned(),
+        })?;
+    if !matches!(format, PcmFormat::S32Le | PcmFormat::S32Be) {
+        return Err(PipelineError::DecodeFailed {
+            path: path.to_path_buf(),
+            reason: "integer PCM direct path requires a 32-bit track".to_owned(),
+        });
+    }
+    let channels = usize::from(track.channels.unwrap_or(2).max(1));
+    let rate = track.sample_rate.unwrap_or(0);
+    let frame_bytes = channels.saturating_mul(4);
+    let max_samples = usize::try_from(MAX_PCM_BYTES_PER_FILE / 4).unwrap_or(usize::MAX);
+    let mut written = 0_usize;
+    for packet in packets {
+        if packet.data.len() % frame_bytes != 0 {
+            return Err(PipelineError::DecodeFailed {
+                path: path.to_path_buf(),
+                reason: "PCM packet is not a whole number of frames".to_owned(),
+            });
+        }
+        let count = packet.data.len() / frame_bytes * channels;
+        if written.saturating_add(count) > max_samples {
+            return Err(PipelineError::DecodeFailed {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "decoded PCM exceeds the {MAX_PCM_BYTES_PER_FILE}-byte per-file limit"
+                ),
+            });
+        }
+        buf.samples_i32
+            .try_reserve(count)
+            .map_err(|_| PipelineError::DecodeFailed {
+                path: path.to_path_buf(),
+                reason: "failed to reserve decoded PCM buffer".to_owned(),
+            })?;
+        buf.samples_i32
+            .extend_from_slice(&s32_bytes_to_i32(&packet.data, format));
+        written = written.saturating_add(count);
+    }
+    if rate == 0 || buf.samples_i32.is_empty() {
+        return Err(PipelineError::EmptyOutput(path.to_path_buf()));
+    }
+    Ok((rate, channels, 32, AudioSampleFormat::Int))
+}
+
+/// Presentation edit to apply to a decoded video audio track. Opus decoders
+/// already drop the `OpusHead` pre-skip, so decoded PCM starts at the presented
+/// origin: a leading empty-edit delay must not be removed a second time. Other
+/// codecs (notably AAC) return their priming and still need the start trim.
+fn video_audio_presentation_edit(track: &ContainerTrack) -> Option<TrackPresentation> {
+    let mut edit = track.presentation_edit?;
+    if track.codec == VideoCodec::Opus {
+        edit.start_us = 0;
+    }
+    Some(edit)
+}
+
+/// Bit-exact 32-bit PCM path including the track's presentation window.
+fn decode_video_pcm_i32_presented(
+    path: &Path,
+    track: &ContainerTrack,
+    packets: &[ContainerPacket],
+    buf: &mut AudioWorkerBuffer,
+) -> Result<(u32, usize, usize, AudioSampleFormat), PipelineError> {
+    let (rate, channels, bits, format) = decode_video_pcm_i32(path, track, packets, buf)?;
+    if let Some(edit) = video_audio_presentation_edit(track) {
+        let frames = buf.samples_i32.len() / channels;
+        trim_presented_frames(
+            &mut buf.samples_i32,
+            channels,
+            presentation_frame_range(edit, rate, frames),
+        );
+    }
+    if buf.samples_i32.is_empty() {
+        return Err(PipelineError::EmptyOutput(path.to_path_buf()));
+    }
+    Ok((rate, channels, bits, format))
+}
+
+/// Decodes one video container audio track into `buf.samples_f32` — or into
+/// `buf.samples_i32` for bit-exact 32-bit PCM — reusing the bounded decoder the
+/// video transcode pipeline uses.
+fn decode_video_audio_track(
+    item: &AudioBatchItem,
+    container: VideoAudioContainer,
+    track_index: usize,
+    codec: AudioTargetCodec,
+    options: &AudioEncodingOptions,
+    buf: &mut AudioWorkerBuffer,
+) -> Result<(u32, usize, usize, AudioSampleFormat), PipelineError> {
+    let path = item.source();
+    let (track, packets) =
+        demux_video_audio_track(path, container.to_video_container(), track_index)?;
+    let direct_i32 = track.codec == VideoCodec::Pcm
+        && matches!(track.pcm_format, Some(PcmFormat::S32Le | PcmFormat::S32Be))
+        && codec == AudioTargetCodec::Pcm
+        && options
+            .bit_depth()
+            .is_none_or(|depth| depth == AudioBitDepth::Int32)
+        && options
+            .sample_rate()
+            .is_none_or(|rate| rate.hz() == track.sample_rate.unwrap_or(0))
+        && options.channels().is_none_or(|channels| {
+            usize::from(channels.get()) == usize::from(track.channels.unwrap_or(2))
+        });
+    if direct_i32 {
+        return decode_video_pcm_i32_presented(path, &track, &packets, buf);
+    }
+    let (source_bits, sample_format) = video_track_pcm_facts(path, &track)?;
+    if let Some(frames) = item.stream().total_samples() {
+        let estimated = frames
+            .saturating_mul(u64::from(item.stream().channels().get()))
+            .min(u64::try_from(MAX_F32_SAMPLES_PER_FILE).unwrap_or(u64::MAX));
+        if let Ok(reserve) = usize::try_from(estimated)
+            && reserve > buf.samples_f32.capacity()
+        {
+            buf.samples_f32
+                .try_reserve(reserve - buf.samples_f32.len())
+                .map_err(|_| PipelineError::DecodeFailed {
+                    path: path.to_path_buf(),
+                    reason: "failed to reserve decoded PCM buffer".to_owned(),
+                })?;
+        }
+    }
+    let mut rate = 0_u32;
+    let mut channels = 0_u16;
+    let mut decoded_bytes = 0_u64;
+    decode_audio_track_chunks(
+        path,
+        &track,
+        &packets,
+        &AtomicBool::new(false),
+        |samples, sample_rate, decoded_channels| {
+            if rate == 0 {
+                rate = sample_rate;
+                channels = decoded_channels;
+            } else if sample_rate != rate || decoded_channels != channels {
+                return Err(PipelineError::DecodeFailed {
+                    path: path.to_path_buf(),
+                    reason: format!(
+                        "audio track changes format from {rate} Hz/{channels} channels to {sample_rate} Hz/{decoded_channels} channels"
+                    ),
+                });
+            }
+            let new_samples = buf.samples_f32.len().saturating_add(samples.len());
+            let new_frames = u64::try_from(new_samples)
+                .unwrap_or(u64::MAX)
+                .saturating_div(u64::from(channels.max(1)));
+            checked_f32_capacity(new_frames, usize::from(channels.max(1)), path)?;
+            let added_bytes = u64::try_from(samples.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(4);
+            if decoded_bytes.saturating_add(added_bytes) > MAX_PCM_BYTES_PER_FILE {
+                return Err(PipelineError::DecodeFailed {
+                    path: path.to_path_buf(),
+                    reason: format!(
+                        "decoded PCM exceeds the {MAX_PCM_BYTES_PER_FILE}-byte per-file limit"
+                    ),
+                });
+            }
+            buf.samples_f32.try_reserve(samples.len()).map_err(|_| {
+                PipelineError::DecodeFailed {
+                    path: path.to_path_buf(),
+                    reason: "failed to reserve decoded PCM buffer".to_owned(),
+                }
+            })?;
+            buf.samples_f32.extend_from_slice(samples);
+            decoded_bytes = decoded_bytes.saturating_add(added_bytes);
+            Ok(())
+        },
+    )?;
+    if let Some(edit) = video_audio_presentation_edit(&track) {
+        let frames = buf.samples_f32.len() / usize::from(channels.max(1));
+        trim_presented_frames(
+            &mut buf.samples_f32,
+            usize::from(channels),
+            presentation_frame_range(edit, rate, frames),
+        );
+    }
+    if buf.samples_f32.is_empty() || rate == 0 || channels == 0 {
+        return Err(PipelineError::EmptyOutput(path.to_path_buf()));
+    }
+    Ok((rate, usize::from(channels), source_bits, sample_format))
+}
+
 fn decode_audio(
     item: &AudioBatchItem,
     codec: AudioTargetCodec,
@@ -763,6 +1075,10 @@ fn decode_audio(
             let (rate, channels) = decode_adts_aac(item.source(), buf)?;
             (rate, channels, 16, AudioSampleFormat::Int)
         }
+        AudioInputFormat::Video {
+            container,
+            track_index,
+        } => decode_video_audio_track(item, container, track_index, codec, options, buf)?,
         _ => decode_symphonia(item.source(), item.input_format(), codec, options, buf)?,
     };
 
@@ -3091,6 +3407,10 @@ fn quantizes_to_second_array(
     if !codec.is_lossless() || options.bit_depth().is_some_and(AudioBitDepth::is_float) {
         return false;
     }
+    if item.input_format().is_video_container() {
+        // Video tracks decode into `samples_f32`; no direct integer copy exists.
+        return true;
+    }
     let stream = item.stream();
     if stream.sample_format() != AudioSampleFormat::Int {
         // PCM containers keep float streams as Float32 unless an integer depth is
@@ -3164,15 +3484,18 @@ fn retained_buffer_bytes(
         && options.channels().is_none_or(|channels| {
             usize::from(channels.get()) == usize::from(stream.channels().get())
         });
+    let video_track = item.input_format().is_video_container();
     let direct_i16 = codec.is_lossless()
         && bits == 16
         && format == AudioSampleFormat::Int
         && no_transform
+        && !video_track
         && explicit.is_none_or(|depth| depth == AudioBitDepth::Int16);
     let direct_i32 = codec == AudioTargetCodec::Pcm
         && bits == 32
         && format == AudioSampleFormat::Int
         && no_transform
+        && !video_track
         && explicit.is_none_or(|depth| depth == AudioBitDepth::Int32);
     let f32_cap = if direct_i16 || direct_i32 {
         0
@@ -3207,6 +3530,13 @@ fn retained_buffer_bytes(
             i32_cap = i32_cap.max(final_bytes);
         }
         Some(AudioBitDepth::Float32) | None => {}
+    }
+    if video_track {
+        // Probing leaves `bits_per_sample` unset for video tracks, so the
+        // estimate above defaults to 16-bit. Decoding resolves the track's real
+        // depth and a 24/32-bit PCM or FLAC track fills `samples_i32`; charge
+        // that vector conservatively so the batch budget cannot be over-subscribed.
+        i32_cap = i32_cap.max(source_bytes.max(final_bytes));
     }
     if alac_generic_byte_copy(item, codec) {
         // `encode_alac_m4a` holds `samples_i16` and its full little-endian byte
@@ -3499,8 +3829,14 @@ pub fn execute_audio_batch(plan: &AudioBatchPlan) -> Result<AudioConversionRepor
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastconv_domain::{AudioOptionBitrate, AudioOutputFormat, AudioQuality};
-    use std::num::{NonZeroU16, NonZeroU32};
+    use crate::video_codecs::{Yuv420Frame, YuvColor, encode_video_cpu};
+    use crate::video_container::{ContainerMedia, mux_video};
+    use crate::video_transcode::encode_audio_track;
+    use fastconv_domain::{
+        AudioEncodeConfig, AudioOptionBitrate, AudioOutputFormat, AudioQuality, TargetAudioCodec,
+        VideoAudioContainer, VideoContainerFormat, VideoEncodeMode, VideoRateControl,
+    };
+    use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -6571,6 +6907,459 @@ mod tests {
             usize::from(from_constructor),
             usize::from(OpusHead::RECOMMENDED_PRE_SKIP)
         );
+        Ok(())
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn video_tone(frames: usize, hz: f32) -> Vec<f32> {
+        (0..frames)
+            .map(|index| {
+                let phase = (index as f32) * hz * std::f32::consts::TAU / 48_000.0;
+                phase.sin() * 0.35
+            })
+            .collect()
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn video_frames(count: usize) -> Vec<Yuv420Frame> {
+        (0..count)
+            .map(|index| {
+                let (width, height) = (64_usize, 48_usize);
+                Yuv420Frame {
+                    width: 64,
+                    height: 48,
+                    y: (0..width * height)
+                        .map(|pixel| u8::try_from((pixel + index * 13) % 251).unwrap_or(0))
+                        .collect(),
+                    u: vec![128_u8; (width / 2) * (height / 2)],
+                    v: vec![118_u8; (width / 2) * (height / 2)],
+                    pts_us: i64::try_from(index).unwrap_or(i64::MAX) * 20_000,
+                    duration_us: 20_000,
+                    color: YuvColor::default(),
+                }
+            })
+            .collect()
+    }
+
+    /// Generates a real container with one video track and one or more audio
+    /// tracks entirely in-process: no `FFmpeg` is spawned anywhere in `crates/`.
+    fn make_video(
+        path: &Path,
+        format: VideoContainerFormat,
+        audio_codecs: &[TargetAudioCodec],
+    ) -> Result<(), PipelineError> {
+        let rate_control = VideoRateControl::DEFAULT;
+        let mode = if format == VideoContainerFormat::Webm {
+            VideoEncodeMode::CpuVp9 { rate_control }
+        } else {
+            VideoEncodeMode::CpuH264 { rate_control }
+        };
+        let video = encode_video_cpu(path, &video_frames(2), mode, 0)?;
+        let mut tracks = vec![video.track];
+        let mut packets = video.packets;
+        for (index, codec) in audio_codecs.iter().enumerate() {
+            #[allow(clippy::cast_precision_loss)]
+            let hz = 440.0 + (index as f32) * 220.0;
+            let samples = video_tone(1_920, hz);
+            let (track, mut audio_packets) = encode_audio_track(
+                path,
+                &samples,
+                48_000,
+                2,
+                *codec,
+                AudioEncodeConfig::default_for(*codec),
+            )?;
+            for packet in &mut audio_packets {
+                packet.track = tracks.len();
+            }
+            tracks.push(track);
+            packets.extend(audio_packets);
+        }
+        let file = File::create(path).map_err(|source| PipelineError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        mux_video(&file, path, format, &ContainerMedia { tracks, packets })?;
+        Ok(())
+    }
+
+    fn extract_video_audio(
+        source: &Path,
+        target: &Path,
+        format: AudioOutputFormat,
+        codec: Option<AudioTargetCodec>,
+        video_format: VideoContainerFormat,
+        track_index: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mode = AudioExecutionMode::resolve_with_codec(format, codec, HardwareBackend::Cpu)?;
+        let options = AudioEncodingOptions::for_codec(
+            format,
+            mode.codec(),
+            AudioRateControl::Default,
+            None,
+            None,
+            None,
+        )?;
+        let container = VideoAudioContainer::try_from_video_container(video_format)
+            .unwrap_or_else(|| unreachable!("video container has no audio"));
+        let stream = fastconv_domain::AudioStreamInfo::new(
+            NonZeroU16::new(2).unwrap_or(NonZeroU16::MIN),
+            NonZeroU32::new(48_000).unwrap_or(NonZeroU32::MIN),
+            None,
+            None,
+        )
+        .unwrap_or_else(|_| unreachable!("validated stream metadata"));
+        let item = AudioBatchItem::new(
+            source.to_path_buf(),
+            target.to_path_buf(),
+            AudioInputFormat::Video {
+                container,
+                track_index,
+            },
+            stream,
+        )
+        .unwrap_or_else(|_| unreachable!("validated batch item"));
+        let plan = AudioBatchPlan::with_options(vec![item], mode, NonZeroUsize::MIN, options)?;
+        execute_audio_batch(&plan)?;
+        Ok(())
+    }
+
+    fn decoded_output_samples(
+        path: &Path,
+        format: AudioOutputFormat,
+        codec: AudioTargetCodec,
+    ) -> Result<usize, PipelineError> {
+        let input = match (format, codec) {
+            (AudioOutputFormat::Wav, _) => AudioInputFormat::Wav,
+            (AudioOutputFormat::Flac, _) => AudioInputFormat::Flac,
+            (AudioOutputFormat::Mp3, _) => AudioInputFormat::Mp3,
+            (AudioOutputFormat::Aac, _) => AudioInputFormat::Aac,
+            (AudioOutputFormat::Aiff, _) => AudioInputFormat::Aiff,
+            (AudioOutputFormat::M4a, AudioTargetCodec::Alac) | (AudioOutputFormat::Alac, _) => {
+                AudioInputFormat::Alac
+            }
+            (AudioOutputFormat::M4a, _) => AudioInputFormat::M4a,
+            (AudioOutputFormat::Opus, _) | (AudioOutputFormat::Ogg, AudioTargetCodec::Opus) => {
+                AudioInputFormat::Opus
+            }
+            (AudioOutputFormat::Ogg, AudioTargetCodec::Vorbis) => AudioInputFormat::Vorbis,
+            (AudioOutputFormat::Ogg, AudioTargetCodec::Flac) => AudioInputFormat::OggFlac,
+            _ => unreachable!("invalid output container/codec pair"),
+        };
+        let mut buf = AudioWorkerBuffer::new();
+        if input == AudioInputFormat::Opus {
+            decode_opus(path, &mut buf)?;
+        } else {
+            decode_symphonia(
+                path,
+                input,
+                codec,
+                &AudioEncodingOptions::default(),
+                &mut buf,
+            )?;
+        }
+        Ok(buf.samples_f32.len() + buf.samples_i16.len() + buf.samples_i32.len())
+    }
+
+    #[test]
+    fn extracts_mp4_aac_into_every_audio_output() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = temp_dir("video-extract-all-outputs");
+        let source = dir.join("source.mp4");
+        make_video(&source, VideoContainerFormat::Mp4, &[TargetAudioCodec::Aac])?;
+        for (name, format, codec) in [
+            (
+                "ogg-vorbis",
+                AudioOutputFormat::Ogg,
+                Some(AudioTargetCodec::Vorbis),
+            ),
+            (
+                "ogg-opus",
+                AudioOutputFormat::Ogg,
+                Some(AudioTargetCodec::Opus),
+            ),
+            (
+                "ogg-flac",
+                AudioOutputFormat::Ogg,
+                Some(AudioTargetCodec::Flac),
+            ),
+            (
+                "m4a-alac",
+                AudioOutputFormat::M4a,
+                Some(AudioTargetCodec::Alac),
+            ),
+            ("flac", AudioOutputFormat::Flac, None),
+            ("wav", AudioOutputFormat::Wav, None),
+            ("mp3", AudioOutputFormat::Mp3, None),
+            ("opus", AudioOutputFormat::Opus, None),
+            ("aac", AudioOutputFormat::Aac, None),
+            ("aiff", AudioOutputFormat::Aiff, None),
+        ] {
+            let target = dir.join(format!("{name}.{}", format.extension()));
+            extract_video_audio(
+                &source,
+                &target,
+                format,
+                codec,
+                VideoContainerFormat::Mp4,
+                0,
+            )?;
+            let decoded = decoded_output_samples(&target, format, mode_codec(format, codec))?;
+            assert!(decoded > 0, "{name} produced no decodable audio");
+        }
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    fn mode_codec(format: AudioOutputFormat, codec: Option<AudioTargetCodec>) -> AudioTargetCodec {
+        codec.unwrap_or_else(|| format.default_codec())
+    }
+
+    #[test]
+    fn extracts_from_every_video_container() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = temp_dir("video-extract-containers");
+        for (container, codec) in [
+            (VideoContainerFormat::Mp4, TargetAudioCodec::Aac),
+            (VideoContainerFormat::Mov, TargetAudioCodec::Pcm),
+            (VideoContainerFormat::Mkv, TargetAudioCodec::Opus),
+            (VideoContainerFormat::Webm, TargetAudioCodec::Opus),
+            (VideoContainerFormat::Avi, TargetAudioCodec::Pcm),
+            (VideoContainerFormat::Ts, TargetAudioCodec::Mp3),
+        ] {
+            let source = dir.join(format!("src.{}", container.extension()));
+            make_video(&source, container, &[codec])?;
+            let target = dir.join(format!("{}.wav", container.extension()));
+            extract_video_audio(&source, &target, AudioOutputFormat::Wav, None, container, 0)?;
+            let decoded =
+                decoded_output_samples(&target, AudioOutputFormat::Wav, AudioTargetCodec::Pcm)?;
+            assert!(decoded > 0, "{container} produced no decodable audio");
+        }
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_requested_track_from_multitrack_video() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = temp_dir("video-extract-multitrack");
+        let source = dir.join("two-tracks.mkv");
+        make_video(
+            &source,
+            VideoContainerFormat::Mkv,
+            &[TargetAudioCodec::Aac, TargetAudioCodec::Opus],
+        )?;
+        for track_index in [0_usize, 1] {
+            let target = dir.join(format!("track-{track_index}.wav"));
+            extract_video_audio(
+                &source,
+                &target,
+                AudioOutputFormat::Wav,
+                None,
+                VideoContainerFormat::Mkv,
+                track_index,
+            )?;
+            let decoded =
+                decoded_output_samples(&target, AudioOutputFormat::Wav, AudioTargetCodec::Pcm)?;
+            assert!(decoded > 0, "track {track_index} produced no audio");
+        }
+        let missing = dir.join("track-2.wav");
+        assert!(
+            extract_video_audio(
+                &source,
+                &missing,
+                AudioOutputFormat::Wav,
+                None,
+                VideoContainerFormat::Mkv,
+                2,
+            )
+            .is_err()
+        );
+        assert!(!missing.exists());
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn video_track_depth_facts_come_from_pcm_and_streaminfo() -> Result<(), PipelineError> {
+        use crate::video_bitstream::PcmFormat;
+        let path = Path::new("synthetic.mkv");
+        for (format, bits, float) in [
+            (PcmFormat::S24Le, 24, false),
+            (PcmFormat::S32Le, 32, false),
+            (PcmFormat::F32Le, 32, true),
+            (PcmFormat::F64Le, 64, true),
+        ] {
+            let track = ContainerTrack {
+                codec: fastconv_domain::VideoCodec::Pcm,
+                width: None,
+                height: None,
+                channels: Some(2),
+                sample_rate: Some(48_000),
+                config: Vec::new(),
+                timescale: 1_000_000,
+                presentation_edit: None,
+                pcm_format: Some(format),
+            };
+            assert_eq!(
+                video_track_pcm_facts(path, &track)?,
+                (
+                    bits,
+                    if float {
+                        AudioSampleFormat::Float
+                    } else {
+                        AudioSampleFormat::Int
+                    }
+                ),
+                "{format:?}"
+            );
+        }
+        // A 24-bit FLAC STREAMINFO is authoritative for the source depth.
+        let packed = (48_000_u64 << 44) | ((2_u64 - 1) << 41) | ((24_u64 - 1) << 36);
+        let mut streaminfo = [0_u8; 34];
+        streaminfo[..4].copy_from_slice(&[0x10, 0x00, 0x10, 0x00]);
+        streaminfo[10..18].copy_from_slice(&packed.to_be_bytes());
+        let track = ContainerTrack {
+            codec: fastconv_domain::VideoCodec::Flac,
+            width: None,
+            height: None,
+            channels: Some(2),
+            sample_rate: Some(48_000),
+            config: streaminfo.to_vec(),
+            timescale: 1_000_000,
+            presentation_edit: None,
+            pcm_format: None,
+        };
+        assert_eq!(
+            video_track_pcm_facts(path, &track)?,
+            (24, AudioSampleFormat::Int)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn video_s32_pcm_direct_path_keeps_low_bits() -> Result<(), PipelineError> {
+        use crate::video_bitstream::PcmFormat;
+        let track = ContainerTrack {
+            codec: fastconv_domain::VideoCodec::Pcm,
+            width: None,
+            height: None,
+            channels: Some(2),
+            sample_rate: Some(48_000),
+            config: Vec::new(),
+            timescale: 1_000_000,
+            presentation_edit: None,
+            pcm_format: Some(PcmFormat::S32Le),
+        };
+        let samples = [16_777_217_i32, -16_777_217, i32::MAX, i32::MIN];
+        let mut data = Vec::new();
+        for sample in samples {
+            data.extend_from_slice(&sample.to_le_bytes());
+        }
+        let packets = [ContainerPacket {
+            track: 0,
+            pts: 0,
+            dts: 0,
+            duration: 4,
+            keyframe: true,
+            data,
+        }];
+        let mut buf = AudioWorkerBuffer::new();
+        let (rate, channels, bits, format) =
+            decode_video_pcm_i32(Path::new("synthetic.mkv"), &track, &packets, &mut buf)?;
+        assert_eq!(
+            (rate, channels, bits, format),
+            (48_000, 2, 32, AudioSampleFormat::Int)
+        );
+        assert_eq!(buf.samples_i32, samples);
+        Ok(())
+    }
+
+    #[test]
+    fn video_presentation_edit_trims_preroll_and_tail() {
+        let edit = TrackPresentation {
+            start_us: 1_000,
+            duration_us: Some(2_000),
+        };
+        // 1 MHz makes one microsecond exactly one frame in this test.
+        assert_eq!(
+            presentation_frame_range(edit, 1_000_000, 5_000),
+            (1_000, 3_000)
+        );
+        let mut samples: Vec<i32> = (0..10_000).collect();
+        trim_presented_frames(&mut samples, 2, (1_000, 3_000));
+        assert_eq!(samples.len(), 4_000);
+        assert_eq!(samples.first(), Some(&2_000));
+        assert_eq!(samples.last(), Some(&5_999));
+        let open = TrackPresentation {
+            start_us: 1_000,
+            duration_us: None,
+        };
+        assert_eq!(
+            presentation_frame_range(open, 1_000_000, 5_000),
+            (1_000, 5_000)
+        );
+        let negative = TrackPresentation {
+            start_us: -1_000,
+            duration_us: None,
+        };
+        assert_eq!(
+            presentation_frame_range(negative, 1_000_000, 5_000),
+            (0, 5_000)
+        );
+    }
+
+    #[test]
+    fn opus_presentation_edit_skips_already_removed_pre_skip() {
+        let edit = TrackPresentation {
+            start_us: 21_333,
+            duration_us: Some(1_000_000),
+        };
+        let mut track = ContainerTrack {
+            codec: fastconv_domain::VideoCodec::Opus,
+            width: None,
+            height: None,
+            channels: Some(2),
+            sample_rate: Some(48_000),
+            config: Vec::new(),
+            timescale: 1_000_000,
+            presentation_edit: Some(edit),
+            pcm_format: None,
+        };
+        let adjusted = video_audio_presentation_edit(&track).unwrap_or(edit);
+        assert_eq!(
+            adjusted.start_us, 0,
+            "Opus pre-skip is already decoded away"
+        );
+        assert_eq!(adjusted.duration_us, edit.duration_us);
+        track.codec = fastconv_domain::VideoCodec::Aac;
+        assert_eq!(
+            video_audio_presentation_edit(&track),
+            Some(edit),
+            "AAC still returns priming and needs the start trim"
+        );
+    }
+
+    #[test]
+    fn video_pcm_estimate_charges_i32_vector() -> Result<(), Box<dyn std::error::Error>> {
+        let stream = fastconv_domain::AudioStreamInfo::new(
+            NonZeroU16::new(2).unwrap_or(NonZeroU16::MIN),
+            NonZeroU32::new(48_000).unwrap_or(NonZeroU32::MIN),
+            None,
+            Some(480_000),
+        )?;
+        let item = AudioBatchItem::new(
+            PathBuf::from("source.mp4"),
+            PathBuf::from("out.wav"),
+            AudioInputFormat::Video {
+                container: VideoAudioContainer::Mp4,
+                track_index: 0,
+            },
+            stream,
+        )?;
+        let (_, _, i32_capacity) = retained_buffer_bytes(
+            &item,
+            AudioTargetCodec::Pcm,
+            &AudioEncodingOptions::default(),
+        );
+        assert!(i32_capacity > 0, "video PCM must charge the i32 vector");
         Ok(())
     }
 

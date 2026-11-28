@@ -5,7 +5,8 @@ pub mod video;
 
 pub use audio::{
     AudioEncodingRequest, ProbedAudio, parse_audio_bit_depth, parse_audio_bitrate,
-    parse_audio_codec, parse_audio_encoding_request, prepare_audio_batch, probe_audio,
+    parse_audio_codec, parse_audio_encoding_request, parse_audio_track, prepare_audio_batch,
+    probe_audio, probe_audio_track,
 };
 pub use hardware::detect_host_hardware;
 pub use image::{ProbedImage, prepare_image_batch, prepare_image_batch_with_options, probe_image};
@@ -93,7 +94,7 @@ impl fmt::Display for ProbeError {
             Self::EmptyAudioDirectory(path) => {
                 write!(
                     f,
-                    "no supported audio files (WAV, FLAC, MP3, OGG, Opus, AAC, M4A, ALAC, or AIFF) found in source directory: {}",
+                    "no supported audio or video files (WAV, FLAC, MP3, OGG, Opus, AAC, M4A, ALAC, AIFF, MP4, MOV, MKV, WebM, AVI, or TS) found in source directory: {}",
                     path.display()
                 )
             }

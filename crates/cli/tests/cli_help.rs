@@ -60,6 +60,7 @@ fn global_help_is_available_through_all_entry_points() -> Result<(), String> {
         "--tiff-compression <deflate|lzw|packbits|none>",
         "--chroma <420|444>",
         "--bit-depth <8|16|24|32|f32>",
+        "--track <N>",
         "fastconv <command> --help",
         "fastconv help <command>",
     ] {
@@ -211,6 +212,8 @@ fn audio_help_documents_all_encoding_flags_and_rules() -> Result<(), String> {
         "--sample-rate <hz>",
         "--channels <1..=8>",
         "--bit-depth <8|16|24|32|f32>",
+        "--track <N>",
+        "mp4, mov, mkv, webm, avi, ts",
         "--threads <N>",
         "--backend <name>",
         "-h, --help",
