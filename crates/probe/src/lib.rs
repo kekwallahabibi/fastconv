@@ -16,7 +16,10 @@ pub use image::{
     ProbedImage, ProbedImageWithAlpha, prepare_image_batch, prepare_image_batch_with_options,
     probe_image, probe_image_with_alpha,
 };
-pub use stack::{natural_cmp_bytes, natural_cmp_str, prepare_frame_sequence};
+pub use stack::{
+    natural_cmp_bytes, natural_cmp_str, prepare_frame_sequence,
+    prepare_frame_sequence_with_hardware,
+};
 pub use video::{
     ExternalAudioRequest, ProbedVideo, RequestedAudioCodec, RequestedVideoCodec,
     VideoTranscodeOptions, detect_video_magic, parse_requested_audio_codec, prepare_video_batch,

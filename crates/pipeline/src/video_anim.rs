@@ -278,7 +278,7 @@ pub(crate) fn rgb_to_yuv420(info: AnimFrameInfo, rgb: &[u8]) -> Result<Yuv420Fra
 /// RGBA-aware entry point used by the animation decoders. Fully opaque RGBA
 /// frames go straight to the SIMD RGBA converter (no flattening copy); frames
 /// with transparency are premultiplied onto black exactly as before.
-fn pixels_to_yuv420(
+pub(crate) fn pixels_to_yuv420(
     info: AnimFrameInfo,
     pixels: &[u8],
     channels: usize,
@@ -453,7 +453,7 @@ pub(crate) fn write_nv12(
 
 /// RGBA-aware NV12 entry point used by the animation decoders. Opaque RGBA
 /// frames avoid the flattening copy entirely.
-fn write_pixels_nv12(
+pub(crate) fn write_pixels_nv12(
     pixels: &[u8],
     width: u32,
     height: u32,

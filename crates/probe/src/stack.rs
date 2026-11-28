@@ -9,12 +9,13 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use fastconv_domain::{
-    AnimationLoop, DomainError, FrameSequencePlan, HardwareBackend, ImageDimensions,
-    StackExecutionMode, StackFps, StackFrame, StackTargetFormat, VideoQuality,
+    AnimationLoop, DomainError, FrameSequencePlan, GpuBackend, HardwareBackend, HostHardware,
+    ImageDimensions, StackBackendRequest, StackExecutionMode, StackFps, StackFrame,
+    TargetVideoCodec, VideoContainerFormat, VideoRateControl,
 };
 
 use crate::{
-    ProbeError, available_cpu_threads, canonical_or_parent,
+    ProbeError, available_cpu_threads, canonical_or_parent, detect_host_hardware,
     image::probe_directory_entry_with_alpha_for_stack, image::probe_image_with_alpha_for_stack,
 };
 
@@ -74,19 +75,20 @@ pub fn natural_cmp_str(a: &str, b: &str) -> Ordering {
     natural_cmp_bytes(a.as_bytes(), b.as_bytes())
 }
 
-fn resolved_extension(format: StackTargetFormat) -> &'static str {
+fn resolved_extension(format: VideoContainerFormat) -> &'static str {
     format.extension()
 }
 
 fn resolve_target_format(
     target: &Path,
-    explicit: Option<StackTargetFormat>,
-) -> Result<StackTargetFormat, ProbeError> {
+    explicit: Option<VideoContainerFormat>,
+) -> Result<VideoContainerFormat, ProbeError> {
     let extension = target
         .extension()
         .and_then(|ext| ext.to_str())
-        .unwrap_or_default();
-    let inferred = StackTargetFormat::from_extension(extension);
+        .unwrap_or_default()
+        .trim();
+    let inferred = VideoContainerFormat::from_extension(extension);
     match (explicit, inferred) {
         (Some(requested), Some(in_view)) if requested != in_view => {
             Err(ProbeError::ConflictingStackTargetFormat {
@@ -98,8 +100,33 @@ fn resolve_target_format(
         (Some(requested), _) | (None, Some(requested)) => Ok(requested),
         (None, None) => Err(ProbeError::UnsupportedTargetFormat {
             path: target.to_path_buf(),
-            expected: "gif or webp (pass --to <gif|webp>)",
+            expected: "gif, webp, mp4, mkv, webm, mov, avi, or ts (pass --to <format>)",
         }),
+    }
+}
+
+/// Probes host hardware only when the request can actually require NVENC:
+/// an explicit NVENC backend on a video container, or `auto` for H.264/HEVC.
+fn hardware_needed(
+    backend: StackBackendRequest,
+    codec: Option<TargetVideoCodec>,
+    container: VideoContainerFormat,
+) -> bool {
+    if matches!(
+        container,
+        VideoContainerFormat::Gif | VideoContainerFormat::Webp
+    ) {
+        return false;
+    }
+    let effective = codec.unwrap_or_else(|| container.default_video_codec());
+    match backend {
+        StackBackendRequest::Explicit(HardwareBackend::Gpu(GpuBackend::Nvenc)) => {
+            matches!(effective, TargetVideoCodec::H264 | TargetVideoCodec::Hevc)
+        }
+        StackBackendRequest::Auto => {
+            matches!(effective, TargetVideoCodec::H264 | TargetVideoCodec::Hevc)
+        }
+        StackBackendRequest::Explicit(_) => false,
     }
 }
 
@@ -205,25 +232,94 @@ pub fn prepare_frame_sequence(
     sources: &[PathBuf],
     target: &Path,
     fps: StackFps,
-    target_format: Option<StackTargetFormat>,
-    quality: VideoQuality,
-    loop_count: AnimationLoop,
+    target_format: Option<VideoContainerFormat>,
+    rate_control: VideoRateControl,
+    requested_codec: Option<TargetVideoCodec>,
+    explicit_loop: Option<AnimationLoop>,
     worker_threads: Option<NonZeroUsize>,
-    backend: HardwareBackend,
+    backend: StackBackendRequest,
+    nvenc_compiled: bool,
 ) -> Result<FrameSequencePlan, ProbeError> {
     if sources.is_empty() {
         return Err(DomainError::EmptyFrameSequence.into());
-    }
-    if let HardwareBackend::Gpu(gpu) = backend {
-        return Err(DomainError::UnsupportedStackBackend {
-            backend: HardwareBackend::Gpu(gpu),
-        }
-        .into());
     }
     if target.as_os_str().is_empty() {
         return Err(DomainError::EmptyPath(fastconv_domain::PathRole::Target).into());
     }
     let resolved_format = resolve_target_format(target, target_format)?;
+    // Reject hardware-independent option errors before touching the system, so
+    // e.g. `--loop` on a video target is never masked by a DRM/procfs I/O error.
+    StackExecutionMode::validate_stack_request(
+        resolved_format,
+        requested_codec,
+        rate_control,
+        explicit_loop,
+        backend,
+        nvenc_compiled,
+    )?;
+    // A CPU-only build can never select NVENC; do not probe the host at all.
+    let hardware = (nvenc_compiled && hardware_needed(backend, requested_codec, resolved_format))
+        .then(detect_host_hardware);
+    let hardware = match hardware {
+        Some(result) => Some(result?),
+        None => None,
+    };
+    prepare_frame_sequence_with_hardware(
+        sources,
+        target,
+        fps,
+        target_format,
+        rate_control,
+        requested_codec,
+        explicit_loop,
+        worker_threads,
+        backend,
+        nvenc_compiled,
+        hardware.as_ref(),
+    )
+}
+
+/// Same validation as [`prepare_frame_sequence`] with an injected host snapshot.
+/// This keeps the domain resolver's hardware decisions unit-testable without
+/// touching real NVIDIA drivers.
+///
+/// # Errors
+///
+/// Returns [`ProbeError`] for the same invalid inputs as
+/// [`prepare_frame_sequence`], including a domain error when the injected
+/// hardware snapshot cannot satisfy an explicit NVENC request.
+#[allow(clippy::too_many_arguments)] // Flat boundary input: one argument per validated CLI option.
+pub fn prepare_frame_sequence_with_hardware(
+    sources: &[PathBuf],
+    target: &Path,
+    fps: StackFps,
+    target_format: Option<VideoContainerFormat>,
+    rate_control: VideoRateControl,
+    requested_codec: Option<TargetVideoCodec>,
+    explicit_loop: Option<AnimationLoop>,
+    worker_threads: Option<NonZeroUsize>,
+    backend: StackBackendRequest,
+    nvenc_compiled: bool,
+    hardware: Option<&HostHardware>,
+) -> Result<FrameSequencePlan, ProbeError> {
+    if sources.is_empty() {
+        return Err(DomainError::EmptyFrameSequence.into());
+    }
+    if target.as_os_str().is_empty() {
+        return Err(DomainError::EmptyPath(fastconv_domain::PathRole::Target).into());
+    }
+    let resolved_format = resolve_target_format(target, target_format)?;
+    // Validate codec/container/rate-control/loop/backend before probing any
+    // source image headers so bad CLI flag combinations fail immediately.
+    let mode = StackExecutionMode::resolve_with_hardware(
+        resolved_format,
+        requested_codec,
+        rate_control,
+        explicit_loop,
+        backend,
+        nvenc_compiled,
+        hardware,
+    )?;
     match fs::metadata(target) {
         Ok(metadata) if metadata.is_dir() => {
             return Err(ProbeError::StackTargetIsDirectory(target.to_path_buf()));
@@ -284,30 +380,57 @@ pub fn prepare_frame_sequence(
 
     reject_aliases(&frames, source_dir, target)?;
 
-    let mode = StackExecutionMode::cpu_animation(resolved_format, quality);
     Ok(FrameSequencePlan::new(
         frames,
         expected,
         fps,
         target.to_path_buf(),
         mode,
-        loop_count,
         threads,
     )?)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{natural_cmp_bytes, natural_cmp_str, prepare_frame_sequence};
+    use super::{natural_cmp_bytes, natural_cmp_str};
     use crate::ProbeError;
+    use crate::stack::prepare_frame_sequence_with_hardware;
     use fastconv_domain::{
-        AnimationLoop, DomainError, HardwareBackend, StackFps, StackTargetFormat, VideoQuality,
+        AnimationLoop, DomainError, FrameSequencePlan, HardwareBackend, StackBackendRequest,
+        StackFps, StackTargetFormat, TargetVideoCodec, VideoContainerFormat, VideoQuality,
+        VideoRateControl,
     };
     use std::fs;
-    use std::num::NonZeroUsize;
+    use std::num::{NonZeroU16, NonZeroUsize};
     use std::path::{Path, PathBuf};
     use std::process;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[allow(clippy::too_many_arguments)] // Mirrors the boundary function's flat argument list.
+    fn prepare(
+        sources: &[PathBuf],
+        target: &Path,
+        fps: StackFps,
+        format: Option<VideoContainerFormat>,
+        quality: VideoQuality,
+        loop_count: AnimationLoop,
+        threads: Option<NonZeroUsize>,
+        backend: HardwareBackend,
+    ) -> Result<FrameSequencePlan, ProbeError> {
+        prepare_frame_sequence_with_hardware(
+            sources,
+            target,
+            fps,
+            format,
+            VideoRateControl::Quality(quality),
+            None,
+            Some(loop_count),
+            threads,
+            StackBackendRequest::Explicit(backend),
+            true,
+            None,
+        )
+    }
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -463,7 +586,7 @@ mod tests {
         let target = root.join("out.webp");
         write_png(&a, 16, 12)?;
         write_png(&b, 16, 12)?;
-        let plan = prepare_frame_sequence(
+        let plan = prepare(
             &[b.clone(), a.clone(), b.clone()],
             &target,
             StackFps::DEFAULT,
@@ -477,7 +600,7 @@ mod tests {
         assert_eq!(plan.frames()[0].source(), b);
         assert_eq!(plan.frames()[1].source(), a);
         assert_eq!(plan.frames()[2].source(), b);
-        assert_eq!(plan.target_format(), StackTargetFormat::Webp);
+        assert_eq!(plan.animation_format(), Some(StackTargetFormat::Webp));
         fs::remove_dir_all(&root).map_err(|source| ProbeError::Io {
             path: root.clone(),
             source,
@@ -486,12 +609,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_gpu_backend_and_conflicting_format() -> Result<(), ProbeError> {
+    fn rejects_gpu_animation_and_conflicting_format() -> Result<(), ProbeError> {
         let root = temp_dir("reject")?;
         let a = root.join("a.png");
         write_png(&a, 16, 12)?;
         let target = root.join("out.gif");
-        let gpu = prepare_frame_sequence(
+        let gpu = prepare(
             std::slice::from_ref(&a),
             &target,
             StackFps::DEFAULT,
@@ -504,14 +627,14 @@ mod tests {
         assert!(matches!(
             gpu,
             Err(ProbeError::InvalidDomain(
-                DomainError::UnsupportedStackBackend { .. }
+                DomainError::UnsupportedVideoPipeline { .. }
             ))
         ));
-        let conflict = prepare_frame_sequence(
+        let conflict = prepare(
             std::slice::from_ref(&a),
             &target,
             StackFps::DEFAULT,
-            Some(StackTargetFormat::Webp),
+            Some(VideoContainerFormat::Webp),
             VideoQuality::DEFAULT,
             AnimationLoop::Infinite,
             None,
@@ -536,7 +659,7 @@ mod tests {
         write_png(&a, 16, 12)?;
         write_png(&b, 20, 12)?;
         let target = root.join("out.gif");
-        let mixed = prepare_frame_sequence(
+        let mixed = prepare(
             &[a.clone(), b.clone()],
             &target,
             StackFps::DEFAULT,
@@ -550,11 +673,11 @@ mod tests {
             mixed,
             Err(ProbeError::StackFrameDimensionMismatch { .. })
         ));
-        let alias = prepare_frame_sequence(
+        let alias = prepare(
             std::slice::from_ref(&a),
             &a,
             StackFps::DEFAULT,
-            Some(StackTargetFormat::Gif),
+            Some(VideoContainerFormat::Gif),
             VideoQuality::DEFAULT,
             AnimationLoop::Infinite,
             None,
@@ -588,7 +711,7 @@ mod tests {
                 source,
             }
         })?;
-        let result = prepare_frame_sequence(
+        let result = prepare(
             std::slice::from_ref(&source),
             &socket_path,
             StackFps::DEFAULT,
@@ -600,6 +723,56 @@ mod tests {
         );
         assert!(matches!(result, Err(ProbeError::NotAFileOrDirectory(_))));
         drop(listener);
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io {
+            path: root.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_every_video_container_and_rejects_loop() -> Result<(), ProbeError> {
+        let root = temp_dir("containers")?;
+        let source = root.join("frame.png");
+        write_png(&source, 16, 16)?;
+        for container in VideoContainerFormat::ALL {
+            let target = root.join(format!("out.{}", container.extension()));
+            let plan = prepare_frame_sequence_with_hardware(
+                std::slice::from_ref(&source),
+                &target,
+                StackFps::DEFAULT,
+                None,
+                VideoRateControl::DEFAULT,
+                None,
+                None,
+                None,
+                StackBackendRequest::Auto,
+                true,
+                None,
+            )?;
+            assert_eq!(plan.target_container(), container);
+            assert!(plan.animation_format().is_none() || !container.supports_remux());
+        }
+        let target = root.join("out.mp4");
+        let loop_request = prepare_frame_sequence_with_hardware(
+            std::slice::from_ref(&source),
+            &target,
+            StackFps::DEFAULT,
+            None,
+            VideoRateControl::DEFAULT,
+            Some(TargetVideoCodec::H264),
+            Some(AnimationLoop::Times(NonZeroU16::MIN)),
+            None,
+            StackBackendRequest::Auto,
+            true,
+            None,
+        );
+        assert!(matches!(
+            loop_request,
+            Err(ProbeError::InvalidDomain(
+                DomainError::UnsupportedStackLoop { .. }
+            ))
+        ));
         fs::remove_dir_all(&root).map_err(|source| ProbeError::Io {
             path: root.clone(),
             source,

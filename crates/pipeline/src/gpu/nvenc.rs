@@ -16,7 +16,8 @@ mod enabled {
     use cudarc::driver::{CudaContext, CudaStream, HostSlice, PinnedHostSlice, result, sys};
     use fastconv_domain::{
         GpuBackend, HardwareBackend, ImageBatchItem, ImageBatchPlan, ImageConversionReport,
-        ImageInputFormat, ImageQuality, VideoCodec, VideoEncodeMode, VideoRateControl,
+        ImageDimensions, ImageInputFormat, ImageQuality, StackFps, StackFrame, VideoCodec,
+        VideoEncodeMode, VideoRateControl,
     };
     use nvidia_video_codec_sdk::{
         Bitstream, Buffer, ENCODE_API, EncodePictureParams, Encoder, EncoderInitParams,
@@ -54,7 +55,7 @@ mod enabled {
         extract_hvcc_from_annex_b,
     };
     use crate::video_codecs::{
-        DecodedFrameInfo, EncodedVideoStream, decode_video_track_streaming,
+        DecodedFrameInfo, EncodedVideoStream, YuvColor, decode_video_track_streaming,
         estimate_video_fps_from_packets, nv12_buffer_len,
     };
     use crate::video_container::{ContainerPacket, ContainerTrack, US_TIMESCALE};
@@ -63,11 +64,134 @@ mod enabled {
     /// Pinned host slots shared between the decode thread and the NVENC thread.
     const VIDEO_RING_SLOTS: usize = 4;
 
+    type PackNv12Fn<'a> = dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError> + 'a;
+
     /// A fully decoded NV12 frame in a recyclable pinned host slot.
     struct FilledPinnedFrame {
         pinned: PinnedHostSlice<u8>,
         info: DecodedFrameInfo,
         pitch: u32,
+    }
+
+    /// Producer side of the shared pinned-host ring. Both the video decoder
+    /// and the still-image decoder fill exactly this structure, so they share
+    /// one NVENC streaming loop and one allocation strategy.
+    struct FrameRing {
+        ready_tx: SyncSender<FilledPinnedFrame>,
+        free_rx: Receiver<PinnedHostSlice<u8>>,
+        seed_free_tx: Option<SyncSender<PinnedHostSlice<u8>>>,
+        geometry: Option<(u32, u32, usize, u32)>,
+        first_pinned: Option<PinnedHostSlice<u8>>,
+        cancelled: Arc<AtomicBool>,
+        stopped_by_consumer: bool,
+    }
+
+    impl FrameRing {
+        fn new(
+            ready_tx: SyncSender<FilledPinnedFrame>,
+            free_rx: Receiver<PinnedHostSlice<u8>>,
+            seed_free_tx: SyncSender<PinnedHostSlice<u8>>,
+            cancelled: Arc<AtomicBool>,
+        ) -> Self {
+            Self {
+                ready_tx,
+                free_rx,
+                seed_free_tx: Some(seed_free_tx),
+                geometry: None,
+                first_pinned: None,
+                cancelled,
+                stopped_by_consumer: false,
+            }
+        }
+
+        /// Writes one NV12 frame into a recycled pinned slot and hands it to the
+        /// NVENC stage. The first frame establishes the ring geometry and seeds
+        /// the free half; later frames only borrow a slot and pack into it.
+        fn push(
+            &mut self,
+            cuda_ctx: &Arc<CudaContext>,
+            info: DecodedFrameInfo,
+            pack: &mut PackNv12Fn<'_>,
+        ) -> Result<(), PipelineError> {
+            if self.cancelled.load(Ordering::Acquire) {
+                self.stopped_by_consumer = true;
+                return Err(video_error("NVENC consumer stopped the decode pipeline"));
+            }
+            let (expected_w, expected_h, pitch_usize, pitch_u32) =
+                if let Some(geometry) = self.geometry {
+                    geometry
+                } else {
+                    if info.width == 0
+                        || info.height == 0
+                        || !info.width.is_multiple_of(2)
+                        || !info.height.is_multiple_of(2)
+                    {
+                        return Err(video_error(format!(
+                            "NVENC requires even, non-zero dimensions; got {}x{}",
+                            info.width, info.height
+                        )));
+                    }
+                    // CUDADEVICEPTR slots come from `cuMemAlloc`, so NVENC needs the
+                    // allocation's row width in bytes, which must be a multiple of 4.
+                    // Packing, upload and registration all use this one stride.
+                    let pitch_usize = usize::try_from(info.width)
+                        .map_err(|_| video_error("NVENC frame width exceeds usize"))?
+                        .next_multiple_of(4);
+                    let pitch_u32 = u32::try_from(pitch_usize)
+                        .map_err(|_| video_error("NVENC frame pitch exceeds u32"))?;
+                    let slot_bytes = nv12_buffer_len(info.width, info.height, pitch_usize)?;
+                    let mut buffers = Vec::with_capacity(VIDEO_RING_SLOTS);
+                    for _ in 0..VIDEO_RING_SLOTS {
+                        buffers.push(alloc_zeroed_pinned(cuda_ctx, slot_bytes)?);
+                    }
+                    let mut buffers = buffers.into_iter();
+                    let pinned = buffers
+                        .next()
+                        .ok_or_else(|| video_error("internal pinned ring buffer underflow"))?;
+                    // Seed the free ring, then drop this sender so a GPU failure
+                    // closes `free_rx` and unblocks the producer's next `recv`.
+                    let seed = self
+                        .seed_free_tx
+                        .take()
+                        .ok_or_else(|| video_error("internal pinned ring already seeded"))?;
+                    for buffer in buffers {
+                        seed.send(buffer)
+                            .map_err(|_| video_error("NVENC consumer stopped during ring setup"))?;
+                    }
+                    drop(seed);
+                    self.first_pinned = Some(pinned);
+                    self.geometry = Some((info.width, info.height, pitch_usize, pitch_u32));
+                    (info.width, info.height, pitch_usize, pitch_u32)
+                };
+            if info.width != expected_w || info.height != expected_h {
+                return Err(video_error("video frame dimensions change mid-stream"));
+            }
+            let mut pinned = if let Some(buffer) = self.first_pinned.take() {
+                buffer
+            } else if let Ok(buffer) = self.free_rx.recv() {
+                buffer
+            } else {
+                self.stopped_by_consumer = true;
+                return Err(video_error("NVENC consumer stopped the decode pipeline"));
+            };
+            let dst = pinned
+                .as_mut_slice()
+                .map_err(|err| video_error(format!("failed to sync CUDA pinned buffer: {err}")))?;
+            pack(dst, pitch_usize)?;
+            if self
+                .ready_tx
+                .send(FilledPinnedFrame {
+                    pinned,
+                    info,
+                    pitch: pitch_u32,
+                })
+                .is_err()
+            {
+                self.stopped_by_consumer = true;
+                return Err(video_error("NVENC consumer stopped the decode pipeline"));
+            }
+            Ok(())
+        }
     }
 
     /// A synchronous `cuMemAlloc` device buffer owned by the NVENC ring.
@@ -1288,6 +1412,8 @@ mod enabled {
                 temporal_aq_supported: self
                     .get_encode_cap(guid, NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_TEMPORAL_AQ)?
                     > 0,
+                max_width: self.get_encode_cap(guid, NV_ENC_CAPS::NV_ENC_CAPS_WIDTH_MAX)?,
+                max_height: self.get_encode_cap(guid, NV_ENC_CAPS::NV_ENC_CAPS_HEIGHT_MAX)?,
             })
         }
 
@@ -1861,7 +1987,8 @@ mod enabled {
         cuda_ctx: &Arc<CudaContext>,
         codec: NvencVideoCodec,
         rate_control: VideoRateControl,
-        fps: u32,
+        fps_num: u32,
+        fps_den: u32,
         plan: NvencVideoPlan,
         disable_b_adapt: bool,
         track_index: usize,
@@ -1910,8 +2037,8 @@ mod enabled {
             encodeHeight: height,
             darWidth: width,
             darHeight: height,
-            frameRateNum: fps,
-            frameRateDen: 1,
+            frameRateNum: fps_num,
+            frameRateDen: fps_den,
             enablePTD: 1,
             encodeConfig: &raw mut preset_cfg.presetCfg,
             tuningInfo: NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_HIGH_QUALITY,
@@ -2462,6 +2589,26 @@ mod enabled {
         ))
     }
 
+    /// Test-only capability probe: the codec GUID must be exposed and accept
+    /// NV12 input before a round-trip test may require an encoder session.
+    #[cfg(test)]
+    pub(crate) fn codec_supports_encode_enabled(codec: VideoCodec) -> Result<bool, PipelineError> {
+        let nvenc_codec = match codec {
+            VideoCodec::H264 => NvencVideoCodec::H264,
+            VideoCodec::Hevc => NvencVideoCodec::Hevc,
+            _ => return Ok(false),
+        };
+        let cuda_ctx = CudaContext::new(0)
+            .map_err(|err| video_error(format!("failed to initialize CUDA device 0: {err}")))?;
+        let encoder = RawNvencEncoder::open(cuda_ctx)?;
+        let guid = nvenc_codec.guid();
+        if !encoder.get_encode_guids()?.contains(&guid) {
+            return Ok(false);
+        }
+        let formats = encoder.get_supported_input_formats(guid)?;
+        Ok(formats.contains(&NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12))
+    }
+
     #[cfg(test)]
     pub(super) fn codec_supports_b_frames_enabled(
         codec: VideoCodec,
@@ -2482,22 +2629,30 @@ mod enabled {
         Ok(caps.max_b_frames > 0)
     }
 
-    /// Decodes source packets straight into pinned host memory while NVENC
-    /// uploads and encodes from a separate CUDA device ring.
+    /// Single NVENC streaming loop shared by video and still-image stacks.
+    /// `producer` fills the bounded pinned ring on a separate thread while
+    /// NVENC initialises and encodes on this one.
     #[allow(clippy::too_many_lines)]
-    pub(super) fn encode_video_nvenc_streaming_enabled<F>(
-        path: &Path,
-        source_track: &ContainerTrack,
-        track_packets: &[ContainerPacket],
-        mode: VideoEncodeMode,
+    #[allow(clippy::too_many_arguments)] // Explicit geometry, codec and ring parameters; no config bag.
+    fn run_nvenc_streaming<'a, P, F>(
+        codec: NvencVideoCodec,
+        rate_control: VideoRateControl,
+        fps: u32,
+        fps_num: u32,
+        fps_den: u32,
         track_index: usize,
         disable_b_adapt: bool,
+        // Stack-only preflight geometry: checked against this adapter's codec
+        // caps before the producer pins any ring slots. Video streams pass
+        // `None` because their geometry is discovery-time data.
+        expected_dimensions: Option<(u32, u32)>,
+        producer: P,
         mut on_frame_encoded: F,
     ) -> Result<(EncodedVideoStream, u64, String), PipelineError>
     where
+        P: FnOnce(Arc<CudaContext>, &mut FrameRing) -> Result<(), PipelineError> + Send + 'a,
         F: FnMut() -> Result<(), PipelineError>,
     {
-        let (codec, rate_control) = NvencVideoCodec::from_mode(mode)?;
         let guid = codec.guid();
 
         // Only the CUDA context is needed before the decode thread starts.
@@ -2508,14 +2663,33 @@ mod enabled {
         let device_name = cuda_ctx
             .name()
             .map_err(|err| video_error(format!("failed to query CUDA device name: {err}")))?;
-        let cancelled = AtomicBool::new(false);
+        if let Some((width, height)) = expected_dimensions {
+            // Open a short-lived encoder session and ask this adapter whether
+            // it can encode this geometry *before* the producer pins and clears
+            // four NV12 slots (~384 MiB at 8192x8192). The main session below
+            // still re-checks the GUID and caps during initialization.
+            let encoder = RawNvencEncoder::open(Arc::clone(&cuda_ctx))?;
+            if !encoder.get_encode_guids()?.contains(&guid) {
+                return Err(video_error(
+                    "this NVIDIA GPU does not expose the requested NVENC video codec",
+                ));
+            }
+            let caps = encoder.query_codec_caps(guid)?;
+            let max_width = u32::try_from(caps.max_width).unwrap_or(u32::MAX);
+            let max_height = u32::try_from(caps.max_height).unwrap_or(u32::MAX);
+            if (max_width > 0 && width > max_width) || (max_height > 0 && height > max_height) {
+                return Err(video_error(format!(
+                    "NVENC stack frame {width}x{height} exceeds this adapter's {max_width}x{max_height} limit"
+                )));
+            }
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let decode_ctx = Arc::clone(&cuda_ctx);
 
         thread::scope(|scope| {
-            let decode_ctx = Arc::clone(&cuda_ctx);
             let (ready_tx, ready_rx) = mpsc::sync_channel::<FilledPinnedFrame>(VIDEO_RING_SLOTS);
             let (free_tx, free_rx) = mpsc::sync_channel::<PinnedHostSlice<u8>>(VIDEO_RING_SLOTS);
-            let seed_free_tx = free_tx.clone();
-            let decode_cancelled = &cancelled;
+            let ring = FrameRing::new(ready_tx, free_rx, free_tx.clone(), Arc::clone(&cancelled));
 
             let decode_handle = thread::Builder::new()
                 .name("fastconv-video-decode".to_owned())
@@ -2525,120 +2699,12 @@ mod enabled {
                             "failed to bind CUDA context on decode thread: {err}"
                         ))
                     })?;
-                    let mut ring_geometry: Option<(u32, u32, usize, u32)> = None;
-                    let mut first_pinned: Option<PinnedHostSlice<u8>> = None;
-                    let mut seed_free_tx = Some(seed_free_tx);
-                    let mut stopped_by_consumer = false;
-
-                    let decode_result = decode_video_track_streaming(
-                        path,
-                        source_track,
-                        track_packets,
-                        |info, pack_nv12| {
-                            if decode_cancelled.load(Ordering::Acquire) {
-                                stopped_by_consumer = true;
-                                return Err(video_error(
-                                    "NVENC consumer stopped the decode pipeline",
-                                ));
-                            }
-                            let (expected_w, expected_h, pitch_usize, pitch_u32) =
-                                if let Some(geometry) = ring_geometry {
-                                    geometry
-                                } else {
-                                    if info.width == 0
-                                        || info.height == 0
-                                        || !info.width.is_multiple_of(2)
-                                        || !info.height.is_multiple_of(2)
-                                    {
-                                        return Err(video_error(format!(
-                                            "NVENC requires even, non-zero dimensions; got {}x{}",
-                                            info.width, info.height
-                                        )));
-                                    }
-                                    // CUDADEVICEPTR slots come from `cuMemAlloc`, so NVENC
-                                    // needs the allocation's row width in bytes, which must
-                                    // be a multiple of 4. The allocation is pitched at
-                                    // `width.next_multiple_of(4)`, so that is its row width:
-                                    // padding only the stride keeps 2-mod-4 picture widths
-                                    // (854, 1366, ...) encodable. Packing, upload and
-                                    // registration all use this one stride.
-                                    let pitch_usize = usize::try_from(info.width)
-                                        .map_err(|_| {
-                                            video_error("NVENC frame width exceeds usize")
-                                        })?
-                                        .next_multiple_of(4);
-                                    let pitch_u32 = u32::try_from(pitch_usize).map_err(|_| {
-                                        video_error("NVENC frame pitch exceeds u32")
-                                    })?;
-                                    let slot_bytes =
-                                        nv12_buffer_len(info.width, info.height, pitch_usize)?;
-                                    let mut buffers = Vec::with_capacity(VIDEO_RING_SLOTS);
-                                    for _ in 0..VIDEO_RING_SLOTS {
-                                        buffers.push(alloc_zeroed_pinned(&decode_ctx, slot_bytes)?);
-                                    }
-                                    let mut buffers = buffers.into_iter();
-                                    let pinned = buffers.next().ok_or_else(|| {
-                                        video_error("internal pinned ring buffer underflow")
-                                    })?;
-                                    // Seed the free ring, then drop this sender so a GPU
-                                    // failure closes `free_rx` and unblocks our `recv`.
-                                    let seed = seed_free_tx.take().ok_or_else(|| {
-                                        video_error("internal pinned ring already seeded")
-                                    })?;
-                                    for buffer in buffers {
-                                        seed.send(buffer).map_err(|_| {
-                                            video_error("NVENC consumer stopped during ring setup")
-                                        })?;
-                                    }
-                                    drop(seed);
-                                    first_pinned = Some(pinned);
-                                    ring_geometry =
-                                        Some((info.width, info.height, pitch_usize, pitch_u32));
-                                    (info.width, info.height, pitch_usize, pitch_u32)
-                                };
-                            if info.width != expected_w || info.height != expected_h {
-                                return Err(video_error(
-                                    "video frame dimensions change mid-stream",
-                                ));
-                            }
-                            let mut pinned = match first_pinned.take() {
-                                Some(buffer) => buffer,
-                                None => {
-                                    if let Ok(buffer) = free_rx.recv() {
-                                        buffer
-                                    } else {
-                                        stopped_by_consumer = true;
-                                        return Err(video_error(
-                                            "NVENC consumer stopped the decode pipeline",
-                                        ));
-                                    }
-                                }
-                            };
-                            let dst = pinned.as_mut_slice().map_err(|err| {
-                                video_error(format!("failed to sync CUDA pinned buffer: {err}"))
-                            })?;
-                            pack_nv12(dst, pitch_usize)?;
-                            if ready_tx
-                                .send(FilledPinnedFrame {
-                                    pinned,
-                                    info,
-                                    pitch: pitch_u32,
-                                })
-                                .is_err()
-                            {
-                                stopped_by_consumer = true;
-                                return Err(video_error(
-                                    "NVENC consumer stopped the decode pipeline",
-                                ));
-                            }
-                            Ok(())
-                        },
-                    );
-
-                    if stopped_by_consumer {
+                    let mut ring = ring;
+                    let result = producer(decode_ctx, &mut ring);
+                    if ring.stopped_by_consumer {
                         Ok(())
                     } else {
-                        decode_result
+                        result
                     }
                 })
                 .map_err(PipelineError::WorkerStartFailed)?;
@@ -2647,7 +2713,7 @@ mod enabled {
             // thread refilling the bounded pinned ring. Any failure here still
             // reaches the shared cancellation path below, which drops both
             // channel ends before joining so the decoder never blocks forever.
-            let init = (|| -> Result<(RawNvencEncoder, u32, NvencVideoPlan), PipelineError> {
+            let init = (|| -> Result<(RawNvencEncoder, NvencVideoPlan), PipelineError> {
                 let encoder = RawNvencEncoder::open(Arc::clone(&cuda_ctx))?;
                 let guids = encoder.get_encode_guids()?;
                 if !guids.contains(&guid) {
@@ -2662,15 +2728,14 @@ mod enabled {
                     ));
                 }
                 let caps = encoder.query_codec_caps(guid)?;
-                let fps = estimate_video_fps_from_packets(track_packets);
                 let plan = NvencVideoPlan::from_caps(fps, caps);
-                Ok((encoder, fps, plan))
+                Ok((encoder, plan))
             })();
 
             // The first decoded frame determines the session and ring geometry;
             // subsequent frames decode while NVENC initialises and encodes.
             let gpu_result = match init {
-                Ok((encoder, fps, plan)) => {
+                Ok((encoder, plan)) => {
                     let first = ready_rx.recv().ok();
                     match first {
                         Some(first) => run_streaming_nvenc_stage(
@@ -2678,7 +2743,8 @@ mod enabled {
                             &cuda_ctx,
                             codec,
                             rate_control,
-                            fps,
+                            fps_num,
+                            fps_den,
                             plan,
                             disable_b_adapt,
                             track_index,
@@ -2715,6 +2781,121 @@ mod enabled {
                 Err(gpu_err) => Err(gpu_err),
             }
         })
+    }
+
+    /// Video-to-video CPU-decode/NVENC-encode path. The integer FPS keeps the
+    /// existing video plan and GOP cadence byte-for-byte identical; only the
+    /// container rate is used for session timing.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Mirrors the shared NVENC streaming signature so video-to-video and stack-to-video use one ring loop"
+    )]
+    pub(super) fn encode_video_nvenc_streaming_enabled<F>(
+        path: &Path,
+        source_track: &ContainerTrack,
+        track_packets: &[ContainerPacket],
+        mode: VideoEncodeMode,
+        track_index: usize,
+        disable_b_adapt: bool,
+        on_frame_encoded: F,
+    ) -> Result<(EncodedVideoStream, u64, String), PipelineError>
+    where
+        F: FnMut() -> Result<(), PipelineError>,
+    {
+        let (codec, rate_control) = NvencVideoCodec::from_mode(mode)?;
+        let fps = estimate_video_fps_from_packets(track_packets);
+        run_nvenc_streaming(
+            codec,
+            rate_control,
+            fps,
+            fps,
+            1,
+            track_index,
+            disable_b_adapt,
+            None,
+            |ctx, ring| {
+                decode_video_track_streaming(path, source_track, track_packets, |info, pack| {
+                    ring.push(&ctx, info, pack)
+                })
+            },
+            on_frame_encoded,
+        )
+    }
+
+    /// Still-image stack to NVENC. Decoding and SIMD NV12 packing overlap the
+    /// GPU stage through the same four-slot pinned ring as video-to-video, with
+    /// only constant-size scratch buffers retained by the producer.
+    pub(super) fn encode_stack_nvenc_streaming_enabled<F>(
+        frames: &[StackFrame],
+        dimensions: ImageDimensions,
+        stack_fps: StackFps,
+        mode: VideoEncodeMode,
+        on_frame_encoded: F,
+    ) -> Result<(EncodedVideoStream, u64, String), PipelineError>
+    where
+        F: FnMut() -> Result<(), PipelineError>,
+    {
+        let (codec, rate_control) = NvencVideoCodec::from_mode(mode)?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "StackFps is validated finite and positive; the value is clamped before use"
+        )]
+        let numeric_fps = stack_fps.get().round() as u64;
+        let fps = u32::try_from(numeric_fps).unwrap_or(240).clamp(1, 240);
+        let (fps_num, fps_den) = stack_fps.rational();
+        run_nvenc_streaming(
+            codec,
+            rate_control,
+            fps,
+            fps_num,
+            fps_den,
+            0,
+            false,
+            Some((dimensions.width().get(), dimensions.height().get())),
+            |ctx, ring| {
+                let mut file_bytes = Vec::new();
+                let mut pixel_buf = Vec::new();
+                let mut flat = Vec::new();
+                for (index, frame) in frames.iter().enumerate() {
+                    let (format, decoded) = crate::stack::decode_stack_frame_into(
+                        frame,
+                        dimensions,
+                        &mut file_bytes,
+                        &mut pixel_buf,
+                    )?;
+                    let (pixels, channels) = crate::stack::opaque_video_pixels(
+                        frame.source(),
+                        format,
+                        decoded,
+                        &mut flat,
+                    )?;
+                    let index_u64 = u64::try_from(index).unwrap_or(u64::MAX);
+                    let pts_us = stack_fps.frame_timestamp_us(index_u64);
+                    let next_pts_us = stack_fps.frame_timestamp_us(index_u64.saturating_add(1));
+                    let info = DecodedFrameInfo {
+                        width: dimensions.width().get(),
+                        height: dimensions.height().get(),
+                        pts_us: i64::try_from(pts_us).unwrap_or(i64::MAX),
+                        duration_us: next_pts_us.saturating_sub(pts_us).max(1),
+                        color: YuvColor::default(),
+                    };
+                    let mut pack = |dst: &mut [u8], pitch: usize| {
+                        crate::video_anim::write_pixels_nv12(
+                            pixels,
+                            info.width,
+                            info.height,
+                            dst,
+                            pitch,
+                            usize::from(channels),
+                        )
+                    };
+                    ring.push(&ctx, info, &mut pack)?;
+                }
+                Ok(())
+            },
+            on_frame_encoded,
+        )
     }
 
     #[cfg(test)]
@@ -2789,11 +2970,17 @@ mod enabled {
     }
 }
 
+#[cfg(all(test, feature = "nvenc"))]
+pub(crate) use enabled::codec_supports_encode_enabled;
+
 #[cfg(not(feature = "nvenc"))]
 use fastconv_domain::GpuBackend;
 #[cfg(any(feature = "nvenc", test))]
 use fastconv_domain::VideoQuality;
-use fastconv_domain::{ImageBatchPlan, ImageConversionReport, ImageQuality, VideoEncodeMode};
+use fastconv_domain::{
+    ImageBatchPlan, ImageConversionReport, ImageDimensions, ImageQuality, StackFps, StackFrame,
+    VideoEncodeMode,
+};
 use std::path::Path;
 
 use crate::PipelineError;
@@ -2816,6 +3003,9 @@ struct NvencCodecCaps {
     bframe_ref_mode: i32,
     lookahead_supported: bool,
     temporal_aq_supported: bool,
+    /// `NV_ENC_CAPS_WIDTH_MAX` / `HEIGHT_MAX`; non-positive means unknown.
+    max_width: i32,
+    max_height: i32,
 }
 
 /// Validated NVENC encode configuration derived from hardware capabilities so
@@ -3152,6 +3342,42 @@ where
     }
 }
 
+/// Streams a still-image stack into NVENC H.264/HEVC. Never falls back to CPU:
+/// a missing `nvenc` feature or any GPU failure is returned explicitly.
+///
+/// # Errors
+///
+/// Returns [`PipelineError::GpuBackendFailed`] without the `nvenc` feature, or a
+/// pipeline error when decoding, CUDA setup, encoding or mux preparation fails.
+// Without the `nvenc` feature the stub below hard-errors; the arguments exist
+// only for signature parity with the enabled build and are intentionally unused.
+#[cfg_attr(not(feature = "nvenc"), allow(unused_variables))]
+pub(crate) fn encode_stack_nvenc_streaming(
+    frames: &[StackFrame],
+    dimensions: ImageDimensions,
+    stack_fps: StackFps,
+    mode: VideoEncodeMode,
+) -> Result<(EncodedVideoStream, u64, String), PipelineError> {
+    #[cfg(feature = "nvenc")]
+    {
+        enabled::encode_stack_nvenc_streaming_enabled(
+            frames,
+            dimensions,
+            stack_fps,
+            mode,
+            || Ok(()),
+        )
+    }
+
+    #[cfg(not(feature = "nvenc"))]
+    {
+        Err(PipelineError::GpuBackendFailed {
+            backend: GpuBackend::Nvenc,
+            reason: "NVENC stack encoding requires building with --features nvenc (no silent CPU fallback)".to_owned(),
+        })
+    }
+}
+
 /// Test-only entry point that sets `disableBadapt = 1` so lookahead cannot
 /// suppress B-frames on synthetic fixtures when verifying B-frame PTS
 /// inversions and reorder roundtrips on B-frame-capable GPUs.
@@ -3276,6 +3502,8 @@ mod unit_tests {
             bframe_ref_mode: 0,
             lookahead_supported: true,
             temporal_aq_supported: false,
+            max_width: 8192,
+            max_height: 8192,
         };
         let plan = NvencVideoPlan::from_caps(60, pascal_hevc);
         assert_eq!(plan.gop_length, 120);
@@ -3294,6 +3522,8 @@ mod unit_tests {
             bframe_ref_mode: 2,
             lookahead_supported: true,
             temporal_aq_supported: true,
+            max_width: 8192,
+            max_height: 8192,
         };
         let plan = NvencVideoPlan::from_caps(60, turing_caps);
         assert_eq!(plan.gop_length, 120);
