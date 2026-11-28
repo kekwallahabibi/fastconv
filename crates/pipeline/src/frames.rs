@@ -21,7 +21,7 @@ use crossbeam_channel as channel;
 
 use fastconv_domain::{
     FrameExtractionPlan, FrameExtractionReport, FrameRange, FrameSelection, ImageExecutionMode,
-    VideoContainerFormat,
+    VideoCodec, VideoContainerFormat,
 };
 
 use crate::PipelineError;
@@ -1235,6 +1235,12 @@ fn decode_video(
         .filter(|packet| packet.track == track_index)
         .collect();
     let mut frame_index = 0_u64;
+    // `stream_mjpeg` keeps its decoded RGB buffer alive while the callback
+    // packs NV12 and the emission buffers are live. Charge that decoder-owned
+    // buffer as an external hold so the aggregate cap covers it too.
+    let is_mjpeg = track.codec == VideoCodec::Mjpeg;
+    let pool = emitter.pool;
+    let mut mjpeg_rgb_hold: Option<ExternalHold<'_>> = None;
     decode_video_track_streaming_ctrl(source, &track, &packets, |info, pack| {
         let index = frame_index;
         frame_index = frame_index.saturating_add(1);
@@ -1243,6 +1249,13 @@ fn decode_video(
             return Ok(ControlFlow::Break(()));
         }
         if emitter.range.contains(index) {
+            if is_mjpeg {
+                // Padded dimensions are an upper bound on the decoder's RGB
+                // buffer length, so the hold can never under-charge it.
+                let rgb_len = frame_byte_len(info.width, info.height, 3)
+                    .map_err(|err| attach_path(err, source))?;
+                ensure_canvas_hold(pool, source, &mut mjpeg_rgb_hold, rgb_len)?;
+            }
             // MJPEG rounds odd dimensions up to even for NV12. Reserve BOTH
             // the NV12 scratch and the padded RGB output atomically from the
             // same pool, convert, compact cropped rows in place, and release
@@ -2694,6 +2707,76 @@ mod tests {
         let rejected = decode_video(&source, VideoContainerFormat::Mp4, &mut emitter);
         assert!(matches!(rejected, Err(PipelineError::DecodeFailed { .. })));
         assert_eq!(tiny_pool.peak_live_bytes(), 0);
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn decode_video_charges_mjpeg_decoder_rgb_to_aggregate_budget() -> Result<(), Box<dyn Error>> {
+        let root = temp_root("mjpeg-budget")?;
+        // AVI video tracks are MJPEG; `stream_mjpeg` keeps one decoded RGB
+        // buffer alive while the callback runs.
+        let source = root.join("in.avi");
+        write_video(&source, VideoContainerFormat::Avi, &solid_frames(4, 32, 32))?;
+        let rgb_bytes = frame_byte_len(32, 32, 3)?;
+        let nv12_bytes = nv12_buffer_len(32, 32, 32)?;
+        // Output RGB + NV12 scratch + decoder-owned MJPEG RGB.
+        let exact_budget = rgb_bytes + nv12_bytes + rgb_bytes;
+
+        let pool = PixelPool::new(exact_budget);
+        let (job_tx, job_rx) = channel::unbounded::<FrameJob<'_>>();
+        let (_error_tx, error_rx) = channel::unbounded::<PipelineError>();
+        let failed = AtomicBool::new(false);
+        let seen = AtomicUsize::new(0);
+        let count = thread::scope(|scope| -> Result<u64, PipelineError> {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    while let Ok(job) = job_rx.recv() {
+                        assert_eq!(job.pixels.len(), rgb_bytes);
+                        thread::sleep(Duration::from_millis(1));
+                        seen.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            let mut emitter = FrameEmitter {
+                selector: Selector::new(FrameSelection::All, 0),
+                range: FrameRange::new(0, None).map_err(|err| frame_error(err.to_string()))?,
+                expected: Some((32, 32)),
+                pool: &pool,
+                job_tx,
+                error_rx: &error_rx,
+                failed: &failed,
+                sequence: 0,
+                last_dims: None,
+            };
+            let _flow = decode_video(&source, VideoContainerFormat::Avi, &mut emitter)?;
+            Ok(emitter.sequence)
+        })?;
+        assert_eq!(count, 4);
+        assert_eq!(seen.load(Ordering::Relaxed), 4);
+        assert!(pool.peak_live_bytes() <= exact_budget);
+        assert_eq!(pool.leased_bytes(), 0);
+
+        // One byte below the combined budget must reject cleanly rather than
+        // let the uncharged decoder buffer push total live pixels past the cap.
+        let tiny_pool = PixelPool::new(exact_budget - 1);
+        let (job_tx, _job_rx) = channel::unbounded::<FrameJob<'_>>();
+        let (_error_tx, error_rx) = channel::unbounded::<PipelineError>();
+        let failed = AtomicBool::new(false);
+        let mut emitter = FrameEmitter {
+            selector: Selector::new(FrameSelection::All, 0),
+            range: FrameRange::new(0, None)?,
+            expected: Some((32, 32)),
+            pool: &tiny_pool,
+            job_tx,
+            error_rx: &error_rx,
+            failed: &failed,
+            sequence: 0,
+            last_dims: None,
+        };
+        let rejected = decode_video(&source, VideoContainerFormat::Avi, &mut emitter);
+        assert!(matches!(rejected, Err(PipelineError::DecodeFailed { .. })));
 
         fs::remove_dir_all(&root)?;
         Ok(())
