@@ -810,7 +810,9 @@ fn probe_bmp(file: &mut File, path: &Path) -> Result<(ImageDimensions, bool), Pr
     let (width, height, bit_count, compression, colors_used) =
         read_bmp_dib_header(file, path, dib_size)?;
 
-    validate_bmp_encoding(
+    // The mask returned for BI_BITFIELDS/BI_ALPHABITFIELDS is the exact signal
+    // the decoder uses to emit RGBA for 16-bit pixels.
+    let alpha_mask = validate_bmp_encoding(
         file,
         path,
         dib_size,
@@ -845,7 +847,9 @@ fn probe_bmp(file: &mut File, path: &Path) -> Result<(ImageDimensions, bool), Pr
 
     // A 32-bpp BMP carries an alpha byte even when no bitfields mask is set;
     // conservative alpha signalling keeps mixed stacks on one channel layout.
-    Ok((dims, bit_count == 32))
+    // 16-bit pixels only carry alpha when the (validated) bitfields alpha mask
+    // is nonzero, matching decode_bmp_16/decoded RGBA in the pipeline.
+    Ok((dims, bit_count == 32 || alpha_mask != 0))
 }
 
 fn validate_bmp_palette_bounds(
@@ -900,7 +904,7 @@ fn validate_bmp_bitfields_masks(
     pixel_offset: u64,
     bit_count: u16,
     compression: u32,
-) -> Result<(), ProbeError> {
+) -> Result<u32, ProbeError> {
     if !matches!(bit_count, 16 | 32) {
         return Err(invalid_image(
             path,
@@ -968,7 +972,7 @@ fn validate_bmp_bitfields_masks(
             "invalid 16-bit BMP BI_BITFIELDS mask exceeding 16 bits",
         ));
     }
-    Ok(())
+    Ok(a)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -981,7 +985,7 @@ fn validate_bmp_encoding(
     bit_count: u16,
     compression: u32,
     colors_used: u32,
-) -> Result<(), ProbeError> {
+) -> Result<u32, ProbeError> {
     match compression {
         0 => {
             if !matches!(bit_count, 1 | 4 | 8 | 16 | 24 | 32) {
@@ -1006,7 +1010,7 @@ fn validate_bmp_encoding(
                     colors_used,
                 )?;
             }
-            Ok(())
+            Ok(0)
         }
         3 | 6 => {
             validate_bmp_bitfields_masks(file, path, dib_size, pixel_offset, bit_count, compression)
@@ -2269,9 +2273,15 @@ fn probe_gif(file: File, path: &Path) -> Result<(ImageDimensions, bool), ProbeEr
     let first_frame = decoder
         .next_frame_info()
         .map_err(|err| invalid_image(path, format!("invalid GIF frame: {err}")))?;
-    let has_alpha = first_frame
-        .as_ref()
-        .is_some_and(|f| f.transparent.is_some());
+    // A frame that does not fully cover the logical screen leaves the rest of
+    // the canvas zero-alpha in the still decoder, so this must signal alpha.
+    let has_alpha = first_frame.as_ref().is_some_and(|f| {
+        f.transparent.is_some()
+            || f.left != 0
+            || f.top != 0
+            || u32::from(f.width) != width
+            || u32::from(f.height) != height
+    });
     if first_frame.is_none() {
         return Err(invalid_image(path, "GIF contains no image frames"));
     }
@@ -2703,7 +2713,7 @@ fn probe_opened_image(
     path: &Path,
     format: ImageInputFormat,
 ) -> Result<ProbedImage, ProbeError> {
-    Ok(probe_opened_image_with_alpha(file, path, format)?.image())
+    Ok(probe_opened_image_with_alpha(file, path, format, false)?.image())
 }
 
 /// Probes headers once and reports both dimensions and the alpha signal.
@@ -2711,6 +2721,7 @@ fn probe_opened_image_with_alpha(
     mut file: File,
     path: &Path,
     format: ImageInputFormat,
+    reject_animated_png: bool,
 ) -> Result<ProbedImageWithAlpha, ProbeError> {
     file.seek(SeekFrom::Start(0))
         .map_err(|source| ProbeError::Io {
@@ -2726,6 +2737,12 @@ fn probe_opened_image_with_alpha(
                 .read_info()
                 .map_err(|err| invalid_image(path, err.to_string()))?;
             let info = reader.info();
+            if reject_animated_png && info.animation_control.is_some() {
+                return Err(invalid_image(
+                    path,
+                    "animated PNG is not supported by the still-image pipeline",
+                ));
+            }
             let has_alpha = matches!(
                 info.color_type,
                 png::ColorType::Rgba | png::ColorType::GrayscaleAlpha
@@ -2891,13 +2908,10 @@ pub fn probe_image(path: &Path) -> Result<ProbedImage, ProbeError> {
     probe_opened_image(file, path, format)
 }
 
-/// Probes a still image's headers together with its alpha signal.
-///
-/// # Errors
-///
-/// Same failures as [`probe_image`], plus animated inputs are rejected by the
-/// per-format header probe exactly as they are for the still-image pipeline.
-pub fn probe_image_with_alpha(path: &Path) -> Result<ProbedImageWithAlpha, ProbeError> {
+fn probe_image_with_alpha_inner(
+    path: &Path,
+    reject_animated_png: bool,
+) -> Result<ProbedImageWithAlpha, ProbeError> {
     let mut file = File::open(path).map_err(|source| ProbeError::Io {
         path: path.to_path_buf(),
         source,
@@ -2907,7 +2921,25 @@ pub fn probe_image_with_alpha(path: &Path) -> Result<ProbedImageWithAlpha, Probe
     let sniffed = sniff_magic_format(header_slice, false)
         .ok_or_else(|| invalid_image(path, UNRECOGNIZED_MAGIC_REASON))?;
     let format = resolve_sniffed_input(&mut file, path, sniffed)?.format;
-    probe_opened_image_with_alpha(file, path, format)
+    probe_opened_image_with_alpha(file, path, format, reject_animated_png)
+}
+
+/// Probes a still image's headers together with its alpha signal.
+///
+/// # Errors
+///
+/// Same failures as [`probe_image`], plus animated inputs are rejected by the
+/// per-format header probe exactly as they are for the still-image pipeline.
+pub fn probe_image_with_alpha(path: &Path) -> Result<ProbedImageWithAlpha, ProbeError> {
+    probe_image_with_alpha_inner(path, false)
+}
+
+/// Stack-only variant of [`probe_image_with_alpha`]: additionally rejects APNG
+/// because the frame-sequence decoder reads only the first frame.
+pub(crate) fn probe_image_with_alpha_for_stack(
+    path: &Path,
+) -> Result<ProbedImageWithAlpha, ProbeError> {
+    probe_image_with_alpha_inner(path, true)
 }
 
 /// Validates a single image file or mixed image folder at the boundary against live host
@@ -3184,10 +3216,9 @@ fn probe_directory_entry(path: &Path) -> Result<Option<ProbedImage>, ProbeError>
     Ok(probe_directory_entry_with_alpha(path)?.map(ProbedImageWithAlpha::image))
 }
 
-/// Directory-entry variant of [`probe_image_with_alpha`] with the same skip
-/// policy as [`probe_directory_entry`] (hidden files and subdirectories).
-pub(crate) fn probe_directory_entry_with_alpha(
+fn probe_directory_entry_with_alpha_inner(
     path: &Path,
+    reject_animated_png: bool,
 ) -> Result<Option<ProbedImageWithAlpha>, ProbeError> {
     let is_hidden = path
         .file_name()
@@ -3214,7 +3245,8 @@ pub(crate) fn probe_directory_entry_with_alpha(
     let strict_ambiguous = !has_any_extension(path, KNOWN_IMAGE_EXTENSIONS);
     if let Some(sniffed) = sniff_magic_format(header_slice, strict_ambiguous) {
         let resolved = resolve_sniffed_input(&mut file, path, sniffed)?;
-        return match probe_opened_image_with_alpha(file, path, resolved.format) {
+        return match probe_opened_image_with_alpha(file, path, resolved.format, reject_animated_png)
+        {
             Ok(probed) => Ok(Some(probed)),
             Err(err) => {
                 // An unreadable file is an I/O failure, not an unknown image: the
@@ -3247,6 +3279,22 @@ pub(crate) fn probe_directory_entry_with_alpha(
     }
 
     Ok(None)
+}
+
+/// Directory-entry variant of [`probe_image_with_alpha`] with the same skip
+/// policy as [`probe_directory_entry`] (hidden files and subdirectories).
+pub(crate) fn probe_directory_entry_with_alpha(
+    path: &Path,
+) -> Result<Option<ProbedImageWithAlpha>, ProbeError> {
+    probe_directory_entry_with_alpha_inner(path, false)
+}
+
+/// Stack-only variant of [`probe_directory_entry_with_alpha`]: rejects APNG
+/// because the frame-sequence decoder reads only the first frame.
+pub(crate) fn probe_directory_entry_with_alpha_for_stack(
+    path: &Path,
+) -> Result<Option<ProbedImageWithAlpha>, ProbeError> {
+    probe_directory_entry_with_alpha_inner(path, true)
 }
 
 fn resolve_single_target(

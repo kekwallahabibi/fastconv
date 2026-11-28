@@ -15,7 +15,7 @@ use fastconv_domain::{
 
 use crate::{
     ProbeError, available_cpu_threads, canonical_or_parent,
-    image::probe_directory_entry_with_alpha, image::probe_image_with_alpha,
+    image::probe_directory_entry_with_alpha_for_stack, image::probe_image_with_alpha_for_stack,
 };
 
 /// Bounds of the significant part of a digit run (leading zeros stripped).
@@ -111,7 +111,7 @@ fn probe_single_file(path: &Path) -> Result<(StackFrame, ImageDimensions), Probe
     if !metadata.is_file() {
         return Err(ProbeError::NotAFile(path.to_path_buf()));
     }
-    let probed = probe_image_with_alpha(path)?;
+    let probed = probe_image_with_alpha_for_stack(path)?;
     Ok((
         StackFrame::new(path.to_path_buf(), probed.format, probed.has_alpha)?,
         probed.dimensions,
@@ -131,7 +131,7 @@ fn probe_source_directory(
             path: source_dir.to_path_buf(),
             source,
         })?;
-        if let Some(probed) = probe_directory_entry_with_alpha(&entry.path())? {
+        if let Some(probed) = probe_directory_entry_with_alpha_for_stack(&entry.path())? {
             probed_entries.push((entry.path(), probed));
         }
     }
@@ -227,6 +227,9 @@ pub fn prepare_frame_sequence(
     match fs::metadata(target) {
         Ok(metadata) if metadata.is_dir() => {
             return Err(ProbeError::StackTargetIsDirectory(target.to_path_buf()));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(ProbeError::NotAFileOrDirectory(target.to_path_buf()));
         }
         Ok(_) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -563,6 +566,40 @@ mod tests {
                 DomainError::StackTargetOverlapsSource(_)
             ))
         ));
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io {
+            path: root.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_non_regular_stack_target() -> Result<(), ProbeError> {
+        let root = temp_dir("nonregular")?;
+        let source = root.join("a.png");
+        write_png(&source, 16, 12)?;
+        // A Unix socket is an existing, non-regular entry that `metadata` accepts
+        // but must not be replaced by the staging rename.
+        let socket_path = root.join("out.gif");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).map_err(|source| {
+            ProbeError::Io {
+                path: socket_path.clone(),
+                source,
+            }
+        })?;
+        let result = prepare_frame_sequence(
+            std::slice::from_ref(&source),
+            &socket_path,
+            StackFps::DEFAULT,
+            None,
+            VideoQuality::DEFAULT,
+            AnimationLoop::Infinite,
+            None,
+            HardwareBackend::Cpu,
+        );
+        assert!(matches!(result, Err(ProbeError::NotAFileOrDirectory(_))));
+        drop(listener);
         fs::remove_dir_all(&root).map_err(|source| ProbeError::Io {
             path: root.clone(),
             source,
