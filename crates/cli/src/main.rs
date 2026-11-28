@@ -31,8 +31,11 @@ const GLOBAL_HELP: &str = r"Usage:
                   [--quality <0..=100> | --lossless] [--fps <N> | --every <N>]
                   [--start <N>] [--end <N>] [--threads <N>] [--backend <auto|cpu>]
   fastconv stack <image-dir | img1 img2 ...> <target>
-                 [--fps <N>] [--to <gif|webp>] [--quality <0..=100>]
-                 [--loop <infinite|N>] [--threads <N>] [--backend <auto|cpu>]
+                 [--fps <N>] [--to <gif|webp|mp4|mkv|webm|mov|avi|ts>]
+                 [--vcodec <h264|hevc|av1|vp9|mjpeg|gif|webp>]
+                 [--quality <0..=100> | --vbitrate <rate>]
+                 [--loop <infinite|N>] [--threads <N>]
+                 [--backend <auto|cpu|nvenc>]
   fastconv remux <source> <target> [--to <mp4|mkv|webm|mov|avi|ts>] [--threads <N>]
   fastconv video <source> <target> [--to <format>] [--vcodec <codec>]
                  [--acodec <codec>] [--quality <0..=100> | --vbitrate <rate>]
@@ -46,7 +49,7 @@ Commands:
   probe    Inspect CPU, GPU adapters, and GPU media backends
   convert  Convert still images (lossy/lossless; CPU or NVENC HEIC)
   frames   Extract still image frames from video or animated GIF/WebP
-  stack    Encode a stack of still images into animated GIF or WebP
+  stack    Encode a stack of still images into GIF/WebP or a video container
   audio    Convert audio files or extract audio tracks from video containers
   remux    Losslessly remux video containers (no re-encoding)
   video    Transcode audio/video tracks between containers

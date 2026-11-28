@@ -26,8 +26,8 @@ pub use image::{
 };
 pub use metrics::{BenchmarkMetrics, BenchmarkSample, PeakMemory, Throughput, WorkloadUnit};
 pub use stack::{
-    FrameSequencePlan, FrameSequenceReport, StackExecutionMode, StackFps, StackFrame,
-    StackTargetFormat, parse_animation_loop,
+    FrameSequencePlan, FrameSequenceReport, StackBackendRequest, StackExecutionMode, StackFps,
+    StackFrame, StackTargetFormat, parse_animation_loop,
 };
 pub use video::{
     AnimationLoop, AnimationMeta, AudioBitrate, AudioChannels, AudioEncodeConfig,
@@ -295,6 +295,24 @@ pub enum DomainError {
     UnsupportedStackBackend {
         backend: HardwareBackend,
     },
+    /// `--loop` was supplied for a video container, which has no animation loop.
+    UnsupportedStackLoop {
+        container: VideoContainerFormat,
+    },
+    /// A video container requires even frame dimensions.
+    StackOddVideoDimensions {
+        container: VideoContainerFormat,
+        width: u32,
+        height: u32,
+    },
+    /// A video track stores each axis as a u16.
+    StackVideoDimensionLimit {
+        container: VideoContainerFormat,
+        width: u32,
+        height: u32,
+        max_width: u32,
+        max_height: u32,
+    },
 }
 
 pub(crate) fn require_non_empty(value: &str, field: &'static str) -> Result<String, DomainError> {
@@ -521,7 +539,10 @@ impl fmt::Display for DomainError {
             | Self::ConflictingStackTargetFormat { .. }
             | Self::StackDimensionLimit { .. }
             | Self::StackTargetOverlapsSource(_)
-            | Self::UnsupportedStackBackend { .. } => fmt_stack_error(self, f),
+            | Self::UnsupportedStackBackend { .. }
+            | Self::UnsupportedStackLoop { .. }
+            | Self::StackOddVideoDimensions { .. }
+            | Self::StackVideoDimensionLimit { .. } => fmt_stack_error(self, f),
             Self::UnsupportedAudioRateControl {
                 format,
                 codec,
@@ -606,6 +627,31 @@ fn fmt_stack_error(err: &DomainError, f: &mut fmt::Formatter<'_>) -> fmt::Result
         DomainError::UnsupportedStackBackend { backend } => write!(
             f,
             "backend '{backend}' is not supported for image stacks; use cpu (no silent CPU fallback)"
+        ),
+        DomainError::UnsupportedStackLoop { container } => write!(
+            f,
+            "--loop is not supported for {} video stacks (animation only)",
+            container.label()
+        ),
+        DomainError::StackOddVideoDimensions {
+            container,
+            width,
+            height,
+        } => write!(
+            f,
+            "{} video stacks require even dimensions, got {width}x{height}",
+            container.label()
+        ),
+        DomainError::StackVideoDimensionLimit {
+            container,
+            width,
+            height,
+            max_width,
+            max_height,
+        } => write!(
+            f,
+            "stack frame dimensions {width}x{height} exceed the {} video limit of {max_width}x{max_height}",
+            container.label()
         ),
         _ => Err(fmt::Error),
     }

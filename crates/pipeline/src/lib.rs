@@ -31,6 +31,14 @@ pub use frames::execute_frame_extraction;
 pub use stack::execute_frame_sequence;
 pub use video_transcode::execute_video_transcode_batch;
 
+/// True when this binary was built with NVENC support. The CLI passes this to
+/// the probe boundary so an explicit GPU request fails early instead of being
+/// silently downgraded to a CPU encoder.
+#[must_use]
+pub const fn nvenc_compiled_in() -> bool {
+    cfg!(feature = "nvenc")
+}
+
 use std::error::Error;
 use std::fmt;
 use std::io;

@@ -1,9 +1,10 @@
-//! Concrete CPU execution of a validated [`FrameSequencePlan`].
+//! Concrete execution of a validated [`FrameSequencePlan`].
 //!
-//! Sources are decoded one at a time into reusable scratch buffers and
-//! streamed straight into the shared animation encoder; no frame list is ever
-//! retained in memory. Every legal state is described by the domain plan, so
-//! there is no backend switch and no CPU fallback here.
+//! Animation stacks stream one image at a time into the shared GIF/WebP
+//! encoder. Video stacks either decode into a budgeted `Yuv420Frame` list on the
+//! CPU or stream NV12 directly into the pinned NVENC ring. Every legal state is
+//! described by the domain plan, so there is no backend switch and no CPU
+//! fallback when a GPU encoder was selected.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -11,12 +12,18 @@ use std::io;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Component, Path, PathBuf};
 
-use fastconv_domain::{FrameSequencePlan, FrameSequenceReport, ImageDimensions, StackFrame};
+use fastconv_domain::{
+    AnimationLoop, FrameSequencePlan, FrameSequenceReport, ImageDimensions, StackExecutionMode,
+    StackFrame, VideoContainerFormat, VideoEncodeMode,
+};
 
 use crate::PipelineError;
 use crate::decode::{DecodeTargetHint, DecodedPixelFormat, decode_source_image_into};
+use crate::gpu::nvenc::encode_stack_nvenc_streaming;
 use crate::staging::StagingTarget;
-use crate::video_anim::{AnimFrameInfo, encode_animation_stream_bounded};
+use crate::video_anim::{AnimFrameInfo, encode_animation_stream_bounded, pixels_to_yuv420};
+use crate::video_container::{ContainerMedia, mux_video};
+use crate::video_transcode::enforce_decoded_budget;
 
 /// Raw-pixel ceiling for in-flight animation frames (256 MiB). This caps
 /// normal frames; a single frame whose raw size exceeds the budget is still
@@ -233,13 +240,303 @@ fn normalize_frame<'a>(
     Ok(scratch.as_slice())
 }
 
+/// Decodes one still image into the caller-owned scratch buffer. The returned
+/// slice borrows only `pixel_buf`, so the same allocation is reused per frame.
+pub(crate) fn decode_stack_frame_into<'a>(
+    frame: &StackFrame,
+    dimensions: ImageDimensions,
+    file_bytes: &mut Vec<u8>,
+    pixel_buf: &'a mut Vec<u8>,
+) -> Result<(DecodedPixelFormat, &'a [u8]), PipelineError> {
+    let meta = decode_source_image_into(
+        frame.source(),
+        frame.format(),
+        dimensions,
+        DecodeTargetHint::Native,
+        file_bytes,
+        pixel_buf,
+    )?;
+    let decoded = pixel_buf
+        .get(..meta.byte_len)
+        .ok_or_else(|| PipelineError::DecodeFailed {
+            path: frame.source().to_path_buf(),
+            reason: "decoded frame buffer is shorter than reported".to_owned(),
+        })?;
+    Ok((meta.format, decoded))
+}
+
+/// Returns an opaque pixel layout suitable for a video encoder. RGB8 and fully
+/// opaque RGBA8 keep their native layout (and the SIMD conversion); grayscale
+/// and translucent sources are flattened onto opaque black into `flat`.
+pub(crate) fn opaque_video_pixels<'a>(
+    source: &Path,
+    format: DecodedPixelFormat,
+    decoded: &'a [u8],
+    flat: &'a mut Vec<u8>,
+) -> Result<(&'a [u8], u8), PipelineError> {
+    match format {
+        DecodedPixelFormat::Rgb8 => Ok((decoded, 3)),
+        DecodedPixelFormat::Rgba8
+            if decoded
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[3] == u8::MAX) =>
+        {
+            Ok((decoded, 4))
+        }
+        DecodedPixelFormat::L8 | DecodedPixelFormat::La8 | DecodedPixelFormat::Rgba8 => {
+            let channels = channels_of(format);
+            let pixels = decoded.len() / usize::from(channels);
+            let needed =
+                pixels
+                    .checked_mul(3)
+                    .ok_or_else(|| PipelineError::UnsupportedPixelFormat {
+                        path: source.to_path_buf(),
+                        format: "RGB flatten size overflow".to_owned(),
+                    })?;
+            ensure_scratch(flat, needed)?;
+            match (format, decoded.len() % usize::from(channels)) {
+                (DecodedPixelFormat::L8, 0) => {
+                    for (dst, &lum) in flat.as_chunks_mut::<3>().0.iter_mut().zip(decoded.iter()) {
+                        dst.copy_from_slice(&[lum, lum, lum]);
+                    }
+                }
+                (DecodedPixelFormat::La8, 0) => {
+                    for (dst, pixel) in flat
+                        .as_chunks_mut::<3>()
+                        .0
+                        .iter_mut()
+                        .zip(decoded.as_chunks::<2>().0.iter())
+                    {
+                        let alpha = u32::from(pixel[1]);
+                        let lum = u32::from(pixel[0]);
+                        for component in dst.iter_mut() {
+                            *component = u8::try_from((lum * alpha + 127) / 255).unwrap_or(u8::MAX);
+                        }
+                    }
+                }
+                (DecodedPixelFormat::Rgba8, 0) => {
+                    for (dst, pixel) in flat
+                        .as_chunks_mut::<3>()
+                        .0
+                        .iter_mut()
+                        .zip(decoded.as_chunks::<4>().0.iter())
+                    {
+                        let alpha = u32::from(pixel[3]);
+                        for (component, &source) in dst.iter_mut().zip(pixel.iter().take(3)) {
+                            *component = u8::try_from((u32::from(source) * alpha + 127) / 255)
+                                .unwrap_or(u8::MAX);
+                        }
+                    }
+                }
+                _ => {
+                    return Err(PipelineError::UnsupportedPixelFormat {
+                        path: source.to_path_buf(),
+                        format: "decoded frame length is not a whole number of pixels".to_owned(),
+                    });
+                }
+            }
+            Ok((flat.as_slice(), 3))
+        }
+    }
+}
+
+fn frame_timing(fps: fastconv_domain::StackFps, index: u64) -> (i64, u64) {
+    let pts = fps.frame_timestamp_us(index);
+    let next = fps.frame_timestamp_us(index.saturating_add(1));
+    (
+        i64::try_from(pts).unwrap_or(i64::MAX),
+        next.saturating_sub(pts).max(1),
+    )
+}
+
+fn finish_execution(
+    plan: &FrameSequencePlan,
+    staging: StagingTarget,
+    workers: usize,
+    hardware_device: Option<String>,
+) -> Result<FrameSequenceReport, PipelineError> {
+    let output_bytes = staging
+        .file()?
+        .metadata()
+        .map_err(|source| PipelineError::Io {
+            path: plan.target_path().to_path_buf(),
+            source,
+        })?;
+    let output_bytes = NonZeroU64::new(output_bytes.len())
+        .ok_or_else(|| PipelineError::EmptyOutput(plan.target_path().to_path_buf()))?;
+    // Re-check immediately before atomic rename so a symlink planted during
+    // encoding cannot overwrite a source image.
+    verify_no_alias(plan)?;
+    staging.commit()?;
+    Ok(FrameSequenceReport::new(
+        plan.frame_count(),
+        plan.dimensions(),
+        plan.fps().get(),
+        plan.mode(),
+        plan.target_path().to_path_buf(),
+        output_bytes,
+        NonZeroUsize::new(workers).unwrap_or_else(|| plan.worker_threads()),
+        hardware_device,
+    ))
+}
+
+/// CPU video stacks: budget every decoded frame up front, then decode and
+/// convert one image at a time into a bounded `Yuv420Frame` list.
+fn execute_cpu_video_sequence(
+    plan: &FrameSequencePlan,
+    container: VideoContainerFormat,
+    mode: VideoEncodeMode,
+) -> Result<FrameSequenceReport, PipelineError> {
+    let dimensions = plan.dimensions();
+    let width = u64::from(dimensions.width().get());
+    let height = u64::from(dimensions.height().get());
+    let plane_bytes = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .and_then(|bytes| bytes.checked_div(2))
+        .ok_or_else(|| PipelineError::EncodeFailed {
+            path: plan.target_path().to_path_buf(),
+            reason: "video frame size overflow".to_owned(),
+        })?;
+    let total_bytes = plane_bytes
+        .checked_mul(plan.frame_count().get())
+        .ok_or_else(|| PipelineError::EncodeFailed {
+            path: plan.target_path().to_path_buf(),
+            reason: "decoded stack size overflow".to_owned(),
+        })?;
+    enforce_decoded_budget(plan.target_path(), total_bytes)?;
+
+    let capacity =
+        usize::try_from(plan.frame_count().get()).map_err(|_| PipelineError::EncodeFailed {
+            path: plan.target_path().to_path_buf(),
+            reason: "stack frame count exceeds addressable memory".to_owned(),
+        })?;
+    let mut frames = Vec::new();
+    frames
+        .try_reserve_exact(capacity)
+        .map_err(|_| PipelineError::EncodeFailed {
+            path: plan.target_path().to_path_buf(),
+            reason: "cannot allocate decoded stack frame list".to_owned(),
+        })?;
+    let mut file_bytes = Vec::new();
+    let mut pixel_buf = Vec::new();
+    let mut flat = Vec::new();
+    for (index, frame) in plan.frames().iter().enumerate() {
+        let (format, decoded) =
+            decode_stack_frame_into(frame, dimensions, &mut file_bytes, &mut pixel_buf)?;
+        let (pixels, channels) = opaque_video_pixels(frame.source(), format, decoded, &mut flat)?;
+        let (pts_us, duration_us) = frame_timing(plan.fps(), u64::try_from(index).unwrap_or(0));
+        frames.push(pixels_to_yuv420(
+            AnimFrameInfo {
+                width: dimensions.width().get(),
+                height: dimensions.height().get(),
+                pts_us,
+                duration_us,
+                channels,
+            },
+            pixels,
+            usize::from(channels),
+        )?);
+    }
+
+    let stream = crate::video_codecs::encode_video_cpu(plan.target_path(), &frames, mode, 0)?;
+    let staging = StagingTarget::create_with_handle(plan.target_path(), 0)?;
+    mux_video(
+        staging.file()?,
+        plan.target_path(),
+        container,
+        &ContainerMedia {
+            tracks: vec![stream.track],
+            packets: stream.packets,
+        },
+    )?;
+    finish_execution(plan, staging, plan.worker_threads().get(), None)
+}
+
+/// NVENC video stacks: one image at a time goes straight into the pinned NV12
+/// ring. A missing `nvenc` feature or GPU failure is a hard error from the
+/// backend; there is no CPU path here.
+fn execute_nvenc_video_sequence(
+    plan: &FrameSequencePlan,
+    mode: VideoEncodeMode,
+) -> Result<FrameSequenceReport, PipelineError> {
+    let (stream, frames_encoded, device) =
+        encode_stack_nvenc_streaming(plan.frames(), plan.dimensions(), plan.fps(), mode)?;
+    let expected = plan.frame_count().get();
+    if frames_encoded != expected {
+        return Err(PipelineError::EncodeFailed {
+            path: plan.target_path().to_path_buf(),
+            reason: format!("NVENC wrote {frames_encoded} frames for {expected} sources"),
+        });
+    }
+    let container = match plan.mode() {
+        StackExecutionMode::Video { container, .. } => container,
+        StackExecutionMode::Animation { .. } => {
+            return Err(PipelineError::EncodeFailed {
+                path: plan.target_path().to_path_buf(),
+                reason: "animation stacks cannot use the NVENC video path".to_owned(),
+            });
+        }
+    };
+    let staging = StagingTarget::create_with_handle(plan.target_path(), 1)?;
+    mux_video(
+        staging.file()?,
+        plan.target_path(),
+        container,
+        &ContainerMedia {
+            tracks: vec![stream.track],
+            packets: stream.packets,
+        },
+    )?;
+    finish_execution(plan, staging, plan.worker_threads().get(), Some(device))
+}
+
+/// Executes a validated frame sequence into its target.
+///
+/// # Errors
+///
+/// Returns [`PipelineError`] on an execution-time alias, decode failure,
+/// incompatible pixels, encoder failure, GPU failure, or empty output.
+pub fn execute_frame_sequence(
+    plan: &FrameSequencePlan,
+) -> Result<FrameSequenceReport, PipelineError> {
+    match plan.mode() {
+        StackExecutionMode::Animation { .. } => execute_animation_sequence(plan),
+        StackExecutionMode::Video {
+            container,
+            encode_mode,
+        } => {
+            verify_no_alias(plan)?;
+            match encode_mode {
+                VideoEncodeMode::CpuH264 { .. }
+                | VideoEncodeMode::CpuAv1 { .. }
+                | VideoEncodeMode::CpuVp9 { .. }
+                | VideoEncodeMode::CpuMjpeg { .. } => {
+                    execute_cpu_video_sequence(plan, container, encode_mode)
+                }
+                VideoEncodeMode::NvencH264 { .. } | VideoEncodeMode::NvencHevc { .. } => {
+                    execute_nvenc_video_sequence(plan, encode_mode)
+                }
+                VideoEncodeMode::CpuGif { .. } | VideoEncodeMode::CpuWebp { .. } => {
+                    Err(PipelineError::EncodeFailed {
+                        path: plan.target_path().to_path_buf(),
+                        reason: "animated GIF/WebP stacks must use the animation path".to_owned(),
+                    })
+                }
+            }
+        }
+    }
+}
+
 /// Executes a validated frame sequence into its animated GIF/WebP target.
 ///
 /// # Errors
 ///
 /// Returns [`PipelineError`] on an execution-time alias, decode failure,
 /// transparent pixels in an opaque stack, encoder failure, or empty output.
-pub fn execute_frame_sequence(
+fn execute_animation_sequence(
     plan: &FrameSequencePlan,
 ) -> Result<FrameSequenceReport, PipelineError> {
     verify_no_alias(plan)?;
@@ -270,10 +567,10 @@ pub fn execute_frame_sequence(
         let file = staging.file()?;
         let fps = plan.fps();
         encode_animation_stream_bounded(
-            plan.target_format().as_video_container(),
+            plan.target_container(),
             plan.quality(),
             workers,
-            plan.loop_count(),
+            plan.loop_count().unwrap_or(AnimationLoop::Infinite),
             file,
             RAW_PIXEL_BUDGET,
             frame_bytes,
@@ -324,30 +621,7 @@ pub fn execute_frame_sequence(
             reason: format!("encoder wrote {written} frames for {expected} sources"),
         });
     }
-    let output_bytes = staging
-        .file()?
-        .metadata()
-        .map_err(|source| PipelineError::Io {
-            path: plan.target_path().to_path_buf(),
-            source,
-        })?;
-    let output_bytes = NonZeroU64::new(output_bytes.len())
-        .ok_or_else(|| PipelineError::EmptyOutput(plan.target_path().to_path_buf()))?;
-    let worker_threads = NonZeroUsize::new(workers).unwrap_or_else(|| plan.worker_threads());
-    // Re-check immediately before atomic rename so a symlink planted during
-    // encoding cannot overwrite a source image.
-    verify_no_alias(plan)?;
-    staging.commit()?;
-
-    Ok(FrameSequenceReport::new(
-        plan.frame_count(),
-        dimensions,
-        plan.fps().get(),
-        plan.target_format(),
-        plan.target_path().to_path_buf(),
-        output_bytes,
-        worker_threads,
-    ))
+    finish_execution(plan, staging, workers, None)
 }
 
 #[cfg(test)]
@@ -357,9 +631,12 @@ mod tests {
     use crate::video_anim::{
         decode_gif_frames_streaming_pixels, decode_webp_frames_streaming_pixels,
     };
+    #[cfg(feature = "nvenc")]
+    use fastconv_domain::TargetVideoCodec;
     use fastconv_domain::{
-        AnimationLoop, FrameSequencePlan, ImageDimensions, ImageInputFormat, StackExecutionMode,
-        StackFps, StackFrame, StackTargetFormat, VideoQuality,
+        AnimationLoop, FrameSequencePlan, GpuBackend, HardwareBackend, ImageDimensions,
+        ImageInputFormat, StackExecutionMode, StackFps, StackFrame, StackTargetFormat,
+        VideoContainerFormat, VideoEncodeMode, VideoQuality, VideoRateControl,
     };
     use std::fs;
     use std::num::{NonZeroU16, NonZeroUsize};
@@ -480,8 +757,11 @@ mod tests {
             })?,
             fps,
             target.clone(),
-            StackExecutionMode::cpu_animation(format, quality),
-            AnimationLoop::Times(NonZeroU16::new(2).unwrap_or(NonZeroU16::MIN)),
+            StackExecutionMode::animation(
+                format,
+                quality,
+                AnimationLoop::Times(NonZeroU16::new(2).unwrap_or(NonZeroU16::MIN)),
+            ),
             NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN),
         )
         .map_err(|err| PipelineError::EncodeFailed {
@@ -656,8 +936,11 @@ mod tests {
             })?,
             fps,
             target,
-            StackExecutionMode::cpu_animation(StackTargetFormat::Gif, quality),
-            AnimationLoop::Times(NonZeroU16::new(2).unwrap_or(NonZeroU16::MIN)),
+            StackExecutionMode::animation(
+                StackTargetFormat::Gif,
+                quality,
+                AnimationLoop::Times(NonZeroU16::new(2).unwrap_or(NonZeroU16::MIN)),
+            ),
             NonZeroUsize::new(16).unwrap_or(NonZeroUsize::MIN),
         )
         .map_err(|err| PipelineError::EncodeFailed {
@@ -676,6 +959,353 @@ mod tests {
         let report = execute_frame_sequence(&uncapped_plan)?;
         assert_eq!(report.worker_threads().get(), 2);
 
+        fs::remove_dir_all(&root).map_err(|source| PipelineError::Io {
+            path: root.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    fn video_plan(
+        frames: Vec<StackFrame>,
+        target: PathBuf,
+        container: VideoContainerFormat,
+        mode: VideoEncodeMode,
+    ) -> Result<FrameSequencePlan, PipelineError> {
+        video_plan_dims(frames, target, container, mode, 24, 16)
+    }
+
+    fn video_plan_dims(
+        frames: Vec<StackFrame>,
+        target: PathBuf,
+        container: VideoContainerFormat,
+        mode: VideoEncodeMode,
+        width: u32,
+        height: u32,
+    ) -> Result<FrameSequencePlan, PipelineError> {
+        let plan_mode = StackExecutionMode::video(container, mode).map_err(|err| {
+            PipelineError::EncodeFailed {
+                path: target.clone(),
+                reason: err.to_string(),
+            }
+        })?;
+        FrameSequencePlan::new(
+            frames,
+            ImageDimensions::new(width, height).map_err(|err| PipelineError::EncodeFailed {
+                path: target.clone(),
+                reason: err.to_string(),
+            })?,
+            StackFps::new(10.0).map_err(|err| PipelineError::EncodeFailed {
+                path: target.clone(),
+                reason: err.to_string(),
+            })?,
+            target,
+            plan_mode,
+            NonZeroUsize::MIN,
+        )
+        .map_err(|err| PipelineError::EncodeFailed {
+            path: PathBuf::from("frame-stack-test"),
+            reason: err.to_string(),
+        })
+    }
+
+    #[test]
+    fn encodes_cpu_video_stacks_into_every_container_and_roundtrips() -> Result<(), PipelineError> {
+        let root = temp_dir("cpu-video")?;
+        let mut frames = Vec::new();
+        for index in 0_u8..3 {
+            let source = root.join(format!("frame_{index}.png"));
+            write_png(
+                &source,
+                24,
+                16,
+                png::ColorType::Rgb,
+                &solid_rgb(24, 16, index),
+            )?;
+            frames.push(frame(source, false)?);
+        }
+        let modes = [
+            VideoEncodeMode::CpuH264 {
+                rate_control: VideoRateControl::DEFAULT,
+            },
+            VideoEncodeMode::CpuAv1 {
+                rate_control: VideoRateControl::DEFAULT,
+            },
+            VideoEncodeMode::CpuVp9 {
+                rate_control: VideoRateControl::DEFAULT,
+            },
+            VideoEncodeMode::CpuMjpeg {
+                quality: VideoQuality::DEFAULT,
+            },
+        ];
+        let containers = [
+            VideoContainerFormat::Mp4,
+            VideoContainerFormat::Mkv,
+            VideoContainerFormat::Webm,
+            VideoContainerFormat::Mov,
+            VideoContainerFormat::Avi,
+            VideoContainerFormat::Ts,
+        ];
+        for container in containers {
+            for mode in modes {
+                if !mode.codec().supported_in(container) {
+                    continue;
+                }
+                let target = root.join(format!(
+                    "{}-{}.{}",
+                    container.extension(),
+                    mode.codec().cli_name(),
+                    container.extension()
+                ));
+                let report = execute_frame_sequence(&video_plan(
+                    frames.clone(),
+                    target.clone(),
+                    container,
+                    mode,
+                )?)?;
+                assert_eq!(report.frames_encoded().get(), 3);
+                assert_eq!(report.target_container(), container);
+                assert_eq!(report.video_codec(), mode.codec());
+                assert_eq!(report.backend(), HardwareBackend::Cpu);
+                let media = crate::video_container::demux_video(&target, container)?;
+                assert!(
+                    media.packets.windows(2).all(|w| w[0].dts < w[1].dts),
+                    "non-monotonic DTS in {} {}",
+                    container,
+                    mode.codec()
+                );
+                let decoded = crate::video_codecs::decode_video_track(
+                    &target,
+                    &media.tracks[0],
+                    &media.packets,
+                )?;
+                assert_eq!(decoded.len(), 3, "{} {}", container, mode.codec());
+                assert_eq!((decoded[0].width, decoded[0].height), (24, 16));
+                assert!(
+                    decoded.windows(2).all(|w| w[0].pts_us < w[1].pts_us),
+                    "non-monotonic PTS in {} {}",
+                    container,
+                    mode.codec()
+                );
+            }
+        }
+        fs::remove_dir_all(&root).map_err(|source| PipelineError::Io {
+            path: root.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn video_stacks_flatten_translucent_and_grayscale_sources() -> Result<(), PipelineError> {
+        let root = temp_dir("video-alpha")?;
+        let rgba_path = root.join("rgba.png");
+        let l8_path = root.join("l8.png");
+        let la8_path = root.join("la8.png");
+        // Fully transparent white must flatten to black (0, 0, 0), not leak 255.
+        let transparent_white = [255_u8, 255, 255, 0].repeat((24 * 16) as usize);
+        write_png(&rgba_path, 24, 16, png::ColorType::Rgba, &transparent_white)?;
+        let gray = vec![160_u8; (24 * 16) as usize];
+        write_png(&l8_path, 24, 16, png::ColorType::Grayscale, &gray)?;
+        let gray_alpha = [200_u8, 0].repeat((24 * 16) as usize);
+        write_png(
+            &la8_path,
+            24,
+            16,
+            png::ColorType::GrayscaleAlpha,
+            &gray_alpha,
+        )?;
+
+        let frames = vec![
+            frame(rgba_path, true)?,
+            frame(l8_path, false)?,
+            frame(la8_path, true)?,
+        ];
+        let target = root.join("mixed_formats.mp4");
+        let report = execute_frame_sequence(&video_plan(
+            frames,
+            target.clone(),
+            VideoContainerFormat::Mp4,
+            VideoEncodeMode::CpuH264 {
+                rate_control: VideoRateControl::DEFAULT,
+            },
+        )?)?;
+        assert_eq!(report.frames_encoded().get(), 3);
+        let media = crate::video_container::demux_video(&target, VideoContainerFormat::Mp4)?;
+        let decoded =
+            crate::video_codecs::decode_video_track(&target, &media.tracks[0], &media.packets)?;
+        assert_eq!(decoded.len(), 3);
+        // Frame 0 (transparent white flattened onto black) and Frame 2 (transparent LA8)
+        // have near-black limited-range luma (~16); Frame 1 (L8=160) is visibly brighter.
+        assert!(
+            decoded[0].y[0] <= 24,
+            "RGBA alpha leaked: {}",
+            decoded[0].y[0]
+        );
+        assert!(
+            decoded[1].y[0] >= 120,
+            "L8 luma too dark: {}",
+            decoded[1].y[0]
+        );
+        assert!(
+            decoded[2].y[0] <= 24,
+            "LA8 alpha leaked: {}",
+            decoded[2].y[0]
+        );
+
+        // Odd-length corrupt buffer for a 2-channel format must fail explicitly.
+        let mut flat = Vec::new();
+        assert!(matches!(
+            super::opaque_video_pixels(
+                Path::new("corrupt.png"),
+                crate::decode::DecodedPixelFormat::La8,
+                &[128, 255, 64],
+                &mut flat,
+            ),
+            Err(PipelineError::UnsupportedPixelFormat { .. })
+        ));
+
+        fs::remove_dir_all(&root).map_err(|source| PipelineError::Io {
+            path: root.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_video_stack_rejects_decoded_budget_before_allocation() -> Result<(), PipelineError> {
+        let root = temp_dir("budget")?;
+        let frames = (0..2)
+            .map(|index| frame(root.join(format!("missing_{index}.png")), false))
+            .collect::<Result<Vec<_>, _>>()?;
+        // 40k x 40k x 1.5 bytes per frame already exceeds the 1 GiB cap; the
+        // budget check must fire before any frame is decoded or retained.
+        let plan = FrameSequencePlan::new(
+            frames,
+            ImageDimensions::new(40_000, 40_000).map_err(|err| PipelineError::EncodeFailed {
+                path: PathBuf::from("budget"),
+                reason: err.to_string(),
+            })?,
+            StackFps::DEFAULT,
+            root.join("budget.mp4"),
+            StackExecutionMode::video(
+                VideoContainerFormat::Mp4,
+                VideoEncodeMode::CpuH264 {
+                    rate_control: VideoRateControl::DEFAULT,
+                },
+            )
+            .map_err(|err| PipelineError::EncodeFailed {
+                path: PathBuf::from("budget"),
+                reason: err.to_string(),
+            })?,
+            NonZeroUsize::MIN,
+        )
+        .map_err(|err| PipelineError::EncodeFailed {
+            path: PathBuf::from("budget"),
+            reason: err.to_string(),
+        })?;
+        assert!(matches!(
+            execute_frame_sequence(&plan),
+            Err(PipelineError::DecodeFailed { .. })
+        ));
+        fs::remove_dir_all(&root).map_err(|source| PipelineError::Io {
+            path: root.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[cfg(not(feature = "nvenc"))]
+    #[test]
+    fn nvenc_stack_fails_explicitly_without_the_feature() -> Result<(), PipelineError> {
+        let root = temp_dir("nvenc-disabled")?;
+        let source = root.join("frame.png");
+        write_png(&source, 24, 16, png::ColorType::Rgb, &solid_rgb(24, 16, 0))?;
+        let target = root.join("out.mp4");
+        let plan = video_plan(
+            vec![frame(source, false)?],
+            target,
+            VideoContainerFormat::Mp4,
+            VideoEncodeMode::NvencH264 {
+                rate_control: VideoRateControl::DEFAULT,
+            },
+        )?;
+        assert!(matches!(
+            execute_frame_sequence(&plan),
+            Err(PipelineError::GpuBackendFailed {
+                backend: GpuBackend::Nvenc,
+                ..
+            })
+        ));
+        fs::remove_dir_all(&root).map_err(|source| PipelineError::Io {
+            path: root.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[cfg(feature = "nvenc")]
+    #[test]
+    fn nvenc_stack_encoding_reports_gpu_path_and_roundtrips() -> Result<(), PipelineError> {
+        if cudarc::driver::CudaContext::new(0).is_err() {
+            return Ok(());
+        }
+        let root = temp_dir("nvenc-stack")?;
+        let mut frames = Vec::new();
+        for index in 0_u8..3 {
+            let source = root.join(format!("frame_{index}.png"));
+            write_png(
+                &source,
+                320,
+                240,
+                png::ColorType::Rgb,
+                &solid_rgb(320, 240, index),
+            )?;
+            frames.push(frame(source, false)?);
+        }
+        for (codec, container) in [
+            (TargetVideoCodec::H264, VideoContainerFormat::Mp4),
+            (TargetVideoCodec::Hevc, VideoContainerFormat::Mkv),
+        ] {
+            let mode = match codec {
+                TargetVideoCodec::H264 => VideoEncodeMode::NvencH264 {
+                    rate_control: VideoRateControl::DEFAULT,
+                },
+                TargetVideoCodec::Hevc => VideoEncodeMode::NvencHevc {
+                    rate_control: VideoRateControl::DEFAULT,
+                },
+                _ => {
+                    return Err(PipelineError::EncodeFailed {
+                        path: PathBuf::from("nvenc-stack-test"),
+                        reason: "unexpected codec".to_owned(),
+                    });
+                }
+            };
+            let target = root.join(format!(
+                "out-{}.{}",
+                codec.cli_name(),
+                container.extension()
+            ));
+            let report = execute_frame_sequence(&video_plan_dims(
+                frames.clone(),
+                target.clone(),
+                container,
+                mode,
+                320,
+                240,
+            )?)?;
+            assert_eq!(report.frames_encoded().get(), 3);
+            assert_eq!(report.backend(), HardwareBackend::Gpu(GpuBackend::Nvenc));
+            assert!(
+                report
+                    .hardware_device()
+                    .is_some_and(|name| !name.is_empty())
+            );
+            let media = crate::video_container::demux_video(&target, container)?;
+            let decoded =
+                crate::video_codecs::decode_video_track(&target, &media.tracks[0], &media.packets)?;
+            assert_eq!(decoded.len(), 3);
+        }
         fs::remove_dir_all(&root).map_err(|source| PipelineError::Io {
             path: root.clone(),
             source,

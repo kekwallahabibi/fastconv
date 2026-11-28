@@ -1,11 +1,11 @@
 //! Pure data models for encoding an ordered sequence of still images into an
-//! animation. No I/O happens here: every external fact is validated once in
-//! `fastconv-probe` before a plan is built.
+//! animation or a video container. No I/O happens here: every external fact is
+//! validated once in `fastconv-probe` before a plan is built.
 //!
-//! [`StackExecutionMode`] has exactly one legal variant today. That is the
-//! deliberate extension seam: adding video containers later means adding
-//! variants to this enum and matching them in the pipeline, not loosening the
-//! plan with flags, optional codec fields or a silent CPU fallback.
+//! [`StackExecutionMode`] has exactly two legal variants: animation (GIF/WebP)
+//! and video (a validated container/encoder pair). There is no backend field
+//! that could disagree with the encoder, so a GPU request can only be rejected
+//! at the boundary, never silently downgraded.
 
 use std::fmt;
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::{
-    AnimationLoop, DomainError, HardwareBackend, ImageDimensions, ImageInputFormat, PathRole,
-    VideoContainerFormat, VideoQuality,
+    AnimationLoop, DomainError, GpuBackend, HardwareBackend, HostHardware, ImageDimensions,
+    ImageInputFormat, PathRole, TargetVideoCodec, VideoContainerFormat, VideoEncodeMode,
+    VideoQuality, VideoRateControl,
 };
 
 /// Animation-only output formats. Video containers are intentionally absent:
@@ -84,7 +85,56 @@ impl fmt::Display for StackTargetFormat {
     }
 }
 
-/// Finite, strictly positive animation frame rate. The bounds keep one frame
+/// Backend requested at the CLI boundary for a frame stack. `Auto` is resolved
+/// exactly once in `fastconv-probe`; an explicit GPU backend is never replaced
+/// by a CPU encoder when hardware is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub enum StackBackendRequest {
+    Auto,
+    Explicit(HardwareBackend),
+}
+
+impl StackBackendRequest {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Explicit(HardwareBackend::Cpu) => "cpu",
+            Self::Explicit(HardwareBackend::Gpu(GpuBackend::Nvenc)) => "nvenc",
+            Self::Explicit(HardwareBackend::Gpu(GpuBackend::Vaapi)) => "vaapi",
+            Self::Explicit(HardwareBackend::Gpu(GpuBackend::Qsv)) => "qsv",
+            Self::Explicit(HardwareBackend::Gpu(GpuBackend::Amf)) => "amf",
+            Self::Explicit(HardwareBackend::Gpu(GpuBackend::VideoToolbox)) => "videotoolbox",
+            Self::Explicit(HardwareBackend::Gpu(GpuBackend::Vulkan)) => "vulkan",
+        }
+    }
+
+    #[must_use]
+    pub fn from_name(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "cpu" | "software" => Some(Self::Explicit(HardwareBackend::Cpu)),
+            "nvenc" => Some(Self::Explicit(HardwareBackend::Gpu(GpuBackend::Nvenc))),
+            "vaapi" => Some(Self::Explicit(HardwareBackend::Gpu(GpuBackend::Vaapi))),
+            "qsv" => Some(Self::Explicit(HardwareBackend::Gpu(GpuBackend::Qsv))),
+            "amf" => Some(Self::Explicit(HardwareBackend::Gpu(GpuBackend::Amf))),
+            "videotoolbox" => Some(Self::Explicit(HardwareBackend::Gpu(
+                GpuBackend::VideoToolbox,
+            ))),
+            "vulkan" => Some(Self::Explicit(HardwareBackend::Gpu(GpuBackend::Vulkan))),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for StackBackendRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Finite, strictly positive frame rate. The bounds keep one frame
 /// duration at least 1 µs and below `u64::MAX` µs even after multiplication.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
@@ -133,6 +183,66 @@ impl StackFps {
         let micros = secs * 1_000_000.0 / self.0;
         micros.round() as u64
     }
+
+    /// Best rational approximation of the frame rate as `(numerator, denominator)`.
+    ///
+    /// NVENC receives these as `frameRateNum`/`frameRateDen`, so `29.97` stays
+    /// `2997/100` and `0.5` stays `1/2` rather than collapsing to `1/1`. The
+    /// continued-fraction search is bounded to `u32` components; the exact
+    /// integer frame rates always terminate after the first term.
+    #[must_use]
+    pub fn rational(self) -> (u32, u32) {
+        let (num, den) = if self.0 >= 1.0 {
+            approximate_rational(self.0)
+        } else {
+            let (num, den) = approximate_rational(1.0 / self.0);
+            (den, num)
+        };
+        (
+            u32::try_from(num.clamp(1, u64::from(u32::MAX))).unwrap_or(u32::MAX),
+            u32::try_from(den.clamp(1, u64::from(u32::MAX))).unwrap_or(u32::MAX),
+        )
+    }
+}
+
+/// Continued-fraction convergents, stopping at the first exact term or when
+/// components exceed NVENC-safe bounds (`num <= 1_000_000`, `den <= 10_000`).
+/// `h2/k2` and `h1/k1` are the two preceding convergents, which keeps every
+/// intermediate fraction fully reduced and avoids driver-hostile 10^8+
+/// denominators for high-precision user floats like `29.970000001`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the term is floored and bounded to u64 before conversion"
+)]
+fn approximate_rational(value: f64) -> (u64, u64) {
+    const MAX_NUM: u64 = 1_000_000;
+    const MAX_DEN: u64 = 10_000;
+    let (mut h2, mut k2, mut h1, mut k1) = (0_u64, 1_u64, 1_u64, 0_u64);
+    let mut best = (1_u64, 1_u64);
+    let mut x = value;
+    for _ in 0..64 {
+        let term = x.floor();
+        if !term.is_finite() || term < 1.0 {
+            break;
+        }
+        let a = term as u64;
+        let h = a.saturating_mul(h1).saturating_add(h2);
+        let k = a.saturating_mul(k1).saturating_add(k2);
+        if k == 0 || k > MAX_DEN || h == 0 || h > MAX_NUM {
+            break;
+        }
+        best = (h, k);
+        if (x - term).abs() < 1e-12 {
+            break;
+        }
+        h2 = h1;
+        k2 = k1;
+        h1 = h;
+        k1 = k;
+        x = 1.0 / (x - term);
+    }
+    best
 }
 
 impl fmt::Display for StackFps {
@@ -187,50 +297,248 @@ impl StackFrame {
     }
 }
 
-/// Compile-time-legal execution mode for a frame sequence. Every variant is
-/// CPU-only by construction; there is no backend field that could disagree
-/// with it, so a GPU request can only be rejected at the boundary.
+/// Compile-time-legal execution mode for a frame sequence. The encoder is part
+/// of the variant, so a backend can never disagree with it and a video plan can
+/// never carry an animation loop count (or vice versa).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 pub enum StackExecutionMode {
-    CpuAnimation {
+    Animation {
         format: StackTargetFormat,
         quality: VideoQuality,
+        loop_count: AnimationLoop,
+    },
+    Video {
+        container: VideoContainerFormat,
+        encode_mode: VideoEncodeMode,
     },
 }
 
 impl StackExecutionMode {
     #[must_use]
+    pub const fn animation(
+        format: StackTargetFormat,
+        quality: VideoQuality,
+        loop_count: AnimationLoop,
+    ) -> Self {
+        Self::Animation {
+            format,
+            quality,
+            loop_count,
+        }
+    }
+
+    /// Backwards-compatible constructor for animation plans that use the
+    /// default infinite loop count.
+    #[must_use]
     pub const fn cpu_animation(format: StackTargetFormat, quality: VideoQuality) -> Self {
-        Self::CpuAnimation { format, quality }
+        Self::animation(format, quality, AnimationLoop::Infinite)
+    }
+
+    /// Builds a video mode, rejecting animation containers and codecs that the
+    /// container cannot carry. The bidirectional diagnostic comes from
+    /// `DomainError::UnsupportedVideoCodec`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::UnsupportedVideoCodec`] for an animation container
+    /// or a container/codec mismatch.
+    pub fn video(
+        container: VideoContainerFormat,
+        encode_mode: VideoEncodeMode,
+    ) -> Result<Self, DomainError> {
+        let codec = encode_mode.codec();
+        if matches!(
+            container,
+            VideoContainerFormat::Gif | VideoContainerFormat::Webp
+        ) || !codec.supported_in(container)
+        {
+            return Err(DomainError::UnsupportedVideoCodec {
+                codec: codec.as_video_codec(),
+                container,
+            });
+        }
+        Ok(Self::Video {
+            container,
+            encode_mode,
+        })
+    }
+
+    /// Resolves the CLI request exactly once, without any silent CPU fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error for an unsupported codec/container pair, rate
+    /// control on a codec that cannot use it, a loop count on a video container,
+    /// an unsupported GPU backend, or an NVENC request without compiled support
+    /// and a detected encode-capable NVIDIA adapter.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Every argument is an independently validated boundary input; bundling them would add an unvalidated intermediate type"
+    )]
+    pub fn resolve_with_hardware(
+        container: VideoContainerFormat,
+        requested_codec: Option<TargetVideoCodec>,
+        rate_control: VideoRateControl,
+        explicit_loop: Option<AnimationLoop>,
+        backend: StackBackendRequest,
+        nvenc_compiled: bool,
+        hardware: Option<&HostHardware>,
+    ) -> Result<Self, DomainError> {
+        let codec = match requested_codec {
+            Some(codec) if !codec.supported_in(container) => {
+                return Err(DomainError::UnsupportedVideoCodec {
+                    codec: codec.as_video_codec(),
+                    container,
+                });
+            }
+            Some(codec) => codec,
+            None => container.default_video_codec(),
+        };
+        let nvenc_available = nvenc_compiled
+            && hardware.is_some_and(|host| host.supports_video_encode(GpuBackend::Nvenc));
+        let require_nvenc = || -> Result<HardwareBackend, DomainError> {
+            if nvenc_available {
+                Ok(HardwareBackend::Gpu(GpuBackend::Nvenc))
+            } else {
+                let reason = if nvenc_compiled {
+                    "NVENC stack encoding requires an encode-capable NVIDIA GPU detected on this host (no silent CPU fallback)"
+                } else {
+                    "NVENC stack encoding requires building with --features nvenc (no silent CPU fallback)"
+                };
+                Err(DomainError::UnsupportedVideoPipeline {
+                    codec: codec.as_video_codec(),
+                    backend: HardwareBackend::Gpu(GpuBackend::Nvenc),
+                    reason: reason.to_owned(),
+                })
+            }
+        };
+
+        if matches!(
+            container,
+            VideoContainerFormat::Gif | VideoContainerFormat::Webp
+        ) {
+            let resolved = match backend {
+                StackBackendRequest::Auto => HardwareBackend::Cpu,
+                StackBackendRequest::Explicit(backend) => backend,
+            };
+            let encode_mode = VideoEncodeMode::resolve(codec, rate_control, resolved)?;
+            let format = StackTargetFormat::from_extension(container.extension()).ok_or(
+                DomainError::UnsupportedVideoCodec {
+                    codec: codec.as_video_codec(),
+                    container,
+                },
+            )?;
+            return Ok(Self::Animation {
+                format,
+                quality: encode_mode.quality(),
+                loop_count: explicit_loop.unwrap_or(AnimationLoop::Infinite),
+            });
+        }
+
+        if explicit_loop.is_some() {
+            return Err(DomainError::UnsupportedStackLoop { container });
+        }
+        let resolved = match (backend, codec) {
+            (StackBackendRequest::Explicit(HardwareBackend::Gpu(GpuBackend::Nvenc)), _) => {
+                VideoEncodeMode::resolve(
+                    codec,
+                    rate_control,
+                    HardwareBackend::Gpu(GpuBackend::Nvenc),
+                )?;
+                require_nvenc()?
+            }
+            (StackBackendRequest::Explicit(other), _) => {
+                VideoEncodeMode::resolve(codec, rate_control, other)?;
+                other
+            }
+            (
+                StackBackendRequest::Auto,
+                TargetVideoCodec::Av1 | TargetVideoCodec::Vp9 | TargetVideoCodec::Mjpeg,
+            ) => HardwareBackend::Cpu,
+            (StackBackendRequest::Auto, TargetVideoCodec::Hevc) => require_nvenc()?,
+            (StackBackendRequest::Auto, _) if nvenc_available => {
+                HardwareBackend::Gpu(GpuBackend::Nvenc)
+            }
+            (StackBackendRequest::Auto, _) => HardwareBackend::Cpu,
+        };
+        let encode_mode = VideoEncodeMode::resolve(codec, rate_control, resolved)?;
+        Self::video(container, encode_mode)
     }
 
     #[must_use]
-    pub const fn target_format(self) -> StackTargetFormat {
+    pub const fn animation_format(self) -> Option<StackTargetFormat> {
         match self {
-            Self::CpuAnimation { format, .. } => format,
+            Self::Animation { format, .. } => Some(format),
+            Self::Video { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn target_container(self) -> VideoContainerFormat {
+        match self {
+            Self::Animation { format, .. } => format.as_video_container(),
+            Self::Video { container, .. } => container,
+        }
+    }
+
+    #[must_use]
+    pub const fn video_codec(self) -> TargetVideoCodec {
+        match self {
+            Self::Animation { format, .. } => format.as_video_container().default_video_codec(),
+            Self::Video { encode_mode, .. } => encode_mode.codec(),
+        }
+    }
+
+    #[must_use]
+    pub const fn encode_mode(self) -> Option<VideoEncodeMode> {
+        match self {
+            Self::Animation { .. } => None,
+            Self::Video { encode_mode, .. } => Some(encode_mode),
         }
     }
 
     #[must_use]
     pub const fn quality(self) -> VideoQuality {
         match self {
-            Self::CpuAnimation { quality, .. } => quality,
+            Self::Animation { quality, .. } => quality,
+            Self::Video { encode_mode, .. } => encode_mode.quality(),
+        }
+    }
+
+    #[must_use]
+    pub const fn loop_count(self) -> Option<AnimationLoop> {
+        match self {
+            Self::Animation { loop_count, .. } => Some(loop_count),
+            Self::Video { .. } => None,
         }
     }
 
     #[must_use]
     pub const fn backend(self) -> HardwareBackend {
-        HardwareBackend::Cpu
+        match self {
+            Self::Animation { .. } => HardwareBackend::Cpu,
+            Self::Video { encode_mode, .. } => encode_mode.backend(),
+        }
     }
 }
 
 impl fmt::Display for StackExecutionMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CpuAnimation { format, quality } => {
-                write!(f, "cpu animation .{} q={}", format.extension(), quality)
-            }
+            Self::Animation {
+                format, quality, ..
+            } => write!(f, "cpu animation .{} q={}", format.extension(), quality),
+            Self::Video {
+                container,
+                encode_mode,
+            } => write!(
+                f,
+                "{} video .{} {}",
+                encode_mode.backend(),
+                container.extension(),
+                encode_mode.codec().cli_name()
+            ),
         }
     }
 }
@@ -244,7 +552,6 @@ pub struct FrameSequencePlan {
     fps: StackFps,
     target_path: PathBuf,
     mode: StackExecutionMode,
-    loop_count: AnimationLoop,
     worker_threads: NonZeroUsize,
 }
 
@@ -254,15 +561,14 @@ impl FrameSequencePlan {
     /// # Errors
     ///
     /// Rejects empty frame lists and target paths, a target that aliases any
-    /// source path, dimensions beyond the target format's static limit, and
-    /// any execution mode that is not CPU-only.
+    /// source path, dimensions beyond the target's static limit, odd video
+    /// dimensions, and video dimensions beyond the container track's u16 range.
     pub fn new(
         frames: Vec<StackFrame>,
         dimensions: ImageDimensions,
         fps: StackFps,
         target_path: PathBuf,
         mode: StackExecutionMode,
-        loop_count: AnimationLoop,
         worker_threads: NonZeroUsize,
     ) -> Result<Self, DomainError> {
         if frames.is_empty() {
@@ -271,22 +577,40 @@ impl FrameSequencePlan {
         if target_path.as_os_str().is_empty() {
             return Err(DomainError::EmptyPath(PathRole::Target));
         }
-        if !matches!(mode, StackExecutionMode::CpuAnimation { .. }) {
-            return Err(DomainError::UnsupportedStackBackend {
-                backend: mode.backend(),
-            });
-        }
-        let (max_width, max_height) = mode.target_format().max_dimensions();
         let width = dimensions.width().get();
         let height = dimensions.height().get();
-        if width > max_width || height > max_height {
-            return Err(DomainError::StackDimensionLimit {
-                format: mode.target_format(),
-                width,
-                height,
-                max_width,
-                max_height,
-            });
+        match mode {
+            StackExecutionMode::Animation { format, .. } => {
+                let (max_width, max_height) = format.max_dimensions();
+                if width > max_width || height > max_height {
+                    return Err(DomainError::StackDimensionLimit {
+                        format,
+                        width,
+                        height,
+                        max_width,
+                        max_height,
+                    });
+                }
+            }
+            StackExecutionMode::Video { container, .. } => {
+                let max = u32::from(u16::MAX);
+                if width > max || height > max {
+                    return Err(DomainError::StackVideoDimensionLimit {
+                        container,
+                        width,
+                        height,
+                        max_width: max,
+                        max_height: max,
+                    });
+                }
+                if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+                    return Err(DomainError::StackOddVideoDimensions {
+                        container,
+                        width,
+                        height,
+                    });
+                }
+            }
         }
         if frames
             .iter()
@@ -300,7 +624,6 @@ impl FrameSequencePlan {
             fps,
             target_path,
             mode,
-            loop_count,
             worker_threads,
         })
     }
@@ -333,8 +656,18 @@ impl FrameSequencePlan {
     }
 
     #[must_use]
-    pub const fn target_format(&self) -> StackTargetFormat {
-        self.mode.target_format()
+    pub const fn animation_format(&self) -> Option<StackTargetFormat> {
+        self.mode.animation_format()
+    }
+
+    #[must_use]
+    pub const fn target_container(&self) -> VideoContainerFormat {
+        self.mode.target_container()
+    }
+
+    #[must_use]
+    pub const fn video_codec(&self) -> TargetVideoCodec {
+        self.mode.video_codec()
     }
 
     #[must_use]
@@ -353,8 +686,8 @@ impl FrameSequencePlan {
     }
 
     #[must_use]
-    pub const fn loop_count(&self) -> AnimationLoop {
-        self.loop_count
+    pub const fn loop_count(&self) -> Option<AnimationLoop> {
+        self.mode.loop_count()
     }
 
     #[must_use]
@@ -370,7 +703,10 @@ pub struct FrameSequenceReport {
     frames_encoded: NonZeroU64,
     dimensions: ImageDimensions,
     fps: f64,
-    target_format: StackTargetFormat,
+    target_container: VideoContainerFormat,
+    video_codec: TargetVideoCodec,
+    backend: HardwareBackend,
+    hardware_device: Option<String>,
     target_path: PathBuf,
     output_bytes: NonZeroU64,
     worker_threads: NonZeroUsize,
@@ -383,16 +719,20 @@ impl FrameSequenceReport {
         frames_encoded: NonZeroU64,
         dimensions: ImageDimensions,
         fps: f64,
-        target_format: StackTargetFormat,
+        mode: StackExecutionMode,
         target_path: PathBuf,
         output_bytes: NonZeroU64,
         worker_threads: NonZeroUsize,
+        hardware_device: Option<String>,
     ) -> Self {
         Self {
             frames_encoded,
             dimensions,
             fps,
-            target_format,
+            target_container: mode.target_container(),
+            video_codec: mode.video_codec(),
+            backend: mode.backend(),
+            hardware_device,
             target_path,
             output_bytes,
             worker_threads,
@@ -415,8 +755,23 @@ impl FrameSequenceReport {
     }
 
     #[must_use]
-    pub const fn target_format(&self) -> StackTargetFormat {
-        self.target_format
+    pub const fn target_container(&self) -> VideoContainerFormat {
+        self.target_container
+    }
+
+    #[must_use]
+    pub const fn video_codec(&self) -> TargetVideoCodec {
+        self.video_codec
+    }
+
+    #[must_use]
+    pub const fn backend(&self) -> HardwareBackend {
+        self.backend
+    }
+
+    #[must_use]
+    pub fn hardware_device(&self) -> Option<&str> {
+        self.hardware_device.as_deref()
     }
 
     #[must_use]
@@ -456,11 +811,15 @@ pub fn parse_animation_loop(raw: &str) -> Result<AnimationLoop, DomainError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FrameSequencePlan, StackExecutionMode, StackFps, StackFrame, StackTargetFormat,
-        parse_animation_loop,
+        FrameSequencePlan, FrameSequenceReport, StackBackendRequest, StackExecutionMode, StackFps,
+        StackFrame, StackTargetFormat, parse_animation_loop,
     };
-    use crate::{AnimationLoop, DomainError, ImageDimensions, ImageInputFormat, VideoQuality};
-    use std::num::{NonZeroU16, NonZeroUsize};
+    use crate::{
+        AnimationLoop, CpuInfo, DetectedGpuBackend, DomainError, GpuBackend, GpuCapability,
+        HardwareBackend, HostHardware, ImageDimensions, ImageInputFormat, SimdLevel,
+        TargetVideoCodec, VideoContainerFormat, VideoEncodeMode, VideoQuality, VideoRateControl,
+    };
+    use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
     use std::path::PathBuf;
 
     fn plan() -> Result<FrameSequencePlan, DomainError> {
@@ -475,9 +834,28 @@ mod tests {
             StackFps::DEFAULT,
             PathBuf::from("out.gif"),
             StackExecutionMode::cpu_animation(StackTargetFormat::Gif, VideoQuality::DEFAULT),
-            AnimationLoop::Infinite,
             NonZeroUsize::MIN,
         )
+    }
+
+    fn nvenc_host() -> Result<HostHardware, DomainError> {
+        Ok(HostHardware::new(
+            CpuInfo::new(
+                "test",
+                "x86_64",
+                NonZeroUsize::MIN,
+                NonZeroUsize::MIN,
+                SimdLevel::Scalar,
+                None,
+            )?,
+            Vec::new(),
+            vec![DetectedGpuBackend::new(
+                GpuBackend::Nvenc,
+                GpuCapability::VideoEncodeOnly,
+                "Test RTX",
+                "unit test",
+            )?],
+        ))
     }
 
     #[test]
@@ -497,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn fps_is_bounded_and_drift_free() -> Result<(), DomainError> {
+    fn fps_is_bounded_drift_free_and_rational() -> Result<(), DomainError> {
         for bad in [f64::NAN, f64::INFINITY, 0.0, -1.0, 1e9, 1e-7] {
             assert!(StackFps::new(bad).is_err(), "must reject {bad}");
         }
@@ -508,6 +886,14 @@ mod tests {
         assert_eq!(fps30.frame_timestamp_us(3), 100_000);
         let fps2997 = StackFps::new(29.97)?;
         assert_eq!(fps2997.frame_timestamp_us(1001), 33_400_067);
+        assert_eq!(fps2997.rational(), (2997, 100));
+        assert_eq!(StackFps::new(24_000.0 / 1001.0)?.rational(), (24_000, 1001));
+        assert_eq!(StackFps::new(30_000.0 / 1001.0)?.rational(), (30_000, 1001));
+        assert_eq!(StackFps::new(29.970_000_001)?.rational(), (2997, 100));
+        assert_eq!(StackFps::new(0.5)?.rational(), (1, 2));
+        assert_eq!(StackFps::new(15.0)?.rational(), (15, 1));
+        assert_eq!(StackFps::new(StackFps::MIN)?.rational(), (1, 1_000_000));
+        assert_eq!(StackFps::new(StackFps::MAX)?.rational(), (1_000_000, 1));
         let max = StackFps::new(StackFps::MAX)?;
         assert_eq!(max.frame_timestamp_us(u64::MAX), u64::MAX);
         Ok(())
@@ -517,8 +903,9 @@ mod tests {
     fn validates_plan_invariants() -> Result<(), DomainError> {
         let built = plan()?;
         assert_eq!(built.frame_count().get(), 1);
-        assert_eq!(built.target_format(), StackTargetFormat::Gif);
-        assert_eq!(built.backend(), crate::HardwareBackend::Cpu);
+        assert_eq!(built.animation_format(), Some(StackTargetFormat::Gif));
+        assert_eq!(built.loop_count(), Some(AnimationLoop::Infinite));
+        assert_eq!(built.backend(), HardwareBackend::Cpu);
 
         let oversized = FrameSequencePlan::new(
             vec![StackFrame::new(
@@ -530,7 +917,6 @@ mod tests {
             StackFps::DEFAULT,
             PathBuf::from("out.webp"),
             StackExecutionMode::cpu_animation(StackTargetFormat::Webp, VideoQuality::DEFAULT),
-            AnimationLoop::Infinite,
             NonZeroUsize::MIN,
         );
         assert!(matches!(
@@ -548,13 +934,225 @@ mod tests {
             StackFps::DEFAULT,
             PathBuf::from("a.png"),
             StackExecutionMode::cpu_animation(StackTargetFormat::Gif, VideoQuality::DEFAULT),
-            AnimationLoop::Infinite,
             NonZeroUsize::MIN,
         );
         assert!(matches!(
             aliasing,
             Err(DomainError::StackTargetOverlapsSource(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn video_plans_reject_odd_and_oversized_dimensions() -> Result<(), DomainError> {
+        let mode = StackExecutionMode::video(
+            VideoContainerFormat::Mp4,
+            VideoEncodeMode::CpuH264 {
+                rate_control: VideoRateControl::DEFAULT,
+            },
+        )?;
+        let make = |width, height| {
+            FrameSequencePlan::new(
+                vec![StackFrame::new(
+                    PathBuf::from("a.png"),
+                    ImageInputFormat::Png,
+                    false,
+                )?],
+                ImageDimensions::new(width, height)?,
+                StackFps::DEFAULT,
+                PathBuf::from("out.mp4"),
+                mode,
+                NonZeroUsize::MIN,
+            )
+        };
+        assert!(matches!(
+            make(21, 20),
+            Err(DomainError::StackOddVideoDimensions { .. })
+        ));
+        assert!(matches!(
+            make(65_536, 20),
+            Err(DomainError::StackVideoDimensionLimit { .. })
+        ));
+        let good = make(20, 20)?;
+        assert_eq!(good.loop_count(), None);
+        assert_eq!(good.target_container(), VideoContainerFormat::Mp4);
+        assert_eq!(good.video_codec(), TargetVideoCodec::H264);
+        Ok(())
+    }
+
+    #[test]
+    fn video_constructor_rejects_animation_containers_and_mismatches() {
+        assert!(matches!(
+            StackExecutionMode::video(
+                VideoContainerFormat::Gif,
+                VideoEncodeMode::CpuH264 {
+                    rate_control: VideoRateControl::DEFAULT,
+                }
+            ),
+            Err(DomainError::UnsupportedVideoCodec { .. })
+        ));
+        assert!(matches!(
+            StackExecutionMode::video(
+                VideoContainerFormat::Webm,
+                VideoEncodeMode::CpuMjpeg {
+                    quality: VideoQuality::DEFAULT,
+                }
+            ),
+            Err(DomainError::UnsupportedVideoCodec { .. })
+        ));
+    }
+
+    #[test]
+    fn resolver_picks_zero_fallback_backends() -> Result<(), DomainError> {
+        let host = nvenc_host()?;
+        let rc = VideoRateControl::DEFAULT;
+        let resolve = |container, codec, backend, host: Option<&HostHardware>| {
+            StackExecutionMode::resolve_with_hardware(
+                container, codec, rc, None, backend, true, host,
+            )
+        };
+        assert_eq!(
+            resolve(
+                VideoContainerFormat::Mp4,
+                Some(TargetVideoCodec::H264),
+                StackBackendRequest::Auto,
+                Some(&host)
+            )?
+            .backend(),
+            HardwareBackend::Gpu(GpuBackend::Nvenc)
+        );
+        assert_eq!(
+            resolve(
+                VideoContainerFormat::Mp4,
+                Some(TargetVideoCodec::H264),
+                StackBackendRequest::Auto,
+                None
+            )?
+            .backend(),
+            HardwareBackend::Cpu
+        );
+        assert_eq!(
+            resolve(
+                VideoContainerFormat::Webm,
+                Some(TargetVideoCodec::Vp9),
+                StackBackendRequest::Auto,
+                None
+            )?
+            .backend(),
+            HardwareBackend::Cpu
+        );
+        assert_eq!(
+            resolve(
+                VideoContainerFormat::Gif,
+                None,
+                StackBackendRequest::Auto,
+                None
+            )?,
+            StackExecutionMode::cpu_animation(StackTargetFormat::Gif, VideoQuality::DEFAULT)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolver_rejects_all_silent_fallback_requests() -> Result<(), DomainError> {
+        let host = nvenc_host()?;
+        let rc = VideoRateControl::DEFAULT;
+        let resolve = |container, codec, backend, explicit_loop, compiled, host| {
+            StackExecutionMode::resolve_with_hardware(
+                container,
+                codec,
+                rc,
+                explicit_loop,
+                backend,
+                compiled,
+                host,
+            )
+        };
+        assert!(matches!(
+            resolve(
+                VideoContainerFormat::Mp4,
+                None,
+                StackBackendRequest::Auto,
+                Some(AnimationLoop::Infinite),
+                true,
+                Some(&host)
+            ),
+            Err(DomainError::UnsupportedStackLoop { .. })
+        ));
+        assert!(matches!(
+            resolve(
+                VideoContainerFormat::Mkv,
+                Some(TargetVideoCodec::Hevc),
+                StackBackendRequest::Auto,
+                None,
+                true,
+                None
+            ),
+            Err(DomainError::UnsupportedVideoPipeline { .. })
+        ));
+        assert!(matches!(
+            resolve(
+                VideoContainerFormat::Mp4,
+                Some(TargetVideoCodec::H264),
+                StackBackendRequest::Explicit(HardwareBackend::Gpu(GpuBackend::Nvenc)),
+                None,
+                false,
+                Some(&host)
+            ),
+            Err(DomainError::UnsupportedVideoPipeline { .. })
+        ));
+        assert!(matches!(
+            resolve(
+                VideoContainerFormat::Mp4,
+                Some(TargetVideoCodec::H264),
+                StackBackendRequest::Explicit(HardwareBackend::Gpu(GpuBackend::Vulkan)),
+                None,
+                true,
+                Some(&host)
+            ),
+            Err(DomainError::UnsupportedVideoPipeline { .. })
+        ));
+        assert!(matches!(
+            resolve(
+                VideoContainerFormat::Mp4,
+                Some(TargetVideoCodec::Hevc),
+                StackBackendRequest::Explicit(HardwareBackend::Cpu),
+                None,
+                true,
+                Some(&host)
+            ),
+            Err(DomainError::UnsupportedVideoPipeline { .. })
+        ));
+        assert!(matches!(
+            resolve(
+                VideoContainerFormat::Webm,
+                Some(TargetVideoCodec::H264),
+                StackBackendRequest::Auto,
+                None,
+                true,
+                Some(&host)
+            ),
+            Err(DomainError::UnsupportedVideoCodec { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn report_exposes_execution_path() -> Result<(), DomainError> {
+        let report = FrameSequenceReport::new(
+            NonZeroU64::MIN,
+            ImageDimensions::new(16, 16)?,
+            10.0,
+            StackExecutionMode::cpu_animation(StackTargetFormat::Gif, VideoQuality::DEFAULT),
+            PathBuf::from("out.gif"),
+            NonZeroU64::MIN,
+            NonZeroUsize::MIN,
+            None,
+        );
+        assert_eq!(report.target_container(), VideoContainerFormat::Gif);
+        assert_eq!(report.video_codec(), TargetVideoCodec::Gif);
+        assert_eq!(report.backend(), HardwareBackend::Cpu);
+        assert_eq!(report.hardware_device(), None);
         Ok(())
     }
 
