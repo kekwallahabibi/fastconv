@@ -16,6 +16,9 @@ license = "AGPL-3.0-only"
 [workspace.dependencies]
 alac-encoder = "0.3.0"
 containr = { version = "0.1.1", features = ["mp4", "mkv"] }
+# MPMC channels let frame-extraction workers share one bounded receiver without
+# a mutex-held blocking receive (MIT OR Apache-2.0, already in the lockfile).
+crossbeam-channel = "0.5"
 cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12090"] }
 fastconv-domain = { path = "crates/domain" }
 fastconv-probe = { path = "crates/probe" }

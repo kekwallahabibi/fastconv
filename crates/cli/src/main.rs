@@ -1,4 +1,5 @@
 mod audio;
+mod frames;
 mod video;
 
 use std::env;
@@ -25,6 +26,9 @@ const GLOBAL_HELP: &str = r"Usage:
            (also accepts opus/flac), m4a defaults to aac (also accepts alac).
   audio sources: wav/flac/mp3/ogg/opus/aac/m4a/alac/aiff, or an audio track
            from mp4/mov/mkv/webm/avi/ts (--track <N>, zero-based, default 0).
+  fastconv frames <source> <output-dir> [--to <png|jpeg|webp|qoi|bmp|tiff|jxl|avif|gif|ico|pnm|heic>]
+                  [--quality <0..=100> | --lossless] [--fps <N> | --every <N>]
+                  [--start <N>] [--end <N>] [--threads <N>] [--backend <auto|cpu>]
   fastconv remux <source> <target> [--to <mp4|mkv|webm|mov|avi|ts>] [--threads <N>]
   fastconv video <source> <target> [--to <format>] [--vcodec <codec>]
                  [--acodec <codec>] [--quality <0..=100> | --vbitrate <rate>]
@@ -37,6 +41,7 @@ const GLOBAL_HELP: &str = r"Usage:
 Commands:
   probe    Inspect CPU, GPU adapters, and GPU media backends
   convert  Convert still images (lossy/lossless; CPU or NVENC HEIC)
+  frames   Extract still image frames from video or animated GIF/WebP
   audio    Convert audio files or extract audio tracks from video containers
   remux    Losslessly remux video containers (no re-encoding)
   video    Transcode audio/video tracks between containers
@@ -138,6 +143,7 @@ fn help_text(topic: &str) -> Option<&'static str> {
     match topic {
         "probe" => Some(PROBE_HELP),
         "convert" => Some(CONVERT_HELP),
+        "frames" => Some(frames::FRAMES_HELP),
         "audio" => Some(audio::AUDIO_HELP),
         "remux" => Some(video::REMUX_HELP),
         "video" => Some(video::VIDEO_HELP),
@@ -209,7 +215,7 @@ pub(crate) fn parse_backend(value: &str) -> Result<HardwareBackend, String> {
     }
 }
 
-fn parse_target_format(value: &str) -> Result<ImageOutputFormat, String> {
+pub(crate) fn parse_target_format(value: &str) -> Result<ImageOutputFormat, String> {
     match value {
         "webp" => Ok(ImageOutputFormat::Webp),
         "heic" => Ok(ImageOutputFormat::Heic),
@@ -611,6 +617,14 @@ fn main() -> ExitCode {
             Ok(ProbeCommand::Run) => run_with_failure(run_probe()),
             Err(message) => fail(&message),
         },
+        ["frames", rest @ ..] => match frames::parse_frames_args(rest) {
+            Ok(frames::FramesCommand::Help) => {
+                println!("{}", frames::FRAMES_HELP);
+                ExitCode::SUCCESS
+            }
+            Ok(frames::FramesCommand::Run(parsed)) => run_with_failure(frames::run_frames(&parsed)),
+            Err(message) => fail(&message),
+        },
         ["audio", rest @ ..] => match audio::parse_audio_args(rest) {
             Ok(audio::AudioCommand::Help) => {
                 audio::print_audio_help();
@@ -682,7 +696,7 @@ mod tests {
 
     #[test]
     fn every_command_has_dedicated_help_text() -> Result<(), String> {
-        for topic in ["probe", "convert", "audio", "remux", "video"] {
+        for topic in ["probe", "convert", "frames", "audio", "remux", "video"] {
             let text = help_text(topic).ok_or_else(|| format!("missing help for {topic}"))?;
             assert!(text.contains("Usage:"), "missing usage for {topic}");
             assert!(

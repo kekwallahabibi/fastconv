@@ -13,6 +13,7 @@ alac-encoder.workspace = true
 cudarc = { workspace = true, optional = true }
 fastconv-domain.workspace = true
 containr.workspace = true
+crossbeam-channel.workspace = true
 flacenc = { workspace = true, features = ["par"] }
 heifer.workspace = true
 hound.workspace = true

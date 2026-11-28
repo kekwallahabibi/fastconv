@@ -7,6 +7,7 @@ mod avif;
 mod bmp;
 pub mod cpu;
 mod decode;
+mod frames;
 mod gif;
 pub mod gpu;
 mod heic;
@@ -25,6 +26,7 @@ mod video_container;
 pub mod video_transcode;
 
 pub use audio::execute_audio_batch;
+pub use frames::execute_frame_extraction;
 pub use video_transcode::execute_video_transcode_batch;
 
 use std::error::Error;
@@ -44,14 +46,38 @@ pub use remux::execute_video_batch;
 #[derive(Debug)]
 pub enum PipelineError {
     BackendNotImplemented(HardwareBackend),
-    GpuBackendFailed { backend: GpuBackend, reason: String },
-    Io { path: PathBuf, source: io::Error },
-    DecodeFailed { path: PathBuf, reason: String },
-    EncodeFailed { path: PathBuf, reason: String },
-    RemuxFailed { path: PathBuf, reason: String },
-    UnsupportedPixelFormat { path: PathBuf, format: String },
-    UnsupportedSampleDepth { path: PathBuf, bits: usize },
+    GpuBackendFailed {
+        backend: GpuBackend,
+        reason: String,
+    },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+    DecodeFailed {
+        path: PathBuf,
+        reason: String,
+    },
+    EncodeFailed {
+        path: PathBuf,
+        reason: String,
+    },
+    RemuxFailed {
+        path: PathBuf,
+        reason: String,
+    },
+    UnsupportedPixelFormat {
+        path: PathBuf,
+        format: String,
+    },
+    UnsupportedSampleDepth {
+        path: PathBuf,
+        bits: usize,
+    },
     EmptyOutput(PathBuf),
+    /// No frame in the source satisfied the requested selection/range; no
+    /// output file (and no output directory) was created.
+    NoFramesSelected(PathBuf),
     WorkerPanicked,
     WorkerStartFailed(io::Error),
 }
@@ -92,6 +118,11 @@ impl fmt::Display for PipelineError {
             Self::EmptyOutput(path) => {
                 write!(f, "encoder produced empty output for '{}'", path.display())
             }
+            Self::NoFramesSelected(path) => write!(
+                f,
+                "no frames were selected from '{}'; check --start, --end, --fps and --every",
+                path.display()
+            ),
             Self::WorkerPanicked => f.write_str("conversion worker thread panicked"),
             Self::WorkerStartFailed(source) => {
                 write!(f, "failed to start conversion worker: {source}")
@@ -112,6 +143,7 @@ impl Error for PipelineError {
             | Self::UnsupportedPixelFormat { .. }
             | Self::UnsupportedSampleDepth { .. }
             | Self::EmptyOutput(_)
+            | Self::NoFramesSelected(_)
             | Self::WorkerPanicked => None,
         }
     }

@@ -1,4 +1,3 @@
-use std::fs;
 use std::io::{self, BufWriter, Seek, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
@@ -346,10 +345,115 @@ fn execute_parallel(
     ))
 }
 
-struct EncodeBuffers<'a> {
-    encoded: &'a mut Vec<u8>,
-    aux: &'a mut Vec<u8>,
-    bmp_frame: &'a mut BmpFrameScratch,
+pub(crate) struct EncodeBuffers<'a> {
+    pub(crate) encoded: &'a mut Vec<u8>,
+    pub(crate) aux: &'a mut Vec<u8>,
+    pub(crate) bmp_frame: &'a mut BmpFrameScratch,
+}
+
+/// Shared encoder dispatch for both still-image conversion and frame
+/// extraction. Every format funnels through this one helper so the two commands
+/// exercise byte-for-byte identical, battle-tested encoder code.
+// One shared dispatch takes the target, source, encoder mode, pixels, decoded
+// metadata, reusable buffers, inner thread count, and the BMP write lock: all
+// eight are required by at least one of the twelve encoder backends.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_frame_pixels(
+    target: &Path,
+    source: &Path,
+    encoder: CpuImageEncoder,
+    pixels: &mut [u8],
+    decoded: DecodedFrameMeta,
+    buffers: &mut EncodeBuffers<'_>,
+    encode_threads: usize,
+    bmp_write_lock: &Mutex<()>,
+) -> Result<u64, PipelineError> {
+    match encoder {
+        CpuImageEncoder::Webp { compression, level } => {
+            buffers.encoded.clear();
+            encode_webp_into(target, compression, level, pixels, decoded, buffers.encoded)?;
+            write_encoded_buffer(target, buffers.encoded)
+        }
+        CpuImageEncoder::Jpeg { quality, chroma } => {
+            buffers.encoded.clear();
+            encode_jpeg_into(
+                target,
+                source,
+                quality,
+                chroma,
+                pixels,
+                decoded,
+                buffers.aux,
+                buffers.encoded,
+            )?;
+            write_encoded_buffer(target, buffers.encoded)
+        }
+        CpuImageEncoder::Qoi => {
+            buffers.encoded.clear();
+            encode_qoi_into(target, pixels, decoded, buffers.encoded)?;
+            write_encoded_buffer(target, buffers.encoded)
+        }
+        CpuImageEncoder::Png { level } => encode_png_streaming(target, pixels, decoded, level),
+        CpuImageEncoder::Bmp => encode_bmp_streaming(
+            target,
+            pixels,
+            decoded,
+            buffers.bmp_frame,
+            buffers.aux,
+            bmp_write_lock,
+        ),
+        CpuImageEncoder::Tiff { compression } => encode_tiff_streaming(
+            target,
+            compression,
+            pixels,
+            decoded,
+            buffers.aux,
+            buffers.encoded,
+        ),
+        CpuImageEncoder::Jxl { compression, level } => {
+            let jxl_output =
+                encode_jxl_into(target, compression, level, pixels, decoded, encode_threads)?;
+            write_encoded_buffer(target, &jxl_output)
+        }
+        CpuImageEncoder::Avif {
+            quality,
+            level,
+            chroma,
+            threads,
+        } => {
+            buffers.encoded.clear();
+            encode_avif_into(AvifEncodeRequest {
+                target,
+                quality,
+                level,
+                chroma,
+                threads: threads.max(encode_threads),
+                pixels,
+                decoded,
+                encoded_buf: buffers.encoded,
+            })?;
+            write_encoded_buffer(target, buffers.encoded)
+        }
+        CpuImageEncoder::Gif => {
+            buffers.encoded.clear();
+            encode_gif_into(target, pixels, decoded, buffers.aux, buffers.encoded)?;
+            write_encoded_buffer(target, buffers.encoded)
+        }
+        CpuImageEncoder::Ico => {
+            buffers.encoded.clear();
+            encode_ico_into(target, pixels, decoded, buffers.encoded)?;
+            write_encoded_buffer(target, buffers.encoded)
+        }
+        CpuImageEncoder::Pnm => encode_pnm_streaming(target, pixels, decoded, buffers.aux),
+        CpuImageEncoder::Heic { quality } => encode_heic_streaming(
+            target,
+            quality,
+            encode_threads,
+            pixels,
+            decoded,
+            buffers.aux,
+        ),
+    }
 }
 
 fn encode_item_pixels(
@@ -361,106 +465,16 @@ fn encode_item_pixels(
     encode_threads: usize,
     bmp_write_lock: &Mutex<()>,
 ) -> Result<u64, PipelineError> {
-    match encoder {
-        CpuImageEncoder::Webp { compression, level } => {
-            buffers.encoded.clear();
-            encode_webp_into(
-                item.target(),
-                compression,
-                level,
-                pixels,
-                decoded,
-                buffers.encoded,
-            )?;
-            write_encoded_buffer(item.target(), buffers.encoded)
-        }
-        CpuImageEncoder::Jpeg { quality, chroma } => {
-            buffers.encoded.clear();
-            encode_jpeg_into(
-                item,
-                quality,
-                chroma,
-                pixels,
-                decoded,
-                buffers.aux,
-                buffers.encoded,
-            )?;
-            write_encoded_buffer(item.target(), buffers.encoded)
-        }
-        CpuImageEncoder::Qoi => {
-            buffers.encoded.clear();
-            encode_qoi_into(item.target(), pixels, decoded, buffers.encoded)?;
-            write_encoded_buffer(item.target(), buffers.encoded)
-        }
-        CpuImageEncoder::Png { level } => {
-            encode_png_streaming(item.target(), pixels, decoded, level)
-        }
-        CpuImageEncoder::Bmp => encode_bmp_streaming(
-            item.target(),
-            pixels,
-            decoded,
-            buffers.bmp_frame,
-            buffers.aux,
-            bmp_write_lock,
-        ),
-        CpuImageEncoder::Tiff { compression } => encode_tiff_streaming(
-            item.target(),
-            compression,
-            pixels,
-            decoded,
-            buffers.aux,
-            buffers.encoded,
-        ),
-        CpuImageEncoder::Jxl { compression, level } => {
-            let jxl_output = encode_jxl_into(
-                item.target(),
-                compression,
-                level,
-                pixels,
-                decoded,
-                encode_threads,
-            )?;
-            write_encoded_buffer(item.target(), &jxl_output)
-        }
-        CpuImageEncoder::Avif {
-            quality,
-            level,
-            chroma,
-            threads,
-        } => {
-            buffers.encoded.clear();
-            encode_avif_into(AvifEncodeRequest {
-                target: item.target(),
-                quality,
-                level,
-                chroma,
-                threads: threads.max(encode_threads),
-                pixels,
-                decoded,
-                encoded_buf: buffers.encoded,
-            })?;
-            write_encoded_buffer(item.target(), buffers.encoded)
-        }
-        CpuImageEncoder::Gif => {
-            buffers.encoded.clear();
-            encode_gif_into(item.target(), pixels, decoded, buffers.aux, buffers.encoded)?;
-            write_encoded_buffer(item.target(), buffers.encoded)
-        }
-        CpuImageEncoder::Ico => {
-            buffers.encoded.clear();
-            encode_ico_into(item.target(), pixels, decoded, buffers.encoded)?;
-            write_encoded_buffer(item.target(), buffers.encoded)
-        }
-        CpuImageEncoder::Pnm => encode_pnm_streaming(item.target(), pixels, decoded, buffers.aux),
-        CpuImageEncoder::Heic { quality } => encode_heic_streaming(
-            item.target(),
-            quality,
-            encode_threads,
-            pixels,
-            decoded,
-            buffers.aux,
-        ),
-    }
+    encode_frame_pixels(
+        item.target(),
+        item.source(),
+        encoder,
+        pixels,
+        decoded,
+        buffers,
+        encode_threads,
+        bmp_write_lock,
+    )
 }
 
 fn convert_single_item(
@@ -506,10 +520,19 @@ fn write_encoded_buffer(target: &Path, encoded_buf: &[u8]) -> Result<u64, Pipeli
     if encoded_buf.is_empty() {
         return Err(PipelineError::EmptyOutput(target.to_path_buf()));
     }
-    fs::write(target, encoded_buf).map_err(|source| PipelineError::Io {
+    // Every still format publishes through the same exclusive, atomic staging
+    // path: no partially written image can ever be observed by a reader.
+    let (staging, mut file) = StagingTarget::create_for_image(target)?;
+    file.write_all(encoded_buf)
+        .map_err(|source| PipelineError::Io {
+            path: target.to_path_buf(),
+            source,
+        })?;
+    file.flush().map_err(|source| PipelineError::Io {
         path: target.to_path_buf(),
         source,
     })?;
+    staging.commit_with_permissions(file)?;
     Ok(u64::try_from(encoded_buf.len()).unwrap_or(u64::MAX))
 }
 
@@ -863,8 +886,12 @@ impl ImageBuffer for &SimdJpegBuffer<'_> {
     }
 }
 
+// The JPEG invariant check needs both the output path (for encoder errors) and
+// the source path (for alpha rejection diagnostics), plus the shared buffers.
+#[allow(clippy::too_many_arguments)]
 fn encode_jpeg_into(
-    item: &ImageBatchItem,
+    path: &Path,
+    source: &Path,
     quality: ImageQuality,
     chroma: ChromaSubsampling,
     pixels: &[u8],
@@ -872,7 +899,7 @@ fn encode_jpeg_into(
     aux_buf: &mut Vec<u8>,
     encoded_buf: &mut Vec<u8>,
 ) -> Result<(), PipelineError> {
-    let target = item.target();
+    let target = path;
     let width_u16 = u16::try_from(decoded.width).map_err(|_| PipelineError::EncodeFailed {
         path: target.to_path_buf(),
         reason: format!(
@@ -895,13 +922,13 @@ fn encode_jpeg_into(
             let (quads, remainder) = pixels.as_chunks::<4>();
             if !remainder.is_empty() {
                 return Err(PipelineError::DecodeFailed {
-                    path: item.source().to_path_buf(),
+                    path: source.to_path_buf(),
                     reason: format!("unaligned RGBA8 pixel buffer length {}", pixels.len()),
                 });
             }
             if quads.iter().any(|&[_, _, _, a]| a < 255) {
                 return Err(PipelineError::UnsupportedPixelFormat {
-                    path: item.source().to_path_buf(),
+                    path: source.to_path_buf(),
                     format: "non-opaque alpha channel (JPEG does not support transparency)"
                         .to_owned(),
                 });
@@ -912,7 +939,7 @@ fn encode_jpeg_into(
             let (pairs, remainder) = pixels.as_chunks::<2>();
             if !remainder.is_empty() {
                 return Err(PipelineError::DecodeFailed {
-                    path: item.source().to_path_buf(),
+                    path: source.to_path_buf(),
                     reason: format!("unaligned LA8 pixel buffer length {}", pixels.len()),
                 });
             }
@@ -921,7 +948,7 @@ fn encode_jpeg_into(
             for &[v, a] in pairs {
                 if a < 255 {
                     return Err(PipelineError::UnsupportedPixelFormat {
-                        path: item.source().to_path_buf(),
+                        path: source.to_path_buf(),
                         format: "non-opaque alpha channel (JPEG does not support transparency)"
                             .to_owned(),
                     });

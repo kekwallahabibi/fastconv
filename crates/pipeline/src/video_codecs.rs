@@ -1020,6 +1020,8 @@ pub(crate) fn decode_video_track(
 /// Streaming NV12 decode path shared by the CPU animation pipeline and the
 /// NVENC backend.
 mod streaming {
+    use std::ops::ControlFlow;
+
     use super::{
         Av1Decoder, Av1Planes, ContainerPacket, ContainerTrack, DecodedFrameInfo, H264Decoder,
         H264YuvFrame, HevcDecoder, Path, PipelineError, PixelLayout, VideoCodec, Vp9DecodedFrame,
@@ -1998,6 +2000,44 @@ mod streaming {
             )),
         }
     }
+
+    /// `ControlFlow`-returning variant used by frame extraction. A `Break`
+    /// from the callback stops decoding immediately: the existing `Result`-
+    /// based plumbing is translated through a private sentinel that can never
+    /// escape into a real pipeline error.
+    pub(crate) fn decode_video_track_streaming_ctrl<F>(
+        path: &Path,
+        track: &ContainerTrack,
+        packets: &[ContainerPacket],
+        mut on_frame: F,
+    ) -> Result<ControlFlow<()>, PipelineError>
+    where
+        F: FnMut(
+            DecodedFrameInfo,
+            &mut dyn FnMut(&mut [u8], usize) -> Result<(), PipelineError>,
+        ) -> Result<ControlFlow<()>, PipelineError>,
+    {
+        let mut stopped = false;
+        let wrapped =
+            |info: DecodedFrameInfo, pack: &mut PackFn<'_>| -> Result<(), PipelineError> {
+                match on_frame(info, pack)? {
+                    ControlFlow::Continue(()) => Ok(()),
+                    ControlFlow::Break(()) => {
+                        stopped = true;
+                        Err(decode_error(path, crate::video_anim::FRAMES_EARLY_STOP))
+                    }
+                }
+            };
+        match decode_video_track_streaming(path, track, packets, wrapped) {
+            Ok(()) => Ok(ControlFlow::Continue(())),
+            Err(PipelineError::DecodeFailed { reason, .. })
+                if stopped && reason == crate::video_anim::FRAMES_EARLY_STOP =>
+            {
+                Ok(ControlFlow::Break(()))
+            }
+            Err(err) => Err(err),
+        }
+    }
 } // mod streaming
 
 /// Reads the source colour description from canonical codec configuration.
@@ -2050,7 +2090,9 @@ fn source_color(track: &ContainerTrack, packets: &[&ContainerPacket]) -> YuvColo
 
 #[cfg(any(feature = "nvenc", test))]
 pub(crate) use streaming::estimate_video_fps_from_packets;
-pub(crate) use streaming::{decode_video_track_streaming, nv12_buffer_len};
+pub(crate) use streaming::{
+    decode_video_track_streaming, decode_video_track_streaming_ctrl, nv12_buffer_len,
+};
 
 /// Splits an Annex-B byte stream into one packet per coded access unit,
 /// grouping parameter sets and SEI with the VCL NAL that follows them.

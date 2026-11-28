@@ -524,6 +524,7 @@ dependencies = [
  "alac-encoder",
  "avif-serialize",
  "containr",
+ "crossbeam-channel",
  "cudarc",
  "fastconv-domain",
  "flacenc",
