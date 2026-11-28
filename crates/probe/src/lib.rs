@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod frames;
 pub mod hardware;
 pub mod image;
 pub mod video;
@@ -8,6 +9,7 @@ pub use audio::{
     parse_audio_codec, parse_audio_encoding_request, parse_audio_track, prepare_audio_batch,
     probe_audio, probe_audio_track,
 };
+pub use frames::prepare_frame_extraction;
 pub use hardware::detect_host_hardware;
 pub use image::{ProbedImage, prepare_image_batch, prepare_image_batch_with_options, probe_image};
 pub use video::{

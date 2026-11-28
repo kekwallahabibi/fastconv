@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -29,6 +30,10 @@ const ANIM_MEMORY_LIMIT: u64 = 512 * 1024 * 1024;
 pub(crate) const ANIM_DECODED_BUDGET: u64 = 1_073_741_824;
 /// Upper bound on parallel per-frame quantisation/encoding workers.
 const MAX_ANIM_WORKERS: usize = 8;
+/// Private sentinel used to translate a `ControlFlow::Break` from a streaming
+/// callback through the older `Result`-based decoder plumbing. It never leaves
+/// the extraction pipeline as a user-visible error.
+pub(crate) const FRAMES_EARLY_STOP: &str = "\u{0}fastconv-frames-early-stop";
 
 fn decode_error(path: &Path, reason: impl Into<String>) -> PipelineError {
     PipelineError::DecodeFailed {
@@ -504,14 +509,17 @@ fn simd_color(color: YuvColor) -> Result<(SimdYuvRange, YuvStandardMatrix), Pipe
 }
 
 /// Inverse conversion of pitched NV12 into packed RGB8 using the source's
-/// signalled colour matrix and range.
-pub(crate) fn nv12_to_rgb8(
+/// signalled colour matrix and range into a caller-owned buffer. The buffer is
+/// reused across frames so extraction never allocates a fresh RGB image per
+/// decoded frame.
+pub(crate) fn nv12_to_rgb8_into(
     nv12: &[u8],
+    dst: &mut [u8],
     pitch: usize,
     width: u32,
     height: u32,
     color: YuvColor,
-) -> Result<Vec<u8>, PipelineError> {
+) -> Result<(), PipelineError> {
     let path = Path::new("animation-nv12-to-rgb8");
     if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
         return Err(decode_error(
@@ -539,6 +547,13 @@ pub(crate) fn nv12_to_rgb8(
             format!("NV12 buffer is {} bytes, needs {needed}", nv12.len()),
         ));
     }
+    let rgb_len = byte_len(width, height, 3)?;
+    if dst.len() < rgb_len {
+        return Err(decode_error(
+            path,
+            format!("RGB buffer is {} bytes, needs {rgb_len}", dst.len()),
+        ));
+    }
     let (range, matrix) = simd_color(color)?;
     let stride = u32::try_from(pitch).map_err(|_| decode_error(path, "NV12 pitch exceeds u32"))?;
     let rgb_stride = u32::try_from(frame_w.saturating_mul(3))
@@ -551,9 +566,28 @@ pub(crate) fn nv12_to_rgb8(
         width,
         height,
     };
+    yuv::yuv_nv12_to_rgb(
+        &image,
+        &mut dst[..rgb_len],
+        rgb_stride,
+        range,
+        matrix,
+        SIMD_MODE,
+    )
+    .map_err(|err| decode_error(path, format!("SIMD NV12 → RGB conversion failed: {err}")))
+}
+
+/// Inverse conversion of pitched NV12 into a freshly allocated packed RGB8.
+/// Prefer [`nv12_to_rgb8_into`] on hot paths that can recycle a buffer.
+pub(crate) fn nv12_to_rgb8(
+    nv12: &[u8],
+    pitch: usize,
+    width: u32,
+    height: u32,
+    color: YuvColor,
+) -> Result<Vec<u8>, PipelineError> {
     let mut rgb = vec![0_u8; byte_len(width, height, 3)?];
-    yuv::yuv_nv12_to_rgb(&image, &mut rgb, rgb_stride, range, matrix, SIMD_MODE)
-        .map_err(|err| decode_error(path, format!("SIMD NV12 → RGB conversion failed: {err}")))?;
+    nv12_to_rgb8_into(nv12, &mut rgb, pitch, width, height, color)?;
     Ok(rgb)
 }
 
@@ -1115,6 +1149,36 @@ where
     gif_streaming_pixels_impl(path, true, on_frame)
 }
 
+/// `ControlFlow`-returning GIF variant: `Break` stops compositing immediately.
+/// Existing callers keep using the `Result` wrapper above unchanged.
+pub(crate) fn decode_gif_frames_streaming_pixels_ctrl<F>(
+    path: &Path,
+    mut on_frame: F,
+) -> Result<ControlFlow<()>, PipelineError>
+where
+    F: FnMut(AnimFrameInfo, &[u8]) -> Result<ControlFlow<()>, PipelineError>,
+{
+    let mut stopped = false;
+    let wrapped = |info: AnimFrameInfo, pixels: &[u8]| -> Result<(), PipelineError> {
+        match on_frame(info, pixels)? {
+            ControlFlow::Continue(()) => Ok(()),
+            ControlFlow::Break(()) => {
+                stopped = true;
+                Err(decode_error(path, FRAMES_EARLY_STOP))
+            }
+        }
+    };
+    match decode_gif_frames_streaming_pixels(path, wrapped) {
+        Ok(()) => Ok(ControlFlow::Continue(())),
+        Err(PipelineError::DecodeFailed { reason, .. })
+            if stopped && reason == FRAMES_EARLY_STOP =>
+        {
+            Ok(ControlFlow::Break(()))
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Streams GIF frames directly into a caller-supplied pitched NV12 buffer.
 pub(crate) fn decode_gif_frames_streaming_nv12<F>(
     path: &Path,
@@ -1328,6 +1392,35 @@ where
     F: FnMut(AnimFrameInfo, &[u8]) -> Result<(), PipelineError>,
 {
     webp_streaming_pixels_impl(path, true, on_frame)
+}
+
+/// `ControlFlow`-returning WebP variant: `Break` stops frame decoding immediately.
+pub(crate) fn decode_webp_frames_streaming_pixels_ctrl<F>(
+    path: &Path,
+    mut on_frame: F,
+) -> Result<ControlFlow<()>, PipelineError>
+where
+    F: FnMut(AnimFrameInfo, &[u8]) -> Result<ControlFlow<()>, PipelineError>,
+{
+    let mut stopped = false;
+    let wrapped = |info: AnimFrameInfo, pixels: &[u8]| -> Result<(), PipelineError> {
+        match on_frame(info, pixels)? {
+            ControlFlow::Continue(()) => Ok(()),
+            ControlFlow::Break(()) => {
+                stopped = true;
+                Err(decode_error(path, FRAMES_EARLY_STOP))
+            }
+        }
+    };
+    match decode_webp_frames_streaming_pixels(path, wrapped) {
+        Ok(()) => Ok(ControlFlow::Continue(())),
+        Err(PipelineError::DecodeFailed { reason, .. })
+            if stopped && reason == FRAMES_EARLY_STOP =>
+        {
+            Ok(ControlFlow::Break(()))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Streams WebP frames directly into a caller-supplied pitched NV12 buffer.

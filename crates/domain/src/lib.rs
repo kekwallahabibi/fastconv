@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod frames;
 pub mod hardware;
 pub mod image;
 pub mod metrics;
@@ -11,6 +12,7 @@ pub use audio::{
     AudioStreamInfo, AudioTargetCodec, PcmWavLayout, VideoAudioContainer, aac_frame_capacity_bps,
     fnv1a64,
 };
+pub use frames::{FrameExtractionPlan, FrameExtractionReport, FrameRange, FrameSelection};
 pub use hardware::{
     CpuInfo, DetectedGpuBackend, GpuAdapterInfo, GpuCapability, GpuVendor, HostHardware, SimdLevel,
 };
@@ -233,6 +235,27 @@ pub enum DomainError {
         requested: usize,
         count: usize,
     },
+    /// A frame-extraction selection (e.g. `--fps`) was not valid.
+    InvalidFrameSelection {
+        reason: String,
+    },
+    /// A frame-extraction range had `start > end`.
+    InvalidFrameRange {
+        start: u64,
+        end: u64,
+    },
+    /// The source is not usable as a frame-extraction input.
+    FrameSourceRejected {
+        reason: String,
+    },
+    /// The probed dimensions exceed a static limit of the target image format.
+    FrameDimensionLimit {
+        format: image::ImageOutputFormat,
+        width: u32,
+        height: u32,
+        max_width: u32,
+        max_height: u32,
+    },
 }
 
 pub(crate) fn require_non_empty(value: &str, field: &'static str) -> Result<String, DomainError> {
@@ -445,6 +468,10 @@ impl fmt::Display for DomainError {
             Self::InvalidAudioQuality { value, max } => {
                 write!(f, "audio quality must be in 0..={max}, got {value}")
             }
+            Self::InvalidFrameSelection { .. }
+            | Self::InvalidFrameRange { .. }
+            | Self::FrameSourceRejected { .. }
+            | Self::FrameDimensionLimit { .. } => fmt_frame_error(self, f),
             Self::UnsupportedAudioRateControl {
                 format,
                 codec,
@@ -457,6 +484,32 @@ impl fmt::Display for DomainError {
             ),
             _ => fmt_encoding_error(self, f),
         }
+    }
+}
+
+/// Formats frame-extraction validation errors. The caller's guard is the only
+/// path into this helper, so any other variant is a formatter bug.
+fn fmt_frame_error(err: &DomainError, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match err {
+        DomainError::InvalidFrameSelection { reason } => {
+            write!(f, "invalid frame selection: {reason}")
+        }
+        DomainError::InvalidFrameRange { start, end } => write!(
+            f,
+            "invalid frame range: start {start} must not be greater than end {end}"
+        ),
+        DomainError::FrameSourceRejected { reason } => write!(f, "frame source rejected: {reason}"),
+        DomainError::FrameDimensionLimit {
+            format,
+            width,
+            height,
+            max_width,
+            max_height,
+        } => write!(
+            f,
+            "frame dimensions {width}x{height} exceed the .{format} static limit of {max_width}x{max_height}"
+        ),
+        _ => Err(fmt::Error),
     }
 }
 

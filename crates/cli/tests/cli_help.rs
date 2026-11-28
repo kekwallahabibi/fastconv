@@ -49,6 +49,7 @@ fn global_help_is_available_through_all_entry_points() -> Result<(), String> {
         "Commands:",
         "probe ",
         "convert ",
+        "frames ",
         "audio ",
         "remux ",
         "video ",
@@ -58,6 +59,8 @@ fn global_help_is_available_through_all_entry_points() -> Result<(), String> {
         "--hwdecode <auto|cpu|nvdec>",
         "--add-audio <path>",
         "--replace-audio",
+        "[--fps <N> | --every <N>]",
+        "[--start <N>] [--end <N>]",
         "--compression-level <fast|balanced|best>",
         "--tiff-compression <deflate|lzw|packbits|none>",
         "--chroma <420|444>",
@@ -83,7 +86,7 @@ fn version_flag_reports_version() -> Result<(), String> {
 #[test]
 fn every_subcommand_has_dedicated_help() -> Result<(), String> {
     let global = stdout(&["--help"])?;
-    for command in ["probe", "convert", "audio", "remux", "video"] {
+    for command in ["probe", "convert", "frames", "audio", "remux", "video"] {
         let by_flag = stdout(&[command, "--help"])?;
         assert_eq!(stdout(&[command, "-h"])?, by_flag, "{command} -h differs");
         assert_eq!(
@@ -191,6 +194,43 @@ fn convert_help_documents_accepted_flags_and_rules() -> Result<(), String> {
         !text.contains("CPU has no native HEIC encoder"),
         "convert help must not claim the CPU backend lacks a HEIC encoder"
     );
+    Ok(())
+}
+
+#[test]
+fn frames_help_documents_selection_and_backend_rules() -> Result<(), String> {
+    let text = stdout(&["frames", "--help"])?;
+    for needle in [
+        "fastconv frames <source> <output-dir>",
+        "[--to <format>]",
+        "[--quality <0..=100> | --lossless]",
+        "[--fps <N> | --every <N>]",
+        "[--start <N>] [--end <N>]",
+        "[--threads <N>] [--backend <auto|cpu>]",
+        "--to <format>",
+        "--quality <0..=100>",
+        "--lossless",
+        "--fps <N>",
+        "--every <N>",
+        "--start <N>",
+        "--end <N>",
+        "--threads <N>",
+        "--backend <auto|cpu>",
+        "-h, --help",
+        "frame_000001",
+        "animated GIF/WebP",
+        "default: png",
+        "mutually exclusive",
+        "no silent CPU fallback",
+        "nvenc",
+        "vaapi",
+        "qsv",
+        "amf",
+        "videotoolbox",
+        "vulkan",
+    ] {
+        assert!(text.contains(needle), "frames help missing '{needle}'");
+    }
     Ok(())
 }
 
