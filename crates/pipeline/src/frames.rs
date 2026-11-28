@@ -98,6 +98,23 @@ fn row_bytes(width: u32, channels: usize) -> Result<usize, PipelineError> {
         .ok_or_else(|| frame_error("frame row stride overflows usize"))
 }
 
+/// Trims only even-alignment padding (at most one extra column/row) from a
+/// decoded frame. A frame larger than the probed size is real content, not
+/// padding, so it is emitted at its decoded size instead of being truncated.
+fn output_dimensions(decoded: (u32, u32), probed: Option<(u32, u32)>) -> (u32, u32) {
+    match probed {
+        Some((width, height))
+            if decoded.0 >= width
+                && decoded.1 >= height
+                && decoded.0 - width <= 1
+                && decoded.1 - height <= 1 =>
+        {
+            (width, height)
+        }
+        _ => decoded,
+    }
+}
+
 /// Compacts a padded RGB buffer down to its cropped dimensions in place, so no
 /// second raw-pixel allocation is needed for odd-sized decoded frames.
 fn compact_cropped_rgb(
@@ -368,12 +385,9 @@ impl FrameEmitter<'_> {
         if self.failed.load(Ordering::Relaxed) {
             return Err(PipelineError::WorkerPanicked);
         }
-        // Padded decoded dimensions (e.g. odd-sized MJPEG) are trimmed to the
-        // probed source size when that is smaller; never emit padding.
-        let (out_width, out_height) = match self.expected {
-            Some((w, h)) if w <= width && h <= height => (w, h),
-            _ => (width, height),
-        };
+        // Only alignment padding is trimmed; an oversized decoded frame keeps
+        // its full size so no real pixels are silently dropped.
+        let (out_width, out_height) = output_dimensions((width, height), self.expected);
         let needed = frame_byte_len(out_width, out_height, channels).map_err(|_| {
             PipelineError::DecodeFailed {
                 path: source.to_path_buf(),
@@ -763,7 +777,7 @@ pub fn execute_frame_extraction(
 mod tests {
     use super::{
         FrameExtractionPlan, PipelineError, compact_cropped_rgb, copy_cropped_rows,
-        execute_frame_extraction,
+        execute_frame_extraction, output_dimensions,
     };
     use crate::video_anim::{AnimFrameInfo, encode_animation_stream};
     use crate::video_codecs::{
@@ -1206,6 +1220,20 @@ mod tests {
         copy_cropped_rows(&rgba, 2, &mut out, 1, 2, 4)?;
         assert_eq!(out, [1, 2, 3, 4, 5, 6, 7, 8]);
         Ok(())
+    }
+
+    #[test]
+    fn output_dimensions_trims_only_alignment_padding() {
+        let probed = Some((321_u32, 241_u32));
+        // MJPEG's even-alignment padding is trimmed.
+        assert_eq!(output_dimensions((322, 242), probed), (321, 241));
+        assert_eq!(output_dimensions((321, 241), probed), (321, 241));
+        // Real content beyond one pixel of padding is never truncated.
+        assert_eq!(output_dimensions((400, 300), probed), (400, 300));
+        assert_eq!(output_dimensions((322, 300), probed), (322, 300));
+        // A smaller decoded frame is emitted at its own size.
+        assert_eq!(output_dimensions((320, 240), probed), (320, 240));
+        assert_eq!(output_dimensions((322, 242), None), (322, 242));
     }
 
     #[test]
