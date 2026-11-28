@@ -15,6 +15,40 @@ use crate::{
     VideoContainerFormat,
 };
 
+/// A finite, strictly positive target frame rate. The field is private so the
+/// enum variant that carries it cannot be built with NaN or a non-positive rate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct TargetFps(f64);
+
+impl TargetFps {
+    /// Creates a validated target FPS.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidFrameSelection`] when `fps` is NaN,
+    /// infinite, or not strictly positive.
+    pub fn new(fps: f64) -> Result<Self, DomainError> {
+        if !fps.is_finite() || fps <= 0.0 {
+            return Err(DomainError::InvalidFrameSelection {
+                reason: format!("--fps must be a finite number greater than zero, got {fps}"),
+            });
+        }
+        Ok(Self(fps))
+    }
+
+    #[must_use]
+    pub const fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl fmt::Display for TargetFps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Which decoded frames are kept. Illegal states (a non-positive, non-finite
 /// FPS, or a zero sampling interval) can only be built through the validated
 /// constructor.
@@ -26,7 +60,7 @@ pub enum FrameSelection {
     /// Keep every N-th frame in the requested range, starting with its first.
     Every(NonZeroU32),
     /// Keep frames at whole `1 / fps` second intervals from the range's first frame.
-    TargetFps(f64),
+    TargetFps(TargetFps),
 }
 
 impl FrameSelection {
@@ -37,12 +71,7 @@ impl FrameSelection {
     /// Returns [`DomainError::InvalidFrameSelection`] when `fps` is NaN,
     /// infinite, or not strictly positive.
     pub fn target_fps(fps: f64) -> Result<Self, DomainError> {
-        if !fps.is_finite() || fps <= 0.0 {
-            return Err(DomainError::InvalidFrameSelection {
-                reason: format!("--fps must be a finite number greater than zero, got {fps}"),
-            });
-        }
-        Ok(Self::TargetFps(fps))
+        Ok(Self::TargetFps(TargetFps::new(fps)?))
     }
 
     /// Human-readable description for progress and diagnostics.
@@ -383,7 +412,7 @@ impl FrameExtractionReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameExtractionPlan, FrameRange, FrameSelection};
+    use super::{FrameExtractionPlan, FrameRange, FrameSelection, TargetFps};
     use crate::{
         DomainError, HardwareBackend, ImageDimensions, ImageExecutionMode, ImageOutputFormat,
         PathRole, VideoContainerFormat,
@@ -410,7 +439,7 @@ mod tests {
     fn validates_fps_selection() -> Result<(), DomainError> {
         assert_eq!(
             FrameSelection::target_fps(29.97)?,
-            FrameSelection::TargetFps(29.97)
+            FrameSelection::TargetFps(TargetFps::new(29.97)?)
         );
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
             assert!(matches!(

@@ -21,6 +21,33 @@ fn reject(path: &Path, reason: impl Into<String>) -> ProbeError {
     }
 }
 
+/// True when `source` itself sits at a path the extractor would generate
+/// (`frame_<digits>.<ext>` inside the output directory). The alias check below
+/// compares the source with the *directory*; this closes the gap where a file
+/// named like an output frame would be overwritten by its own extraction.
+fn is_generated_frame_path(
+    source: &Path,
+    output_dir: &Path,
+    extension: &str,
+) -> Result<bool, ProbeError> {
+    let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
+        return Ok(false);
+    };
+    let Some(parent) = source.parent() else {
+        return Ok(false);
+    };
+    if canonical_or_parent(parent)? != canonical_or_parent(output_dir)? {
+        return Ok(false);
+    }
+    let Some(rest) = name.strip_prefix("frame_") else {
+        return Ok(false);
+    };
+    let Some((digits, ext)) = rest.rsplit_once('.') else {
+        return Ok(false);
+    };
+    Ok(ext == extension && !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// Validates a frame-extraction request once at the filesystem/media boundary.
 ///
 /// GPUs are rejected outright: extraction is a CPU-only pipeline and a silent
@@ -111,6 +138,12 @@ pub fn prepare_frame_extraction(
         return Err(reject(
             source,
             "output directory aliases the source file (in-place extraction is not allowed)",
+        ));
+    }
+    if is_generated_frame_path(&validated_source, output_dir, output_format.extension())? {
+        return Err(reject(
+            source,
+            "source path matches a generated frame_<n>.<ext> name in the output directory",
         ));
     }
 
@@ -283,6 +316,63 @@ mod tests {
             aliased,
             Err(ProbeError::InvalidVideo { .. } | ProbeError::TargetNotADirectory(_))
         ));
+        fs::remove_dir_all(&root).map_err(|source| ProbeError::Io {
+            path: root.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_source_named_like_a_generated_frame() -> Result<(), ProbeError> {
+        let root = temp_root("frame-name")?;
+        let source = root.join("frame_000001.gif");
+        fs::write(&source, TINY_GIF).map_err(|err| ProbeError::Io {
+            path: source.clone(),
+            source: err,
+        })?;
+        let result = prepare_frame_extraction(
+            &source,
+            &root,
+            ImageOutputFormat::Gif,
+            None,
+            FrameSelection::All,
+            FrameRange::new(0, None).map_err(ProbeError::from)?,
+            None,
+            HardwareBackend::Cpu,
+        );
+        assert!(matches!(result, Err(ProbeError::InvalidVideo { .. })));
+
+        // A different extension cannot collide with the .gif output frame.
+        let other_ext = prepare_frame_extraction(
+            &source,
+            &root,
+            ImageOutputFormat::Png,
+            None,
+            FrameSelection::All,
+            FrameRange::new(0, None).map_err(ProbeError::from)?,
+            None,
+            HardwareBackend::Cpu,
+        );
+        assert!(other_ext.is_ok());
+
+        // An ordinary name in the same directory stays valid.
+        let ordinary = root.join("clip.gif");
+        fs::write(&ordinary, TINY_GIF).map_err(|err| ProbeError::Io {
+            path: ordinary.clone(),
+            source: err,
+        })?;
+        let valid = prepare_frame_extraction(
+            &ordinary,
+            &root,
+            ImageOutputFormat::Gif,
+            None,
+            FrameSelection::All,
+            FrameRange::new(0, None).map_err(ProbeError::from)?,
+            None,
+            HardwareBackend::Cpu,
+        );
+        assert!(valid.is_ok());
         fs::remove_dir_all(&root).map_err(|source| ProbeError::Io {
             path: root.clone(),
             source,

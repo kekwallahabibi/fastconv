@@ -316,6 +316,7 @@ mod tests {
     use super::{FramesArgs, FramesCommand, parse_frames_args};
     use fastconv_domain::{
         FrameSelection, HardwareBackend, ImageCompression, ImageOutputFormat, ImageQuality,
+        TargetFps,
     };
     use std::num::{NonZeroU32, NonZeroUsize};
     use std::path::PathBuf;
@@ -373,7 +374,10 @@ mod tests {
                 quality: ImageQuality::new(90).map_err(|err| err.to_string())?
             })
         );
-        assert_eq!(parsed.selection, FrameSelection::TargetFps(12.5));
+        assert_eq!(
+            parsed.selection,
+            FrameSelection::TargetFps(TargetFps::new(12.5).map_err(|err| err.to_string())?)
+        );
         assert_eq!((parsed.start, parsed.end), (3, Some(9)));
         assert_eq!(parsed.threads, NonZeroUsize::new(4));
         assert_eq!(parsed.backend, HardwareBackend::Cpu);

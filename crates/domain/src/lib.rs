@@ -12,7 +12,9 @@ pub use audio::{
     AudioStreamInfo, AudioTargetCodec, PcmWavLayout, VideoAudioContainer, aac_frame_capacity_bps,
     fnv1a64,
 };
-pub use frames::{FrameExtractionPlan, FrameExtractionReport, FrameRange, FrameSelection};
+pub use frames::{
+    FrameExtractionPlan, FrameExtractionReport, FrameRange, FrameSelection, TargetFps,
+};
 pub use hardware::{
     CpuInfo, DetectedGpuBackend, GpuAdapterInfo, GpuCapability, GpuVendor, HostHardware, SimdLevel,
 };

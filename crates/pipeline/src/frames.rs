@@ -9,8 +9,8 @@
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::thread;
 
 use crossbeam_channel as channel;
@@ -31,22 +31,154 @@ use crate::video_anim::{
 use crate::video_codecs::{decode_video_track_streaming_ctrl, nv12_buffer_len};
 use crate::video_container::demux_video;
 
-/// Upper bound on raw pixel bytes held by in-flight extraction jobs. Buffers
-/// returned by workers are reused, so the allocation count tracks this budget
-/// rather than the total number of frames in the source.
+/// Hard upper bound on the *aggregate* raw decoded-pixel bytes held at once by
+/// one extraction: decoder-held, queued, worker-held and buffers kept for reuse
+/// all count. Every live buffer stays charged to this budget until dropped.
 const MAX_IN_FLIGHT_BYTES: usize = 256 * 1024 * 1024;
 /// Memory-hungry 4K still encoders use at most this many image workers.
 const MAX_HEAVY_WORKERS: usize = 8;
-/// Fallback per-pixel size when the source has no probed dimensions.
-const FALLBACK_FRAME_BYTES: usize = 3840 * 2160 * 4;
 
-/// One recycled decoded frame travelling from decoder to encoder worker.
+/// A decoded frame travelling from decoder to encoder worker. `charged` is the
+/// byte amount this buffer holds against the pool budget until it is returned.
 struct FrameJob {
     sequence: u64,
     pixels: Vec<u8>,
+    charged: usize,
     width: u32,
     height: u32,
     format: DecodedPixelFormat,
+}
+
+fn frame_error(reason: impl Into<String>) -> PipelineError {
+    PipelineError::DecodeFailed {
+        path: PathBuf::new(),
+        reason: reason.into(),
+    }
+}
+
+/// Copies the valid columns/rows of a padded decoded frame into a cropped
+/// destination. The padded stride is required by NV12 conversion but must not
+/// leak into the emitted image dimensions.
+fn copy_cropped_rows(
+    src: &[u8],
+    src_width: u32,
+    dst: &mut [u8],
+    dst_width: u32,
+    height: u32,
+    channels: usize,
+) -> Result<(), PipelineError> {
+    let overflow = || frame_error("frame row offset overflows usize");
+    let src_w = usize::try_from(src_width).map_err(|_| overflow())?;
+    let dst_w = usize::try_from(dst_width).map_err(|_| overflow())?;
+    let rows = usize::try_from(height).map_err(|_| overflow())?;
+    let row_bytes = dst_w.checked_mul(channels).ok_or_else(overflow)?;
+    for row in 0..rows {
+        let start = row
+            .checked_mul(src_w)
+            .and_then(|v| v.checked_mul(channels))
+            .ok_or_else(overflow)?;
+        let end = start.checked_add(row_bytes).ok_or_else(overflow)?;
+        let dst_start = row.checked_mul(row_bytes).ok_or_else(overflow)?;
+        let dst_end = dst_start.checked_add(row_bytes).ok_or_else(overflow)?;
+        let src_row = src
+            .get(start..end)
+            .ok_or_else(|| frame_error("decoded frame row is out of bounds"))?;
+        let dst_row = dst
+            .get_mut(dst_start..dst_end)
+            .ok_or_else(|| frame_error("cropped frame row is out of bounds"))?;
+        dst_row.copy_from_slice(src_row);
+    }
+    Ok(())
+}
+
+/// Byte-bounded pool of raw decoded-pixel buffers. Admission is based on the
+/// actual frame length at `take` time; pooled buffers remain charged so the
+/// decoder, the job queue and all workers together can never exceed `limit`.
+struct PixelPool {
+    state: Mutex<PoolState>,
+    changed: Condvar,
+    limit: usize,
+}
+
+struct PoolState {
+    /// Returned buffers with the byte amount charged for each.
+    free: Vec<(Vec<u8>, usize)>,
+    /// Sum of charges for every live buffer, including worker-held ones.
+    live_bytes: usize,
+}
+
+impl PixelPool {
+    fn new(limit: usize) -> Self {
+        Self {
+            state: Mutex::new(PoolState {
+                free: Vec::new(),
+                live_bytes: 0,
+            }),
+            changed: Condvar::new(),
+            limit,
+        }
+    }
+
+    /// Reserves `needed` bytes and returns a cleared buffer with at least that
+    /// capacity, plus the amount charged to the budget for this buffer.
+    fn take(&self, needed: usize) -> Result<(Vec<u8>, usize), PipelineError> {
+        if needed > self.limit {
+            return Err(frame_error(format!(
+                "a frame needs {needed} pixel bytes, above the {}-byte budget",
+                self.limit
+            )));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(pos) = state
+                .free
+                .iter()
+                .position(|(buffer, _)| buffer.capacity() >= needed)
+            {
+                let (mut buffer, charged) = state.free.remove(pos);
+                buffer.clear();
+                buffer.resize(needed, 0);
+                return Ok((buffer, charged));
+            }
+            let additional = state.live_bytes.saturating_add(needed);
+            if additional <= self.limit {
+                state.live_bytes = additional;
+                return Ok((vec![0_u8; needed], needed));
+            }
+            // An idle buffer too small for this frame can be released; its
+            // charge stays counted until this exact point.
+            if let Some(pos) = state
+                .free
+                .iter()
+                .position(|(buffer, _)| buffer.capacity() < needed)
+            {
+                let (buffer, charged) = state.free.remove(pos);
+                drop(buffer);
+                state.live_bytes = state.live_bytes.saturating_sub(charged);
+                continue;
+            }
+            // Every remaining byte is in a queued or worker-owned buffer; a
+            // returning worker notifies this wait.
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Returns a buffer to the pool; its bytes stay charged to the budget.
+    fn release(&self, buffer: Vec<u8>, charged: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.free.push((buffer, charged));
+        drop(state);
+        self.changed.notify_one();
+    }
 }
 
 /// Chooses frames deterministically from an inclusive zero-based range.
@@ -61,7 +193,7 @@ struct Selector {
 impl Selector {
     fn new(selection: FrameSelection, start: u64) -> Self {
         let interval_us = match selection {
-            FrameSelection::TargetFps(fps) => fps_interval_us(fps),
+            FrameSelection::TargetFps(fps) => fps_interval_us(fps.get()),
             FrameSelection::All | FrameSelection::Every(_) => 1,
         };
         Self {
@@ -168,41 +300,15 @@ fn frame_byte_len(width: u32, height: u32, channels: usize) -> Result<usize, Pip
         })
 }
 
-/// Reuses a returned buffer when possible, otherwise allocates one within the
-/// hard in-flight budget. `vec!` is only reached after the cap check.
-fn take_buffer(pool: &mut Vec<Vec<u8>>, needed: usize) -> Result<Vec<u8>, PipelineError> {
-    if needed > MAX_IN_FLIGHT_BYTES {
-        return Err(PipelineError::DecodeFailed {
-            path: PathBuf::new(),
-            reason: format!(
-                "single frame needs {needed} bytes, above the {MAX_IN_FLIGHT_BYTES}-byte frame budget"
-            ),
-        });
-    }
-    if let Some(index) = pool.iter().position(|buffer| buffer.capacity() >= needed) {
-        let mut buffer = pool.remove(index);
-        buffer.clear();
-        buffer.resize(needed, 0);
-        return Ok(buffer);
-    }
-    // Discard oversized stale buffers so an anomalously large frame cannot pin
-    // memory for the rest of the extraction.
-    pool.clear();
-    Ok(vec![0_u8; needed])
-}
+type FillFn<'a> = &'a mut (dyn FnMut(&mut [u8], u32, u32) -> Result<(), PipelineError> + 'a);
 
-fn channel_capacity(frame_bytes: usize, workers: usize) -> usize {
-    let slots = MAX_IN_FLIGHT_BYTES / frame_bytes.max(1);
-    slots.clamp(1, workers.saturating_mul(2)).max(1)
-}
-
-/// Decode-side state: selection, buffer pool, and bounded job production.
+/// Decode-side state: selection, byte budget, and job production.
 struct FrameEmitter<'a> {
     selector: Selector,
     range: FrameRange,
-    pool: Vec<Vec<u8>>,
+    expected: Option<(u32, u32)>,
+    pool: &'a PixelPool,
     job_tx: channel::Sender<FrameJob>,
-    buffer_rx: &'a channel::Receiver<Vec<u8>>,
     error_rx: &'a channel::Receiver<PipelineError>,
     failed: &'a AtomicBool,
     sequence: u64,
@@ -210,7 +316,9 @@ struct FrameEmitter<'a> {
 }
 
 impl FrameEmitter<'_> {
-    /// Fills a recycled buffer for one selected frame and queues it.
+    /// Fills a budgeted buffer for one selected frame and queues it. `fill`
+    /// receives the cropped output dimensions so padded decoders can trim the
+    /// extra columns/rows before emission.
     #[allow(clippy::too_many_arguments)]
     fn emit(
         &mut self,
@@ -221,7 +329,7 @@ impl FrameEmitter<'_> {
         height: u32,
         format: DecodedPixelFormat,
         channels: usize,
-        fill: &mut dyn FnMut(&mut [u8]) -> Result<(), PipelineError>,
+        fill: FillFn<'_>,
     ) -> Result<(), PipelineError> {
         if !self.selector.should_emit(index, pts_us) {
             return Ok(());
@@ -229,25 +337,31 @@ impl FrameEmitter<'_> {
         if self.failed.load(Ordering::Relaxed) {
             return Err(PipelineError::WorkerPanicked);
         }
-        let needed =
-            frame_byte_len(width, height, channels).map_err(|_| PipelineError::DecodeFailed {
+        // Padded decoded dimensions (e.g. odd-sized MJPEG) are trimmed to the
+        // probed source size when that is smaller; never emit padding.
+        let (out_width, out_height) = match self.expected {
+            Some((w, h)) if w <= width && h <= height => (w, h),
+            _ => (width, height),
+        };
+        let needed = frame_byte_len(out_width, out_height, channels).map_err(|_| {
+            PipelineError::DecodeFailed {
                 path: source.to_path_buf(),
                 reason: "frame dimensions overflow the pixel buffer".to_owned(),
-            })?;
-        while let Ok(returned) = self.buffer_rx.try_recv() {
-            if returned.capacity() <= MAX_IN_FLIGHT_BYTES && self.pool.len() < 32 {
-                self.pool.push(returned);
             }
+        })?;
+        let (mut pixels, charged) = self.pool.take(needed)?;
+        if let Err(err) = fill(&mut pixels, out_width, out_height) {
+            self.pool.release(pixels, charged);
+            return Err(err);
         }
-        let mut pixels = take_buffer(&mut self.pool, needed)?;
-        fill(&mut pixels)?;
         self.sequence = self.sequence.saturating_add(1);
         self.job_tx
             .send(FrameJob {
                 sequence: self.sequence,
                 pixels,
-                width,
-                height,
+                charged,
+                width: out_width,
+                height: out_height,
                 format,
             })
             .map_err(|_| {
@@ -255,7 +369,7 @@ impl FrameEmitter<'_> {
                     .try_recv()
                     .unwrap_or(PipelineError::WorkerPanicked)
             })?;
-        self.last_dims = Some((width, height));
+        self.last_dims = Some((out_width, out_height));
         Ok(())
     }
 }
@@ -269,35 +383,30 @@ fn decode_animation(
     let mut on_frame = |info: crate::video_anim::AnimFrameInfo, pixels: &[u8]| {
         let index = frame_index;
         frame_index = frame_index.saturating_add(1);
+        let at_end = emitter.range.end() == Some(index);
         if emitter.range.is_past_end(index) {
             return Ok(ControlFlow::Break(()));
         }
-        if !emitter.range.contains(index) {
-            return Ok(ControlFlow::Continue(()));
+        if emitter.range.contains(index) {
+            emitter.emit(
+                source,
+                index,
+                info.pts_us,
+                info.width,
+                info.height,
+                DecodedPixelFormat::Rgba8,
+                4,
+                &mut |dst, out_width, out_height| {
+                    copy_cropped_rows(pixels, info.width, dst, out_width, out_height, 4)
+                },
+            )?;
         }
-        emitter.emit(
-            source,
-            index,
-            info.pts_us,
-            info.width,
-            info.height,
-            DecodedPixelFormat::Rgba8,
-            4,
-            &mut |dst| {
-                let Some(slice) = pixels.get(..dst.len()) else {
-                    return Err(PipelineError::DecodeFailed {
-                        path: source.to_path_buf(),
-                        reason: format!(
-                            "animation decoder produced {} bytes, expected at least {}",
-                            pixels.len(),
-                            dst.len()
-                        ),
-                    });
-                };
-                dst.copy_from_slice(slice);
-                Ok(())
-            },
-        )?;
+        // Stop on the inclusive end frame itself: decoding another frame just
+        // to observe `index > end` would fail on a corrupt trailing frame that
+        // was never requested.
+        if at_end {
+            return Ok(ControlFlow::Break(()));
+        }
         Ok(ControlFlow::Continue(()))
     };
     match container {
@@ -337,44 +446,80 @@ fn decode_video(
         .collect();
     let mut frame_index = 0_u64;
     let mut nv12 = Vec::new();
+    let mut rgb_scratch = Vec::new();
     decode_video_track_streaming_ctrl(source, track, &packets, |info, pack| {
         let index = frame_index;
         frame_index = frame_index.saturating_add(1);
+        let at_end = emitter.range.end() == Some(index);
         if emitter.range.is_past_end(index) {
             return Ok(ControlFlow::Break(()));
         }
-        if !emitter.range.contains(index) {
-            return Ok(ControlFlow::Continue(()));
-        }
-        emitter.emit(
-            source,
-            index,
-            info.pts_us,
-            info.width,
-            info.height,
-            DecodedPixelFormat::Rgb8,
-            3,
-            &mut |dst| {
-                let pitch =
-                    usize::try_from(info.width).map_err(|_| PipelineError::DecodeFailed {
-                        path: source.to_path_buf(),
-                        reason: "NV12 pitch overflows usize".to_owned(),
-                    })?;
-                let needed = nv12_buffer_len(info.width, info.height, pitch)?;
-                if nv12.len() < needed {
-                    if needed > MAX_IN_FLIGHT_BYTES {
-                        return Err(PipelineError::DecodeFailed {
+        if emitter.range.contains(index) {
+            emitter.emit(
+                source,
+                index,
+                info.pts_us,
+                info.width,
+                info.height,
+                DecodedPixelFormat::Rgb8,
+                3,
+                &mut |dst, out_width, out_height| {
+                    let pitch =
+                        usize::try_from(info.width).map_err(|_| PipelineError::DecodeFailed {
                             path: source.to_path_buf(),
-                            reason: "NV12 scratch exceeds the frame budget".to_owned(),
-                        });
+                            reason: "NV12 pitch overflows usize".to_owned(),
+                        })?;
+                    let needed = nv12_buffer_len(info.width, info.height, pitch)?;
+                    if nv12.len() < needed {
+                        if needed > MAX_IN_FLIGHT_BYTES {
+                            return Err(PipelineError::DecodeFailed {
+                                path: source.to_path_buf(),
+                                reason: "NV12 scratch exceeds the frame budget".to_owned(),
+                            });
+                        }
+                        nv12.clear();
+                        nv12.resize(needed, 0);
                     }
-                    nv12.clear();
-                    nv12.resize(needed, 0);
-                }
-                pack(nv12.as_mut_slice(), pitch)?;
-                nv12_to_rgb8_into(&nv12, dst, pitch, info.width, info.height, info.color)
-            },
-        )?;
+                    pack(nv12.as_mut_slice(), pitch)?;
+                    if (info.width, info.height) == (out_width, out_height) {
+                        nv12_to_rgb8_into(&nv12, dst, pitch, info.width, info.height, info.color)
+                    } else {
+                        // MJPEG rounds odd dimensions up to even for NV12;
+                        // convert at the padded size, then crop to the source.
+                        let padded = frame_byte_len(info.width, info.height, 3)?;
+                        if rgb_scratch.len() < padded {
+                            if padded > MAX_IN_FLIGHT_BYTES {
+                                return Err(PipelineError::DecodeFailed {
+                                    path: source.to_path_buf(),
+                                    reason: "RGB scratch exceeds the frame budget".to_owned(),
+                                });
+                            }
+                            rgb_scratch.clear();
+                            rgb_scratch.resize(padded, 0);
+                        }
+                        nv12_to_rgb8_into(
+                            &nv12,
+                            &mut rgb_scratch[..padded],
+                            pitch,
+                            info.width,
+                            info.height,
+                            info.color,
+                        )?;
+                        copy_cropped_rows(
+                            &rgb_scratch[..padded],
+                            info.width,
+                            dst,
+                            out_width,
+                            out_height,
+                            3,
+                        )
+                    }
+                },
+            )?;
+        }
+        if at_end {
+            return Ok(ControlFlow::Break(()));
+        }
         Ok(ControlFlow::Continue(()))
     })
 }
@@ -389,14 +534,15 @@ fn run_decode(
         }
         container => decode_video(plan.source(), container, emitter)?,
     };
-    // Breaking early (past `--end`) is an expected optimisation.
+    // Breaking early (past `--end`) is an expected optimisation. This discards
+    // only a `#[must_use]` flow marker, never an error or a fallback.
     let _ = flow;
     Ok(())
 }
 
 struct WorkerContext<'a> {
     job_rx: &'a channel::Receiver<FrameJob>,
-    buffer_tx: &'a channel::Sender<Vec<u8>>,
+    pool: &'a PixelPool,
     error_tx: &'a channel::Sender<PipelineError>,
     failed: &'a AtomicBool,
     total_bytes: &'a AtomicU64,
@@ -410,7 +556,7 @@ struct WorkerContext<'a> {
 
 fn run_worker(ctx: &WorkerContext<'_>) {
     let job_rx = ctx.job_rx;
-    let buffer_tx = ctx.buffer_tx;
+    let pool = ctx.pool;
     let error_tx = ctx.error_tx;
     let failed = ctx.failed;
     let total_bytes = ctx.total_bytes;
@@ -427,12 +573,24 @@ fn run_worker(ctx: &WorkerContext<'_>) {
         if failed.load(Ordering::Relaxed) {
             // Keep draining jobs and returning buffers so the decoder can
             // never block on a failed worker.
-            if buffer_tx.send(job.pixels).is_err() {
-                break;
-            }
+            pool.release(job.pixels, job.charged);
             continue;
         }
         let target = output_dir.join(format!("frame_{:06}.{extension}", job.sequence));
+        if target == source {
+            // The probe boundary rejects this layout first; keep a lexical
+            // backstop so no caller can publish a frame over its own source.
+            let err = PipelineError::EncodeFailed {
+                path: target,
+                reason: "frame target would overwrite the extraction source".to_owned(),
+            };
+            failed.store(true, Ordering::Relaxed);
+            if error_tx.send(err).is_err() {
+                break;
+            }
+            pool.release(job.pixels, job.charged);
+            continue;
+        }
         let decoded = crate::decode::DecodedFrameMeta {
             width: job.width,
             height: job.height,
@@ -469,9 +627,7 @@ fn run_worker(ctx: &WorkerContext<'_>) {
                 }
             }
         }
-        if buffer_tx.send(job.pixels).is_err() {
-            break;
-        }
+        pool.release(job.pixels, job.charged);
     }
 }
 
@@ -498,12 +654,10 @@ pub fn execute_frame_extraction(
         }
         _ => (configured.max(1), 1),
     };
-    let known_bytes = plan
-        .source_dimensions()
-        .and_then(|dims| frame_byte_len(dims.width().get(), dims.height().get(), 4).ok())
-        .unwrap_or(FALLBACK_FRAME_BYTES);
-    let (job_tx, job_rx) = channel::bounded::<FrameJob>(channel_capacity(known_bytes, workers));
-    let (buffer_tx, buffer_rx) = channel::unbounded::<Vec<u8>>();
+    // The aggregate byte budget, not a slot count, is the memory limiter: the
+    // pool charges every live buffer regardless of where it currently sits.
+    let pool = PixelPool::new(MAX_IN_FLIGHT_BYTES);
+    let (job_tx, job_rx) = channel::unbounded::<FrameJob>();
     let (error_tx, error_rx) = channel::unbounded::<PipelineError>();
     let failed = AtomicBool::new(false);
     let total_bytes = AtomicU64::new(0);
@@ -515,7 +669,7 @@ pub fn execute_frame_extraction(
             scope.spawn(|| {
                 let ctx = WorkerContext {
                     job_rx: &job_rx,
-                    buffer_tx: &buffer_tx,
+                    pool: &pool,
                     error_tx: &error_tx,
                     failed: &failed,
                     total_bytes: &total_bytes,
@@ -529,12 +683,15 @@ pub fn execute_frame_extraction(
                 run_worker(&ctx);
             });
         }
+        let expected = plan
+            .source_dimensions()
+            .map(|dims| (dims.width().get(), dims.height().get()));
         let mut emitter = FrameEmitter {
             selector: Selector::new(plan.selection(), plan.range().start()),
             range: plan.range(),
-            pool: Vec::new(),
+            expected,
+            pool: &pool,
             job_tx,
-            buffer_rx: &buffer_rx,
             error_rx: &error_rx,
             failed: &failed,
             sequence: 0,
@@ -579,10 +736,12 @@ pub fn execute_frame_extraction(
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameExtractionPlan, PipelineError, execute_frame_extraction};
+    use super::{FrameExtractionPlan, PipelineError, copy_cropped_rows, execute_frame_extraction};
     use crate::video_anim::{AnimFrameInfo, encode_animation_stream};
-    use crate::video_codecs::{Yuv420Frame, YuvColor, encode_video_cpu};
-    use crate::video_container::{ContainerMedia, mux_video};
+    use crate::video_codecs::{
+        Yuv420Frame, YuvColor, decode_video_track_streaming_ctrl, encode_video_cpu,
+    };
+    use crate::video_container::{ContainerMedia, demux_video, mux_video};
     use fastconv_domain::{
         AnimationLoop, FrameRange, FrameSelection, ImageDimensions, ImageExecutionMode,
         ImageOutputFormat, VideoContainerFormat, VideoEncodeMode, VideoQuality, VideoRateControl,
@@ -592,6 +751,7 @@ mod tests {
     use std::fs::{self, File};
     use std::io::BufReader;
     use std::num::{NonZeroU32, NonZeroUsize};
+    use std::ops::ControlFlow;
     use std::path::{Path, PathBuf};
     use std::process;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1002,6 +1162,75 @@ mod tests {
         let mut dst = vec![0_u8; expected.len()];
         nv12_to_rgb8_into(&nv12, &mut dst, pitch, width, height, YuvColor::default())?;
         assert_eq!(dst, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn copy_cropped_rows_trims_padded_columns() -> Result<(), Box<dyn Error>> {
+        let padded = [1_u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut cropped = [0_u8; 6];
+        copy_cropped_rows(&padded, 4, &mut cropped, 3, 2, 1)?;
+        assert_eq!(cropped, [1, 2, 3, 5, 6, 7]);
+
+        // RGBA rows with a padding column and row are trimmed on both axes.
+        let rgba = [1_u8, 2, 3, 4, 9, 9, 9, 9, 5, 6, 7, 8, 9, 9, 9, 9];
+        let mut out = [0_u8; 8];
+        copy_cropped_rows(&rgba, 2, &mut out, 1, 2, 4)?;
+        assert_eq!(out, [1, 2, 3, 4, 5, 6, 7, 8]);
+        Ok(())
+    }
+
+    #[test]
+    fn ctrl_decode_stops_after_callback_break() -> Result<(), Box<dyn Error>> {
+        let root = temp_root("ctrl-stop")?;
+        let source = root.join("in.mp4");
+        write_video(&source, VideoContainerFormat::Mp4, &solid_frames(3, 32, 32))?;
+        let media = demux_video(&source, VideoContainerFormat::Mp4)?;
+        let track_index = media
+            .tracks
+            .iter()
+            .position(|track| track.codec.is_video())
+            .ok_or("no video track")?;
+        let packets: Vec<_> = media
+            .packets
+            .iter()
+            .filter(|packet| packet.track == track_index)
+            .cloned()
+            .collect();
+        let mut seen = 0_u64;
+        let flow = decode_video_track_streaming_ctrl(
+            &source,
+            &media.tracks[track_index],
+            &packets,
+            |_info, _pack| {
+                seen = seen.saturating_add(1);
+                Ok(ControlFlow::Break(()))
+            },
+        )?;
+        assert_eq!(seen, 1, "decode must stop at the callback break");
+        assert!(matches!(flow, ControlFlow::Break(())));
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn end_zero_extracts_only_the_first_frame() -> Result<(), Box<dyn Error>> {
+        let root = temp_root("end-zero")?;
+        let source = root.join("in.mp4");
+        write_video(&source, VideoContainerFormat::Mp4, &solid_frames(3, 32, 32))?;
+        let out = root.join("png");
+        let report = execute_frame_extraction(&plan(
+            &source,
+            &out,
+            VideoContainerFormat::Mp4,
+            ImageOutputFormat::Png,
+            FrameSelection::All,
+            FrameRange::new(0, Some(0))?,
+        )?)?;
+        assert_eq!(report.frames_extracted().get(), 1);
+        assert!(out.join("frame_000001.png").is_file());
+        assert!(!out.join("frame_000002.png").exists());
+        fs::remove_dir_all(&root)?;
         Ok(())
     }
 }
