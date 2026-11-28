@@ -91,6 +91,36 @@ fn copy_cropped_rows(
     Ok(())
 }
 
+fn row_bytes(width: u32, channels: usize) -> Result<usize, PipelineError> {
+    usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(channels))
+        .ok_or_else(|| frame_error("frame row stride overflows usize"))
+}
+
+/// Compacts a padded RGB buffer down to its cropped dimensions in place, so no
+/// second raw-pixel allocation is needed for odd-sized decoded frames.
+fn compact_cropped_rgb(
+    rgb: &mut Vec<u8>,
+    padded_width: u32,
+    out_width: u32,
+    out_height: u32,
+) -> Result<(), PipelineError> {
+    let overflow = || frame_error("cropped row offset overflows usize");
+    let src_stride = row_bytes(padded_width, 3)?;
+    let out_stride = row_bytes(out_width, 3)?;
+    let rows = usize::try_from(out_height).map_err(|_| overflow())?;
+    for row in 0..rows {
+        let start = row.checked_mul(src_stride).ok_or_else(overflow)?;
+        let end = start.checked_add(out_stride).ok_or_else(overflow)?;
+        let target = row.checked_mul(out_stride).ok_or_else(overflow)?;
+        rgb.copy_within(start..end, target);
+    }
+    let cropped = rows.checked_mul(out_stride).ok_or_else(overflow)?;
+    rgb.truncate(cropped);
+    Ok(())
+}
+
 /// Byte-bounded pool of raw decoded-pixel buffers. Admission is based on the
 /// actual frame length at `take` time; pooled buffers remain charged so the
 /// decoder, the job queue and all workers together can never exceed `limit`.
@@ -300,7 +330,7 @@ fn frame_byte_len(width: u32, height: u32, channels: usize) -> Result<usize, Pip
         })
 }
 
-type FillFn<'a> = &'a mut (dyn FnMut(&mut [u8], u32, u32) -> Result<(), PipelineError> + 'a);
+type FillFn<'a> = &'a mut (dyn FnMut(&mut Vec<u8>, u32, u32) -> Result<(), PipelineError> + 'a);
 
 /// Decode-side state: selection, byte budget, and job production.
 struct FrameEmitter<'a> {
@@ -329,6 +359,7 @@ impl FrameEmitter<'_> {
         height: u32,
         format: DecodedPixelFormat,
         channels: usize,
+        reserve: Option<usize>,
         fill: FillFn<'_>,
     ) -> Result<(), PipelineError> {
         if !self.selector.should_emit(index, pts_us) {
@@ -349,10 +380,20 @@ impl FrameEmitter<'_> {
                 reason: "frame dimensions overflow the pixel buffer".to_owned(),
             }
         })?;
-        let (mut pixels, charged) = self.pool.take(needed)?;
+        // A padded decoder reserves its larger frame size but compacts to the
+        // cropped length inside `fill`; both sizes stay charged to the same pool.
+        let reserved = reserve.unwrap_or(needed).max(needed);
+        let (mut pixels, charged) = self.pool.take(reserved)?;
         if let Err(err) = fill(&mut pixels, out_width, out_height) {
             self.pool.release(pixels, charged);
             return Err(err);
+        }
+        if pixels.len() != needed {
+            let actual = pixels.len();
+            self.pool.release(pixels, charged);
+            return Err(frame_error(format!(
+                "frame buffer is {actual} bytes, expected {needed} after cropping"
+            )));
         }
         self.sequence = self.sequence.saturating_add(1);
         self.job_tx
@@ -396,8 +437,9 @@ fn decode_animation(
                 info.height,
                 DecodedPixelFormat::Rgba8,
                 4,
+                None,
                 &mut |dst, out_width, out_height| {
-                    copy_cropped_rows(pixels, info.width, dst, out_width, out_height, 4)
+                    copy_cropped_rows(pixels, info.width, &mut dst[..], out_width, out_height, 4)
                 },
             )?;
         }
@@ -446,7 +488,6 @@ fn decode_video(
         .collect();
     let mut frame_index = 0_u64;
     let mut nv12 = Vec::new();
-    let mut rgb_scratch = Vec::new();
     decode_video_track_streaming_ctrl(source, track, &packets, |info, pack| {
         let index = frame_index;
         frame_index = frame_index.saturating_add(1);
@@ -455,6 +496,10 @@ fn decode_video(
             return Ok(ControlFlow::Break(()));
         }
         if emitter.range.contains(index) {
+            // MJPEG rounds odd dimensions up to even for NV12. Reserve the
+            // padded RGB bytes from the same pool as the emitted frame, then
+            // compact in place: no second raw-pixel allocation escapes the cap.
+            let padded = frame_byte_len(info.width, info.height, 3)?;
             emitter.emit(
                 source,
                 index,
@@ -463,6 +508,7 @@ fn decode_video(
                 info.height,
                 DecodedPixelFormat::Rgb8,
                 3,
+                Some(padded),
                 &mut |dst, out_width, out_height| {
                     let pitch =
                         usize::try_from(info.width).map_err(|_| PipelineError::DecodeFailed {
@@ -481,39 +527,18 @@ fn decode_video(
                         nv12.resize(needed, 0);
                     }
                     pack(nv12.as_mut_slice(), pitch)?;
-                    if (info.width, info.height) == (out_width, out_height) {
-                        nv12_to_rgb8_into(&nv12, dst, pitch, info.width, info.height, info.color)
-                    } else {
-                        // MJPEG rounds odd dimensions up to even for NV12;
-                        // convert at the padded size, then crop to the source.
-                        let padded = frame_byte_len(info.width, info.height, 3)?;
-                        if rgb_scratch.len() < padded {
-                            if padded > MAX_IN_FLIGHT_BYTES {
-                                return Err(PipelineError::DecodeFailed {
-                                    path: source.to_path_buf(),
-                                    reason: "RGB scratch exceeds the frame budget".to_owned(),
-                                });
-                            }
-                            rgb_scratch.clear();
-                            rgb_scratch.resize(padded, 0);
-                        }
-                        nv12_to_rgb8_into(
-                            &nv12,
-                            &mut rgb_scratch[..padded],
-                            pitch,
-                            info.width,
-                            info.height,
-                            info.color,
-                        )?;
-                        copy_cropped_rows(
-                            &rgb_scratch[..padded],
-                            info.width,
-                            dst,
-                            out_width,
-                            out_height,
-                            3,
-                        )
+                    nv12_to_rgb8_into(
+                        &nv12,
+                        &mut dst[..padded],
+                        pitch,
+                        info.width,
+                        info.height,
+                        info.color,
+                    )?;
+                    if (info.width, info.height) != (out_width, out_height) {
+                        compact_cropped_rgb(dst, info.width, out_width, out_height)?;
                     }
+                    Ok(())
                 },
             )?;
         }
@@ -736,7 +761,10 @@ pub fn execute_frame_extraction(
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameExtractionPlan, PipelineError, copy_cropped_rows, execute_frame_extraction};
+    use super::{
+        FrameExtractionPlan, PipelineError, compact_cropped_rgb, copy_cropped_rows,
+        execute_frame_extraction,
+    };
     use crate::video_anim::{AnimFrameInfo, encode_animation_stream};
     use crate::video_codecs::{
         Yuv420Frame, YuvColor, decode_video_track_streaming_ctrl, encode_video_cpu,
@@ -1177,6 +1205,20 @@ mod tests {
         let mut out = [0_u8; 8];
         copy_cropped_rows(&rgba, 2, &mut out, 1, 2, 4)?;
         assert_eq!(out, [1, 2, 3, 4, 5, 6, 7, 8]);
+        Ok(())
+    }
+
+    #[test]
+    fn compact_cropped_rgb_trims_padded_rows_in_place() -> Result<(), Box<dyn Error>> {
+        // Padded 4x2 RGB buffer (24 bytes) cropped to 3x2 (18 bytes).
+        let mut rgb: Vec<u8> = (1_u8..=24).collect();
+        compact_cropped_rgb(&mut rgb, 4, 3, 2)?;
+        assert_eq!(
+            rgb,
+            vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 14, 15, 16, 17, 18, 19, 20, 21
+            ]
+        );
         Ok(())
     }
 
