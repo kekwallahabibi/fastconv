@@ -18,7 +18,9 @@ use crate::decode::{DecodeTargetHint, DecodedPixelFormat, decode_source_image_in
 use crate::staging::StagingTarget;
 use crate::video_anim::{AnimFrameInfo, encode_animation_stream_bounded};
 
-/// Raw-pixel ceiling for in-flight animation frames (256 MiB).
+/// Raw-pixel ceiling for in-flight animation frames (256 MiB). This caps
+/// normal frames; a single frame whose raw size exceeds the budget is still
+/// processed through one worker, with memory bounded to that one frame.
 const RAW_PIXEL_BUDGET: u64 = 256 * 1024 * 1024;
 
 /// Resolves an output path against the nearest existing ancestor so a
@@ -253,7 +255,11 @@ pub fn execute_frame_sequence(
     // the byte budget is charged twice per worker.
     let by_memory = RAW_PIXEL_BUDGET / frame_bytes.saturating_mul(2).max(1);
     let memory_workers = usize::try_from(by_memory).unwrap_or(usize::MAX).max(1);
-    let workers = plan.worker_threads().get().min(memory_workers).max(1);
+    let workers = plan
+        .worker_threads()
+        .get()
+        .min(memory_workers)
+        .clamp(1, crate::video_anim::MAX_ANIM_WORKERS);
 
     let staging = StagingTarget::create_with_handle(plan.target_path(), 0)?;
     let mut file_bytes = Vec::new();
@@ -619,6 +625,57 @@ mod tests {
             execute_frame_sequence(&alias_plan),
             Err(PipelineError::EncodeFailed { .. })
         ));
+        fs::remove_dir_all(&root).map_err(|source| PipelineError::Io {
+            path: root.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn reports_effective_worker_count_capped_at_encoder_limit() -> Result<(), PipelineError> {
+        let root = temp_dir("worker-cap")?;
+        let source = root.join("source.png");
+        write_png(&source, 24, 16, png::ColorType::Rgb, &solid_rgb(24, 16, 0))?;
+        let frames = vec![frame(source, false)?];
+
+        let target = root.join("capped.gif");
+        let fps = StackFps::new(10.0).map_err(|err| PipelineError::EncodeFailed {
+            path: target.clone(),
+            reason: err.to_string(),
+        })?;
+        let quality = VideoQuality::new(95).map_err(|err| PipelineError::EncodeFailed {
+            path: target.clone(),
+            reason: err.to_string(),
+        })?;
+        let capped_plan = FrameSequencePlan::new(
+            frames.clone(),
+            ImageDimensions::new(24, 16).map_err(|err| PipelineError::EncodeFailed {
+                path: target.clone(),
+                reason: err.to_string(),
+            })?,
+            fps,
+            target,
+            StackExecutionMode::cpu_animation(StackTargetFormat::Gif, quality),
+            AnimationLoop::Times(NonZeroU16::new(2).unwrap_or(NonZeroU16::MIN)),
+            NonZeroUsize::new(16).unwrap_or(NonZeroUsize::MIN),
+        )
+        .map_err(|err| PipelineError::EncodeFailed {
+            path: PathBuf::from("frame-stack-test"),
+            reason: err.to_string(),
+        })?;
+        let report = execute_frame_sequence(&capped_plan)?;
+        assert_eq!(
+            report.worker_threads().get(),
+            crate::video_anim::MAX_ANIM_WORKERS
+        );
+
+        // A request below the cap must be reported unchanged.
+        let uncapped_target = root.join("uncapped.gif");
+        let uncapped_plan = plan(frames, uncapped_target, StackTargetFormat::Gif)?;
+        let report = execute_frame_sequence(&uncapped_plan)?;
+        assert_eq!(report.worker_threads().get(), 2);
+
         fs::remove_dir_all(&root).map_err(|source| PipelineError::Io {
             path: root.clone(),
             source,

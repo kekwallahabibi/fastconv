@@ -29,7 +29,7 @@ const ANIM_MEMORY_LIMIT: u64 = 512 * 1024 * 1024;
 /// Total decoded bytes one animation track may retain during a full decode.
 pub(crate) const ANIM_DECODED_BUDGET: u64 = 1_073_741_824;
 /// Upper bound on parallel per-frame quantisation/encoding workers.
-const MAX_ANIM_WORKERS: usize = 8;
+pub(crate) const MAX_ANIM_WORKERS: usize = 8;
 /// Private sentinel used to translate a `ControlFlow::Break` from a streaming
 /// callback through the older `Result`-based decoder plumbing. It never leaves
 /// the extraction pipeline as a user-visible error.
@@ -1908,7 +1908,9 @@ where
 /// Bounded variant used by frame stacks. `max_inflight_bytes` caps the total
 /// raw pixels held by the admission queue, prepared jobs and pending writes;
 /// `bytes_per_frame` scales that budget to the plan's actual frame size so an
-/// 8K stack cannot multiply a small worker count into gigabytes of RAM.
+/// 8K stack cannot multiply a small worker count into gigabytes of RAM. A
+/// single frame larger than the budget is still encoded through one worker,
+/// with memory bounded to that one frame.
 #[allow(clippy::too_many_arguments)] // Flat budget knobs keep the default wrapper zero-cost.
 pub(crate) fn encode_animation_stream_bounded<P>(
     format: VideoContainerFormat,
