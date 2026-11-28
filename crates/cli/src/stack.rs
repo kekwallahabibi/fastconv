@@ -35,7 +35,9 @@ Options:
    --fps <N>             Frames per second (default 15); finite, strictly
                          positive and bounded to 1e-6..=1_000_000 so frame
                          timings neither round to zero nor overflow; fractional
-                         rates are passed to NVENC as num/den
+                         rates are passed to NVENC as num/den; AVI targets
+                         require a frame duration within its u32 microsecond
+                         header (about >=0.000233 fps)
    --to <format>         Output container; inferred from the target extension
                          when omitted, and rejected if it conflicts with that
                          extension. Supports gif, webp, mp4, mkv, webm, mov,
@@ -142,8 +144,9 @@ pub(crate) fn parse_stack_args(args: &[&str]) -> Result<StackCommand, String> {
                     return Err(duplicate_flag("--to"));
                 }
                 let (raw, next) = flag_value_with_next(args, i, "--to")?;
+                let format = raw.trim();
                 state.to = Some(
-                    VideoContainerFormat::from_extension(raw).ok_or_else(|| {
+                    VideoContainerFormat::from_extension(format).ok_or_else(|| {
                         format!("unknown format '{raw}' (expected gif, webp, mp4, mkv, webm, mov, avi, or ts)")
                     })?,
                 );
@@ -263,8 +266,11 @@ fn print_report(report: &fastconv_domain::FrameSequenceReport, elapsed: std::tim
         (backend, Some(device)) => format!("{backend} on {device}"),
         (backend, None) => backend.to_string(),
     };
+    let threads = report
+        .worker_threads()
+        .map_or_else(String::new, |count| format!(" | {count} thread(s)"));
     println!(
-        "encoded {} frame(s) [{}x{} | .{} | {} | {} fps | {} | {} thread(s)] into {}: {:.2} MB in {:.1} ms ({:.2} fps)",
+        "encoded {} frame(s) [{}x{} | .{} | {} | {} fps | {}{}] into {}: {:.2} MB in {:.1} ms ({:.2} fps)",
         report.frames_encoded(),
         report.dimensions().width(),
         report.dimensions().height(),
@@ -272,7 +278,7 @@ fn print_report(report: &fastconv_domain::FrameSequenceReport, elapsed: std::tim
         report.video_codec().cli_name(),
         report.fps(),
         path,
-        report.worker_threads(),
+        threads,
         report.target_path().display(),
         mb,
         secs * 1_000.0,

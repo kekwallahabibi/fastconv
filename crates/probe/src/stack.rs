@@ -86,7 +86,8 @@ fn resolve_target_format(
     let extension = target
         .extension()
         .and_then(|ext| ext.to_str())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .trim();
     let inferred = VideoContainerFormat::from_extension(extension);
     match (explicit, inferred) {
         (Some(requested), Some(in_view)) if requested != in_view => {
@@ -246,8 +247,19 @@ pub fn prepare_frame_sequence(
         return Err(DomainError::EmptyPath(fastconv_domain::PathRole::Target).into());
     }
     let resolved_format = resolve_target_format(target, target_format)?;
-    let hardware =
-        hardware_needed(backend, requested_codec, resolved_format).then(detect_host_hardware);
+    // Reject hardware-independent option errors before touching the system, so
+    // e.g. `--loop` on a video target is never masked by a DRM/procfs I/O error.
+    StackExecutionMode::validate_stack_request(
+        resolved_format,
+        requested_codec,
+        rate_control,
+        explicit_loop,
+        backend,
+        nvenc_compiled,
+    )?;
+    // A CPU-only build can never select NVENC; do not probe the host at all.
+    let hardware = (nvenc_compiled && hardware_needed(backend, requested_codec, resolved_format))
+        .then(detect_host_hardware);
     let hardware = match hardware {
         Some(result) => Some(result?),
         None => None,

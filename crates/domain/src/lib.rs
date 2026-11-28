@@ -27,7 +27,7 @@ pub use image::{
 pub use metrics::{BenchmarkMetrics, BenchmarkSample, PeakMemory, Throughput, WorkloadUnit};
 pub use stack::{
     FrameSequencePlan, FrameSequenceReport, StackBackendRequest, StackExecutionMode, StackFps,
-    StackFrame, StackTargetFormat, parse_animation_loop,
+    StackFrame, StackTargetFormat, StackVideoMode, parse_animation_loop,
 };
 pub use video::{
     AnimationLoop, AnimationMeta, AudioBitrate, AudioChannels, AudioEncodeConfig,
@@ -313,6 +313,13 @@ pub enum DomainError {
         max_width: u32,
         max_height: u32,
     },
+    /// The selected video encoder has a static total-pixel budget.
+    StackVideoPixelLimit {
+        container: VideoContainerFormat,
+        width: u32,
+        height: u32,
+        max_pixels: u64,
+    },
 }
 
 pub(crate) fn require_non_empty(value: &str, field: &'static str) -> Result<String, DomainError> {
@@ -542,7 +549,8 @@ impl fmt::Display for DomainError {
             | Self::UnsupportedStackBackend { .. }
             | Self::UnsupportedStackLoop { .. }
             | Self::StackOddVideoDimensions { .. }
-            | Self::StackVideoDimensionLimit { .. } => fmt_stack_error(self, f),
+            | Self::StackVideoDimensionLimit { .. }
+            | Self::StackVideoPixelLimit { .. } => fmt_stack_error(self, f),
             Self::UnsupportedAudioRateControl {
                 format,
                 codec,
@@ -651,6 +659,16 @@ fn fmt_stack_error(err: &DomainError, f: &mut fmt::Formatter<'_>) -> fmt::Result
         } => write!(
             f,
             "stack frame dimensions {width}x{height} exceed the {} video limit of {max_width}x{max_height}",
+            container.label()
+        ),
+        DomainError::StackVideoPixelLimit {
+            container,
+            width,
+            height,
+            max_pixels,
+        } => write!(
+            f,
+            "stack frame {width}x{height} exceeds the {} encoder's {max_pixels}-pixel limit",
             container.label()
         ),
         _ => Err(fmt::Error),

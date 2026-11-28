@@ -354,7 +354,7 @@ fn frame_timing(fps: fastconv_domain::StackFps, index: u64) -> (i64, u64) {
 fn finish_execution(
     plan: &FrameSequencePlan,
     staging: StagingTarget,
-    workers: usize,
+    workers: Option<NonZeroUsize>,
     hardware_device: Option<String>,
 ) -> Result<FrameSequenceReport, PipelineError> {
     let output_bytes = staging
@@ -377,7 +377,7 @@ fn finish_execution(
         plan.mode(),
         plan.target_path().to_path_buf(),
         output_bytes,
-        NonZeroUsize::new(workers).unwrap_or_else(|| plan.worker_threads()),
+        workers,
         hardware_device,
     ))
 }
@@ -452,7 +452,9 @@ fn execute_cpu_video_sequence(
             packets: stream.packets,
         },
     )?;
-    finish_execution(plan, staging, plan.worker_threads().get(), None)
+    // The CPU encoder owns private GOP workers and does not expose a count;
+    // do not misreport the requested `--threads` as execution threads.
+    finish_execution(plan, staging, None, None)
 }
 
 /// NVENC video stacks: one image at a time goes straight into the pinned NV12
@@ -472,7 +474,7 @@ fn execute_nvenc_video_sequence(
         });
     }
     let container = match plan.mode() {
-        StackExecutionMode::Video { container, .. } => container,
+        StackExecutionMode::Video(mode) => mode.container(),
         StackExecutionMode::Animation { .. } => {
             return Err(PipelineError::EncodeFailed {
                 path: plan.target_path().to_path_buf(),
@@ -490,7 +492,8 @@ fn execute_nvenc_video_sequence(
             packets: stream.packets,
         },
     )?;
-    finish_execution(plan, staging, plan.worker_threads().get(), Some(device))
+    // One image decode worker plus encoding on the calling thread.
+    finish_execution(plan, staging, Some(NonZeroUsize::MIN), Some(device))
 }
 
 /// Executes a validated frame sequence into its target.
@@ -504,11 +507,10 @@ pub fn execute_frame_sequence(
 ) -> Result<FrameSequenceReport, PipelineError> {
     match plan.mode() {
         StackExecutionMode::Animation { .. } => execute_animation_sequence(plan),
-        StackExecutionMode::Video {
-            container,
-            encode_mode,
-        } => {
+        StackExecutionMode::Video(mode) => {
             verify_no_alias(plan)?;
+            let container = mode.container();
+            let encode_mode = mode.encode_mode();
             match encode_mode {
                 VideoEncodeMode::CpuH264 { .. }
                 | VideoEncodeMode::CpuAv1 { .. }
@@ -621,7 +623,7 @@ fn execute_animation_sequence(
             reason: format!("encoder wrote {written} frames for {expected} sources"),
         });
     }
-    finish_execution(plan, staging, workers, None)
+    finish_execution(plan, staging, NonZeroUsize::new(workers), None)
 }
 
 #[cfg(test)]
@@ -949,15 +951,15 @@ mod tests {
         })?;
         let report = execute_frame_sequence(&capped_plan)?;
         assert_eq!(
-            report.worker_threads().get(),
-            crate::video_anim::MAX_ANIM_WORKERS
+            report.worker_threads().map(NonZeroUsize::get),
+            Some(crate::video_anim::MAX_ANIM_WORKERS)
         );
 
         // A request below the cap must be reported unchanged.
         let uncapped_target = root.join("uncapped.gif");
         let uncapped_plan = plan(frames, uncapped_target, StackTargetFormat::Gif)?;
         let report = execute_frame_sequence(&uncapped_plan)?;
-        assert_eq!(report.worker_threads().get(), 2);
+        assert_eq!(report.worker_threads().map(NonZeroUsize::get), Some(2));
 
         fs::remove_dir_all(&root).map_err(|source| PipelineError::Io {
             path: root.clone(),
@@ -1204,10 +1206,14 @@ mod tests {
             path: PathBuf::from("budget"),
             reason: err.to_string(),
         })?;
-        assert!(matches!(
-            execute_frame_sequence(&plan),
-            Err(PipelineError::DecodeFailed { .. })
-        ));
+        assert!(
+            matches!(
+                execute_frame_sequence(&plan),
+                Err(PipelineError::DecodeFailed { ref reason, .. })
+                    if reason.contains("per-track budget")
+            ),
+            "expected the per-track decoded-budget guard, not an unrelated decode failure"
+        );
         fs::remove_dir_all(&root).map_err(|source| PipelineError::Io {
             path: root.clone(),
             source,
@@ -1247,9 +1253,6 @@ mod tests {
     #[cfg(feature = "nvenc")]
     #[test]
     fn nvenc_stack_encoding_reports_gpu_path_and_roundtrips() -> Result<(), PipelineError> {
-        if cudarc::driver::CudaContext::new(0).is_err() {
-            return Ok(());
-        }
         let root = temp_dir("nvenc-stack")?;
         let mut frames = Vec::new();
         for index in 0_u8..3 {
@@ -1281,6 +1284,15 @@ mod tests {
                     });
                 }
             };
+            // CUDA context creation alone does not establish NVENC support
+            // (e.g. A100 has CUDA but no NVENC). Skip only codecs this adapter
+            // cannot encode with NV12 input; real encode/mux/decode failures
+            // below remain test failures.
+            if !crate::gpu::nvenc::codec_supports_encode_enabled(codec.as_video_codec())
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let target = root.join(format!(
                 "out-{}.{}",
                 codec.cli_name(),

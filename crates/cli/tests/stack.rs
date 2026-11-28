@@ -373,9 +373,9 @@ fn video_stacks_roundtrip_through_frames_for_every_container() -> Result<(), Str
             "cpu",
         ])?;
         assert!(
-            summary.contains(&format!("| .{container} |"))
-                && summary.contains(codec)
-                && summary.contains("cpu"),
+            summary.contains(&format!("| .{container} | "))
+                && summary.contains(&format!("| {codec} | "))
+                && summary.contains("| cpu"),
             "unexpected summary for .{container}: {summary}"
         );
         let frames_dir = root.join(format!("extracted_{container}"));

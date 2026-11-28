@@ -1412,6 +1412,8 @@ mod enabled {
                 temporal_aq_supported: self
                     .get_encode_cap(guid, NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_TEMPORAL_AQ)?
                     > 0,
+                max_width: self.get_encode_cap(guid, NV_ENC_CAPS::NV_ENC_CAPS_WIDTH_MAX)?,
+                max_height: self.get_encode_cap(guid, NV_ENC_CAPS::NV_ENC_CAPS_HEIGHT_MAX)?,
             })
         }
 
@@ -2587,6 +2589,26 @@ mod enabled {
         ))
     }
 
+    /// Test-only capability probe: the codec GUID must be exposed and accept
+    /// NV12 input before a round-trip test may require an encoder session.
+    #[cfg(test)]
+    pub(crate) fn codec_supports_encode_enabled(codec: VideoCodec) -> Result<bool, PipelineError> {
+        let nvenc_codec = match codec {
+            VideoCodec::H264 => NvencVideoCodec::H264,
+            VideoCodec::Hevc => NvencVideoCodec::Hevc,
+            _ => return Ok(false),
+        };
+        let cuda_ctx = CudaContext::new(0)
+            .map_err(|err| video_error(format!("failed to initialize CUDA device 0: {err}")))?;
+        let encoder = RawNvencEncoder::open(cuda_ctx)?;
+        let guid = nvenc_codec.guid();
+        if !encoder.get_encode_guids()?.contains(&guid) {
+            return Ok(false);
+        }
+        let formats = encoder.get_supported_input_formats(guid)?;
+        Ok(formats.contains(&NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12))
+    }
+
     #[cfg(test)]
     pub(super) fn codec_supports_b_frames_enabled(
         codec: VideoCodec,
@@ -2620,6 +2642,10 @@ mod enabled {
         fps_den: u32,
         track_index: usize,
         disable_b_adapt: bool,
+        // Stack-only preflight geometry: checked against this adapter's codec
+        // caps before the producer pins any ring slots. Video streams pass
+        // `None` because their geometry is discovery-time data.
+        expected_dimensions: Option<(u32, u32)>,
         producer: P,
         mut on_frame_encoded: F,
     ) -> Result<(EncodedVideoStream, u64, String), PipelineError>
@@ -2637,6 +2663,26 @@ mod enabled {
         let device_name = cuda_ctx
             .name()
             .map_err(|err| video_error(format!("failed to query CUDA device name: {err}")))?;
+        if let Some((width, height)) = expected_dimensions {
+            // Open a short-lived encoder session and ask this adapter whether
+            // it can encode this geometry *before* the producer pins and clears
+            // four NV12 slots (~384 MiB at 8192x8192). The main session below
+            // still re-checks the GUID and caps during initialization.
+            let encoder = RawNvencEncoder::open(Arc::clone(&cuda_ctx))?;
+            if !encoder.get_encode_guids()?.contains(&guid) {
+                return Err(video_error(
+                    "this NVIDIA GPU does not expose the requested NVENC video codec",
+                ));
+            }
+            let caps = encoder.query_codec_caps(guid)?;
+            let max_width = u32::try_from(caps.max_width).unwrap_or(u32::MAX);
+            let max_height = u32::try_from(caps.max_height).unwrap_or(u32::MAX);
+            if (max_width > 0 && width > max_width) || (max_height > 0 && height > max_height) {
+                return Err(video_error(format!(
+                    "NVENC stack frame {width}x{height} exceeds this adapter's {max_width}x{max_height} limit"
+                )));
+            }
+        }
         let cancelled = Arc::new(AtomicBool::new(false));
         let decode_ctx = Arc::clone(&cuda_ctx);
 
@@ -2766,6 +2812,7 @@ mod enabled {
             1,
             track_index,
             disable_b_adapt,
+            None,
             |ctx, ring| {
                 decode_video_track_streaming(path, source_track, track_packets, |info, pack| {
                     ring.push(&ctx, info, pack)
@@ -2805,6 +2852,7 @@ mod enabled {
             fps_den,
             0,
             false,
+            Some((dimensions.width().get(), dimensions.height().get())),
             |ctx, ring| {
                 let mut file_bytes = Vec::new();
                 let mut pixel_buf = Vec::new();
@@ -2922,6 +2970,9 @@ mod enabled {
     }
 }
 
+#[cfg(all(test, feature = "nvenc"))]
+pub(crate) use enabled::codec_supports_encode_enabled;
+
 #[cfg(not(feature = "nvenc"))]
 use fastconv_domain::GpuBackend;
 #[cfg(any(feature = "nvenc", test))]
@@ -2952,6 +3003,9 @@ struct NvencCodecCaps {
     bframe_ref_mode: i32,
     lookahead_supported: bool,
     temporal_aq_supported: bool,
+    /// `NV_ENC_CAPS_WIDTH_MAX` / `HEIGHT_MAX`; non-positive means unknown.
+    max_width: i32,
+    max_height: i32,
 }
 
 /// Validated NVENC encode configuration derived from hardware capabilities so
@@ -3448,6 +3502,8 @@ mod unit_tests {
             bframe_ref_mode: 0,
             lookahead_supported: true,
             temporal_aq_supported: false,
+            max_width: 8192,
+            max_height: 8192,
         };
         let plan = NvencVideoPlan::from_caps(60, pascal_hevc);
         assert_eq!(plan.gop_length, 120);
@@ -3466,6 +3522,8 @@ mod unit_tests {
             bframe_ref_mode: 2,
             lookahead_supported: true,
             temporal_aq_supported: true,
+            max_width: 8192,
+            max_height: 8192,
         };
         let plan = NvencVideoPlan::from_caps(60, turing_caps);
         assert_eq!(plan.gop_length, 120);
