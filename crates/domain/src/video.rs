@@ -23,6 +23,19 @@ pub enum VideoContainerFormat {
 }
 
 impl VideoContainerFormat {
+    /// Every video container, in canonical order. Reverse codec lookups use
+    /// this order so diagnostics list containers consistently.
+    pub const ALL: [Self; 8] = [
+        Self::Mp4,
+        Self::Mov,
+        Self::Mkv,
+        Self::Webm,
+        Self::Avi,
+        Self::Ts,
+        Self::Gif,
+        Self::Webp,
+    ];
+
     #[must_use]
     pub const fn extension(self) -> &'static str {
         match self {
@@ -97,6 +110,77 @@ impl VideoContainerFormat {
             Self::Mp4 | Self::Mkv | Self::Mov | Self::Avi | Self::Ts => Some(TargetAudioCodec::Aac),
         }
     }
+
+    /// Video codecs this container can carry, in help-message order. Subtitle
+    /// tracks are reported separately and never appear in this list.
+    #[must_use]
+    pub const fn supported_video_codecs(self) -> &'static [TargetVideoCodec] {
+        match self {
+            Self::Mp4 => &[
+                TargetVideoCodec::H264,
+                TargetVideoCodec::Hevc,
+                TargetVideoCodec::Av1,
+                TargetVideoCodec::Vp9,
+            ],
+            Self::Mov | Self::Mkv | Self::Avi => &[
+                TargetVideoCodec::H264,
+                TargetVideoCodec::Hevc,
+                TargetVideoCodec::Av1,
+                TargetVideoCodec::Vp9,
+                TargetVideoCodec::Mjpeg,
+            ],
+            Self::Webm => &[TargetVideoCodec::Vp9, TargetVideoCodec::Av1],
+            Self::Ts => &[
+                TargetVideoCodec::H264,
+                TargetVideoCodec::Hevc,
+                TargetVideoCodec::Av1,
+            ],
+            Self::Gif => &[TargetVideoCodec::Gif],
+            Self::Webp => &[TargetVideoCodec::Webp],
+        }
+    }
+
+    /// Audio codecs this container can carry, in help-message order. Empty for
+    /// animation containers, which have no audio track at all.
+    #[must_use]
+    pub const fn supported_audio_codecs(self) -> &'static [TargetAudioCodec] {
+        match self {
+            Self::Mp4 => &[
+                TargetAudioCodec::Aac,
+                TargetAudioCodec::Opus,
+                TargetAudioCodec::Mp3,
+                TargetAudioCodec::Flac,
+            ],
+            Self::Mov => &[
+                TargetAudioCodec::Aac,
+                TargetAudioCodec::Opus,
+                TargetAudioCodec::Mp3,
+                TargetAudioCodec::Flac,
+                TargetAudioCodec::Pcm,
+            ],
+            Self::Mkv => &[
+                TargetAudioCodec::Aac,
+                TargetAudioCodec::Opus,
+                TargetAudioCodec::Mp3,
+                TargetAudioCodec::Vorbis,
+                TargetAudioCodec::Flac,
+                TargetAudioCodec::Pcm,
+            ],
+            Self::Webm => &[TargetAudioCodec::Opus, TargetAudioCodec::Vorbis],
+            Self::Avi => &[
+                TargetAudioCodec::Aac,
+                TargetAudioCodec::Opus,
+                TargetAudioCodec::Mp3,
+                TargetAudioCodec::Pcm,
+            ],
+            Self::Ts => &[
+                TargetAudioCodec::Aac,
+                TargetAudioCodec::Opus,
+                TargetAudioCodec::Mp3,
+            ],
+            Self::Gif | Self::Webp => &[],
+        }
+    }
 }
 
 impl fmt::Display for VideoContainerFormat {
@@ -127,6 +211,25 @@ pub enum VideoCodec {
 }
 
 impl VideoCodec {
+    /// Every recognised video/audio/subtitle codec, in canonical order.
+    pub const ALL: [Self; 15] = [
+        Self::H264,
+        Self::Hevc,
+        Self::Av1,
+        Self::Vp9,
+        Self::Mjpeg,
+        Self::Aac,
+        Self::Opus,
+        Self::Mp3,
+        Self::Vorbis,
+        Self::Flac,
+        Self::Pcm,
+        Self::TimedText,
+        Self::Gif,
+        Self::Webp,
+        Self::Unknown,
+    ];
+
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -145,6 +248,48 @@ impl VideoCodec {
             Self::Gif => "GIF",
             Self::Webp => "WebP",
             Self::Unknown => "unknown",
+        }
+    }
+
+    /// CLI-facing codec name, used in diagnostics and comparisons.
+    #[must_use]
+    pub const fn cli_name(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+            Self::Av1 => "av1",
+            Self::Vp9 => "vp9",
+            Self::Mjpeg => "mjpeg",
+            Self::Aac => "aac",
+            Self::Opus => "opus",
+            Self::Mp3 => "mp3",
+            Self::Vorbis => "vorbis",
+            Self::Flac => "flac",
+            Self::Pcm => "pcm",
+            Self::TimedText => "timed-text",
+            Self::Gif => "gif",
+            Self::Webp => "webp",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Containers that can carry this codec, in canonical order. This is the
+    /// reverse of [`Self::supported_in`]; both must agree for every pair.
+    #[must_use]
+    pub const fn supported_containers(self) -> &'static [VideoContainerFormat] {
+        use VideoContainerFormat as C;
+        match self {
+            Self::H264 | Self::Hevc | Self::Aac | Self::Mp3 => {
+                &[C::Mp4, C::Mov, C::Mkv, C::Avi, C::Ts]
+            }
+            Self::Av1 | Self::Opus => &[C::Mp4, C::Mov, C::Mkv, C::Webm, C::Avi, C::Ts],
+            Self::Vp9 => &[C::Mp4, C::Mov, C::Mkv, C::Webm, C::Avi],
+            Self::Mjpeg | Self::Pcm => &[C::Mov, C::Mkv, C::Avi],
+            Self::Vorbis => &[C::Mkv, C::Webm],
+            Self::Flac | Self::TimedText => &[C::Mp4, C::Mov, C::Mkv],
+            Self::Gif => &[C::Gif],
+            Self::Webp => &[C::Webp],
+            Self::Unknown => &[],
         }
     }
 
@@ -265,6 +410,17 @@ pub enum TargetVideoCodec {
 }
 
 impl TargetVideoCodec {
+    /// Every selectable video codec, in CLI help order.
+    pub const ALL: [Self; 7] = [
+        Self::H264,
+        Self::Hevc,
+        Self::Av1,
+        Self::Vp9,
+        Self::Mjpeg,
+        Self::Gif,
+        Self::Webp,
+    ];
+
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -275,6 +431,34 @@ impl TargetVideoCodec {
             Self::Mjpeg => "MJPEG",
             Self::Gif => "GIF",
             Self::Webp => "WebP",
+        }
+    }
+
+    /// CLI-facing codec name, used in diagnostics.
+    #[must_use]
+    pub const fn cli_name(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+            Self::Av1 => "av1",
+            Self::Vp9 => "vp9",
+            Self::Mjpeg => "mjpeg",
+            Self::Gif => "gif",
+            Self::Webp => "webp",
+        }
+    }
+
+    /// Containers accepting this encoded video codec, in canonical order.
+    #[must_use]
+    pub const fn supported_containers(self) -> &'static [VideoContainerFormat] {
+        use VideoContainerFormat as C;
+        match self {
+            Self::H264 | Self::Hevc => &[C::Mp4, C::Mov, C::Mkv, C::Avi, C::Ts],
+            Self::Av1 => &[C::Mp4, C::Mov, C::Mkv, C::Webm, C::Avi, C::Ts],
+            Self::Vp9 => &[C::Mp4, C::Mov, C::Mkv, C::Webm, C::Avi],
+            Self::Mjpeg => &[C::Mov, C::Mkv, C::Avi],
+            Self::Gif => &[C::Gif],
+            Self::Webp => &[C::Webp],
         }
     }
 
@@ -330,6 +514,16 @@ pub enum TargetAudioCodec {
 }
 
 impl TargetAudioCodec {
+    /// Every selectable audio codec, in CLI help order.
+    pub const ALL: [Self; 6] = [
+        Self::Aac,
+        Self::Opus,
+        Self::Mp3,
+        Self::Vorbis,
+        Self::Flac,
+        Self::Pcm,
+    ];
+
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -339,6 +533,32 @@ impl TargetAudioCodec {
             Self::Vorbis => "Vorbis",
             Self::Flac => "FLAC",
             Self::Pcm => "PCM",
+        }
+    }
+
+    /// CLI-facing codec name, used in diagnostics.
+    #[must_use]
+    pub const fn cli_name(self) -> &'static str {
+        match self {
+            Self::Aac => "aac",
+            Self::Opus => "opus",
+            Self::Mp3 => "mp3",
+            Self::Vorbis => "vorbis",
+            Self::Flac => "flac",
+            Self::Pcm => "pcm",
+        }
+    }
+
+    /// Containers accepting this encoded audio codec, in canonical order.
+    #[must_use]
+    pub const fn supported_containers(self) -> &'static [VideoContainerFormat] {
+        use VideoContainerFormat as C;
+        match self {
+            Self::Aac | Self::Mp3 => &[C::Mp4, C::Mov, C::Mkv, C::Avi, C::Ts],
+            Self::Opus => &[C::Mp4, C::Mov, C::Mkv, C::Webm, C::Avi, C::Ts],
+            Self::Vorbis => &[C::Mkv, C::Webm],
+            Self::Flac => &[C::Mp4, C::Mov, C::Mkv],
+            Self::Pcm => &[C::Mov, C::Mkv, C::Avi],
         }
     }
 
@@ -3978,5 +4198,90 @@ mod tests {
             .to_string(),
             "cpu H.264 (bitrate 2000k)"
         );
+    }
+
+    #[test]
+    fn container_stream_matrix_is_symmetric_across_all_pairs() {
+        for container in VideoContainerFormat::ALL {
+            for codec in VideoCodec::ALL {
+                let forward = container
+                    .supported_video_codecs()
+                    .iter()
+                    .any(|c| c.cli_name() == codec.cli_name())
+                    || container
+                        .supported_audio_codecs()
+                        .iter()
+                        .any(|c| c.cli_name() == codec.cli_name())
+                    || (codec == VideoCodec::TimedText
+                        && VideoCodec::TimedText
+                            .supported_containers()
+                            .contains(&container));
+                assert_eq!(
+                    codec.supported_in(container),
+                    forward,
+                    "{codec}/{container}: forward lists disagree with supported_in"
+                );
+                assert_eq!(
+                    codec.supported_containers().contains(&container),
+                    forward,
+                    "{codec}/{container}: reverse list disagrees with forward lists"
+                );
+            }
+            for codec in TargetVideoCodec::ALL {
+                let forward = container.supported_video_codecs().contains(&codec);
+                assert_eq!(forward, codec.supported_in(container));
+                assert_eq!(forward, codec.supported_containers().contains(&container));
+            }
+            for codec in TargetAudioCodec::ALL {
+                let forward = container.supported_audio_codecs().contains(&codec);
+                assert_eq!(forward, codec.supported_in(container));
+                assert_eq!(forward, codec.supported_containers().contains(&container));
+            }
+        }
+        assert_eq!(VideoCodec::TimedText.cli_name(), "timed-text");
+        assert_eq!(VideoCodec::Unknown.cli_name(), "unknown");
+    }
+
+    #[test]
+    fn unsupported_video_codec_error_reports_both_directions() {
+        let cases: &[(VideoCodec, VideoContainerFormat, &[&str])] = &[
+            (
+                VideoCodec::H264,
+                VideoContainerFormat::Webm,
+                &["vp9", "av1", "mp4", "mov", "mkv", "avi", "ts"],
+            ),
+            (
+                VideoCodec::Aac,
+                VideoContainerFormat::Webm,
+                &["opus", "vorbis", "mp4", "mov", "mkv", "avi", "ts"],
+            ),
+            (
+                VideoCodec::Pcm,
+                VideoContainerFormat::Mp4,
+                &["aac", "opus", "mp3", "flac", "mov", "mkv", "avi"],
+            ),
+            (
+                VideoCodec::Aac,
+                VideoContainerFormat::Gif,
+                &["GIF supports no audio", "mp4", "mov", "mkv", "avi", "ts"],
+            ),
+            (
+                VideoCodec::TimedText,
+                VideoContainerFormat::Webm,
+                &["subtitle", "mp4", "mov", "mkv"],
+            ),
+            (
+                VideoCodec::Unknown,
+                VideoContainerFormat::Ts,
+                &["supported video codecs", "supported audio codecs", "none"],
+            ),
+        ];
+        for &(codec, container, expected) in cases {
+            let text = DomainError::UnsupportedVideoCodec { codec, container }.to_string();
+            for &needle in expected {
+                assert!(text.contains(needle), "{text}");
+            }
+        }
+        assert!(!VideoCodec::TimedText.supported_in(VideoContainerFormat::Webm));
     }
 }

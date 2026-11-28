@@ -15,7 +15,7 @@ use containr::mp4::{
     AudioCodec, Brand, MuxOptions, SampleEntrySpec, TrackSpec as Mp4TrackSpec, VisualCodec,
 };
 use containr::{CodecConfig, EditEntry, EditList, Timebase, Track, TrackKind};
-use fastconv_domain::{VideoCodec, VideoContainerFormat};
+use fastconv_domain::{DomainError, VideoCodec, VideoContainerFormat};
 
 use crate::PipelineError;
 use crate::video_bitstream::{
@@ -2119,11 +2119,11 @@ pub(crate) fn mux_video(
         if !track.codec.supported_in(format) {
             return Err(container_error(
                 target_path,
-                format!(
-                    "codec {} is not supported in {}",
-                    track.codec,
-                    format.label()
-                ),
+                DomainError::UnsupportedVideoCodec {
+                    codec: track.codec,
+                    container: format,
+                }
+                .to_string(),
             ));
         }
     }

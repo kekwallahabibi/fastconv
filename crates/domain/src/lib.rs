@@ -208,7 +208,6 @@ pub enum DomainError {
     UnsupportedAudioCodecForFormat {
         format: AudioOutputFormat,
         codec: AudioTargetCodec,
-        supported: &'static str,
     },
     InvalidAudioBitDepth {
         raw: String,
@@ -277,6 +276,84 @@ impl fmt::Display for PathRole {
     }
 }
 
+/// Renders a canonical list of CLI names, using `none` for an empty list so
+/// diagnostics never end in an ambiguous dangling separator.
+fn cli_name_list<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    let names: Vec<&str> = names.into_iter().collect();
+    if names.is_empty() {
+        "none".to_owned()
+    } else {
+        names.join(", ")
+    }
+}
+
+/// Reports both directions of a video stream/container mismatch: what the
+/// container can carry for this kind of stream and where this codec is legal.
+fn fmt_unsupported_video_codec(
+    codec: VideoCodec,
+    container: VideoContainerFormat,
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    let supported = if codec.is_video() {
+        format!(
+            "supported video codecs: {}",
+            cli_name_list(
+                container
+                    .supported_video_codecs()
+                    .iter()
+                    .map(|codec| codec.cli_name())
+            )
+        )
+    } else if codec.is_audio() {
+        if container.supported_audio_codecs().is_empty() {
+            format!("{} supports no audio", container.label())
+        } else {
+            format!(
+                "supported audio codecs: {}",
+                cli_name_list(
+                    container
+                        .supported_audio_codecs()
+                        .iter()
+                        .map(|codec| codec.cli_name())
+                )
+            )
+        }
+    } else if codec == VideoCodec::TimedText {
+        if codec.supported_in(container) {
+            "supported subtitle codecs: timed-text".to_owned()
+        } else {
+            format!("{} supports no subtitles", container.label())
+        }
+    } else {
+        // Unknown stream kind: report both codec families so a container's
+        // capabilities are always visible.
+        format!(
+            "supported video codecs: {}; supported audio codecs: {}",
+            cli_name_list(
+                container
+                    .supported_video_codecs()
+                    .iter()
+                    .map(|codec| codec.cli_name())
+            ),
+            cli_name_list(
+                container
+                    .supported_audio_codecs()
+                    .iter()
+                    .map(|codec| codec.cli_name())
+            )
+        )
+    };
+    write!(
+        f,
+        "codec '{}' cannot be stored in {} ({}; containers supporting {}: {})",
+        codec.cli_name(),
+        container.label(),
+        supported,
+        codec.cli_name(),
+        cli_name_list(codec.supported_containers().iter().map(|c| c.extension()))
+    )
+}
+
 impl fmt::Display for DomainError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -298,10 +375,9 @@ impl fmt::Display for DomainError {
             Self::InvalidDimensions { width, height } => {
                 write!(f, "image dimensions must be non-zero, got {width}x{height}")
             }
-            Self::UnsupportedVideoCodec { codec, container } => write!(
-                f,
-                "codec '{codec}' is not supported in {container} containers"
-            ),
+            Self::UnsupportedVideoCodec { codec, container } => {
+                fmt_unsupported_video_codec(*codec, *container, f)
+            }
             Self::UnsupportedVideoPipeline {
                 codec,
                 backend,
@@ -431,13 +507,24 @@ fn fmt_encoding_error(err: &DomainError, f: &mut fmt::Formatter<'_>) -> fmt::Res
         DomainError::InvalidAudioCodec { raw, expected } => {
             write!(f, "invalid audio codec '{raw}' (expected {expected})")
         }
-        DomainError::UnsupportedAudioCodecForFormat {
-            format,
-            codec,
-            supported,
-        } => write!(
+        DomainError::UnsupportedAudioCodecForFormat { format, codec } => write!(
             f,
-            "codec '{codec}' cannot be stored in {format} (expected {supported})"
+            "codec '{}' cannot be stored in {} (supported codecs: {}; containers supporting {}: {})",
+            codec.cli_name(),
+            format.container_label(),
+            cli_name_list(
+                format
+                    .supported_codecs()
+                    .iter()
+                    .map(|codec| codec.cli_name())
+            ),
+            codec.cli_name(),
+            cli_name_list(
+                codec
+                    .supported_formats()
+                    .iter()
+                    .map(|format| format.cli_name())
+            )
         ),
         DomainError::InvalidAudioBitDepth { raw, expected } => {
             write!(f, "invalid audio bit depth '{raw}' (expected {expected})")
